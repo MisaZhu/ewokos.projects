@@ -1,4 +1,6 @@
-DIRS = litehtml widget++
+# libwebp first: widget++ resolves <webp.h> from $(BUILD_DIR)/include, which
+# libwebp is what populates.
+DIRS = libwebp litehtml widget++
 
 all: basic_libs
 	@echo "all done."

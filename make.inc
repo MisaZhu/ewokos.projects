@@ -31,5 +31,5 @@ SDK_DIR= $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 include $(EWOKOS_SYS_DIR)/platform/$(ARCH)/make.rule
 
 LDFLAGS = -L $(SDK_DIR)/lib
-CFLAGS += -I include -I $(SDK_DIR)/include
-CXXFLAGS += -I include -I $(SDK_DIR)/include
+CFLAGS += -I include -I $(SDK_DIR)/include $(CFLAGS_EXTRA)
+CXXFLAGS += -I include -I $(SDK_DIR)/include $(CXXFLAGS_EXTRA)

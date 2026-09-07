@@ -6,6 +6,7 @@
 
 #include <graph/graph_ex.h>
 #include <graph/graph_image.h>
+#include <webp.h>
 #include <ewoksys/basic_math.h>
 #include <ewoksys/kernel_tic.h>
 #include <ewoksys/klog.h>
@@ -633,12 +634,40 @@ void XContainer::flushPendingImages()
         queued_count, (int)retry_urls.size(), (int)m_pending_image_urls.size());
 }
 
+/*
+ * WebP is decoded by libwebp, which lives in projects/browser/libs and is
+ * therefore not reachable from graph_image_new_from_data(). The check is a
+ * cheap RIFF/WEBP magic test, so running it ahead of the generic decoder
+ * costs nothing on the formats that decoder does handle.
+ */
+static graph_t* webp_graph_new_from_data(const uint8_t* data, uint32_t size)
+{
+    webp_image_t img;
+    graph_t* g;
+
+    if(!webp_is_webp(data, size))
+        return NULL;
+    if(webp_decode(data, size, &img) != WEBP_OK) {
+        klog("[xBrowser] webp decode failed: size=%u\n", size);
+        return NULL;
+    }
+
+    g = graph_new(NULL, img.width, img.height);
+    if(g != NULL)
+        memcpy(g->buffer, img.pixels,
+                (size_t)img.width * img.height * sizeof(uint32_t));
+    webp_image_free(&img);
+    return g;
+}
+
 bool XContainer::loadImageData(const std::string& url, uint8_t* data, int sz)
 {
     if (data == NULL || sz <= 0 || url.empty())
         return false;
 
-    graph_t* img = graph_image_new_from_data(GRAPH_IMAGE_TYPE_AUTO, data, sz);
+    graph_t* img = webp_graph_new_from_data(data, (uint32_t)sz);
+    if (img == NULL)
+        img = graph_image_new_from_data(GRAPH_IMAGE_TYPE_AUTO, data, sz);
     if (img == NULL) {
         klog("[xBrowser] image decode failed: url=%s size=%d\n", url.c_str(), sz);
         return false;
