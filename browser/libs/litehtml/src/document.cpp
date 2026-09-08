@@ -1060,6 +1060,11 @@ void litehtml::document::style_step_stamp(element* el)
 	if(el)
 	{
 		el->m_step_stamp = m_step_epoch;
+		/* A fresh stamp means only this element's own work has completed; its
+		 * subtree has not been covered yet. Clear any m_step_done left over
+		 * from the previous phase or epoch, otherwise the element would be
+		 * pruned on resume and its children never visited. */
+		el->m_step_done = false;
 		m_step_stamped++;
 	}
 }

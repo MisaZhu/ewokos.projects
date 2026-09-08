@@ -10,6 +10,7 @@ litehtml::element::element(litehtml::document* doc) : m_doc(doc), m_parent(nullp
 	m_box		= 0;
 	m_skip		= false;
 	m_step_stamp	= 0;
+	m_step_done		= false;
 }
 
 litehtml::element::~element()

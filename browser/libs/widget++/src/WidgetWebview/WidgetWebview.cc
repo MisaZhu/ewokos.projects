@@ -15,12 +15,24 @@
 #include <ewoksys/proc.h>
 #include <deque>
 #include <ctype.h>
+#include <stdlib.h>
 #include <pthread.h>
 
-/* libgloss heap diagnostics (see compat.c). Walks the block chain, so it is
- * only called from a throttled once-per-second log below. */
+/* libgloss heap diagnostics (see compat.c). Walks the whole block chain under
+ * the malloc lock, so it must never run on a timed path: it is only called
+ * from the throttled watchdog below, and only with XBROWSER_HEAPSTAT=1. */
 extern "C" void ewok_heap_stat(uint32_t* blocks, uint32_t* free_blocks,
-        uint32_t* used_bytes, uint32_t* free_bytes);
+        uint32_t* used_bytes, uint32_t* free_bytes,
+        uint32_t* free_list_len, uint32_t* free_list_max);
+
+static bool heap_stat_enabled() {
+    static int enabled = -1;
+    if(enabled < 0) {
+        const char* v = getenv("XBROWSER_HEAPSTAT");
+        enabled = (v != nullptr && v[0] == '1') ? 1 : 0;
+    }
+    return enabled == 1;
+}
 
 using namespace Ewok;
 
@@ -854,26 +866,40 @@ void WidgetWebview::onTimer(uint32_t timerFPS, uint32_t timerSteps)
     }
 
     /* Red-line watchdog: every tick must stay bounded so xwin events are
-     * served promptly. Log the tick cost plus the heap shape once per second
-     * -- an unbounded tick or a runaway block count shows up here instead of
-     * only as a frozen window. */
+     * served promptly. An unbounded tick shows up here instead of only as a
+     * frozen window. The heap snapshot walks the whole block chain under the
+     * malloc lock, so a diagnostic must not itself stall the event loop it is
+     * watching: it is opt-in via XBROWSER_HEAPSTAT=1. */
     uint64_t tick_end = kernel_tic_ms(0);
     uint32_t tick_ms = (uint32_t)(tick_end - tick_start);
-    if (tick_end - m_lastStatLogAt >= 1000) {
-        uint32_t blocks = 0;
-        uint32_t free_blocks = 0;
-        uint32_t used_bytes = 0;
-        uint32_t free_bytes = 0;
-        m_lastStatLogAt = tick_end;
-        ewok_heap_stat(&blocks, &free_blocks, &used_bytes, &free_bytes);
-        klog("[xBrowser] tick watchdog: cost=%u ms pending=%d build=%d style_inflight=%d | heap blocks=%u free=%u used=%u KB holes=%u KB\n",
-            tick_ms, (int)has_more_results, (int)m_buildPhase,
-            (int)m_styleStepInFlight, blocks, free_blocks,
-            used_bytes / 1024, free_bytes / 1024);
-    } else if (tick_ms > 50) {
+    if (tick_ms > 50) {
         klog("[xBrowser] tick overrun: cost=%u ms pending=%d build=%d style_inflight=%d\n",
             tick_ms, (int)has_more_results, (int)m_buildPhase,
             (int)m_styleStepInFlight);
+    }
+    if (tick_end - m_lastStatLogAt >= 1000) {
+        m_lastStatLogAt = tick_end;
+        if (heap_stat_enabled()) {
+            uint32_t blocks = 0;
+            uint32_t free_blocks = 0;
+            uint32_t used_bytes = 0;
+            uint32_t free_bytes = 0;
+            uint32_t flist_len = 0;
+            uint32_t flist_max = 0;
+            ewok_heap_stat(&blocks, &free_blocks, &used_bytes, &free_bytes,
+                &flist_len, &flist_max);
+            /* flist must equal free_blocks: a mismatch means the allocator's
+             * free lists drifted out of sync with the physical block chain. */
+            klog("[xBrowser] tick watchdog: cost=%u ms pending=%d build=%d style_inflight=%d | heap blocks=%u free=%u used=%u KB holes=%u KB flist=%u/%u flmax=%u\n",
+                tick_ms, (int)has_more_results, (int)m_buildPhase,
+                (int)m_styleStepInFlight, blocks, free_blocks,
+                used_bytes / 1024, free_bytes / 1024,
+                flist_len, free_blocks, flist_max);
+        } else {
+            klog("[xBrowser] tick watchdog: cost=%u ms pending=%d build=%d style_inflight=%d\n",
+                tick_ms, (int)has_more_results, (int)m_buildPhase,
+                (int)m_styleStepInFlight);
+        }
     }
 }
 
@@ -935,8 +961,9 @@ bool WidgetWebview::applyPendingLayoutUpdates()
             }
             updated = true;
         } else {
-            klog("[xBrowser] style step chunk: %u ms phase=%d\n",
-                chunk_ms, style_doc->style_step_phase());
+            klog("[xBrowser] style step chunk: %u ms phase=%d stamped=%u visits=%u\n",
+                chunk_ms, style_doc->style_step_phase(),
+                style_doc->style_step_stamped(), style_doc->style_step_visits());
         }
     }
 

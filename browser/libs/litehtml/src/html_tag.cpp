@@ -450,7 +450,7 @@ static litehtml::tstring selector_key_lower(const litehtml::tstring& src)
  * document::update_master_styles_step when a chunked update completes. */
 void litehtml::dump_apply_phase_profile()
 {
-	klog("[xBrowser] apply phases: calls=%u cand=%u ms match=%u ms add=%u ms recur=%u ms\n",
+	WB_LOG("[xBrowser] apply phases: calls=%u cand=%u ms match=%u ms add=%u ms recur=%u ms\n",
 		g_apply_calls, g_apply_cand_ms, g_apply_match_ms, g_apply_add_ms, g_apply_recur_ms);
 	g_apply_calls = 0;
 	g_apply_cand_ms = 0;
@@ -471,7 +471,13 @@ void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 		{
 			/* This element's own matching already ran in the current chunked
 			 * apply epoch. Its subtree may still hold unvisited nodes, so the
-			 * children walk below must run even though self-work is skipped. */
+			 * children walk below must run even though self-work is skipped --
+			 * unless the whole subtree already finished, in which case pruning
+			 * here keeps a resumed chunk O(path length) instead of O(tree). */
+			if(m_step_done)
+			{
+				return;
+			}
 		}
 		else if(doc->style_step_exhausted())
 		{
@@ -500,6 +506,11 @@ void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 		{
 			el->apply_stylesheet(stylesheet);
 		}
+	}
+	/* The whole subtree is covered unless the slice ran out mid-walk. */
+	if(stepping && !doc->style_step_exhausted())
+	{
+		m_step_done = true;
 	}
 }
 
@@ -904,8 +915,29 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	{
 		if(m_step_stamp == step_doc->style_step_epoch())
 		{
-			/* Already parsed in this chunked-parse epoch; the child walk at the
-			 * bottom of this function still runs so paused subtrees resume. */
+			/* Own work already completed in this chunked-parse epoch. Falling
+			 * through to it anyway (the previous behaviour) made every resumed
+			 * chunk re-run the whole stamped prefix from the root down to the
+			 * frontier, so a ~1k-node tree needed ~1k chunks and never finished
+			 * -- the visible doc stayed style-pending and never rendered. Only
+			 * the paused subtree still needs walking, and if this subtree
+			 * already finished it is pruned outright, which makes a resume cost
+			 * O(path length) instead of O(tree). */
+			if(m_step_done)
+			{
+				return;
+			}
+			for(auto& el : m_children)
+			{
+				if(step_doc->style_step_exhausted())
+					break;
+				el->parse_styles();
+			}
+			if(!step_doc->style_step_exhausted())
+			{
+				m_step_done = true;
+			}
+			return;
 		}
 		else if(step_doc->style_step_exhausted())
 		{
@@ -1131,6 +1163,10 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 					break;
 				el->parse_styles();
 			}
+			if(step_parse && !step_doc->style_step_exhausted())
+			{
+				m_step_done = true; /* subtree fully covered in this epoch */
+			}
 			if(profile_enabled)
 			{
 				parse_style_profile_add(g_parse_style_profile.child_ms, part_start);
@@ -1212,6 +1248,10 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 				if(step_parse && step_doc->style_step_exhausted())
 					break;
 				el->parse_styles();
+			}
+			if(step_parse && !step_doc->style_step_exhausted())
+			{
+				m_step_done = true; /* subtree fully covered in this epoch */
 			}
 			if(profile_enabled)
 			{
@@ -1604,6 +1644,10 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 			if(step_parse && step_doc->style_step_exhausted())
 				break;
 			el->parse_styles();
+		}
+		if(step_parse && !step_doc->style_step_exhausted())
+		{
+			m_step_done = true; /* subtree fully covered in this epoch */
 		}
 		if(profile_enabled)
 		{

@@ -4,6 +4,21 @@
 #include "document.h"
 #include <ewoksys/klog.h>
 
+/*
+ * xBrowser render/network diagnostics. Silenced by default so the console is
+ * not flooded during normal browsing; build with -DXBROWSER_DEBUG=1 to enable.
+ * The "if (0)" form keeps argument expressions referenced so perf-timing
+ * locals do not trip -Wunused when logging is off.
+ */
+#ifndef XBROWSER_DEBUG
+#define XBROWSER_DEBUG 0
+#endif
+#if !XBROWSER_DEBUG
+/* Gate klog() itself (every klog() here is an [xBrowser] trace). The macro's
+ * self-reference is not re-expanded, so the real klog() stays under "if (0)". */
+#define klog(...) do { if (0) klog(__VA_ARGS__); } while (0)
+#endif
+
 namespace litehtml
 {
 
@@ -116,22 +131,43 @@ void css::parse_css_url( const tstring& str, tstring& url )
 	url = _t("");
 	size_t pos1 = str.find(_t('('));
 	size_t pos2 = str.find(_t(')'));
-	if(pos1 != tstring::npos && pos2 != tstring::npos)
+	if(pos1 == tstring::npos || pos2 == tstring::npos || pos2 < pos1)
 	{
-		url = str.substr(pos1 + 1, pos2 - pos1 - 1);
-		if(url.length())
+		return;
+	}
+	/* Only url(...) names a fetchable image. Any other function --
+	 * linear-gradient(), radial-gradient(), image-set() -- is paint syntax,
+	 * not a reference: feeding its argument list to the loader used to send
+	 * the download thread off resolving "45deg, #ececec 25%, ..." as a host
+	 * name (a 3-second DNS stall per gradient, plus log spam). */
+	{
+		tstring func = str.substr(0, pos1);
+		trim(func);
+		for(size_t i = 0; i < func.length(); i++)
 		{
-			if(url[0] == _t('\'') || url[0] == _t('"'))
+			if(func[i] >= _t('A') && func[i] <= _t('Z'))
 			{
-				url.erase(0, 1);
+				func[i] = (tchar_t)(func[i] - _t('A') + _t('a'));
 			}
 		}
-		if(url.length())
+		if(!func.empty() && func != _t("url"))
 		{
-			if(url[url.length() - 1] == _t('\'') || url[url.length() - 1] == _t('"'))
-			{
-				url.erase(url.length() - 1, 1);
-			}
+			return;
+		}
+	}
+	url = str.substr(pos1 + 1, pos2 - pos1 - 1);
+	if(url.length())
+	{
+		if(url[0] == _t('\'') || url[0] == _t('"'))
+		{
+			url.erase(0, 1);
+		}
+	}
+	if(url.length())
+	{
+		if(url[url.length() - 1] == _t('\'') || url[url.length() - 1] == _t('"'))
+		{
+			url.erase(url.length() - 1, 1);
 		}
 	}
 }

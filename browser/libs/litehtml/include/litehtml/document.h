@@ -131,6 +131,11 @@ namespace litehtml
 		bool							style_step_active() const { return m_step_phase != 0; }
 		int								style_step_phase() const { return m_step_phase; }
 		unsigned int					style_step_epoch() const { return m_step_epoch; }
+		/* Progress counters for the chunked walk: stamped is cumulative across
+		 * chunks (so it must keep climbing, otherwise the walk is stuck redoing
+		 * the same elements), visits is per chunk. */
+		uint32_t						style_step_stamped() const { return m_step_stamped; }
+		uint32_t						style_step_visits() const { return m_step_visits; }
 		bool							style_step_exhausted();
 		void							style_step_stamp(element* el);
 		/* Master css changed while a step was in flight: restart from scratch. */

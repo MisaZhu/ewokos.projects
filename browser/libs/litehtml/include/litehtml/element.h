@@ -35,6 +35,11 @@ protected:
 		/* Chunked style-update stamp: epoch of the last update phase that
 		 * visited this element (see document::update_master_styles_step). */
 		unsigned int				m_step_stamp;
+		/* Set once this element's whole subtree has been processed in the
+		 * current step epoch, letting a resumed chunk prune it in O(1) instead
+		 * of re-walking it. Only meaningful together with a matching
+		 * m_step_stamp, so a new epoch invalidates it implicitly. */
+		bool						m_step_done;
 
 		// returns refer to m_pos member;
 		position&					get_position();
