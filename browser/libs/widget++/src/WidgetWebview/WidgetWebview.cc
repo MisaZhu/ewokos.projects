@@ -53,6 +53,16 @@ using namespace Ewok;
 #endif
 
 static const uint32_t kLayoutDebounceMs = 30;
+/* Hard upper bounds on how long a stale layout may wait. A burst of image
+ * arrivals refreshes m_layoutDirtyAt on every tick, so the 30ms quiet period
+ * alone starves the re-layout until the download queue drains: the bitmaps are
+ * decoded and cached, but the <img> boxes keep the 0x0 size measured before
+ * they arrived, so nothing shows. kLayoutMaxWaitMs caps that wait.
+ * kLayoutBehindStyleMs is the longer cap for layout held back by a master-style
+ * pass or by stylesheets still in flight; past it the page re-lays out
+ * progressively instead of waiting for every sheet to land. */
+static const uint32_t kLayoutMaxWaitMs = 200;
+static const uint32_t kLayoutBehindStyleMs = 500;
 /* Hard red line: xwin input events must be served promptly, so every heavy
  * main-thread pass (result consumption, master-style update) runs against a
  * per-tick wall-clock budget. While the user is actively interacting the
@@ -147,6 +157,8 @@ WidgetWebview::WidgetWebview()
     , m_deferBuildStep(false)
     , m_layoutDirtyAt(0)
     , m_buildLayoutDirtyAt(0)
+    , m_layoutDirtySince(0)
+    , m_buildLayoutDirtySince(0)
 {
     m_container = new XContainer(&m_browser_context, this);
     m_task_running = false;
@@ -200,6 +212,8 @@ void WidgetWebview::cleanupBuildResources()
     m_styleStepInFlight = false;
     m_layoutDirtyAt = 0;
     m_buildLayoutDirtyAt = 0;
+    m_layoutDirtySince = 0;
+    m_buildLayoutDirtySince = 0;
     m_seenCssUrls.clear();
     m_buildPhase = BUILD_IDLE;
     m_buildTargetContext = nullptr;
@@ -589,13 +603,10 @@ bool WidgetWebview::loadCSSContent(const std::string& url, const std::string& co
         if (target_doc) {
             if (target_build) {
                 m_buildNeedsStyleUpdate = true;
-                m_buildNeedsLayout = true;
-                m_buildLayoutDirtyAt = kernel_tic_ms(0);
             } else {
                 m_needsStyleUpdate = true;
-                m_needsLayout = true;
-                m_layoutDirtyAt = kernel_tic_ms(0);
             }
+            markLayoutDirty(target_build);
             res = true;
         } else if (is_default_css) {
             if (m_buildPhase == BUILD_PRELOAD_CSS) {
@@ -637,13 +648,9 @@ bool WidgetWebview::loadImageContent(const std::string& url, uint8_t* content, i
         klog("[xBrowser] decode image: ok=%d size=%d cost=%u ms build=%d\n",
             res ? 1 : 0, sz, decode_ms, target_build ? 1 : 0);
         if (res && target_doc) {
-            if (target_build) {
-                m_buildNeedsLayout = true;
-                m_buildLayoutDirtyAt = kernel_tic_ms(0);
-            } else {
-                m_needsLayout = true;
-                m_layoutDirtyAt = kernel_tic_ms(0);
-            }
+            /* The bitmap is in the cache now, but the element was measured
+             * without it: layout has to run again or the image stays 0x0. */
+            markLayoutDirty(target_build);
         }
     }
     pthread_mutex_unlock(&m_renderMutex);
@@ -676,13 +683,7 @@ bool WidgetWebview::mountDecodedImage(const std::string& url, graph_t* img)
     if (img != NULL && target_container != NULL) {
         res = target_container->mountImage(url, img);
         if (res) {
-            if (target_build) {
-                m_buildNeedsLayout = true;
-                m_buildLayoutDirtyAt = kernel_tic_ms(0);
-            } else {
-                m_needsLayout = true;
-                m_layoutDirtyAt = kernel_tic_ms(0);
-            }
+            markLayoutDirty(target_build);
         }
     }
     pthread_mutex_unlock(&m_renderMutex);
@@ -955,6 +956,26 @@ void WidgetWebview::onTimer(uint32_t timerFPS, uint32_t timerSteps)
     }
 }
 
+void WidgetWebview::markLayoutDirty(bool build)
+{
+    uint64_t now = kernel_tic_ms(0);
+    if (build) {
+        m_buildNeedsLayout = true;
+        /* Keep the original dirty-since stamp: it is what bounds the wait when
+         * arrivals keep refreshing m_buildLayoutDirtyAt. */
+        if (m_buildLayoutDirtySince == 0) {
+            m_buildLayoutDirtySince = now;
+        }
+        m_buildLayoutDirtyAt = now;
+    } else {
+        m_needsLayout = true;
+        if (m_layoutDirtySince == 0) {
+            m_layoutDirtySince = now;
+        }
+        m_layoutDirtyAt = now;
+    }
+}
+
 bool WidgetWebview::applyPendingLayoutUpdates()
 {
     bool updated = false;
@@ -1008,8 +1029,7 @@ bool WidgetWebview::applyPendingLayoutUpdates()
                 klog("[xBrowser] apply css-update: chunk=%u ms (chunked)\n", chunk_ms);
                 m_needsStyleUpdate = false;
                 /* Layout now reflects the final styles; ask for one render. */
-                m_needsLayout = true;
-                m_layoutDirtyAt = kernel_tic_ms(0);
+                markLayoutDirty(false);
             }
             updated = true;
         } else {
@@ -1019,10 +1039,17 @@ bool WidgetWebview::applyPendingLayoutUpdates()
         }
     }
 
+    /* The style chunk above can take its whole budget, so re-read the clock:
+     * the caps below are wall-clock promises to the user. */
+    now = kernel_tic_ms(0);
+
     if (m_buildDoc) {
+        bool build_quiet = (m_buildLayoutDirtyAt == 0 ||
+                (now - m_buildLayoutDirtyAt) >= kLayoutDebounceMs);
+        bool build_forced = (m_buildLayoutDirtySince != 0 &&
+                (now - m_buildLayoutDirtySince) >= kLayoutMaxWaitMs);
         if (!style_build && (m_buildNeedsStyleUpdate || m_buildNeedsLayout) &&
-                m_buildLayoutDirtyAt != 0 &&
-                (now - m_buildLayoutDirtyAt) < kLayoutDebounceMs) {
+                !build_quiet && !build_forced) {
             pthread_mutex_unlock(&m_renderMutex);
             return updated;
         }
@@ -1032,15 +1059,18 @@ bool WidgetWebview::applyPendingLayoutUpdates()
             uint64_t render_start = kernel_tic_ms(0);
             m_buildDoc->render(m_clientWidth);
             uint32_t render_ms = (uint32_t)(kernel_tic_ms(0) - render_start);
-            klog("[xBrowser] render(build-pending): %u ms\n", render_ms);
+            klog("[xBrowser] render(build-pending): %u ms forced=%d\n",
+                render_ms, build_forced ? 1 : 0);
             m_buildNeedsLayout = false;
             m_buildLayoutDirtyAt = 0;
+            m_buildLayoutDirtySince = 0;
             updated = true;
         }
     } else {
         m_buildNeedsStyleUpdate = false;
         m_buildNeedsLayout = false;
         m_buildLayoutDirtyAt = 0;
+        m_buildLayoutDirtySince = 0;
     }
 
     if (m_doc) {
@@ -1049,21 +1079,34 @@ bool WidgetWebview::applyPendingLayoutUpdates()
          * running for the build doc does not block the visible doc. */
         bool style_pending = m_needsStyleUpdate ||
                 (m_styleStepInFlight && style_doc == m_doc);
-        if (!style_pending && m_needsLayout &&
-                (m_layoutDirtyAt == 0 ||
-                 (now - m_layoutDirtyAt) >= kLayoutDebounceMs)) {
+        bool quiet = (m_layoutDirtyAt == 0 ||
+                (now - m_layoutDirtyAt) >= kLayoutDebounceMs);
+        bool forced = (m_layoutDirtySince != 0 &&
+                (now - m_layoutDirtySince) >= kLayoutMaxWaitMs);
+        /* Images keep landing while stylesheets are still in flight, and
+         * m_pendingCss > 0 postpones the style walk itself. Without this cap a
+         * freshly displayed page holds every image at its pre-arrival 0x0 box
+         * until the last sheet lands, so past the cap lay out progressively;
+         * the style walk marks layout dirty again when it finishes and the
+         * page settles on the fully styled layout. */
+        bool behind_style = style_pending && m_layoutDirtySince != 0 &&
+                (now - m_layoutDirtySince) >= kLayoutBehindStyleMs;
+        if (m_needsLayout && (quiet || forced) && (!style_pending || behind_style)) {
             uint64_t render_start = kernel_tic_ms(0);
             m_doc->render(m_clientWidth);
             uint32_t layout_ms = (uint32_t)(kernel_tic_ms(0) - render_start);
-            klog("[xBrowser] render(pending): %u ms\n", layout_ms);
+            klog("[xBrowser] render(pending): %u ms forced=%d behind_style=%d\n",
+                layout_ms, forced ? 1 : 0, behind_style ? 1 : 0);
             m_needsLayout = false;
             m_layoutDirtyAt = 0;
+            m_layoutDirtySince = 0;
             updated = true;
         }
     } else {
         m_needsStyleUpdate = false;
         m_needsLayout = false;
         m_layoutDirtyAt = 0;
+        m_layoutDirtySince = 0;
         m_styleStepInFlight = false;
     }
 

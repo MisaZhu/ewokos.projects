@@ -99,6 +99,9 @@ protected:
     void setBuildStatus(const std::string& status, int progress);
     void advanceBuildStep();
     bool applyPendingLayoutUpdates();
+    /* Record that layout is stale and must be redone. Caller holds
+     * m_renderMutex. `build` selects the build doc over the visible doc. */
+    void markLayoutDirty(bool build);
     void clampScrollLocked(int docWidth, int docHeight);
     bool hasSeenCSS(const std::string& url) const;
     void rememberCSS(const std::string& url);
@@ -171,6 +174,12 @@ private:
     bool m_deferBuildStep;
     uint64_t m_layoutDirtyAt;
     uint64_t m_buildLayoutDirtyAt;
+    /* When layout first became dirty (0 = clean). m_layoutDirtyAt is refreshed
+     * by every arrival, so a steady stream of images would keep pushing the
+     * debounce window forward and the page would never re-layout; these give
+     * the wait a hard upper bound. */
+    uint64_t m_layoutDirtySince;
+    uint64_t m_buildLayoutDirtySince;
 };
 
 }

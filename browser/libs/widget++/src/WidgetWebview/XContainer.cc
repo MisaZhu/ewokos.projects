@@ -752,9 +752,7 @@ void XContainer::get_image_size(const litehtml::tchar_t* src, const litehtml::tc
     if (it != m_images.end() && it->second.image != NULL) {
         sz.width = it->second.image->w;
         sz.height = it->second.image->h;
-        return;
     }
-    return;
 }
 
 void XContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::background_paint& bg)

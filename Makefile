@@ -5,9 +5,8 @@ DIRS = macemu \
 	doom \
 	cards \
 	mine \
-	previous  \
 	browser
-#	video saver minivmac nx11 fltk
+#	previous video saver minivmac nx11 fltk
 
 all: $(DIRS)
 

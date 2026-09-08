@@ -6,8 +6,8 @@ TARGET_DIR = $(BUILD_DIR)
 
 LDFLAGS = -L $(TARGET_DIR)/lib
 
-CFLAGS += -Iinclude -Iinclude/litehtml -Iinclude/gumbo -I $(TARGET_DIR)/include -fno-rtti -nostdinc++
-CXXFLAGS += -Iinclude -Iinclude/litehtml -Iinclude/gumbo -I $(TARGET_DIR)/include -fno-rtti -nostdinc++
+CFLAGS += -Iinclude -Iinclude/litehtml -Iinclude/gumbo -I $(TARGET_DIR)/include -fno-rtti -nostdinc++ -MMD -MP
+CXXFLAGS += -Iinclude -Iinclude/litehtml -Iinclude/gumbo -I $(TARGET_DIR)/include -fno-rtti -nostdinc++ -MMD -MP
 
 LITEHTML_OBJS = \
 	$(ARCH)/src/el_break.o \
@@ -69,8 +69,16 @@ $(TASK): $(TASK_OBJS)
 	$(AR) crs $(TASK) $(TASK_OBJS) 
 	cp -r include/* $(TARGET_DIR)/include
 
+# make.rule's pattern rules do not track #include edges, so editing a widely
+# included header (element.h / html_tag.h) left objects such as document.o
+# stale: the archive then mixed the old and new element vtable / sizeof(html_tag)
+# and el_image was under-allocated and mis-dispatched, silently breaking every
+# image. -MMD -MP writes a .d beside each .o; including them makes each object
+# depend on its headers so a header edit recompiles all affected objects.
+-include $(LITEHTML_OBJS:.o=.d) $(GUMBO_OBJS:.o=.d)
 
 clean:
 	rm -f $(TASK_OBJS)
+	rm -f $(LITEHTML_OBJS:.o=.d) $(GUMBO_OBJS:.o=.d)
 	rm -f $(TASK)
 

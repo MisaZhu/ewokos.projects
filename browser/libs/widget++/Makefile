@@ -20,8 +20,14 @@ $(LIB_WIDGET_WEBVIEW): $(LIB_WIDGET_WEBVIEW_OBJS)
 
 $(ARCH)/%.o: %.cc
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+# See libs/litehtml/Makefile: XContainer/WidgetWebview compile against the
+# litehtml headers copied into $(TARGET_DIR)/include, so they must rebuild when
+# element.h / html_tag.h change or the ABI silently diverges from liblitehtml.a.
+-include $(LIB_WIDGET_WEBVIEW_OBJS:.o=.d)
 
 clean:
 	rm -f $(LIB_WIDGET_WEBVIEW_OBJS)
+	rm -f $(LIB_WIDGET_WEBVIEW_OBJS:.o=.d)
 	rm -f $(LIB_WIDGET_WEBVIEW)
