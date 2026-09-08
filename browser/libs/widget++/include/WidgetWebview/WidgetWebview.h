@@ -8,6 +8,7 @@
 #include <graph/graph.h>
 #include <memory>
 #include <vector>
+#include <unordered_map>
 #include <pthread.h>
 
 class XContainer;
@@ -59,6 +60,11 @@ public:
     bool loadHtml(const std::string& url);
     void setDefaultCSS(const std::string& url);
     bool loadCSS(const std::string& url);
+    /* Record the <link media="..."> attribute for a queued stylesheet URL so
+     * loadCSSContent can drop sheets whose media never matches this device
+     * (e.g. media="print"): master-stylesheet selectors carry no media list,
+     * so without this a print-only sheet would apply its rules on screen. */
+    void setCSSMedia(const std::string& url, const std::string& media);
     bool loadImage(const std::string& url);
 
     bool loadCSSContent(const std::string& url, const std::string& content);
@@ -124,6 +130,13 @@ private:
     // Task queue
     std::vector<HttpTask> m_taskQueue;
     std::vector<std::string> m_seenCssUrls;
+    // url -> <link media> attribute for in-flight stylesheet fetches.
+    std::unordered_map<std::string, std::string> m_cssMedia;
+    /* Guards m_cssMedia only. Must stay separate from m_renderMutex:
+     * setCSSMedia runs inside litehtml document creation (el_link ->
+     * XContainer::link), which BUILD_CREATE_DOC drives while already
+     * holding m_renderMutex; re-taking it there self-deadlocks. */
+    pthread_mutex_t m_cssMediaMutex;
     pthread_mutex_t m_taskMutex;
     std::vector<HttpResult> m_resultQueue;
     pthread_mutex_t m_resultMutex;

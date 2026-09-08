@@ -326,3 +326,10 @@ main, figure, figcaption, details, summary, dialog
 	display: block;
 }
 
+/* No video decoder on this platform: hide the element instead of letting
+   its fallback markup ("Sorry, your browser does not support embedded
+   videos...") spill into the page flow. Page CSS can still override. */
+video {
+	display: none;
+}
+

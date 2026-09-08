@@ -154,6 +154,7 @@ WidgetWebview::WidgetWebview()
     pthread_mutex_init(&m_taskMutex, NULL);
     pthread_mutex_init(&m_resultMutex, NULL);
     pthread_mutex_init(&m_renderMutex, NULL);
+    pthread_mutex_init(&m_cssMediaMutex, NULL);
 }
 
 WidgetWebview::~WidgetWebview()
@@ -179,6 +180,7 @@ WidgetWebview::~WidgetWebview()
     pthread_mutex_destroy(&m_taskMutex);
     pthread_mutex_destroy(&m_resultMutex);
     pthread_mutex_destroy(&m_renderMutex);
+    pthread_mutex_destroy(&m_cssMediaMutex);
 }
 
 void WidgetWebview::cleanupBuildResources()
@@ -410,6 +412,9 @@ bool WidgetWebview::loadHtml(const std::string& url)
     cleanupBuildResources();
     m_buildTargetContext = (m_activeContext == &m_browser_context) ? &m_buildContext : &m_browser_context;
     m_buildTargetContext->master_css().clear();
+    pthread_mutex_lock(&m_cssMediaMutex);
+    m_cssMedia.clear();
+    pthread_mutex_unlock(&m_cssMediaMutex);
     pthread_mutex_unlock(&m_renderMutex);
 
     addTask({url, HttpTask::TASK_HTML, false});
@@ -433,6 +438,21 @@ bool WidgetWebview::loadCSS(const std::string& url)
         return false;
     }
     return true;
+}
+
+void WidgetWebview::setCSSMedia(const std::string& url, const std::string& media)
+{
+    /* Dedicated mutex: this runs on the document-create path (el_link ->
+     * XContainer::link -> here) while BUILD_CREATE_DOC already holds
+     * m_renderMutex around createFromString; taking m_renderMutex again
+     * would self-deadlock and freeze the build and every repaint. */
+    pthread_mutex_lock(&m_cssMediaMutex);
+    if(media.empty()) {
+        m_cssMedia.erase(url);
+    } else {
+        m_cssMedia[url] = media;
+    }
+    pthread_mutex_unlock(&m_cssMediaMutex);
 }
 
 bool WidgetWebview::loadHtmlTask(const std::string& url)
@@ -529,7 +549,36 @@ bool WidgetWebview::loadCSSContent(const std::string& url, const std::string& co
         if (target_doc) {
             target_doc->abort_style_step();
         }
-        ctx->load_master_stylesheet(content.c_str());
+        /* A <link media="..."> sheet whose media never matches this device
+         * (w3.org ships print.css with a[href]::after{content:" <" attr(href)
+         * " >"}) must not reach the master stylesheet: master selectors carry
+         * no media list, so print-only rules would render on screen. */
+        bool media_matches = true;
+        std::string media_attr;
+        pthread_mutex_lock(&m_cssMediaMutex);
+        std::unordered_map<std::string, std::string>::iterator mit = m_cssMedia.find(url);
+        if (mit != m_cssMedia.end())
+            media_attr = mit->second;
+        pthread_mutex_unlock(&m_cssMediaMutex);
+        if (!media_attr.empty()) {
+            litehtml::media_query_list::ptr mlist =
+                litehtml::media_query_list::create_from_string(media_attr.c_str(), nullptr);
+            if (mlist) {
+                XContainer* media_cont = target_build ? m_buildContainer : m_container;
+                if (media_cont) {
+                    litehtml::media_features feat;
+                    media_cont->get_media_features(feat);
+                    mlist->apply_media_features(feat);
+                    media_matches = mlist->is_used();
+                }
+            }
+        }
+        if (media_matches) {
+            ctx->load_master_stylesheet(content.c_str());
+        } else {
+            klog("[xBrowser] skip css (media mismatch): url=%s media=%s\n",
+                url.c_str(), media_attr.c_str());
+        }
         uint32_t parse_ms = (uint32_t)(kernel_tic_ms(0) - parse_start);
         bool is_default_css = (!m_defaultCSSUrl.empty() && url == m_defaultCSSUrl);
         if (is_default_css) {
@@ -649,6 +698,9 @@ bool WidgetWebview::loadHtmlContent(const std::string& content)
     cleanupBuildResources();
     m_buildTargetContext = (m_activeContext == &m_browser_context) ? &m_buildContext : &m_browser_context;
     m_buildTargetContext->master_css().clear();
+    pthread_mutex_lock(&m_cssMediaMutex);
+    m_cssMedia.clear();
+    pthread_mutex_unlock(&m_cssMediaMutex);
     int stripped_scripts = 0;
     m_buildHtmlContent = strip_script_blocks(content, &stripped_scripts);
     if(stripped_scripts > 0) {

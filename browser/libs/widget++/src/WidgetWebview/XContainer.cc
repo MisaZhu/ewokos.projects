@@ -935,4 +935,23 @@ void XContainer::get_language(litehtml::tstring& language, litehtml::tstring& cu
 
 void XContainer::link(litehtml::document* ptr, const litehtml::element::ptr& el)
 {
+    /* el_link lands here because import_css never supplies sheet text
+     * synchronously in this async container. Record the <link> media
+     * attribute against the queued URL so loadCSSContent can drop sheets
+     * whose media never matches this device (media="print"): master-sheet
+     * selectors carry no media list, so a print-only sheet would otherwise
+     * apply its rules on screen. */
+    if(!el || !m_webview)
+        return;
+    const tchar_t* rel = el->get_attr(_t("rel"));
+    if(!rel || t_strcasecmp(rel, _t("stylesheet")))
+        return;
+    const tchar_t* href = el->get_attr(_t("href"));
+    if(!href || !href[0])
+        return;
+    std::string full_url = getFullURL(std::string(href), m_base_url);
+    if(full_url.empty())
+        return;
+    const tchar_t* media = el->get_attr(_t("media"));
+    m_webview->setCSSMedia(full_url, media ? std::string(media) : std::string());
 }

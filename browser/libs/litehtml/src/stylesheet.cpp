@@ -88,14 +88,27 @@ void css::parse_stylesheet(const tchar_t* str, const tchar_t* baseurl, document*
 		while(*p == '@')
 		{
 			const tchar_t* sPos = p;
-			p = find_char(p, '{');
-			if(*p == '{')
+			const tchar_t* brace = find_char(p, '{');
+			const tchar_t* semi = find_char(p, ';');
+			if(semi < brace)
 			{
-				p = find_close_bracket_ptr(p, '{', '}');
+				/* Statement at-rule (@charset, @namespace, @layer a,b; and
+				 * @import url(...);): ends at ';' before any block. Scanning
+				 * for '{' here would swallow the following style rule. */
+				parse_atrule(ptr_to_string(sPos, semi), baseurl, doc, media);
+				p = semi + 1;
 			}
-			if(*p)
+			else
 			{
-				parse_atrule(ptr_to_string(sPos, p), baseurl, doc, media);
+				p = brace;
+				if(*p == '{')
+				{
+					p = find_close_bracket_ptr(p, '{', '}');
+				}
+				if(*p)
+				{
+					parse_atrule(ptr_to_string(sPos, p), baseurl, doc, media);
+				}
 			}
 			p = skip_comments_and_ws(p);
 		}
@@ -103,11 +116,15 @@ void css::parse_stylesheet(const tchar_t* str, const tchar_t* baseurl, document*
 		if(!*p) break;
 
 		const tchar_t* style_start = find_char(p, '{');
-		const tchar_t* style_end = find_char(p, '}');
+		/* Balanced close: native CSS nesting puts inner '{...}' blocks inside
+		 * the declaration text; stopping at the first '}' would desync the
+		 * scan and drop the rest of the sheet. Nested rules land in the
+		 * declaration text where style::add ignores them as malformed. */
+		const tchar_t* style_end = *style_start ? find_close_bracket_ptr(style_start, '{', '}') : style_start;
 		if(*style_start && *style_end && style_end > style_start)
 		{
 			style::ptr st = new style();
-			st->add(style_start + 1, style_end - style_start - 1, baseurl);
+			st->add(style_start + 1, style_end - style_start - 2, baseurl);
 
 			parse_selectors(ptr_to_string(p, style_start), st, media);
 
@@ -116,7 +133,7 @@ void css::parse_stylesheet(const tchar_t* str, const tchar_t* baseurl, document*
 				doc->add_media_list(media);
 			}
 
-			p = style_end + 1;
+			p = style_end;
 		} else
 		{
 			break;
