@@ -124,6 +124,12 @@ protected:
 		virtual element_clear		get_clear() const;
 		virtual size_t				get_children_count() const;
 		virtual element::ptr		get_child(int idx) const;
+		/* Resolved --custom-properties visible to this element; only
+		 * html_tag overrides it. Pointer (null by default) + inline so no
+		 * out-of-line static is emitted: the build uses -fno-rtti and pulls
+		 * operator new from libewokstl, so referencing __cxa_guard via a
+		 * function-local static would drag in libcxx's conflicting copy. */
+		virtual const string_map*	get_custom_props() const { return 0; }
 		virtual overflow			get_overflow() const;
 
 		virtual css_length			get_css_left() const;

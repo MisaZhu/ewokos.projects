@@ -2,6 +2,121 @@
 #include "el_image.h"
 #include "document.h"
 
+/* Pick one URL from a srcset attribute: an exact 1x candidate wins, then the
+ * narrowest w descriptor (this device is a low-density viewport), then the
+ * first candidate. Descriptors other than x/w are ignored. */
+namespace litehtml {
+static tstring pick_srcset_candidate(const tstring& srcset)
+{
+	tstring first_url;
+	tstring best_url;
+	int best_w = 0;
+	bool have_w = false;
+	size_t i = 0;
+	while(i <= srcset.length())
+	{
+		size_t comma = srcset.find(_t(','), i);
+		if(comma == tstring::npos)
+		{
+			comma = srcset.length();
+		}
+		tstring cand = srcset.substr(i, comma - i);
+		i = comma + 1;
+		trim(cand);
+		if(cand.empty())
+		{
+			continue;
+		}
+		size_t sp = 0;
+		while(sp < cand.length() && cand[sp] != _t(' ') && cand[sp] != _t('\t'))
+		{
+			sp++;
+		}
+		tstring url = cand.substr(0, sp);
+		tstring desc = cand.substr(sp);
+		trim(desc);
+		if(url.empty())
+		{
+			continue;
+		}
+		if(first_url.empty())
+		{
+			first_url = url;
+		}
+		if(desc.empty())
+		{
+			return url;	// bare candidate: default 1x
+		}
+		tchar_t last = desc[desc.length() - 1];
+		if(last == _t('x') || last == _t('X'))
+		{
+			if(t_atoi(desc.c_str()) == 1)
+			{
+				return url;	// exact 1x match
+			}
+		} else if(last == _t('w') || last == _t('W'))
+		{
+			int w = t_atoi(desc.c_str());
+			if(w > 0 && (!have_w || w < best_w))
+			{
+				best_w = w;
+				best_url = url;
+				have_w = true;
+			}
+		}
+	}
+	if(have_w)
+	{
+		return best_url;
+	}
+	return first_url;
+}
+} // namespace litehtml
+
+void litehtml::el_image::resolve_effective_src()
+{
+	if(!m_srcset.empty())
+	{
+		tstring cand = pick_srcset_candidate(m_srcset);
+		if(!cand.empty())
+		{
+			m_src = cand;
+		}
+	}
+	if(m_src.empty())
+	{
+		element::ptr p = parent();
+		if(p && p->get_tagName() && !t_strcasecmp(p->get_tagName(), _t("picture")))
+		{
+			int cnt = (int) p->get_children_count();
+			for(int k = 0; k < cnt; k++)
+			{
+				element::ptr ch = p->get_child(k);
+				if(!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("source")))
+				{
+					continue;
+				}
+				const tchar_t* ss = ch->get_attr(_t("srcset"));
+				if(ss && ss[0])
+				{
+					tstring cand = pick_srcset_candidate(ss);
+					if(!cand.empty())
+					{
+						m_src = cand;
+						break;
+					}
+				}
+				const tchar_t* ssrc = ch->get_attr(_t("src"));
+				if(ssrc && ssrc[0])
+				{
+					m_src = ssrc;
+					break;
+				}
+			}
+		}
+	}
+}
+
 litehtml::el_image::el_image(litehtml::document* doc) : html_tag(doc)
 {
 	m_display = display_inline_block;
@@ -182,6 +297,7 @@ int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 void litehtml::el_image::parse_attributes()
 {
 	m_src = get_attr(_t("src"), _t(""));
+	m_srcset = get_attr(_t("srcset"), _t(""));
 
 	const tchar_t* attr_height = get_attr(_t("height"));
 	if(attr_height)
@@ -261,6 +377,7 @@ void litehtml::el_image::draw( uint_ptr hdc, int x, int y, const position* clip 
 
 void litehtml::el_image::parse_styles( bool is_reparse /*= false*/ )
 {
+	resolve_effective_src();
 	html_tag::parse_styles(is_reparse);
 
 	document* doc = get_document();

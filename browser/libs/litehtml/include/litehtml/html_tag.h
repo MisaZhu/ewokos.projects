@@ -43,6 +43,10 @@ namespace litehtml
 		string_vector			m_class_values;
 		tstring					m_tag;
 		litehtml::style			m_style;
+		/* Resolved --custom-properties visible to this element (inherited
+		 * from the parent chain plus own declarations), used to expand
+		 * var() references in raw property values at parse_styles time. */
+		string_map				m_custom_props;
 		string_map				m_attrs;
 		mutable string_map		m_style_property_cache;
 		vertical_align			m_vertical_align;
@@ -96,6 +100,8 @@ namespace litehtml
 		int						m_border_spacing_y;
 		border_collapse			m_border_collapse;
 		void					init_font(const tchar_t* own_font_size, const tchar_t* own_name, const tchar_t* own_weight, const tchar_t* own_style, const tchar_t* own_decoration);
+		void					resolve_custom_properties();
+		void					expand_css_functions();
 
 		virtual void			select_all(const css_selector& selector, elements_vector& res);
 
@@ -136,6 +142,7 @@ namespace litehtml
 		virtual element_clear		get_clear() const override;
 		virtual size_t				get_children_count() const override;
 		virtual element::ptr		get_child(int idx) const override;
+		virtual const string_map*	get_custom_props() const override { return &m_custom_props; }
 		virtual element_position	get_element_position(css_offsets* offsets = 0) const override;
 		virtual overflow			get_overflow() const override;
 

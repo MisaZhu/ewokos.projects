@@ -401,6 +401,19 @@ void css::parse_atrule(const tstring& text, const tchar_t* baseurl, document* do
 
 			parse_stylesheet(media_style.c_str(), baseurl, doc, new_media);
 		}
+	} else if(text.substr(0, 6) == _t("@layer"))
+	{
+		/* Cascade layers: layer ordering is not implemented, but dropping
+		 * the body (previous behaviour) lost every rule on sites that wrap
+		 * their stylesheet in @layer. Parse the body as ordinary rules at
+		 * the current media; source order approximates layer order. */
+		tstring::size_type b1 = text.find_first_of(_t('{'));
+		tstring::size_type b2 = text.find_last_of(_t('}'));
+		if(b1 != tstring::npos)
+		{
+			tstring layer_style = (b2 != tstring::npos) ? text.substr(b1 + 1, b2 - b1 - 1) : text.substr(b1 + 1);
+			parse_stylesheet(layer_style.c_str(), baseurl, doc, media);
+		}
 	}
 }
 

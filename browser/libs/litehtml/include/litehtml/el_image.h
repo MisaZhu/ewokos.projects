@@ -8,6 +8,12 @@ namespace litehtml
 	class el_image : public html_tag
 	{
 		tstring	m_src;
+		tstring	m_srcset;
+
+		/* HTML5 responsive images: pick a concrete URL from the img srcset
+		 * or, when src is absent, from the <source> children of a <picture>
+		 * parent, before the base class loads m_src. */
+		void	resolve_effective_src();
 	public:
 		el_image(litehtml::document* doc);
 		virtual ~el_image(void);

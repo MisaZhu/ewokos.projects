@@ -907,6 +907,369 @@ const litehtml::tchar_t* litehtml::html_tag::get_style_property_own(const tchar_
 	return m_style.get_property(name);
 }
 
+/*---------------------------------------------------------------------------------
+ Modern CSS value support: custom properties (var()) and the clamp()/min()/max()
+ math functions. litehtml::style keeps property values as raw strings until
+ parse_styles() consumes them, so both are expanded here, per element, right
+ before consumption: custom properties resolve through the parent chain first,
+ then every var()/clamp()/min()/max() occurrence in a value is rewritten to a
+ plain px literal (or the declaration is dropped, as the spec requires for
+ unresolvable var() references).
+---------------------------------------------------------------------------------*/
+
+namespace litehtml {
+
+static bool expand_var_refs(const tstring& in, const string_map& vars, tstring& out, int depth)
+{
+	if(depth > 8)
+	{
+		return false;
+	}
+	out.clear();
+	size_t i = 0;
+	while(i < in.length())
+	{
+		size_t f = in.find(_t("var("), i);
+		if(f == tstring::npos)
+		{
+			out += in.substr(i);
+			break;
+		}
+		out += in.substr(i, f - i);
+		int paren = 1;
+		size_t j = f + 4;
+		size_t comma = tstring::npos;
+		while(j < in.length() && paren > 0)
+		{
+			tchar_t c = in[j];
+			if(c == _t('('))
+			{
+				paren++;
+			} else if(c == _t(')'))
+			{
+				paren--;
+				if(paren == 0) break;
+			} else if(c == _t(',') && paren == 1 && comma == tstring::npos)
+			{
+				comma = j;
+			}
+			j++;
+		}
+		if(j >= in.length())
+		{
+			return false;	// unbalanced parens
+		}
+		tstring name = in.substr(f + 4, (comma == tstring::npos ? j : comma) - (f + 4));
+		trim(name);
+		tstring sub;
+		string_map::const_iterator it = vars.find(name);
+		if(it != vars.end())
+		{
+			sub = it->second;
+		} else if(comma != tstring::npos)
+		{
+			/* Fallbacks keep their whitespace in the spec, but property values
+			 * in m_custom_props are stored trimmed, so trim here too to keep
+			 * both sources interchangeable ("var(--x, 88px)"). */
+			sub = in.substr(comma + 1, j - comma - 1);
+			trim(sub);
+		} else
+		{
+			return false;	// undefined custom property, no fallback
+		}
+		if(sub.find(_t("var(")) != tstring::npos)
+		{
+			tstring subexp;
+			if(!expand_var_refs(sub, vars, subexp, depth + 1))
+			{
+				return false;
+			}
+			sub = subexp;
+		}
+		out += sub;
+		i = j + 1;
+	}
+	return true;
+}
+
+/* Position of the innermost clamp(/min(/max( at or after 'from', or npos.
+ * The greatest match position wins, so nested functions are evaluated
+ * inside-out by the caller loop. */
+static size_t find_math_func(const tstring& s, size_t from, tstring& fname)
+{
+	static const tchar_t* names[3] = { _t("clamp("), _t("min("), _t("max(") };
+	size_t best = tstring::npos;
+	for(int k = 0; k < 3; k++)
+	{
+		size_t p = s.find(names[k], from);
+		while(p != tstring::npos && p > 0)
+		{
+			tchar_t prev = s[p - 1];
+			if((prev >= _t('a') && prev <= _t('z')) || (prev >= _t('A') && prev <= _t('Z')) || prev == _t('-'))
+			{
+				p = s.find(names[k], p + 1);
+				continue;
+			}
+			break;
+		}
+		if(p != tstring::npos && (best == tstring::npos || p > best))
+		{
+			best = p;
+			fname = names[k];
+		}
+	}
+	return best;
+}
+
+/* Evaluate a single length token (no operators, no nested function) to px.
+ * Percent and predefined keywords are rejected: they need a containing block
+ * this value-expansion pass does not have. */
+static bool eval_one_length(const tstring& tok, document* doc, int font_size, int& out_px)
+{
+	tstring a = tok;
+	trim(a);
+	if(a.empty() || a.find(_t('(')) != tstring::npos)
+	{
+		return false;
+	}
+	css_length len;
+	len.fromString(a.c_str());
+	if(len.is_predefined() || len.units() == css_units_percentage)
+	{
+		return false;
+	}
+	out_px = doc->cvt_units(len, font_size);
+	return true;
+}
+
+/* Evaluate an additive length expression: terms separated by top-level '+'/'-'
+ * (e.g. "2.51rem + 6.198vw", the standard fluid-type preferred value inside
+ * clamp()). Every term must be a resolvable length; a percent or nested
+ * function makes the whole expression unresolvable so the caller falls back. */
+static bool eval_length_expr(const tstring& expr, document* doc, int font_size, int& out_px)
+{
+	tstring s = expr;
+	trim(s);
+	if(s.empty() || s.find(_t('(')) != tstring::npos)
+	{
+		return false;
+	}
+	int total = 0;
+	int sign = 1;
+	bool any = false;
+	tstring term;
+	for(size_t k = 0; k < s.length(); k++)
+	{
+		tchar_t c = s[k];
+		if((c == _t('+') || c == _t('-')) && k > 0)
+		{
+			int px = 0;
+			if(!term.empty())
+			{
+				if(!eval_one_length(term, doc, font_size, px))
+				{
+					return false;
+				}
+				total += sign * px;
+				any = true;
+			}
+			term.clear();
+			sign = (c == _t('-')) ? -1 : 1;
+		} else
+		{
+			term += c;
+		}
+	}
+	if(!term.empty())
+	{
+		int px = 0;
+		if(!eval_one_length(term, doc, font_size, px))
+		{
+			return false;
+		}
+		total += sign * px;
+		any = true;
+	}
+	if(!any)
+	{
+		return false;
+	}
+	out_px = total;
+	return true;
+}
+
+/* Rewrite every clamp()/min()/max() in 'val' to a px literal. clamp(MIN,PREF,
+ * MAX) applies real clamping max(MIN, min(PREF,MAX)); each argument may be an
+ * additive length expression (Xrem + Yvw). Percent/calc()/nested-func arguments
+ * that cannot be resolved here are skipped. Returns false when nothing
+ * evaluates, so the caller can drop the declaration. */
+static bool eval_math_funcs(tstring& val, document* doc, int font_size)
+{
+	for(int guard = 0; guard < 16; guard++)
+	{
+		tstring fname;
+		size_t f = find_math_func(val, 0, fname);
+		if(f == tstring::npos)
+		{
+			return true;
+		}
+		size_t args_start = f + fname.length();
+		int paren = 1;
+		size_t j = args_start;
+		size_t start = args_start;
+		std::vector<tstring> args;
+		while(j < val.length() && paren > 0)
+		{
+			tchar_t c = val[j];
+			if(c == _t('('))
+			{
+				paren++;
+			} else if(c == _t(')'))
+			{
+				paren--;
+				if(paren == 0)
+				{
+					args.push_back(val.substr(start, j - start));
+					break;
+				}
+			} else if(c == _t(',') && paren == 1)
+			{
+				args.push_back(val.substr(start, j - start));
+				start = j + 1;
+			}
+			j++;
+		}
+		if(j >= val.length())
+		{
+			return false;	// unbalanced parens
+		}
+		int picked = 0;
+		bool have = false;
+		if(fname[0] == _t('c'))
+		{
+			/* clamp(MIN, PREFERRED, MAX) = max(MIN, min(PREFERRED, MAX)). */
+			int lo = 0, pref = 0, hi = 0;
+			bool hlo = false, hpref = false, hhi = false;
+			if(args.size() >= 1) hlo   = eval_length_expr(args[0], doc, font_size, lo);
+			if(args.size() >= 2) hpref = eval_length_expr(args[1], doc, font_size, pref);
+			if(args.size() >= 3) hhi   = eval_length_expr(args[2], doc, font_size, hi);
+			if(hpref)
+			{
+				picked = pref;
+				if(hhi && picked > hi) picked = hi;
+				if(hlo && picked < lo) picked = lo;
+				have = true;
+			}
+			else if(hhi) { picked = hi; have = true; }	/* preferred unresolvable: assume wide viewport */
+			else if(hlo) { picked = lo; have = true; }
+		} else
+		{
+			bool want_min = (fname[1] == _t('i'));
+			for(size_t k = 0; k < args.size(); k++)
+			{
+				int px = 0;
+				if(!eval_length_expr(args[k], doc, font_size, px))
+				{
+					continue;
+				}
+				if(!have || (want_min ? px < picked : px > picked))
+				{
+					picked = px;
+					have = true;
+				}
+			}
+		}
+		if(!have)
+		{
+			return false;
+		}
+		tstring repl = std::to_string(picked) + _t("px");
+		val.replace(f, (j - f) + 1, repl);
+	}
+	return true;
+}
+
+void litehtml::html_tag::resolve_custom_properties()
+{
+	m_custom_props.clear();
+	element::ptr p = parent();
+	if(p)
+	{
+		/* Virtual accessor: works without RTTI and returns null for
+		 * non-html_tag parents (text nodes etc.). */
+		const string_map* pm = p->get_custom_props();
+		if(pm)
+		{
+			m_custom_props = *pm;
+		}
+	}
+	for(props_map::const_iterator it = m_style.properties().begin(); it != m_style.properties().end(); ++it)
+	{
+		if(it->first.length() > 2 && it->first[0] == _t('-') && it->first[1] == _t('-'))
+		{
+			tstring v;
+			if(!expand_var_refs(it->second.m_value, m_custom_props, v, 0))
+			{
+				v = it->second.m_value;
+			}
+			m_custom_props[it->first] = v;
+		}
+	}
+}
+
+void litehtml::html_tag::expand_css_functions()
+{
+	bool has_func = false;
+	for(props_map::const_iterator it = m_style.properties().begin(); it != m_style.properties().end(); ++it)
+	{
+		const tstring& v = it->second.m_value;
+		if(v.find(_t("var(")) != tstring::npos || v.find(_t("clamp(")) != tstring::npos ||
+		   v.find(_t("min(")) != tstring::npos || v.find(_t("max(")) != tstring::npos)
+		{
+			has_func = true;
+			break;
+		}
+	}
+	if(!has_func)
+	{
+		return;
+	}
+	document* doc = get_document();
+	props_map old = m_style.properties();
+	m_style.clear();
+	for(props_map::const_iterator it = old.begin(); it != old.end(); ++it)
+	{
+		const tstring& name = it->first;
+		const tstring& raw = it->second.m_value;
+		if(name.length() > 2 && name[0] == _t('-') && name[1] == _t('-'))
+		{
+			/* keep the raw definition: it is re-resolved per element */
+			m_style.add_property(name.c_str(), raw.c_str(), NULL, it->second.m_important);
+			continue;
+		}
+		tstring v = raw;
+		if(v.find(_t("var(")) != tstring::npos)
+		{
+			tstring exp;
+			if(!expand_var_refs(v, m_custom_props, exp, 0))
+			{
+				continue;	// invalid at computed-value time: drop it
+			}
+			v = exp;
+		}
+		if(v.find(_t("clamp(")) != tstring::npos || v.find(_t("min(")) != tstring::npos || v.find(_t("max(")) != tstring::npos)
+		{
+			if(doc && !eval_math_funcs(v, doc, m_font_size))
+			{
+				continue;
+			}
+		}
+		m_style.add_property(name.c_str(), v.c_str(), NULL, it->second.m_important);
+	}
+}
+
+} // namespace litehtml
+
 void litehtml::html_tag::parse_styles(bool is_reparse)
 {
 	document* step_doc = get_document();
@@ -965,6 +1328,12 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		parse_style_profile_add(g_parse_style_profile.inline_style_ms, part_start);
 		part_start = kernel_tic_ms(0);
 	}
+
+	/* Resolve --custom-properties (inherited + own) and rewrite var()/
+	 * clamp()/min()/max() in the raw values before anything below consumes
+	 * them. No-op on trees that use none of these. */
+	resolve_custom_properties();
+	expand_css_functions();
 
 	own_style_refs own_refs = collect_own_style_refs(m_style);
 	init_font(own_style_ref_ptr(own_refs.font_size), own_style_ref_ptr(own_refs.font_family),
@@ -1945,8 +2314,6 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 		case select_pseudo_class:
 			if(apply_pseudo)
 			{
-				if (!el_parent) return select_no_match;
-
 				tstring selector_param;
 				tstring	selector_name;
 
@@ -1966,7 +2333,14 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 				}
 
 				int selector = value_index(selector_name.c_str(), pseudo_class_strings);
-				
+
+				/* Structural pseudo-classes need a parent; :root is the
+				 * opposite - it matches exactly the parentless element. */
+				if(!el_parent && selector != pseudo_class_root)
+				{
+					return select_no_match;
+				}
+
 				switch(selector)
 				{
 				case pseudo_class_only_child:
@@ -2065,6 +2439,15 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 						{
 							return select_no_match;
 						}
+					}
+					break;
+				case pseudo_class_root:
+					/* :root = the document root element; without this, sheets
+					 * that define custom properties on :root silently lose
+					 * every --var declaration. */
+					if(parent())
+					{
+						return select_no_match;
 					}
 					break;
 				default:

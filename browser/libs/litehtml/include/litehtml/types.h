@@ -490,7 +490,7 @@ namespace litehtml
 	};
 
 
-#define pseudo_class_strings		_t("only-child;only-of-type;first-child;first-of-type;last-child;last-of-type;nth-child;nth-of-type;nth-last-child;nth-last-of-type;not;lang")
+#define pseudo_class_strings		_t("only-child;only-of-type;first-child;first-of-type;last-child;last-of-type;nth-child;nth-of-type;nth-last-child;nth-last-of-type;not;lang;root")
 
 	enum pseudo_class
 	{
@@ -506,6 +506,7 @@ namespace litehtml
 		pseudo_class_nth_last_of_type,
 		pseudo_class_not,
 		pseudo_class_lang,
+		pseudo_class_root,
 	};
 
 #define content_property_string		_t("none;normal;open-quote;close-quote;no-open-quote;no-close-quote")

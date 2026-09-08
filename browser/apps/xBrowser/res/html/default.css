@@ -333,3 +333,30 @@ video {
 	display: none;
 }
 
+/* HTML5 static-rendering defaults. This browser runs without JS and without
+   plugin/SVG decoders, so elements whose payload only exists for those paths
+   are hidden instead of spilling fallback markup or raw text into the flow.
+   <canvas> and <noscript> keep their (correct no-JS) fallback content. */
+template, dialog, svg, math, audio, iframe,
+frame, frameset, noframes, embed, object, applet, portal,
+source, track {
+	display: none;
+}
+
+dialog[open] {
+	display: block;
+}
+
+[hidden] {
+	display: none;
+}
+
+search, address {
+	display: block;
+}
+
+mark {
+	background: #ff0;
+	color: #000;
+}
+
