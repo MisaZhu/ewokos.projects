@@ -50,6 +50,24 @@ const litehtml::tchar_t* litehtml::el_text::get_style_property( const tchar_t* n
 void litehtml::el_text::parse_styles(bool is_reparse)
 {
 	(void)is_reparse;
+	{
+		/* Chunked style-update gating: text nodes are leaves, so a node already
+		 * measured in this epoch can be skipped outright, and a node reached
+		 * after the slice expired waits for the next chunk. */
+		document* step_doc = get_document();
+		if(step_doc && step_doc->style_step_phase() == 2)
+		{
+			if(m_step_stamp == step_doc->style_step_epoch())
+			{
+				return;
+			}
+			if(step_doc->style_step_exhausted())
+			{
+				return;
+			}
+			step_doc->style_step_stamp(this);
+		}
+	}
 	uint64_t start_ms = kernel_tic_ms(0);
 	uint32_t transform_ms = 0;
 	uint32_t measure_ms = 0;

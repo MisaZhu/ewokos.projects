@@ -44,6 +44,41 @@ static bool flex_flag(const tchar_t* val, const tchar_t* a, const tchar_t* b = 0
 	return false;
 }
 
+static int flex_len(const tchar_t* v, int avail, int font_size, document* doc)
+{
+	if(!v || !v[0]) return 0;
+	css_length l;
+	l.fromString(v);
+	if(l.is_predefined()) return 0;
+	int px = doc->cvt_units(l, font_size, avail);
+	return px > 0 ? px : 0;
+}
+
+/* gap / row-gap / column-gap: "gap: <row> [<column>]" */
+static void flex_parse_gap(html_tag* el, int avail, int& row_gap, int& col_gap)
+{
+	row_gap = col_gap = 0;
+	const tchar_t* gap_s = el->get_style_property(_t("gap"), false, 0);
+	if(gap_s)
+	{
+		tstring gs = gap_s;
+		string_vector toks;
+		split_string(gs, toks, _t(" \t"));
+		if(toks.size() >= 1)
+			row_gap = flex_len(toks[0].c_str(), avail, el->get_font_size(), el->get_document());
+		if(toks.size() >= 2)
+			col_gap = flex_len(toks[1].c_str(), avail, el->get_font_size(), el->get_document());
+		else
+			col_gap = row_gap;
+	}
+	const tchar_t* cg = el->get_style_property(_t("column-gap"), false, 0);
+	if(cg && !flex_flag(cg, "normal"))
+		col_gap = flex_len(cg, avail, el->get_font_size(), el->get_document());
+	const tchar_t* rg = el->get_style_property(_t("row-gap"), false, 0);
+	if(rg && !flex_flag(rg, "normal"))
+		row_gap = flex_len(rg, avail, el->get_font_size(), el->get_document());
+}
+
 int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pass /*= false*/ )
 {
 	int parent_width = max_width;
@@ -100,6 +135,8 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	bool do_wrap			= flex_flag(wrap_s, "wrap", "wrap-reverse");
 	const tchar_t* jc_s		= get_style_property(_t("justify-content"), false, _t("flex-start"));
 	const tchar_t* ai_s		= get_style_property(_t("align-items"), false, _t("stretch"));
+	int row_gap = 0, col_gap = 0;
+	flex_parse_gap(this, avail, row_gap, col_gap);
 
 	std::vector<flex_item> items;
 	for(auto& el : m_children)
@@ -219,7 +256,8 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		int used = 0;
 		for(size_t i = 0; i < items.size(); i++)
 		{
-			if(do_wrap && !cur.empty() && used + items[i].base > avail)
+			if(do_wrap && !cur.empty() &&
+					used + items[i].base + (int)cur.size() * col_gap > avail)
 			{
 				lines.push_back(cur);
 				cur.clear();
@@ -248,7 +286,8 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			total_shrink += it.shrink * (float)it.base;
 		}
 
-		int free = avail - sum;
+		int col_gaps = col_gap * (int)(line.size() ? line.size() - 1 : 0);
+		int free = avail - sum - col_gaps;
 		if(free > 0 && total_grow > 0)
 		{
 			for(size_t i = 0; i < line.size(); i++)
@@ -300,7 +339,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		}
 
 		// main-axis packing of the leftover space
-		int lead = 0, gap = 0;
+		int lead = 0, jgap = 0;
 		if(flex_flag(jc_s, "center"))
 		{
 			lead = free / 2;
@@ -311,12 +350,12 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		}
 		else if(flex_flag(jc_s, "space-between") && line.size() > 1)
 		{
-			gap = free / (int)(line.size() - 1);
+			jgap = free / (int)(line.size() - 1);
 		}
 		else if(flex_flag(jc_s, "space-around") && !line.empty())
 		{
-			gap = free / (int)line.size();
-			lead = gap / 2;
+			jgap = free / (int)line.size();
+			lead = jgap / 2;
 		}
 
 		std::vector<int> xs(line.size());
@@ -325,11 +364,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			for(size_t i = 0; i < line.size(); i++)
 			{
 				xs[i] = xoff;
-				xoff += items[line[i]].main + gap;
+				xoff += items[line[i]].main + col_gap + jgap;
 			}
 			if(row_reverse)
 			{
-				int total = xoff - gap;
+				int total = xoff - col_gap - jgap;
 				for(size_t i = 0; i < line.size(); i++)
 				{
 					xs[i] = avail - total + (total - xs[i] - items[line[i]].main);
@@ -373,11 +412,12 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		for(size_t i = 0; i < line.size(); i++)
 		{
 			line_used += items[line[i]].main;
-			if(i + 1 < line.size()) line_used += gap;
+			if(i + 1 < line.size()) line_used += col_gap + jgap;
 		}
 		if(line_used > used_width) used_width = line_used;
 
 		bottom += line_cross;
+		if(li + 1 < lines.size()) bottom += row_gap;
 	}
 
 	/* width_auto: size to the container (block) or the used content (inline-flex).
@@ -406,5 +446,251 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 
 	if(used_width > ret_width) ret_width = used_width;
 	ret_width += content_margins_left() + content_margins_right();
+	return ret_width;
+}
+
+/*
+ * Grid (row-major) layout subset: explicit column tracks from
+ * grid-template-columns (lengths, percentages, fr, auto, repeat(n, ...)),
+ * auto rows sized to the tallest item, plus gap/row-gap/column-gap.
+ * Anything else degrades to block flow, which is what an implicit
+ * single-column grid would produce anyway.
+ */
+
+namespace litehtml
+{
+	struct grid_track
+	{
+		bool	is_fixed;
+		int		fixed_w;
+		float	fr;
+	};
+}
+
+/* the embedded STL string has no rfind */
+static size_t str_rfind(const tstring& s, char c)
+{
+	for(int i = (int)s.length() - 1; i >= 0; i--)
+	{
+		if(s[(size_t)i] == c) return (size_t)i;
+	}
+	return tstring::npos;
+}
+
+static void grid_parse_tracks(const tchar_t* spec, int avail, int font_size, document* doc,
+		std::vector<grid_track>& tracks)
+{
+	// split on spaces outside parentheses
+	std::vector<tstring> toks;
+	tstring cur;
+	int depth = 0;
+	for(const tchar_t* p = spec; ; p++)
+	{
+		char c = *p;
+		if(c == '(') depth++;
+		if(c == ')') depth--;
+		if(c == 0 || ((c == ' ' || c == '\t') && depth == 0))
+		{
+			if(!cur.empty())
+			{
+				toks.push_back(cur);
+				cur.clear();
+			}
+			if(c == 0) break;
+			continue;
+		}
+		cur += c;
+	}
+
+	for(size_t i = 0; i < toks.size(); i++)
+	{
+		const tstring& t = toks[i];
+		if(t.substr(0, 7) == _t("repeat("))
+		{
+			int count = atoi(t.c_str() + 7);
+			size_t cpos = t.find(_t(','));
+			size_t epos = str_rfind(t, ')');
+			if(count > 0 && cpos != tstring::npos && epos != tstring::npos && epos > cpos)
+			{
+				tstring inner = t.substr(cpos + 1, epos - cpos - 1);
+				std::vector<grid_track> sub;
+				grid_parse_tracks(inner.c_str(), avail, font_size, doc, sub);
+				for(int r = 0; r < count; r++)
+					for(size_t s = 0; s < sub.size(); s++)
+						tracks.push_back(sub[s]);
+			}
+			continue;
+		}
+
+		grid_track tr;
+		tr.is_fixed = false;
+		tr.fixed_w = 0;
+		tr.fr = 1;
+		size_t fl = str_rfind(t, 'r');
+		if(fl != tstring::npos && fl == t.length() - 2 && t.substr(fl) == _t("fr"))
+		{
+			tr.fr = (float)atof(t.c_str());
+			if(tr.fr <= 0) tr.fr = 1;
+		}
+		else if(t == _t("auto"))
+		{
+			tr.fr = 1;
+		}
+		else if(t.substr(0, 7) == _t("minmax("))
+		{
+			size_t cpos = t.find(_t(','));
+			size_t epos = str_rfind(t, ')');
+			if(cpos != tstring::npos && epos != tstring::npos)
+			{
+				std::vector<grid_track> sub;
+				tstring maxt = t.substr(cpos + 1, epos - cpos - 1);
+				grid_parse_tracks(maxt.c_str(), avail, font_size, doc, sub);
+				if(!sub.empty()) tr = sub[0];
+			}
+		}
+		else if(!t.empty() && t[t.length() - 1] == _t('%'))
+		{
+			tr.is_fixed = true;
+			tr.fixed_w = avail * atoi(t.c_str()) / 100;
+		}
+		else
+		{
+			css_length l;
+			l.fromString(t.c_str());
+			if(!l.is_predefined() && l.units() != css_units_none)
+			{
+				tr.is_fixed = true;
+				tr.fixed_w = doc->cvt_units(l, font_size, avail);
+			}
+		}
+		tracks.push_back(tr);
+	}
+}
+
+int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pass /*= false*/ )
+{
+	int parent_width = max_width;
+
+	calc_outlines(parent_width);
+
+	m_pos.clear();
+	m_pos.move_to(x, y);
+	m_pos.x += content_margins_left();
+	m_pos.y += content_margins_top();
+
+	int ret_width = 0;
+	int avail = max_width;
+	bool width_auto = true;
+
+	if(!m_css_width.is_predefined())
+	{
+		int w = calc_width(parent_width);
+		if(m_box_sizing == box_sizing_border_box)
+		{
+			w -= m_padding.width() + m_borders.width();
+		}
+		ret_width = avail = w;
+		width_auto = false;
+	}
+	else if(avail)
+	{
+		avail -= content_margins_left() + content_margins_right();
+	}
+	if(avail < 0) avail = 0;
+
+	std::vector<grid_track> tracks;
+	const tchar_t* tc = get_style_property(_t("grid-template-columns"), false, 0);
+	if(tc)
+		grid_parse_tracks(tc, avail, m_font_size, get_document(), tracks);
+	if(tracks.empty())
+		return render_box(x, y, max_width, second_pass);
+
+	int row_gap = 0, col_gap = 0;
+	flex_parse_gap(this, avail, row_gap, col_gap);
+
+	int n = (int)tracks.size();
+	int gaps = col_gap * (n - 1);
+	int fixed_sum = 0;
+	float fr_sum = 0;
+	for(int i = 0; i < n; i++)
+	{
+		if(tracks[i].is_fixed) fixed_sum += tracks[i].fixed_w;
+		else fr_sum += tracks[i].fr;
+	}
+	int flex_avail = avail - gaps - fixed_sum;
+	if(flex_avail < 0) flex_avail = 0;
+	std::vector<int> col_w(n);
+	for(int i = 0; i < n; i++)
+	{
+		if(tracks[i].is_fixed)
+			col_w[i] = tracks[i].fixed_w;
+		else
+			col_w[i] = fr_sum > 0 ? (int)((float)flex_avail * tracks[i].fr / fr_sum) : 0;
+		if(col_w[i] < 0) col_w[i] = 0;
+	}
+
+	std::vector<element::ptr> items;
+	for(auto& el : m_children)
+	{
+		if(!el || !el->is_visible()) continue;
+		element_position ep = el->get_element_position();
+		if(ep == element_position_absolute || ep == element_position_fixed) continue;
+		if(el->is_white_space()) continue;
+		switch(el->get_display())
+		{
+		case display_inline:		el->set_display(display_block);		break;
+		case display_inline_block:	el->set_display(display_block);		break;
+		case display_inline_flex:	el->set_display(display_flex);		break;
+		default:						break;
+		}
+		items.push_back(el);
+	}
+
+	int bottom = 0;
+	int cur_row_h = 0;
+	for(size_t i = 0; i < items.size(); i++)
+	{
+		int col = (int)(i % (size_t)n);
+
+		if(col == 0 && i != 0)
+		{
+			bottom += cur_row_h + row_gap;
+			cur_row_h = 0;
+		}
+
+		int ix = m_pos.x;
+		for(int c = 0; c < col; c++)
+			ix += col_w[c] + col_gap;
+
+		element::ptr el = items[i];
+		int outer = col_w[col];
+		int cross = 0;
+		if(el->get_display() == display_inline_text)
+		{
+			litehtml::size sz;
+			el->get_content_size(sz, outer);
+			el->m_pos = sz;
+			el->m_pos.x = ix;
+			el->m_pos.y = m_pos.y + bottom;
+			cross = sz.height;
+		}
+		else
+		{
+			el->render(ix, m_pos.y + bottom, outer, second_pass);
+			cross = el->get_position().height + el->margin_top() + el->margin_bottom();
+		}
+		if(cross > cur_row_h) cur_row_h = cross;
+	}
+	bottom += cur_row_h;
+
+	m_pos.width = width_auto ? avail : avail;
+	m_pos.height = bottom;
+	calc_auto_margins(parent_width);
+
+	m_pos.move_to(x, y);
+	m_pos.x += content_margins_left();
+	m_pos.y += content_margins_top();
+
+	ret_width = avail + content_margins_left() + content_margins_right();
 	return ret_width;
 }

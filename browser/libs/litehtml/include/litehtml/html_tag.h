@@ -142,6 +142,9 @@ namespace litehtml
 		virtual void				set_attr(const tchar_t* name, const tchar_t* val) override;
 		virtual const tchar_t*		get_attr(const tchar_t* name, const tchar_t* def = 0) override;
 		virtual void				apply_stylesheet(const litehtml::css& stylesheet) override;
+		/* Own-element stylesheet matching without the children walk; used by
+		 * apply_stylesheet to make the chunked style update resumable. */
+		void						apply_stylesheet_own(const litehtml::css& stylesheet);
 		virtual void				refresh_styles() override;
 
 		virtual bool				is_white_space() const override;
@@ -231,6 +234,7 @@ namespace litehtml
 		void						draw_children_table(uint_ptr hdc, int x, int y, const position* clip, draw_flag flag, int zindex);
 		int							render_box(int x, int y, int max_width, bool second_pass = false);
 		int											render_flex(int x, int y, int max_width, bool second_pass = false);
+		int											render_grid(int x, int y, int max_width, bool second_pass = false);
 		int							render_table(int x, int y, int max_width, bool second_pass = false);
 		int							fix_line_width(int max_width, element_float flt);
 		void						parse_background();

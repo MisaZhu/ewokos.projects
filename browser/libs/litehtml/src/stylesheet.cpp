@@ -2,6 +2,7 @@
 #include "stylesheet.h"
 #include <algorithm>
 #include "document.h"
+#include <ewoksys/klog.h>
 
 namespace litehtml
 {
@@ -162,12 +163,108 @@ bool css::parse_selectors( const tstring& txt, const litehtml::style::ptr& style
 
 void css::sort_selectors()
 {
+	m_index.built = false;
 	std::sort(m_selectors.begin(), m_selectors.end(),
 		 [](const css_selector::ptr& v1, const css_selector::ptr& v2)
 		 {
 			 return (*v1) < (*v2);
 		 }
 	);
+}
+
+static tstring index_key_lower(const tstring& src)
+{
+	tstring out = src;
+	for(size_t i = 0; i < out.length(); i++)
+	{
+		if(out[i] >= 'A' && out[i] <= 'Z')
+		{
+			out[i] = (tchar_t)(out[i] - 'A' + 'a');
+		}
+	}
+	return out;
+}
+
+css::selector_index& css::get_selector_index() const
+{
+	if(m_index.built)
+	{
+		return m_index;
+	}
+	m_index.buckets.clear();
+	m_index.universal.clear();
+	m_index.stamps.assign(m_selectors.size(), 0);
+	m_index.epoch = 0;
+	for(size_t i = 0; i < m_selectors.size(); i++)
+	{
+		const css_element_selector& right = m_selectors[i]->m_right;
+		int kind = 0;
+		tstring key;
+		for(css_attribute_selector::vector::const_iterator it = right.m_attrs.begin(); it != right.m_attrs.end(); ++it)
+		{
+			if(it->attribute == _t("class") && it->condition == select_equal && !it->class_val.empty())
+			{
+				kind = 1;
+				key = index_key_lower(it->class_val.front());
+				break;
+			}
+		}
+		if(!kind)
+		{
+			for(css_attribute_selector::vector::const_iterator it = right.m_attrs.begin(); it != right.m_attrs.end(); ++it)
+			{
+				if(it->attribute == _t("id") && it->condition == select_equal && !it->val.empty())
+				{
+					kind = 2;
+					key = index_key_lower(it->val);
+					break;
+				}
+			}
+		}
+		if(!kind && !right.m_tag.empty() && right.m_tag != _t("*"))
+		{
+			kind = 3;
+			key = index_key_lower(right.m_tag);
+		}
+		if(kind)
+		{
+			selector_index::key_t key2(kind, key);
+			// buckets are unsorted while building: linear scan for the key
+			std::vector<int>* bucket = 0;
+			for(size_t b = 0; b < m_index.buckets.size(); b++)
+			{
+				if(m_index.buckets[b].first.first == kind && m_index.buckets[b].first.second == key)
+				{
+					bucket = &m_index.buckets[b].second;
+					break;
+				}
+			}
+			if(!bucket)
+			{
+				m_index.buckets.push_back(selector_index::bucket_t(key2, std::vector<int>()));
+				bucket = &m_index.buckets.back().second;
+			}
+			bucket->push_back((int)i);
+		}
+		else
+		{
+			m_index.universal.push_back((int)i);
+		}
+	}
+	std::sort(m_index.buckets.begin(), m_index.buckets.end(),
+		 [](const selector_index::bucket_t& a, const selector_index::bucket_t& b)
+		 {
+			if(a.first.first != b.first.first)
+			{
+				return a.first.first < b.first.first;
+			}
+			return a.first.second < b.first.second;
+		 }
+	);
+	m_index.built = true;
+	klog("[xBrowser] selector index: buckets=%u universal=%u selectors=%u\n",
+		(unsigned)m_index.buckets.size(), (unsigned)m_index.universal.size(), (unsigned)m_selectors.size());
+	return m_index;
 }
 
 void css::parse_atrule(const tstring& text, const tchar_t* baseurl, document* doc, const media_query_list::ptr& media)

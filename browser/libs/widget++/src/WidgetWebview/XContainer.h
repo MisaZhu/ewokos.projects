@@ -75,7 +75,13 @@ public:
                                                     uint32_t& createFontCalls, uint32_t& createFontMs) const;
     static uint8_t*                    loadURL(const std::string& url, int* sz);
     static std::string                 normalizeURL(const std::string& url, const std::string& baseurl);
+    /* Decode-only path: pure heap work (webp/png/jpeg -> bitmap), safe to run
+     * on the download worker thread; no shm/IPC/widget state is touched. */
+    static graph_t*                    decodeImageData(const uint8_t* data, int sz);
     bool                               loadImageData(const std::string& url, uint8_t* data, int sz);
+    /* UI-thread O(1) mount of a bitmap decoded by decodeImageData(); takes
+     * ownership on success (replacing any cached image for the same url). */
+    bool                               mountImage(const std::string& url, graph_t* img);
 
 private:
     enum { CHAR_WIDTH_CACHE_SIZE = 8192 };

@@ -3,6 +3,7 @@
 #include "types.h"
 #include "context.h"
 #include "gumbo/gumbo.h"
+#include <stdint.h>
 
 namespace litehtml
 {
@@ -47,6 +48,10 @@ namespace litehtml
 
 	class html_tag;
 
+	/* Defined in html_tag.cpp: dumps and resets the per-update apply-phase
+	 * timing counters (candidate collect / match / add_style / recursion). */
+	void dump_apply_phase_profile();
+
 	class document
 	{
 	public:
@@ -76,6 +81,21 @@ namespace litehtml
 		int									m_last_font_size;
 		uint_ptr							m_last_font;
 		font_metrics						m_last_font_metrics;
+		/* Time-sliced master-style update state: a full refresh+apply+parse
+		 * pass on a CSS-heavy page costs seconds, so it is split into chunks
+		 * bounded by a wall-clock deadline handed in by the UI thread. Each
+		 * chunk walks the tree and stamps visited elements with m_step_epoch;
+		 * stamped elements are skipped until the epoch changes, which makes a
+		 * paused walk resumable without redoing work. */
+		unsigned int						m_step_epoch;
+		int									m_step_phase;
+		uint64_t							m_step_deadline;
+		uint32_t							m_step_visits;
+		uint32_t							m_step_stamped;
+		uint32_t							m_step_apply_ms;
+		uint32_t							m_step_parse_ms;
+		uint64_t							m_step_start;
+		bool								m_step_exhausted;
 	public:
 		document(litehtml::document_container* objContainer, litehtml::context* ctx);
 		virtual ~document();
@@ -104,6 +124,17 @@ namespace litehtml
 		bool                            match_lang(const tstring & lang);
 		void							add_tabular(const element::ptr& el);
 		void							update_master_styles();
+		/* Runs one time-bounded chunk of the master-style update; returns true
+		 * when the whole update (refresh+apply+parse) has completed. Callers
+		 * drive it from their event loop so a slow page never blocks input. */
+		bool							update_master_styles_step(uint64_t deadline_ms);
+		bool							style_step_active() const { return m_step_phase != 0; }
+		int								style_step_phase() const { return m_step_phase; }
+		unsigned int					style_step_epoch() const { return m_step_epoch; }
+		bool							style_step_exhausted();
+		void							style_step_stamp(element* el);
+		/* Master css changed while a step was in flight: restart from scratch. */
+		void							abort_style_step() { m_step_phase = 0; }
 		bool							is_fast_mode() const { return m_context && m_context->is_fast_mode(); }
 
 		static litehtml::document::ptr createFromString(const tchar_t* str, litehtml::document_container* objPainter, litehtml::context* ctx, litehtml::css* user_styles = 0);

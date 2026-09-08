@@ -190,6 +190,15 @@ litehtml::document::document(litehtml::document_container* objContainer, litehtm
 	m_last_font_valid = false;
 	m_last_font_size = 0;
 	m_last_font = 0;
+	m_step_epoch = 0;
+	m_step_phase = 0;
+	m_step_deadline = 0;
+	m_step_visits = 0;
+	m_step_stamped = 0;
+	m_step_apply_ms = 0;
+	m_step_parse_ms = 0;
+	m_step_start = 0;
+	m_step_exhausted = false;
 }
 
 void litehtml::reset_dom_internal_profile()
@@ -754,6 +763,9 @@ void litehtml::document::add_stylesheet( const tchar_t* str, const tchar_t* base
 {
 	if(str && str[0])
 	{
+		/* Master css changed: any chunked update in flight is stale (its epoch
+		 * stamps would skip elements against the old stylesheet set). */
+		abort_style_step();
 		m_css.push_back(css_text(str, baseurl, media));
 	}
 }
@@ -974,6 +986,9 @@ bool litehtml::document::media_changed()
 		container()->get_media_features(m_media);
 		if (update_media_lists(m_media))
 		{
+			/* Full unbounded reparse below: drop any chunked step in flight so
+			 * its epoch stamps cannot make parse_styles skip elements. */
+			abort_style_step();
 			m_root->refresh_styles();
 			m_root->parse_styles();
 			return true;
@@ -996,6 +1011,7 @@ bool litehtml::document::lang_changed()
 		{
 			m_culture.clear();
 		}
+		abort_style_step(); /* see media_changed(): unbounded reparse follows */
 		m_root->refresh_styles();
 		m_root->parse_styles();
 		return true;
@@ -1018,25 +1034,95 @@ bool litehtml::document::update_media_lists(const media_features& features)
 
 void litehtml::document::update_master_styles()
 {
-	if(m_root && m_context)
+	/* Legacy unbounded entry point: run the chunked update to completion. */
+	while(!update_master_styles_step(kernel_tic_ms(0) + 10000))
 	{
-		uint64_t update_start = kernel_tic_ms(0);
-		m_root->refresh_styles();
-		uint32_t refresh_ms = (uint32_t)(kernel_tic_ms(0) - update_start);
-
-		uint64_t apply_start = kernel_tic_ms(0);
-		m_root->apply_stylesheet(m_context->master_css());
-		uint32_t apply_ms = (uint32_t)(kernel_tic_ms(0) - apply_start);
-
-		uint64_t parse_start = kernel_tic_ms(0);
-		reset_parse_style_profile();
-		m_root->parse_styles();
-		dump_parse_style_profile();
-		uint32_t parse_ms = (uint32_t)(kernel_tic_ms(0) - parse_start);
-
-		klog("[xBrowser] update master styles: refresh=%u ms apply=%u ms parse=%u ms total=%u ms\n",
-			refresh_ms, apply_ms, parse_ms, (uint32_t)(kernel_tic_ms(0) - update_start));
 	}
+}
+
+bool litehtml::document::style_step_exhausted()
+{
+	if(m_step_exhausted)
+	{
+		return true;
+	}
+	/* Sampling the clock on every element visit is measurable on a 1k-node
+	 * tree; check it once per 64 visits instead. */
+	if((++m_step_visits & 63) == 0 && kernel_tic_ms(0) >= m_step_deadline)
+	{
+		m_step_exhausted = true;
+	}
+	return m_step_exhausted;
+}
+
+void litehtml::document::style_step_stamp(element* el)
+{
+	if(el)
+	{
+		el->m_step_stamp = m_step_epoch;
+		m_step_stamped++;
+	}
+}
+
+bool litehtml::document::update_master_styles_step(uint64_t deadline_ms)
+{
+	if(!m_root || !m_context)
+	{
+		return true;
+	}
+	if(m_step_phase == 0)
+	{
+		reset_dom_internal_profile();
+		reset_parse_style_profile();
+		m_step_start = kernel_tic_ms(0);
+		m_step_apply_ms = 0;
+		m_step_parse_ms = 0;
+		m_root->refresh_styles();
+		/* Fresh epoch pair per update: apply uses E, parse uses E+1, so stamps
+		 * never alias across phases or against a previous update. */
+		m_step_epoch += 2;
+		m_step_phase = 1;
+	}
+	m_step_deadline = deadline_ms;
+	m_step_exhausted = false;
+	m_step_visits = 0;
+
+	if(m_step_phase == 1)
+	{
+		uint64_t walk_start = kernel_tic_ms(0);
+		m_root->apply_stylesheet(m_context->master_css());
+		m_step_apply_ms += (uint32_t)(kernel_tic_ms(0) - walk_start);
+		if(m_step_exhausted)
+		{
+			return false;
+		}
+		/* The walk covered the whole tree: apply phase complete. */
+		m_step_epoch++;
+		m_step_phase = 2;
+		m_step_exhausted = false;
+		m_step_visits = 0;
+	}
+	if(m_step_phase == 2)
+	{
+		if(kernel_tic_ms(0) >= m_step_deadline)
+		{
+			return false;
+		}
+		uint64_t walk_start = kernel_tic_ms(0);
+		m_root->parse_styles();
+		m_step_parse_ms += (uint32_t)(kernel_tic_ms(0) - walk_start);
+		if(m_step_exhausted)
+		{
+			return false;
+		}
+	}
+	m_step_phase = 0;
+	dump_parse_style_profile();
+	dump_dom_internal_profile();
+	litehtml::dump_apply_phase_profile();
+	klog("[xBrowser] update master styles: apply=%u ms parse=%u ms total=%u ms (chunked)\n",
+		m_step_apply_ms, m_step_parse_ms, (uint32_t)(kernel_tic_ms(0) - m_step_start));
+	return true;
 }
 
 void litehtml::document::add_media_list( media_query_list::ptr list )

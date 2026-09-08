@@ -17,6 +17,11 @@
 #include <ctype.h>
 #include <pthread.h>
 
+/* libgloss heap diagnostics (see compat.c). Walks the block chain, so it is
+ * only called from a throttled once-per-second log below. */
+extern "C" void ewok_heap_stat(uint32_t* blocks, uint32_t* free_blocks,
+        uint32_t* used_bytes, uint32_t* free_bytes);
+
 using namespace Ewok;
 
 /*
@@ -36,6 +41,15 @@ using namespace Ewok;
 #endif
 
 static const uint32_t kLayoutDebounceMs = 30;
+/* Hard red line: xwin input events must be served promptly, so every heavy
+ * main-thread pass (result consumption, master-style update) runs against a
+ * per-tick wall-clock budget. While the user is actively interacting the
+ * budget collapses to a few ms; render()/draw() stay indivisible for now. */
+static const uint64_t kStyleBudgetIdleMs = 25;
+static const uint64_t kStyleBudgetInputMs = 3;
+static const uint64_t kResultBudgetIdleMs = 25;
+static const uint64_t kResultBudgetInputMs = 3;
+static const uint64_t kInputActiveWindowMs = 250;
 
 static std::string strip_script_blocks(const std::string& html, int* removed_count)
 {
@@ -109,6 +123,10 @@ WidgetWebview::WidgetWebview()
     , m_scrollY(0)
     , m_needsStyleUpdate(false)
     , m_needsLayout(false)
+    , m_pendingCss(0)
+    , m_styleStepInFlight(false)
+    , m_lastInputAt(0)
+    , m_lastStatLogAt(0)
     , m_buildNeedsStyleUpdate(false)
     , m_buildNeedsLayout(false)
     , m_flushDeferredImages(false)
@@ -165,6 +183,7 @@ void WidgetWebview::cleanupBuildResources()
     m_defaultCssPrepared = false;
     m_defaultCssLoading = false;
     m_deferBuildStep = false;
+    m_styleStepInFlight = false;
     m_layoutDirtyAt = 0;
     m_buildLayoutDirtyAt = 0;
     m_seenCssUrls.clear();
@@ -395,8 +414,10 @@ bool WidgetWebview::loadCSS(const std::string& url)
         return false;
     }
     rememberCSS(full_url);
+    m_pendingCss++;
     if(!addTask({full_url, HttpTask::TASK_CSS, false})) {
         forgetCSS(full_url);
+        m_pendingCss--;
         return false;
     }
     return true;
@@ -404,7 +425,7 @@ bool WidgetWebview::loadCSS(const std::string& url)
 
 bool WidgetWebview::loadHtmlTask(const std::string& url)
 {
-    HttpResult result = {url, HttpTask::TASK_HTML, false, ""};
+    HttpResult result = {url, HttpTask::TASK_HTML, false, "", nullptr};
     int sz = 0;
     uint64_t fetch_start = kernel_tic_ms(0);
     uint8_t* content = XContainer::loadURL(url, &sz);
@@ -427,7 +448,7 @@ bool WidgetWebview::loadHtmlTask(const std::string& url)
 
 bool WidgetWebview::loadCSSTask(const std::string& url)
 {
-    HttpResult result = {url, HttpTask::TASK_CSS, false, ""};
+    HttpResult result = {url, HttpTask::TASK_CSS, false, "", nullptr};
     int sz = 0;
     uint64_t fetch_start = kernel_tic_ms(0);
     uint8_t* content = XContainer::loadURL(url, &sz);
@@ -448,12 +469,19 @@ bool WidgetWebview::loadCSSTask(const std::string& url)
 
 bool WidgetWebview::loadImageTask(const std::string& url)
 {
-    HttpResult result = {url, HttpTask::TASK_IMAGE, false, ""};
+    HttpResult result = {url, HttpTask::TASK_IMAGE, false, "", nullptr};
     int sz = 0;
     uint64_t fetch_start = kernel_tic_ms(0);
     uint8_t* content = XContainer::loadURL(url, &sz);
     if(content != NULL && sz > 0) {
-        result.content.assign((char*)content, sz);
+        /* Decode on this worker thread (pure heap work, no shm/IPC): the UI
+         * thread then only mounts the finished bitmap in O(1) instead of
+         * burning tens of ms per image inside its event tick. */
+        uint64_t decode_start = kernel_tic_ms(0);
+        result.image = XContainer::decodeImageData(content, sz);
+        klog("[xBrowser] worker decode image: url=%s hash=%08x ok=%d size=%d cost=%u ms\n",
+            url.c_str(), debug_hash_text(url), result.image ? 1 : 0, sz,
+            (uint32_t)(kernel_tic_ms(0) - decode_start));
         free(content);
         result.ok = true;
     }
@@ -468,6 +496,9 @@ bool WidgetWebview::loadImageTask(const std::string& url)
 
 bool WidgetWebview::loadCSSContent(const std::string& url, const std::string& content)
 {
+    if(m_pendingCss > 0) {
+        m_pendingCss--;
+    }
     bool res = false;
     if (!content.empty()) {
         uint64_t parse_start = kernel_tic_ms(0);
@@ -479,6 +510,12 @@ bool WidgetWebview::loadCSSContent(const std::string& url, const std::string& co
             ctx = m_buildTargetContext ? m_buildTargetContext : &m_buildContext;
             target_doc = m_buildDoc;
             target_build = true;
+        }
+        /* An in-flight chunked style update is stale once new master css
+         * arrives: its epoch stamps would skip elements against the old
+         * stylesheet set, so restart it from scratch. */
+        if (target_doc) {
+            target_doc->abort_style_step();
         }
         ctx->load_master_stylesheet(content.c_str());
         uint32_t parse_ms = (uint32_t)(kernel_tic_ms(0) - parse_start);
@@ -557,6 +594,42 @@ bool WidgetWebview::loadImageContent(const std::string& url, uint8_t* content, i
     return res;
 }
 
+bool WidgetWebview::mountDecodedImage(const std::string& url, graph_t* img)
+{
+    /* UI-thread half of the worker-side decode: cache the finished bitmap and
+     * mark layout dirty. O(1) — no decoding, no allocation-heavy work here. */
+    bool res = false;
+    pthread_mutex_lock(&m_renderMutex);
+    if (m_doc == nullptr && m_buildDoc == nullptr) {
+        klog("[xBrowser] image mount deferred: no-doc url=%s hash=%08x\n",
+            url.c_str(), debug_hash_text(url));
+        pthread_mutex_unlock(&m_renderMutex);
+        return false;
+    }
+    XContainer* target_container = m_container;
+    bool target_build = false;
+    if (m_buildDoc != nullptr && m_buildContainer != NULL) {
+        target_container = m_buildContainer;
+        target_build = true;
+    }
+    if (img != NULL && target_container != NULL) {
+        res = target_container->mountImage(url, img);
+        if (res) {
+            if (target_build) {
+                m_buildNeedsLayout = true;
+                m_buildLayoutDirtyAt = kernel_tic_ms(0);
+            } else {
+                m_needsLayout = true;
+                m_layoutDirtyAt = kernel_tic_ms(0);
+            }
+        }
+    }
+    pthread_mutex_unlock(&m_renderMutex);
+    if(res)
+        update();
+    return res;
+}
+
 bool WidgetWebview::loadHtmlContent(const std::string& content)
 {
     update();
@@ -593,7 +666,9 @@ bool WidgetWebview::loadHtmlContent(const std::string& content)
         }
         pthread_mutex_unlock(&m_renderMutex);
         if(queued) {
+            m_pendingCss++;
             if(!addTask({m_defaultCSSUrl, HttpTask::TASK_CSS, false})) {
+                m_pendingCss--;
                 pthread_mutex_lock(&m_renderMutex);
                 m_defaultCssLoading = false;
                 m_defaultCssPrepared = true;
@@ -698,7 +773,16 @@ bool WidgetWebview::processResults()
         loadCSSContent(result.url, result.content);
     }
     else if(result.type == HttpTask::TASK_IMAGE) {
-        if(!loadImageContent(result.url, (uint8_t*)result.content.data(), result.content.size())) {
+        bool mounted = false;
+        if(result.image != nullptr) {
+            mounted = mountDecodedImage(result.url, result.image);
+            if(mounted) {
+                result.image = nullptr; /* ownership moved into the cache */
+            }
+        } else {
+            mounted = loadImageContent(result.url, (uint8_t*)result.content.data(), result.content.size());
+        }
+        if(!mounted) {
             pthread_mutex_lock(&m_renderMutex);
             bool retry_later = (m_doc == nullptr && m_buildDoc == nullptr);
             pthread_mutex_unlock(&m_renderMutex);
@@ -708,6 +792,10 @@ bool WidgetWebview::processResults()
                 pthread_mutex_unlock(&m_resultMutex);
                 klog("[xBrowser] image result requeued: url=%s hash=%08x size=%d\n",
                     result.url.c_str(), debug_hash_text(result.url), (int)result.content.size());
+            } else if(result.image != nullptr) {
+                /* Not requeued and not mounted: release the decoded bitmap. */
+                graph_free(result.image);
+                result.image = nullptr;
             }
         }
     }
@@ -739,7 +827,15 @@ void WidgetWebview::onTimer(uint32_t timerFPS, uint32_t timerSteps)
         m_pendingDeleteContainer = nullptr;
     }
 
+    /* Consume results only within this tick's budget so the xwin event loop
+     * keeps turning even while a burst of downloads lands. */
+    uint64_t tick_start = kernel_tic_ms(0);
+    bool input_active = (m_lastInputAt != 0 && (tick_start - m_lastInputAt) < kInputActiveWindowMs);
+    uint64_t result_budget = input_active ? kResultBudgetInputMs : kResultBudgetIdleMs;
     bool has_more_results = processResults();
+    while(has_more_results && (kernel_tic_ms(0) - tick_start) < result_budget) {
+        has_more_results = processResults();
+    }
     if (applyPendingLayoutUpdates()) {
         update();
     }
@@ -756,30 +852,104 @@ void WidgetWebview::onTimer(uint32_t timerFPS, uint32_t timerSteps)
     if(has_more_results) {
         update();
     }
+
+    /* Red-line watchdog: every tick must stay bounded so xwin events are
+     * served promptly. Log the tick cost plus the heap shape once per second
+     * -- an unbounded tick or a runaway block count shows up here instead of
+     * only as a frozen window. */
+    uint64_t tick_end = kernel_tic_ms(0);
+    uint32_t tick_ms = (uint32_t)(tick_end - tick_start);
+    if (tick_end - m_lastStatLogAt >= 1000) {
+        uint32_t blocks = 0;
+        uint32_t free_blocks = 0;
+        uint32_t used_bytes = 0;
+        uint32_t free_bytes = 0;
+        m_lastStatLogAt = tick_end;
+        ewok_heap_stat(&blocks, &free_blocks, &used_bytes, &free_bytes);
+        klog("[xBrowser] tick watchdog: cost=%u ms pending=%d build=%d style_inflight=%d | heap blocks=%u free=%u used=%u KB holes=%u KB\n",
+            tick_ms, (int)has_more_results, (int)m_buildPhase,
+            (int)m_styleStepInFlight, blocks, free_blocks,
+            used_bytes / 1024, free_bytes / 1024);
+    } else if (tick_ms > 50) {
+        klog("[xBrowser] tick overrun: cost=%u ms pending=%d build=%d style_inflight=%d\n",
+            tick_ms, (int)has_more_results, (int)m_buildPhase,
+            (int)m_styleStepInFlight);
+    }
 }
 
 bool WidgetWebview::applyPendingLayoutUpdates()
 {
     bool updated = false;
     uint64_t now = kernel_tic_ms(0);
+    bool input_active = (m_lastInputAt != 0 && (now - m_lastInputAt) < kInputActiveWindowMs);
     pthread_mutex_lock(&m_renderMutex);
 
+    /* One chunked style step per tick, shared by the build doc and the visible
+     * doc (build first). The chunk is bounded by a wall-clock budget that
+     * collapses while the user is interacting, so the xwin event loop never
+     * waits behind a full master-style pass. A step already in flight skips
+     * the debounce/pending gates so it always keeps making progress. */
+    litehtml::document* style_doc = nullptr;
+    bool style_build = false;
+    if (m_buildDoc && m_buildNeedsStyleUpdate) {
+        style_doc = m_buildDoc;
+        style_build = true;
+    } else if (m_doc && m_needsStyleUpdate &&
+            (m_styleStepInFlight || m_pendingCss <= 0 ||
+             (m_layoutDirtyAt != 0 && (now - m_layoutDirtyAt) > 3000))) {
+        style_doc = m_doc;
+    }
+    bool style_step_running = m_styleStepInFlight ||
+            (style_doc != nullptr && style_doc->style_step_active());
+    if (style_doc != nullptr && !style_step_running &&
+            !style_build && m_layoutDirtyAt != 0 &&
+            (now - m_layoutDirtyAt) < kLayoutDebounceMs) {
+        style_doc = nullptr; /* fresh start stays behind the debounce gate */
+    }
+    if (style_doc != nullptr && !style_build &&
+            (m_styleStepInFlight || style_doc->style_step_active()) &&
+            m_layoutDirtyAt != 0 && (now - m_layoutDirtyAt) > 3000) {
+        /* 3s force point hit while a step was in flight: the stylesheet set
+         * may have grown since it started, so restart the walk from scratch.
+         * The next tick begins a fresh phase-0 chunk. */
+        style_doc->abort_style_step();
+        m_styleStepInFlight = false;
+        style_doc = nullptr;
+    }
+    if (style_doc != nullptr) {
+        uint64_t style_budget = input_active ? kStyleBudgetInputMs : kStyleBudgetIdleMs;
+        uint64_t chunk_start = kernel_tic_ms(0);
+        bool done = style_doc->update_master_styles_step(chunk_start + style_budget);
+        uint32_t chunk_ms = (uint32_t)(kernel_tic_ms(0) - chunk_start);
+        m_styleStepInFlight = !done;
+        if (done) {
+            if (style_build) {
+                klog("[xBrowser] apply build styles: %u ms (chunked)\n", chunk_ms);
+                m_buildNeedsStyleUpdate = false;
+            } else {
+                klog("[xBrowser] apply css-update: chunk=%u ms (chunked)\n", chunk_ms);
+                m_needsStyleUpdate = false;
+                /* Layout now reflects the final styles; ask for one render. */
+                m_needsLayout = true;
+                m_layoutDirtyAt = kernel_tic_ms(0);
+            }
+            updated = true;
+        } else {
+            klog("[xBrowser] style step chunk: %u ms phase=%d\n",
+                chunk_ms, style_doc->style_step_phase());
+        }
+    }
+
     if (m_buildDoc) {
-        if ((m_buildNeedsStyleUpdate || m_buildNeedsLayout) &&
+        if (!style_build && (m_buildNeedsStyleUpdate || m_buildNeedsLayout) &&
                 m_buildLayoutDirtyAt != 0 &&
                 (now - m_buildLayoutDirtyAt) < kLayoutDebounceMs) {
             pthread_mutex_unlock(&m_renderMutex);
-            return false;
+            return updated;
         }
-        if (m_buildNeedsStyleUpdate) {
-            uint64_t style_start = kernel_tic_ms(0);
-            m_buildDoc->update_master_styles();
-            uint32_t style_ms = (uint32_t)(kernel_tic_ms(0) - style_start);
-            klog("[xBrowser] apply build styles: %u ms\n", style_ms);
-            m_buildNeedsStyleUpdate = false;
-            updated = true;
-        }
-        if (m_buildNeedsLayout) {
+        /* While the build doc's style step is in flight m_buildNeedsStyleUpdate
+         * stays set, so the render below waits for the walk to complete. */
+        if (!m_buildNeedsStyleUpdate && m_buildNeedsLayout) {
             uint64_t render_start = kernel_tic_ms(0);
             m_buildDoc->render(m_clientWidth);
             uint32_t render_ms = (uint32_t)(kernel_tic_ms(0) - render_start);
@@ -795,37 +965,14 @@ bool WidgetWebview::applyPendingLayoutUpdates()
     }
 
     if (m_doc) {
-        if ((m_needsStyleUpdate || m_needsLayout) &&
-                m_layoutDirtyAt != 0 &&
-                (now - m_layoutDirtyAt) < kLayoutDebounceMs) {
-            pthread_mutex_unlock(&m_renderMutex);
-            return updated;
-        }
-        if (m_needsStyleUpdate) {
-            uint32_t text_width_calls = 0, text_width_ms = 0, draw_text_calls = 0, draw_text_ms = 0;
-            uint32_t text_width_hits = 0, text_width_misses = 0;
-            uint32_t char_width_hits = 0, char_width_misses = 0;
-            uint32_t create_font_calls = 0, create_font_ms = 0;
-            if (m_container) {
-                m_container->resetPerfStats();
-            }
-            uint64_t style_start = kernel_tic_ms(0);
-            m_doc->update_master_styles();
-            uint32_t style_ms = (uint32_t)(kernel_tic_ms(0) - style_start);
-            if (m_container) {
-                m_container->getPerfStats(text_width_calls, text_width_ms, draw_text_calls, draw_text_ms,
-                                          text_width_hits, text_width_misses,
-                                          char_width_hits, char_width_misses,
-                                          create_font_calls, create_font_ms);
-            }
-            klog("[xBrowser] apply css-update: style=%u ms text_width=%u/%u ms hit=%u miss=%u char_hit=%u char_miss=%u create_font=%u/%u ms\n",
-                style_ms, text_width_calls, text_width_ms, text_width_hits, text_width_misses,
-                char_width_hits, char_width_misses,
-                create_font_calls, create_font_ms);
-            m_needsStyleUpdate = false;
-            updated = true;
-        }
-        if (m_needsLayout) {
+        /* Render only once this doc's chunked style update has completed;
+         * laying out half-styled content would just be thrown away. A step
+         * running for the build doc does not block the visible doc. */
+        bool style_pending = m_needsStyleUpdate ||
+                (m_styleStepInFlight && style_doc == m_doc);
+        if (!style_pending && m_needsLayout &&
+                (m_layoutDirtyAt == 0 ||
+                 (now - m_layoutDirtyAt) >= kLayoutDebounceMs)) {
             uint64_t render_start = kernel_tic_ms(0);
             m_doc->render(m_clientWidth);
             uint32_t layout_ms = (uint32_t)(kernel_tic_ms(0) - render_start);
@@ -838,6 +985,7 @@ bool WidgetWebview::applyPendingLayoutUpdates()
         m_needsStyleUpdate = false;
         m_needsLayout = false;
         m_layoutDirtyAt = 0;
+        m_styleStepInFlight = false;
     }
 
     pthread_mutex_unlock(&m_renderMutex);
@@ -885,6 +1033,9 @@ void WidgetWebview::advanceBuildStep()
         build_ctx->set_fast_mode(true);
         m_buildContainer = new XContainer(build_ctx, this);
         m_buildContainer->set_client_size(m_clientWidth, m_clientHeight);
+        /* Page URL drives relative/root-relative resolution for stylesheets
+         * and images discovered while the DOM is being created. */
+        m_buildContainer->set_base_url(m_buildHtmlUrl.c_str());
         m_buildContainer->setDeferImageLoad(true);
         m_buildContainer->resetPerfStats();
         if(m_buildHtmlContent.empty()) {
@@ -1168,6 +1319,10 @@ void WidgetWebview::updateScroller()
 
 bool WidgetWebview::onMouse(xevent_t* ev)
 {
+	/* Note input activity: onTimer shrinks its work budgets while the user
+	 * is interacting so xwin events are always served promptly. */
+	m_lastInputAt = kernel_tic_ms(0);
+
 	// Call parent class onMouse for drag scrolling
 	bool handled = Scrollable::onMouse(ev);
 	if (handled)

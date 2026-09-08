@@ -405,6 +405,16 @@ void XContainer::draw_list_marker(litehtml::uint_ptr hdc, const litehtml::list_m
     }
 }
 
+static std::string url_origin(const std::string& url) {
+    size_t scheme_end = url.find("://");
+    if(scheme_end == std::string::npos)
+        return std::string();
+    size_t path_start = url.find('/', scheme_end + 3);
+    if(path_start == std::string::npos)
+        return url;
+    return url.substr(0, path_start);
+}
+
 const std::string XContainer::getFullURL(const std::string& src, const std::string& baseurl) {
     std::string clean_src = trim_request_url(src);
     std::string clean_baseurl = trim_request_url(baseurl);
@@ -430,11 +440,22 @@ const std::string XContainer::getFullURL(const std::string& src, const std::stri
         return path;
     }
 
+    /* Root-relative path (/foo/bar.css): resolve against the base origin,
+     * otherwise "/_next/static/css/x.css" would be fetched as-is and fail. */
+    if(!clean_src.empty() && clean_src[0] == '/') {
+        std::string origin = url_origin(clean_baseurl);
+        if(!origin.empty())
+            return origin + clean_src;
+        return clean_src;
+    }
+    if(clean_src.compare(0, 2, "./") == 0)
+        clean_src.erase(0, 2);
+
     if (!clean_baseurl.empty()) {
         size_t slash = clean_baseurl.find_last_of('/');
         std::string base_dir = slash == std::string::npos ? clean_baseurl : clean_baseurl.substr(0, slash + 1);
         if(!base_dir.empty())
-            path = base_dir + path;
+            path = base_dir + clean_src;
     }
     return path;
 }
@@ -582,6 +603,8 @@ void XContainer::load_image(const litehtml::tchar_t* src, const litehtml::tchar_
 
     std::string img_path = std::string(src);
     std::string base_url = baseurl ? std::string(baseurl) : std::string();
+    if(base_url.empty())
+        base_url = m_base_url;
     std::string full_url = getFullURL(img_path, base_url);
     if(full_url.empty())
         return; 
@@ -660,25 +683,52 @@ static graph_t* webp_graph_new_from_data(const uint8_t* data, uint32_t size)
     return g;
 }
 
+graph_t* XContainer::decodeImageData(const uint8_t* data, int sz)
+{
+    if (data == NULL || sz <= 0)
+        return NULL;
+
+    graph_t* img = webp_graph_new_from_data(data, (uint32_t)sz);
+    if (img == NULL)
+        img = graph_image_new_from_data(GRAPH_IMAGE_TYPE_AUTO, data, sz);
+    return img;
+}
+
 bool XContainer::loadImageData(const std::string& url, uint8_t* data, int sz)
 {
     if (data == NULL || sz <= 0 || url.empty())
         return false;
 
-    graph_t* img = webp_graph_new_from_data(data, (uint32_t)sz);
-    if (img == NULL)
-        img = graph_image_new_from_data(GRAPH_IMAGE_TYPE_AUTO, data, sz);
+    graph_t* img = decodeImageData(data, sz);
     if (img == NULL) {
         klog("[xBrowser] image decode failed: url=%s size=%d\n", url.c_str(), sz);
         return false;
     }
+    return mountImage(url, img);
+}
 
-    ImageInfo info;
-    info.image = img;
-    info.ref_count = 1;
-    m_images[url] = info;
-    klog("[xBrowser] image cached: url=%s size=%d dim=%dx%d ref=%d\n",
-        url.c_str(), sz, img->w, img->h, info.ref_count);
+bool XContainer::mountImage(const std::string& url, graph_t* img)
+{
+    if (img == NULL || url.empty())
+        return false;
+
+    /* Free the previous bitmap for this url (if any) before overwriting the
+     * cache slot, so re-decodes of the same url do not leak. */
+    auto it = m_images.find(url);
+    if (it != m_images.end()) {
+        if (it->second.image && it->second.image != img) {
+            graph_free(it->second.image);
+        }
+        it->second.image = img;
+        it->second.ref_count = 1;
+    } else {
+        ImageInfo info;
+        info.image = img;
+        info.ref_count = 1;
+        m_images[url] = info;
+    }
+    klog("[xBrowser] image cached: url=%s dim=%dx%d ref=1\n",
+        url.c_str(), img->w, img->h);
     return true;
 }
 
@@ -692,6 +742,8 @@ void XContainer::get_image_size(const litehtml::tchar_t* src, const litehtml::tc
 
     std::string img_path = std::string(src);
     std::string base_url = baseurl ? std::string(baseurl) : std::string();
+    if(base_url.empty())
+        base_url = m_base_url;
     std::string full_url = getFullURL(img_path, base_url);
     if(full_url.empty())
         return;
@@ -815,6 +867,10 @@ void XContainer::import_css(litehtml::tstring& text, const litehtml::tstring& ur
 
     std::string css_path = std::string(url);
     std::string base_url = std::string(baseurl);
+    /* el_link passes an empty baseurl; fall back to the page URL so that
+     * root-relative stylesheet hrefs (/_next/static/css/...) resolve. */
+    if(base_url.empty())
+        base_url = m_base_url;
     std::string full_url = getFullURL(css_path, base_url);
     if(full_url.empty())
         return;
@@ -828,7 +884,7 @@ void XContainer::set_caption(const litehtml::tchar_t* caption)
 void XContainer::set_base_url(const litehtml::tchar_t* base_url)
 {
     if (base_url != NULL) {
-        m_base_url = std::string(base_url);
+        m_base_url = normalizeURL(std::string(base_url), "");
     } else {
         m_base_url.clear();
     }

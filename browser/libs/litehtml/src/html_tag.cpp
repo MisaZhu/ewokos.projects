@@ -197,6 +197,12 @@ static bool g_parse_style_profile_active = false;
 static parse_style_profile_t g_parse_style_profile = {};
 static const bool g_parse_style_profile_supported = true;
 
+static uint32_t g_apply_calls = 0;
+static uint32_t g_apply_cand_ms = 0;
+static uint32_t g_apply_match_ms = 0;
+static uint32_t g_apply_add_ms = 0;
+static uint32_t g_apply_recur_ms = 0;
+
 static inline bool parse_style_profile_enabled()
 {
 	return g_parse_style_profile_active;
@@ -427,14 +433,91 @@ litehtml::element::ptr litehtml::html_tag::select_one( const css_selector& selec
 	return 0;
 }
 
+static litehtml::tstring selector_key_lower(const litehtml::tstring& src)
+{
+	litehtml::tstring out = src;
+	for(size_t i = 0; i < out.length(); i++)
+	{
+		if(out[i] >= 'A' && out[i] <= 'Z')
+		{
+			out[i] = (litehtml::tchar_t)(out[i] - 'A' + 'a');
+		}
+	}
+	return out;
+}
+
+/* Dumps and clears the apply_stylesheet phase counters; called by
+ * document::update_master_styles_step when a chunked update completes. */
+void litehtml::dump_apply_phase_profile()
+{
+	klog("[xBrowser] apply phases: calls=%u cand=%u ms match=%u ms add=%u ms recur=%u ms\n",
+		g_apply_calls, g_apply_cand_ms, g_apply_match_ms, g_apply_add_ms, g_apply_recur_ms);
+	g_apply_calls = 0;
+	g_apply_cand_ms = 0;
+	g_apply_match_ms = 0;
+	g_apply_add_ms = 0;
+	g_apply_recur_ms = 0;
+}
+
+/* Per-element stylesheet matching (apply_stylesheet_own) plus the children
+ * walk and the chunked-update gating live in the wrapper below. */
 void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 {
+	document* doc = get_document();
+	bool stepping = (doc && doc->style_step_phase() == 1);
+	if(stepping)
+	{
+		if(m_step_stamp == doc->style_step_epoch())
+		{
+			/* This element's own matching already ran in the current chunked
+			 * apply epoch. Its subtree may still hold unvisited nodes, so the
+			 * children walk below must run even though self-work is skipped. */
+		}
+		else if(doc->style_step_exhausted())
+		{
+			/* Time slice used up before this element was reached: leave it
+			 * unstamped so the resumed walk redoes it. */
+			return;
+		}
+		else
+		{
+			apply_stylesheet_own(stylesheet);
+			doc->style_step_stamp(this);
+		}
+	}
+	else
+	{
+		apply_stylesheet_own(stylesheet);
+	}
+
+	for(auto& el : m_children)
+	{
+		if(stepping && doc->style_step_exhausted())
+		{
+			break;
+		}
+		if(el->get_display() != display_inline_text)
+		{
+			el->apply_stylesheet(stylesheet);
+		}
+	}
+}
+
+void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
+{
+	if((const void*)&stylesheet == nullptr)
+	{
+		klog("[xBrowser] apply_stylesheet: NULL stylesheet on tag=%s\n", m_tag.c_str());
+		return;
+	}
 	uint64_t apply_start = kernel_tic_ms(0);
 	if(stylesheet.has_before_after())
 	{
 		remove_before_after();
 	}
 
+	const tstring k_class_attr = _t("class");
+	const tstring k_id_attr = _t("id");
 	auto right_selector_maybe_matches = [&](const litehtml::css_selector::ptr& sel) -> bool
 	{
 		const css_element_selector& right = sel->m_right;
@@ -448,8 +531,8 @@ void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 
 		for(const auto& attr_sel : right.m_attrs)
 		{
-			const bool is_class_attr = (attr_sel.attribute == _t("class"));
-			const bool is_id_attr = (attr_sel.attribute == _t("id"));
+			const bool is_class_attr = (attr_sel.attribute == k_class_attr);
+			const bool is_id_attr = (attr_sel.attribute == k_id_attr);
 			switch(attr_sel.condition)
 			{
 			case select_exists:
@@ -570,8 +653,63 @@ void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 		return true;
 	};
 
-	for(const auto& sel : stylesheet.selectors())
+	css::selector_index& sel_idx = stylesheet.get_selector_index();
+	std::vector<int> candidates;
+	uint64_t cand_start = kernel_tic_ms(0);
 	{
+		uint32_t epoch = sel_idx.begin_visit();
+		auto push_bucket = [&](const css::selector_index::key_t& key)
+		{
+			std::vector<int>* bucket = css::find_selector_bucket(sel_idx, key);
+			if(!bucket)
+			{
+				return;
+			}
+			for(size_t j = 0; j < bucket->size(); j++)
+			{
+				int si = (*bucket)[j];
+				if(sel_idx.stamps[si] != epoch)
+				{
+					sel_idx.stamps[si] = epoch;
+					candidates.push_back(si);
+				}
+			}
+		};
+		for(size_t u = 0; u < sel_idx.universal.size(); u++)
+		{
+			int si = sel_idx.universal[u];
+			if(sel_idx.stamps[si] != epoch)
+			{
+				sel_idx.stamps[si] = epoch;
+				candidates.push_back(si);
+			}
+		}
+		css::selector_index::key_t key;
+		key.first = 3;
+		key.second = selector_key_lower(m_tag);
+		push_bucket(key);
+		const tchar_t* own_id_attr = get_attr(k_id_attr.c_str());
+		if(own_id_attr)
+		{
+			key.first = 2;
+			key.second = selector_key_lower(tstring(own_id_attr));
+			push_bucket(key);
+		}
+		for(size_t c = 0; c < m_class_values.size(); c++)
+		{
+			key.first = 1;
+			key.second = selector_key_lower(m_class_values[c]);
+			push_bucket(key);
+		}
+		std::sort(candidates.begin(), candidates.end());
+	}
+	g_apply_cand_ms += kernel_tic_ms(0) - cand_start;
+	g_apply_calls++;
+
+	for(size_t ci = 0; ci < candidates.size(); ci++)
+	{
+		uint64_t match_start = kernel_tic_ms(0);
+		const litehtml::css_selector::ptr& sel = stylesheet.selectors()[candidates[ci]];
 		if(!sel->is_media_valid())
 		{
 			continue;
@@ -584,6 +722,7 @@ void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 
 		if(apply == select_no_match)
 		{
+			g_apply_match_ms += kernel_tic_ms(0) - match_start;
 			continue;
 		}
 		if(apply & select_match_pseudo_class)
@@ -591,9 +730,12 @@ void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 			apply = select(*sel, true);
 			if(apply == select_no_match)
 			{
+				g_apply_match_ms += kernel_tic_ms(0) - match_start;
 				continue;
 			}
 		}
+		g_apply_match_ms += kernel_tic_ms(0) - match_start;
+		uint64_t add_start = kernel_tic_ms(0);
 
 		if(apply != select_no_match)
 		{
@@ -632,15 +774,11 @@ void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 				}
 			}
 		}
+		g_apply_add_ms += (uint32_t)(kernel_tic_ms(0) - add_start);
 	}
 
-	for(auto& el : m_children)
-	{
-		if(el->get_display() != display_inline_text)
-		{
-			el->apply_stylesheet(stylesheet);
-		}
-	}
+	/* The children walk and the per-root phase dump live in the
+	 * apply_stylesheet wrapper; recursion timing is folded into it. */
 	litehtml::profile_apply_stylesheet((uint32_t)stylesheet.selectors().size(), apply_start);
 }
 
@@ -760,6 +898,22 @@ const litehtml::tchar_t* litehtml::html_tag::get_style_property_own(const tchar_
 
 void litehtml::html_tag::parse_styles(bool is_reparse)
 {
+	document* step_doc = get_document();
+	bool step_parse = (!is_reparse && step_doc && step_doc->style_step_phase() == 2);
+	if(step_parse)
+	{
+		if(m_step_stamp == step_doc->style_step_epoch())
+		{
+			/* Already parsed in this chunked-parse epoch; the child walk at the
+			 * bottom of this function still runs so paused subtrees resume. */
+		}
+		else if(step_doc->style_step_exhausted())
+		{
+			/* Slice exhausted before this element: leave it for the next chunk.
+			 * Cache stays warm; the resume pass clears it when work is done. */
+			return;
+		}
+	}
 	clear_style_property_cache();
 	bool profile_enabled = parse_style_profile_enabled();
 	uint64_t part_start = 0;
@@ -965,10 +1119,16 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		m_list_style_position = list_style_position_outside;
 		if(!is_reparse)
 		{
+			if(step_parse)
+			{
+				step_doc->style_step_stamp(this);
+			}
 			if(profile_enabled)
 				part_start = kernel_tic_ms(0);
 			for(auto& el : m_children)
 			{
+				if(step_parse && step_doc->style_step_exhausted())
+					break;
 				el->parse_styles();
 			}
 			if(profile_enabled)
@@ -1041,10 +1201,16 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 
 		if(!is_reparse)
 		{
+			if(step_parse)
+			{
+				step_doc->style_step_stamp(this);
+			}
 			if(profile_enabled)
 				part_start = kernel_tic_ms(0);
 			for(auto& el : m_children)
 			{
+				if(step_parse && step_doc->style_step_exhausted())
+					break;
 				el->parse_styles();
 			}
 			if(profile_enabled)
@@ -1427,10 +1593,16 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 
 	if(!is_reparse)
 	{
+		if(step_parse)
+		{
+			step_doc->style_step_stamp(this);
+		}
 		if(profile_enabled)
 			part_start = kernel_tic_ms(0);
 		for(auto& el : m_children)
 		{
+			if(step_parse && step_doc->style_step_exhausted())
+				break;
 			el->parse_styles();
 		}
 		if(profile_enabled)
@@ -1450,6 +1622,11 @@ int litehtml::html_tag::render( int x, int y, int max_width, bool second_pass )
 	if (m_display == display_flex || m_display == display_inline_flex)
 	{
 		return render_flex(x, y, max_width, second_pass);
+	}
+
+	if (m_display == display_grid || m_display == display_inline_grid)
+	{
+		return render_grid(x, y, max_width, second_pass);
 	}
 
 	return render_box(x, y, max_width, second_pass);

@@ -5,6 +5,7 @@
 #include <Widget/Scrollable.h>
 #include <litehtml.h>
 #include <litehtml/context.h>
+#include <graph/graph.h>
 #include <memory>
 #include <vector>
 #include <pthread.h>
@@ -25,6 +26,11 @@ struct HttpResult {
     int type;
     bool ok;
     std::string content;
+    /* Image tasks only: bitmap decoded on the download worker thread (pure
+     * heap work, no shm/IPC), handed to the UI thread for an O(1) mount.
+     * Ownership stays with the queue entry until it is consumed: a requeued
+     * result keeps the pointer, a dropped one must free it. */
+    graph_t* image;
 };
 
 // Forward declaration in global namespace
@@ -58,6 +64,7 @@ public:
     bool loadCSSContent(const std::string& url, const std::string& content);
     bool loadHtmlContent(const std::string& content);
     bool loadImageContent(const std::string& url, uint8_t* data, int sz);
+    bool mountDecodedImage(const std::string& url, graph_t* img);
 
     friend void* ::_task_thread(void* p);
 protected:
@@ -131,6 +138,18 @@ private:
     // Dirty flags consumed by onTimer so repaint stays draw-only.
     bool m_needsStyleUpdate;
     bool m_needsLayout;
+    // Number of stylesheet fetches still in flight; style re-application is
+    // deferred until it reaches zero so that N staggered CSS arrivals cost one
+    // full update_master_styles pass instead of N.
+    int m_pendingCss;
+    // A chunked master-style update is mid-flight: skip the debounce/pending
+    // gates for its continuation chunks so the walk always makes progress.
+    bool m_styleStepInFlight;
+    // Wall-clock of the last mouse event seen by this webview; onTimer shrinks
+    // its work budget while input is active so xwin events stay responsive.
+    uint64_t m_lastInputAt;
+    // Throttles the once-per-second tick/heap watchdog log in onTimer.
+    uint64_t m_lastStatLogAt;
     bool m_buildNeedsStyleUpdate;
     bool m_buildNeedsLayout;
     bool m_flushDeferredImages;

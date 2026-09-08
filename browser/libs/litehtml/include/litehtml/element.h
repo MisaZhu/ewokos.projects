@@ -32,6 +32,10 @@ protected:
 		element(litehtml::document* doc);
 		virtual ~element();
 
+		/* Chunked style-update stamp: epoch of the last update phase that
+		 * visited this element (see document::update_master_styles_step). */
+		unsigned int				m_step_stamp;
+
 		// returns refer to m_pos member;
 		position&					get_position();
 
