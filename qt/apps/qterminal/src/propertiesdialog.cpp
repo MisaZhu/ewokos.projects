@@ -374,8 +374,6 @@ void PropertiesDialog::apply()
 
     saveShortcuts();
 
-    Properties::Instance()->saveSettings();
-
     Properties::Instance()->dropShowOnStart = dropShowOnStartCheckBox->isChecked();
     Properties::Instance()->dropKeepOpen = dropKeepOpenCheckBox->isChecked();
     Properties::Instance()->dropHeight = dropHeightSpinBox->value();
@@ -397,6 +395,12 @@ void PropertiesDialog::apply()
 
     Properties::Instance()->trimPastedTrailingNewlines = trimPastedTrailingNewlinesCheckBox->isChecked();
     Properties::Instance()->confirmMultilinePaste = confirmMultilinePasteCheckBox->isChecked();
+
+    /* Saved after every field above is assigned: saveShortcuts() already
+       flushed once, but the drop-mode / bookmarks / window-title / bidi /
+       paste values are only set here, so a save placed earlier would persist
+       their stale values. */
+    Properties::Instance()->saveSettings();
 
     emit propertiesChanged();
 }

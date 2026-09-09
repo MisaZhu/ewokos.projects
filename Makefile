@@ -7,7 +7,7 @@ DIRS = macemu \
 	mine \
 	browser \
 	qt
-#	previous video saver minivmac nx11 fltk
+#	previous video saver minivmac nx11
 
 # qt needs the Qt tree that projects/qt/build.sh produces; without it the
 # sub-make prints a note and skips, so every other directory still builds.

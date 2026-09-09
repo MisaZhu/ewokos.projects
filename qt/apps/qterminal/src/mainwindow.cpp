@@ -43,6 +43,7 @@ extern "C" {
 
 #include "terminalconfig.h"
 #include "mainwindow.h"
+
 #include "tabwidget.h"
 #include "termwidgetholder.h"
 #include "config.h"
@@ -163,6 +164,18 @@ void MainWindow::rebuildActions()
     delete settingOwner;
     settingOwner = new QObject(this);
 
+    // Read the shortcut overrides once. Every setup_Action used to build its
+    // own QSettings; see m_shortcuts in the header for why that is expensive
+    // here.
+    m_shortcuts.clear();
+    {
+        QSettings settings;
+        settings.beginGroup(QStringLiteral("Shortcuts"));
+        const QStringList keys = settings.childKeys();
+        for (const QString &key : keys)
+            m_shortcuts.insert(key, settings.value(key).toString());
+    }
+
     // Then create them again
     setup_FileMenu_Actions();
     setup_ActionsMenu_Actions();
@@ -205,13 +218,17 @@ void MainWindow::setDropShortcut(const QKeySequence& dropShortCut)
 void MainWindow::setup_Action(const char *name, QAction *action, const char *defaultShortcut, const QObject *receiver,
                               const char *slot, QMenu *menu, const QVariant &data)
 {
-    QSettings settings;
-    settings.beginGroup(QStringLiteral("Shortcuts"));
-
     QList<QKeySequence> shortcuts;
 
     actions[QLatin1String(name)] = action;
-    const auto sequences = settings.value(QLatin1String(name), QLatin1String(defaultShortcut)).toString().split(QLatin1Char('|'));
+    // The Shortcuts override was read once in rebuildActions(); building a
+    // QSettings here would re-stat the INI file on every action.
+    QString value;
+    if (m_shortcuts.contains(QLatin1String(name)))
+        value = m_shortcuts.value(QLatin1String(name));
+    else if (defaultShortcut)
+        value = QLatin1String(defaultShortcut);
+    const auto sequences = value.split(QLatin1Char('|'));
     for (const QString &sequenceString : sequences)
         shortcuts.append(QKeySequence::fromString(sequenceString));
     actions[QLatin1String(name)]->setShortcuts(shortcuts);

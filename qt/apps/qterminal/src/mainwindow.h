@@ -23,6 +23,7 @@
 
 #include <QMainWindow>
 #include <QAction>
+#include <QHash>
 
 #include "qxtglobalshortcut.h"
 #include "terminalconfig.h"
@@ -70,6 +71,13 @@ private:
     void setup_Action(const char *name, QAction *action, const char *defaultShortcut, const QObject *receiver,
                       const char *slot, QMenu *menu = nullptr, const QVariant &data = QVariant());
     QMap< QString, QAction * > actions;
+
+    // Shortcut overrides read once per rebuildActions(). setup_Action used to
+    // build a fresh QSettings for every action (~34 of them); each QSettings
+    // sync() re-stats the INI file, and on EwokOS a stat is a vfsd IPC round
+    // trip - dozens of them per rebuild turned startup and Apply into a
+    // multi-second stall on SD-backed hardware. One read, then hash lookups.
+    QHash< QString, QString > m_shortcuts;
 
     QStringList menubarOrigTexts;
 

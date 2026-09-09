@@ -283,6 +283,16 @@ void Properties::saveSettings()
     m_settings->setValue(QLatin1String("SwapMouseButtons2and3"), swapMouseButtons2and3);
 
     m_settings->setValue(QLatin1String("PrefDialogSize"), prefDialogSize);
+
+    /* EwokOS: QSettings defers the write to disk until its destructor runs,
+       which only happens at app teardown (`delete Properties::Instance()`
+       after the event loop returns). Force the flush here so every
+       Apply/OK/close persists immediately instead of depending on a fully
+       clean exit reaching that destructor. */
+    m_settings->sync();
+    if (m_settings->status() != QSettings::NoError)
+        qWarning("qterminal: could not save settings to %s (status %d)",
+                 qPrintable(m_settings->fileName()), int(m_settings->status()));
 }
 
 int Properties::versionComparison(const QString &v1, const QString &v2)
