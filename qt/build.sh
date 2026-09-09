@@ -85,9 +85,8 @@
 #                            on qtConfig(process) so the two stay in step; this
 #                            flag is the other half of that.  Nothing in the
 #                            plugin, the demo or apps/ uses QProcess, and
-#                            QDesktopServices::openUrl - which xfilemanager does
-#                            use - already has a ::system() fallback behind
-#                            #if !QT_CONFIG(process).
+#                            QDesktopServices::openUrl already has a ::system()
+#                            fallback behind #if !QT_CONFIG(process).
 #
 #      -qt-zlib              the SDK ships zlib.h and libz.a, so the system test
 #                            would pass and QtCore would link -lz.  The Makefile's
@@ -166,7 +165,7 @@
 #                    unaffected either way.
 #   -no-accessibility / -no-feature-desktopservices
 #                    both are wanted: the Makefile links Qt5AccessibilitySupport,
-#                    and xfilemanager calls QDesktopServices::openUrl.
+#                    and QDesktopServices::openUrl stays available to the apps.
 #
 set -euo pipefail
 
