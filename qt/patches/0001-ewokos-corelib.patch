@@ -1,0 +1,118 @@
+diff --git a/src/corelib/global/qsystemdetection.h b/src/corelib/global/qsystemdetection.h
+index ad5d30d5..5d2e3f45 100644
+--- a/src/corelib/global/qsystemdetection.h
++++ b/src/corelib/global/qsystemdetection.h
+@@ -179,6 +179,19 @@
+ #  define Q_OS_VXWORKS
+ #elif defined(__HAIKU__)
+ #  define Q_OS_HAIKU
++#elif defined(__EWOKOS__)
++/* EwokOS.  Like VxWorks just above, there is no compiler-predefined macro for
++   it - the aarch64-none-elf toolchain is a bare ELF target and defines neither
++   __linux__ nor __unix__ - so __EWOKOS__ comes from the mkspec, which is the
++   mechanism Qt already sanctions for this case.
++
++   Deliberately NOT Q_OS_LINUX.  EwokOS is a POSIX-ish microkernel with its own
++   libc, not Linux: there is no epoll, no /proc, no getauxval, no statx, no
++   dlopen.  Claiming Q_OS_LINUX would pull every one of those code paths in at
++   once; claiming only Q_OS_UNIX (which the block below does for us) selects the
++   portable POSIX files instead, and the genuinely Linux-only features stay off
++   until something proves they are needed and present. */
++#  define Q_OS_EWOKOS
+ #elif defined(__MAKEDEPEND__)
+ #else
+ #  error "Qt has not been ported to this OS - see http://www.qt-project.org/"
+diff --git a/src/corelib/io/io.pri b/src/corelib/io/io.pri
+index a33ffe75..1923add6 100644
+--- a/src/corelib/io/io.pri
++++ b/src/corelib/io/io.pri
+@@ -173,7 +173,17 @@ win32 {
+                 io/qlockfile_unix.cpp \
+                 io/qfilesystemiterator_unix.cpp
+ 
+-        !integrity:!uikit:!rtems {
++        # forkfd exists for exactly one purpose: giving QProcess a race-free
++        # wait-for-child.  The gate upstream is !integrity:!uikit:!rtems, which
++        # tests three OSes and never the feature, so -no-feature-process drops
++        # qprocess_unix.cpp but still compiles this - and forkfd.c needs C11
++        # <stdatomic.h> (atomic_load_explicit), siginfo_t, SA_SIGINFO,
++        # SA_NOCLDSTOP, CLD_EXITED, CLD_KILLED, WNOWAIT and WEXITED.  EwokOS has
++        # none of them: no waitid, and sigaction without SA_SIGINFO.
++        #
++        # Gating it on the same feature that gates its only consumer keeps the
++        # two in step, so turning the feature back on brings forkfd back too.
++        !integrity:!uikit:!rtems:qtConfig(process) {
+             SOURCES += io/forkfd_qt.cpp
+             HEADERS += \
+                      ../3rdparty/forkfd/forkfd.h
+diff --git a/src/corelib/io/qfilesystemengine_unix.cpp b/src/corelib/io/qfilesystemengine_unix.cpp
+index 01aed7ad..35935faf 100644
+--- a/src/corelib/io/qfilesystemengine_unix.cpp
++++ b/src/corelib/io/qfilesystemengine_unix.cpp
+@@ -227,6 +227,39 @@ static inline typename QtPrivate::QEnableIf<(&T::st_atimensec, &T::st_mtimensec,
+     modification->tv_usec = p->st_mtimensec / 1000;
+ }
+ #  endif
++
++#ifdef Q_OS_EWOKOS
++/* EwokOS: struct stat carries plain time_t seconds and has no sub-second field
++   at all - no st_atim, no st_atimespec, no st_atimensec - so none of the three
++   spellings above matches, and the call at setFileTimes() fails with
++   `no matching function for call to 'GetFileTimes::get(...)'`.
++
++   Two details that make this not just a fourth copy of the above:
++
++   - It uses std::enable_if, not QtPrivate::QEnableIf.  GCC does not treat
++     `&T::st_atim` as SFINAE-friendly inside QtPrivate::QEnableIf's non-type
++     argument: with only the three original overloads it emits six hard errors
++     (`'st_atim' is not a member of 'stat'`, and the same for st_mtim,
++     st_atimespec, st_mtimespec, st_atimensec, st_mtimensec) while explaining
++     why each candidate was rejected.  The std::enable_if form used by the
++     fallback set further down this same file does substitute cleanly, so that
++     is the form used here.
++
++   - It is guarded.  Every other platform's struct stat also has st_atime, so
++     an unguarded fourth overload would be ambiguous with the first one.
++
++   tv_usec is zero because there is nothing finer to report; EwokOS's
++   filesystem timestamps have one-second resolution. */
++template <typename T>
++static inline typename std::enable_if<(&T::st_atime, true)>::type get(const T *p, struct timeval *access, struct timeval *modification)
++{
++    access->tv_sec = p->st_atime;
++    access->tv_usec = 0;
++
++    modification->tv_sec = p->st_mtime;
++    modification->tv_usec = 0;
++}
++#endif
+ #endif
+ 
+ qint64 timespecToMSecs(const timespec &spec)
+diff --git a/src/corelib/kernel/qtestsupport_core.cpp b/src/corelib/kernel/qtestsupport_core.cpp
+index 428ebbd6..5aaa8aa1 100644
+--- a/src/corelib/kernel/qtestsupport_core.cpp
++++ b/src/corelib/kernel/qtestsupport_core.cpp
+@@ -43,6 +43,22 @@
+ #include <qt_windows.h>
+ #endif
+ 
++#ifdef Q_OS_EWOKOS
++/* For nanosleep(), and for a *complete* struct timespec - qSleep() below needs
++   both, and POSIX declares both in <time.h>.  Nothing this file includes pulls
++   <time.h> in: glibc only appears to work because its <sys/types.h> chain ends
++   at <time.h>, whereas EwokOS's <sys/types.h> stops short and its <pwd.h>
++   forward-declares `struct timespec;`.  That forward declaration is why the
++   diagnostic reads "has initializer but incomplete type" instead of naming a
++   missing type outright - the name is known, the layout is not - which makes
++   this look like a broken timespec rather than a missing include.
++
++   musl sides with EwokOS against glibc here, so the omission is Qt's rather
++   than the platform's.  Guarded, as the rest of this port's Qt patches are, so
++   the diff is provably inert on every other Unix. */
++#include <time.h>
++#endif
++
+ QT_BEGIN_NAMESPACE
+ 
+ Q_CORE_EXPORT void QTestPrivate::qSleep(int ms)

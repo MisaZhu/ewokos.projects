@@ -5,8 +5,12 @@ DIRS = macemu \
 	doom \
 	cards \
 	mine \
-	browser
+	browser \
+	qt
 #	previous video saver minivmac nx11 fltk
+
+# qt needs the Qt tree that projects/qt/build.sh produces; without it that
+# sub-make stops and says so, but every other directory still builds.
 
 all: $(DIRS)
 
