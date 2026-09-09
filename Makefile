@@ -6,7 +6,6 @@ DIRS = macemu \
 	cards \
 	mine \
 	browser \
-	nx11 \
 	qt
 #	previous video saver minivmac nx11 fltk
 

@@ -1,6 +1,6 @@
 #
-# Qt 5.15 on EwokOS: the "ewokos" QPA platform plugin, and a Widgets demo that
-# links it.
+# Qt 5.15 on EwokOS: the "ewokos" QPA platform plugin, a Widgets demo that
+# links it, and the ported apps under apps/.
 #
 # This builds against the tree projects/qt/build.sh produced - configure plus
 # make in build/qtbuild-$(ARCH)-$(HW), with the sources in build/qtbase-5.15.
@@ -55,6 +55,8 @@ QT_INC     = $(QT_BUILD)/include
 QT_SRC_INC = $(QT_SRC)/include
 QT_LIBDIR = $(QT_BUILD)/lib
 QT_MOC    = $(QT_BUILD)/bin/moc
+QT_UIC    = $(QT_BUILD)/bin/uic
+QT_RCC    = $(QT_BUILD)/bin/rcc
 
 # qplatformdefs.h.  QtCore/private/qcore_unix_p.h includes it by that bare name,
 # so the directory has to be on the path even though nothing here names it.  This
@@ -223,27 +225,95 @@ $(DEMO_BIN): $(DEMO_OBJ) $(PLUGIN_LIB) $(PLUGIN_HDR)
 		-lewoksys -lc -lgloss -lcxx \
 		-Wl,--end-group
 
+# ---- apps: xfilemanager -----------------------------------------------------
+#
+# A port of https://github.com/arshc0der/XFile_Manager (MIT, see the LICENSE in
+# the source directory), kept under apps/xfilemanager.  It is the first app
+# here that needs uic and rcc in addition to moc; all three host tools come
+# from the Qt build tree, and the generated sources live in their own gen/
+# subdirectory for the same reason the plugin's and demo's do.
+
+XFM      = xfilemanager
+XFM_SRC  = apps/$(XFM)
+XFM_GEN  = $(GEN_DIR)/$(XFM)
+XFM_BIN  = $(SDK_DIR)/rootfs/apps/$(XFM)/$(XFM)
+
+XFM_APP_OBJS = \
+	$(ARCH)/$(XFM_SRC)/main.o \
+	$(ARCH)/$(XFM_SRC)/mainwindow.o \
+	$(ARCH)/$(XFM_SRC)/about_xfile_manager.o
+
+XFM_OBJS = \
+	$(XFM_APP_OBJS) \
+	$(XFM_GEN)/moc_mainwindow.o \
+	$(XFM_GEN)/moc_about_xfile_manager.o \
+	$(XFM_GEN)/qrc_XFile_Manager_Resources.o
+
+# uic resolves no paths of its own, so it can run from here.
+$(XFM_GEN)/ui_%.h: $(XFM_SRC)/%.ui
+	@mkdir -p $(XFM_GEN)
+	$(QT_UIC) $< -o $@
+
+# moc and rcc, on the other hand, run from the source directory and are handed
+# the source's bare name plus an absolute output path: moc emits the name as
+# the #include in the generated file (found at compile time via -I$(XFM_SRC)),
+# and rcc resolves the qrc's relative <file> entries against the current
+# directory.  The icons are real prerequisites of the qrc rule because rcc
+# embeds their contents.
+$(XFM_GEN)/moc_%.cpp: $(XFM_SRC)/%.h
+	@mkdir -p $(XFM_GEN)
+	cd $(XFM_SRC) && $(QT_MOC) $(QT_DEFS) $(QT_INCS) $(notdir $<) -o $(CURDIR)/$@
+
+$(XFM_GEN)/qrc_%.cpp: $(XFM_SRC)/%.qrc $(wildcard $(XFM_SRC)/icons/*)
+	@mkdir -p $(XFM_GEN)
+	cd $(XFM_SRC) && $(QT_RCC) --name $* $(notdir $<) -o $(CURDIR)/$@
+
+$(XFM_GEN)/%.o: $(XFM_GEN)/%.cpp
+	$(CXX) $(CXXFLAGS) -I$(XFM_SRC) -I$(XFM_GEN) -c $< -o $@
+
+# The generated ui_*.h must exist before the objects that include them; the
+# app objects additionally search their own source dir (each other's headers)
+# and the gen dir.
+$(ARCH)/$(XFM_SRC)/mainwindow.o:            $(XFM_GEN)/ui_mainwindow.h
+$(ARCH)/$(XFM_SRC)/about_xfile_manager.o:  $(XFM_GEN)/ui_about_xfile_manager.h
+$(XFM_APP_OBJS): CXXFLAGS += -I$(XFM_SRC) -I$(XFM_GEN)
+
+# Same link shape as the demo - see its comment for why --start-group and
+# -nostartfiles look the way they do.
+$(XFM_BIN): $(XFM_OBJS) $(PLUGIN_LIB) $(PLUGIN_HDR)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(XFM_OBJS) -o $@ \
+		-nostartfiles -Wl,-Ttext=100 \
+		-L$(SDK_DIR)/lib -L$(QT_LIBDIR) $(LDFLAGS) \
+		-Wl,--start-group \
+		-lewokosqpa $(QT_LIBS) \
+		$(EWOK_LIB_X) $(EWOK_LIB_GRAPH) \
+		-lewoksys -lc -lgloss -lcxx \
+		-Wl,--end-group
+
 ifeq ($(QT_MISSING),yes)
-# Skip rather than fail: the image simply ships without qtdemo, and everything
-# here self-enables the next build after build.sh has run.
-all plugin demo:
+# Skip rather than fail: the image simply ships without qtdemo and the apps,
+# and everything here self-enables the next build after build.sh has run.
+all plugin demo xfilemanager:
 	@echo "note: projects/qt skipped - Qt 5.15 tree not found ($(QT_MOC) missing)."
 	@echo "      Run projects/qt/build.sh first to configure and build Qt."
 else
-all: $(PLUGIN_LIB) $(PLUGIN_HDR) $(DEMO_BIN)
+all: $(PLUGIN_LIB) $(PLUGIN_HDR) $(DEMO_BIN) $(XFM_BIN)
 
 plugin: $(PLUGIN_LIB) $(PLUGIN_HDR)
 
 demo: $(DEMO_BIN)
+
+xfilemanager: $(XFM_BIN)
 endif
 
 # Header dependencies.  -MMD wrote them next to the objects; without this, editing
 # qewokoswindow.h and running make again would rebuild nothing and link the old
 # objects - which looks like a change that did not take effect and is not one.
-DEPS = $(PLUGIN_OBJS:.o=.d) $(DEMO_OBJ:.o=.d)
+DEPS = $(PLUGIN_OBJS:.o=.d) $(DEMO_OBJ:.o=.d) $(XFM_OBJS:.o=.d)
 -include $(DEPS)
 
 clean:
 	rm -rf $(ARCH) $(GEN_DIR)
 
-.PHONY: all plugin demo clean
+.PHONY: all plugin demo xfilemanager clean

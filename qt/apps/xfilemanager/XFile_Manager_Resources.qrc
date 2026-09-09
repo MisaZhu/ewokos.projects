@@ -1,0 +1,28 @@
+<RCC>
+    <qresource prefix="/Res">
+        <file>icons/empty_folder.png</file>
+        <file>icons/folder.png</file>
+        <file>icons/Downlaod.png</file>
+        <file>icons/Home.png</file>
+        <file>icons/doc.png</file>
+        <file>icons/drive.png</file>
+        <file>icons/images.png</file>
+        <file>icons/music.png</file>
+        <file>icons/video.png</file>
+        <file>icons/left.png</file>
+        <file>icons/right.png</file>
+        <file>icons/system_volume.png</file>
+        <file>icons/documents_folder.png</file>
+        <file>icons/downloads_folder.png</file>
+        <file>icons/music_folder.png</file>
+        <file>icons/pictures_folder.png</file>
+        <file>icons/videos_folder.png</file>
+        <file>icons/desktop_folder.png</file>
+        <file>icons/Desktop.png</file>
+        <file>icons/logo.png</file>
+        <file>icons/info.png</file>
+        <file>icons/Developer.png</file>
+        <file>icons/License.png</file>
+        <file>icons/Github.png</file>
+    </qresource>
+</RCC>

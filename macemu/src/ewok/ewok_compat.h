@@ -42,12 +42,6 @@ int fsync(int fd);
 int ftruncate(int fd, off_t length);
 int system(const char *command);
 
-/* creat() is a classic Unix idiom not present in the EwokOS libc */
-static inline int creat(const char *path, mode_t mode)
-{
-	return open(path, O_CREAT | O_WRONLY | O_TRUNC, mode);
-}
-
 #ifdef __cplusplus
 }
 #endif
