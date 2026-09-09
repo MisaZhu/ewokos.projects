@@ -84,7 +84,14 @@ void qt_initialize_pthread_cond(pthread_cond_t *cond, const char *where)
 #if defined(Q_OS_ANDROID)
     if (local_condattr_setclock && QElapsedTimer::clockType() == QElapsedTimer::MonotonicClock)
         local_condattr_setclock(&condattr, CLOCK_MONOTONIC);
-#elif !defined(Q_OS_MAC)
+/* EwokOS: pthread_condattr_setclock() does not exist, and there would be
+   nothing for it to select anyway - pthread_cond_init() ignores the attribute
+   entirely and pthread_cond_timedwait() measures the deadline with
+   gettimeofday(), so EwokOS condition variables are CLOCK_REALTIME-only.
+   qt_abstime_for_timeout() below converts to that clock just as it does for
+   Mac.  QElapsedTimer itself stays monotonic; only this one hand-over to
+   pthread changes. */
+#elif !defined(Q_OS_MAC) && !defined(Q_OS_EWOKOS)
     if (QElapsedTimer::clockType() == QElapsedTimer::MonotonicClock)
         pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC);
 #endif
@@ -95,10 +102,18 @@ void qt_initialize_pthread_cond(pthread_cond_t *cond, const char *where)
 
 void qt_abstime_for_timeout(timespec *ts, QDeadlineTimer deadline)
 {
-#ifdef Q_OS_MAC
+#if defined(Q_OS_MAC) || defined(Q_OS_EWOKOS)
     // on Mac, qt_gettime() (on qelapsedtimer_mac.cpp) returns ticks related to the Mach absolute time
     // that doesn't work with pthread
     // Mac also doesn't have clock_gettime
+    //
+    // EwokOS lands here for a different reason with the same symptom:
+    // qt_gettime() reads clock_gettime(CLOCK_MONOTONIC), which is the kernel's
+    // microsecond tick counter since boot, while pthread_cond_timedwait()
+    // compares against gettimeofday() - seconds since the epoch.  Handing it
+    // the monotonic absolute value would make every timed wait report
+    // ETIMEDOUT immediately, so rebuild the deadline from the remaining time
+    // against the wall clock that pthread actually uses.
     struct timeval tv;
     qint64 nsec = deadline.remainingTimeNSecs();
     gettimeofday(&tv, 0);

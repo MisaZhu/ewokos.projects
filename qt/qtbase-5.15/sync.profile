@@ -2,6 +2,15 @@
     "QtGui" => "$basedir/src/gui",
     "QtWidgets" => "$basedir/src/widgets",
     "QtCore" => "$basedir/src/corelib",
+    # Needed even though the QtXml module itself is configured off.  This tree
+    # is pruned - src/network, src/sql, src/testlib, src/concurrent,
+    # src/printsupport and src/dbus are gone - and the entries for those went
+    # with them.  src/xml stayed, because src/tools/bootstrap/bootstrap.pro
+    # compiles ../../xml/dom/qdom.cpp and ../../xml/sax/qxml.cpp into the host
+    # bootstrap unconditionally, and QDom includes <QtXml/qtxmlglobal.h>.  With
+    # no QtXml entry here syncqt never writes include/QtXml/, so the bootstrap
+    # fails on that include before any target code is compiled.
+    "QtXml" => "$basedir/src/xml",
     "QtAccessibilitySupport" => "$basedir/src/platformsupport/accessibility",
     "QtWindowsUIAutomationSupport" => "$basedir/src/platformsupport/windowsuiautomation",
     "QtLinuxAccessibilitySupport" => "$basedir/src/platformsupport/linuxaccessibility",
