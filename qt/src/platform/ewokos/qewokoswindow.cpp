@@ -45,7 +45,14 @@ static int ewokosDoubleClickInterval()
 static int ewokosWindowStyle(Qt::WindowFlags flags)
 {
     int style = XWIN_STYLE_NORMAL;
+    const int type = static_cast<int>(flags & Qt::WindowType_Mask);
     const bool customized = (flags & Qt::CustomizeWindowHint);
+
+    /* Menus, combo dropdowns, tooltips: transient surfaces the WM must not
+       decorate at all.  On xwin the frame carries the title, the buttons and
+       the resize corner, and none of those may appear on a popup. */
+    if (type == Qt::Popup || type == Qt::ToolTip || type == Qt::SplashScreen)
+        style |= XWIN_STYLE_NO_FRAME;
 
     if (flags & Qt::FramelessWindowHint)
         style |= XWIN_STYLE_NO_FRAME;
@@ -59,10 +66,8 @@ static int ewokosWindowStyle(Qt::WindowFlags flags)
     if (flags & Qt::WindowStaysOnTopHint)
         style |= XWIN_STYLE_SYSTOP;
 
-    /* Popups, tooltips and tools get a normal window: xwin has no
-       override-redirect or unmanaged surface, so there is nothing better to
-       ask for.  Qt's own popup handling still does the transient behaviour -
-       grabbing the mouse, closing on an outside click. */
+    /* Qt's own popup handling still does the transient behaviour - grabbing
+       the mouse, closing on an outside click. */
     return style;
 }
 
@@ -647,11 +652,16 @@ void EwokosWindow::focusThunk(xwin_t *xwin)
 
 void EwokosWindow::unfocusThunk(xwin_t *xwin)
 {
-    /* A null window is how Qt says "nothing is active now".  Reporting the
-       window that lost focus instead would leave Qt believing it still has
-       focus, and keyboard input would keep going to a window the WM has moved
-       on from. */
-    QWindowSystemInterface::handleWindowActivated(nullptr);
+    /* Deliberately nothing.  handleWindowActivated(nullptr) does not mean
+       "another of our windows is active now", it means "none of them is" -
+       and with the ApplicationState capability undeclared that demotes the
+       whole application to Qt::ApplicationInactive, whose ApplicationDeactivate
+       event makes QApplication close every open popup.  Menus died the moment
+       they opened: opening one focuses it, and the server unfocuses the main
+       window first.  Focus moves are announced by the gaining window's FOCUS
+       event, and an outside click closes popups through QApplication's own
+       mouse-press path, so nothing needs this null report. */
+    Q_UNUSED(xwin);
 }
 
 bool EwokosWindow::closeThunk(xwin_t *xwin)

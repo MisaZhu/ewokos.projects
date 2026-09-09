@@ -8,6 +8,8 @@
 #include <QtCore/qdebug.h>
 #include <QtGui/qguiapplication.h>
 
+#include <x/xwin.h>
+
 #include <unistd.h>
 
 QT_BEGIN_NAMESPACE
@@ -176,6 +178,19 @@ bool EwokosEventDispatcher::processEvents(QEventLoop::ProcessEventsFlags flags)
           the timeout is zero and poll() returns at once. */
     if (QEventDispatcherUNIX::processEvents(flags & ~QEventLoop::WaitForMoreEvents))
         nevents = 1;
+
+    /* 3b. Publish presents the flip could not.  With fps_async on, xwin_repaint()
+          renders into ws_g and then flips ws_g onto the handoff buffer the
+          server composites - but only while the server has consumed the previous
+          submission.  A frame that loses that race is not dropped: libx parks it
+          as present_pending and the contract is that the event loop calls
+          xwin_retry_pending_presents() once per pass to publish it as soon as
+          the server lets go.  x_run() honours that; this dispatcher replaces
+          x_run(), so the call has to live here.  Without it the skipped frame
+          sits in ws_g forever: the screen keeps the pre-resize picture with
+          black unpainted bands no matter how often Qt redraws, which is exactly
+          what happened on every window resize.  No-op when nothing is pending. */
+    xwin_retry_pending_presents();
 
     /* 4. An idle pass.  Without this the loop above spins: processEvents()
           returns false, QEventLoop calls it again immediately, and the CPU is

@@ -10,8 +10,8 @@
 # against an installed Qt (a qt5 .pri, a module list, a working qmake for the
 # target), and the value of building it by hand is that it lives in this repo,
 # under version control, next to the mkspec and the patches it depends on - so
-# changing it does not mean re-running configure or touching build/qtbase-5.15,
-# which is an unpacked tarball.
+# changing it does not mean re-running configure or touching qtbase-5.15,
+# which is a vendored snapshot.
 #
 # Three flags here are load-bearing and easy to lose:
 #
@@ -45,9 +45,14 @@ include $(PROJS_ROOT_DIR)/make.inc
 # ---- the Qt build ----------------------------------------------------------
 
 QT_VER    = 5.15.19
-QT_SRC    = $(EWOKOS_ROOT_DIR)/build/qtbase-5.15
-QT_BUILD  = $(EWOKOS_ROOT_DIR)/build/qtbuild-$(ARCH)-$(HW)
-QT_INC    = $(QT_BUILD)/include
+QT_SRC    = $(CURDIR)/qtbase-5.15
+QT_BUILD  = $(CURDIR)/build/qtbuild-$(ARCH)-$(HW)
+# Two include roots, both needed.  syncqt writes the forwarding headers -
+# the public ones and the versioned private set, including qpa/ - into the
+# source tree; the build tree only gets the generated configuration headers
+# (qconfig.h, qt<module>-config.h, the Depends files).
+QT_INC     = $(QT_BUILD)/include
+QT_SRC_INC = $(QT_SRC)/include
 QT_LIBDIR = $(QT_BUILD)/lib
 QT_MOC    = $(QT_BUILD)/bin/moc
 
@@ -68,22 +73,33 @@ QT_DEFS = \
 
 # Four levels per module, and all four are needed:
 #   include/                      <QtCore/qdebug.h>
-#   include/QtCore/               <QtCore/qtcore-config.h> from qglobal.h
+#   include/QtCore/               (per-module dir, kept for symmetry)
 #   include/<Mod>/<ver>/          <QtCore/private/qtimerinfo_unix_p.h>
 #   include/<Mod>/<ver>/<Mod>/    <qpa/qplatformwindow.h>
+# qtcore-config.h and friends are NOT here: qglobal.h includes them as
+# <QtCore/qtcore-config.h>, which resolves against $(QT_INC) above.
+# The versioned levels are listed for the build tree as well: the five
+# generated private config headers (qconfig_p.h, qt*-config_p.h) live
+# there and nowhere else.
 QT_INCS = \
 	-I$(QT_MKSPEC) \
 	-I$(QT_INC) \
-	-I$(QT_INC)/QtCore \
+	-I$(QT_SRC_INC) \
+	-I$(QT_SRC_INC)/QtCore \
 	-I$(QT_INC)/QtCore/$(QT_VER) \
+	-I$(QT_SRC_INC)/QtCore/$(QT_VER) \
 	-I$(QT_INC)/QtCore/$(QT_VER)/QtCore \
-	-I$(QT_INC)/QtGui \
+	-I$(QT_SRC_INC)/QtCore/$(QT_VER)/QtCore \
+	-I$(QT_SRC_INC)/QtGui \
 	-I$(QT_INC)/QtGui/$(QT_VER) \
+	-I$(QT_SRC_INC)/QtGui/$(QT_VER) \
 	-I$(QT_INC)/QtGui/$(QT_VER)/QtGui \
-	-I$(QT_INC)/QtWidgets \
+	-I$(QT_SRC_INC)/QtGui/$(QT_VER)/QtGui \
+	-I$(QT_SRC_INC)/QtWidgets \
 	-I$(QT_INC)/QtWidgets/$(QT_VER) \
-	-I$(QT_INC)/QtWidgets/$(QT_VER)/QtWidgets \
-	-I$(QT_INC)/QtFontDatabaseSupport/$(QT_VER)
+	-I$(QT_SRC_INC)/QtWidgets/$(QT_VER) \
+	-I$(QT_SRC_INC)/QtWidgets/$(QT_VER)/QtWidgets \
+	-I$(QT_SRC_INC)/QtFontDatabaseSupport/$(QT_VER)
 
 # -Wextra and -pedantic are dropped for the same reason the mkspec drops them:
 # Qt 5.15's own private headers are not clean under them at this GCC version, and
@@ -91,14 +107,16 @@ QT_INCS = \
 CXXFLAGS := $(filter-out -Wextra -pedantic,$(CXXFLAGS))
 CXXFLAGS += $(QT_DEFS) $(QT_INCS) -Wno-error -MMD -MP
 
-# Guard, as a rule rather than $(error): qt is in projects/Makefile's DIRS, so a
-# parse-time error here would stop `make clean` at the projects level on any tree
-# that has not built Qt.  A missing prerequisite only fails the target that needs
-# it, and says what to do about it.
-$(QT_MOC):
-	@echo "Qt has not been built: $(QT_MOC) does not exist." >&2
-	@echo "Run projects/qt/build.sh first (it unpacks, patches and configures Qt)." >&2
-	@false
+# Qt-tree probe, evaluated at parse time.  bin/moc is one of the first
+# binaries a qtbase build produces, so it doubles as the "Qt is built" marker.
+# A probe rather than either of the obvious alternatives:
+#   - $(error) would also fire for `make clean` at the projects level on any
+#     tree that has not built Qt;
+#   - a guard rule for $(QT_MOC) never fires, because nothing lists it as a
+#     prerequisite - the .o pattern rule comes from make.rule and does not
+#     know about moc, so the build dived straight into compiling and failed
+#     on the first missing Qt header.
+QT_MISSING := $(if $(wildcard $(QT_MOC)),,yes)
 
 # ---- generated sources ------------------------------------------------------
 #
@@ -205,11 +223,19 @@ $(DEMO_BIN): $(DEMO_OBJ) $(PLUGIN_LIB) $(PLUGIN_HDR)
 		-lewoksys -lc -lgloss -lcxx \
 		-Wl,--end-group
 
+ifeq ($(QT_MISSING),yes)
+# Skip rather than fail: the image simply ships without qtdemo, and everything
+# here self-enables the next build after build.sh has run.
+all plugin demo:
+	@echo "note: projects/qt skipped - Qt 5.15 tree not found ($(QT_MOC) missing)."
+	@echo "      Run projects/qt/build.sh first to configure and build Qt."
+else
 all: $(PLUGIN_LIB) $(PLUGIN_HDR) $(DEMO_BIN)
 
 plugin: $(PLUGIN_LIB) $(PLUGIN_HDR)
 
 demo: $(DEMO_BIN)
+endif
 
 # Header dependencies.  -MMD wrote them next to the objects; without this, editing
 # qewokoswindow.h and running make again would rebuild nothing and link the old
