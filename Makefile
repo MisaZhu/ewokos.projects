@@ -9,8 +9,9 @@ DIRS = macemu \
 	qt
 #	previous video saver minivmac nx11
 
-# qt needs the Qt tree that projects/qt/build.sh produces; without it the
-# sub-make prints a note and skips, so every other directory still builds.
+# qt needs the Qt tree that projects/qt/build.sh produces; if it is missing for
+# the current ARCH/HW, qt's Makefile now runs build.sh automatically and then
+# carries on, so no manual build.sh step is required.
 
 all: $(DIRS)
 

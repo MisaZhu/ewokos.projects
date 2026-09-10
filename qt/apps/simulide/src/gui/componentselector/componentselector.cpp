@@ -122,10 +122,21 @@ void ComponentSelector::loadXml( const QString &setFile )
         QDomNode    node    = element.firstChild();
 
         QString category = element.attribute( "category" );
-        //const char* charCat = category.toUtf8().data();
-        std::string stdCat = category.toStdString();
-        const char* charCat = &(stdCat[0]);
-        category = QApplication::translate( "xmlfile", charCat );
+        // A <tag> element (present in ic74.xml, icCD.xml and ternary.xml, but
+        // not in arduinos.xml/avrs.xml) carries no "category" attribute, so
+        // category is empty here.  Upstream still ran it through
+        // QApplication::translate() via &(std::string("")[0]).  Under ewok_stl
+        // an empty std::string keeps data_ == NULL and operator[] is a bare
+        // data_[i], so that expression yields a NULL const char* and
+        // translate() dereferences it -> crash on the first comp set that has
+        // a <tag> (ic74.xml).  Only translate when there is a real category,
+        // and use toUtf8().constData() (valid for the whole call) instead of
+        // indexing an std::string that may be empty.
+        if( !category.isEmpty() )
+        {
+            QByteArray catUtf8 = category.toUtf8();
+            category = QApplication::translate( "xmlfile", catUtf8.constData() );
+        }
         //qDebug()<<"category = " <<category;
         
         QString type = element.attribute( "type");

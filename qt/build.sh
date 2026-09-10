@@ -5,9 +5,10 @@
 # Output is build/qtbuild-$(ARCH)-$(HW)/, which is exactly what
 # projects/qt/Makefile compiles the "ewokos" QPA plugin, qtdemo and apps/
 # against: its QT_BUILD is $(CURDIR)/build/qtbuild-$(ARCH)-$(HW), and its probe
-# for "is Qt there" is bin/moc in that directory.  Until this script has run
-# once, that probe fails and `make` at projects/ prints a note and skips qt -
-# the image simply ships without the Qt apps.
+# for "is Qt there" is bin/moc in that directory.  If this script has not run
+# yet for the current ARCH/HW, `make` at projects/qt detects the missing tree
+# and runs this script automatically before continuing - so it is normally not
+# something you have to invoke by hand (the flags below are for when you do).
 #
 # Usage:
 #   ./build.sh                  # syncqt + configure + make

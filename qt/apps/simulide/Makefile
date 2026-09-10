@@ -95,6 +95,7 @@ SIMU_DEFS += -DSIMULIDE_EXAMPLES_DIR='"/apps/simulide/res/examples"'
 # five removed subtrees are simply not there to be found, so this cannot drift
 # out of step with them the way a hand-written list would.
 SIMU_INCS := $(addprefix -I,$(sort $(dir $(shell find $(SRCD) -name '*.h'))))
+SIMU_INCS += -Iavr  # AVR simulator headers
 
 # $(MOCD) is on the path because upstream's .cpp files end with
 # #include "moc_<name>.cpp" and the .pri puts a single flat MOC_DIR on the
@@ -161,6 +162,11 @@ CXXFLAGS += -D__GLIBCXX__=20240614
 # ---- sources ----------------------------------------------------------------
 
 SRCS := $(sort $(shell find $(SRCD) -name '*.cpp'))
+
+# AVR simulator core (outside src/, pure C compiled as C++)
+AVR_SRCS := $(sort $(wildcard avr/*.cpp))
+SRCS += $(AVR_SRCS)
+
 OBJS := $(patsubst %.cpp,$(BLD)/%.o,$(SRCS))
 
 QRC_CPP = $(MOCD)/qrc_application.cpp
@@ -206,7 +212,9 @@ endef
 $(foreach h,$(MOC_HDRS),$(eval $(call MOC_RULE,$(h))))
 
 # "src/.../led.cpp:moc_led.cpp", one per line, from a single grep.
-MOC_PAIRS := $(shell grep -rHo 'moc_[A-Za-z0-9_]*\.cpp' $(SRCS) 2>/dev/null)
+# The character class includes hyphen: upstream has files like clock-base.h
+# whose moc is moc_clock-base.cpp, and [A-Za-z0-9_] would not match it.
+MOC_PAIRS := $(shell grep -rHo 'moc_[A-Za-z0-9_-]*\.cpp' $(SRCS) 2>/dev/null)
 
 # The moc files already compiled into someone else's object.
 MOC_INLINED := $(sort $(notdir $(foreach p,$(MOC_PAIRS),$(word 2,$(subst :, ,$(p))))))

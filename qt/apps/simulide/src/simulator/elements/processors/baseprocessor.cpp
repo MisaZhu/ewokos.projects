@@ -25,6 +25,8 @@
 #include "utils.h"
 #include "simuapi_apppath.h"
 
+#include <QDebug>
+
 BaseProcessor* BaseProcessor::m_pSelf = 0l;
 
 BaseProcessor::BaseProcessor( QObject* parent )
@@ -34,6 +36,17 @@ BaseProcessor::BaseProcessor( QObject* parent )
     m_resetStatus = false;
     m_symbolFile = "";
     m_device     = "";
+
+    // These drive the cycle accumulator in step(): m_nextCycle is compared
+    // against 1 and incremented by m_mcuStepsPT every call.  Upstream left them
+    // uninitialised, which is fine on a platform where a fresh heap object is
+    // zeroed but not guaranteed here - a garbage/NaN m_nextCycle makes
+    // "while( m_nextCycle >= 1 )" never true, so the MCU is created and loaded
+    // yet never executes a single instruction.  Zero them explicitly.
+    m_nextCycle   = 0;
+    m_mcuStepsPT  = 0;
+    m_msimStep    = 0;
+    m_extraCycle  = 0;
 
     m_ramTable = new RamTable( this );
     MainWindow::self()->m_ramTabWidgetLayout->addWidget( m_ramTable );
@@ -61,6 +74,7 @@ void BaseProcessor::initialized()
     m_loadStatus = true;
     m_msimStep = 0;
     m_extraCycle = 0;
+    m_nextCycle = 0;   // restart the cycle accumulator for this firmware/run
 }
 
 void BaseProcessor::setExtraStep() // Run Extra Simulation Step If MCU clock speed > Simulation speed
@@ -70,6 +84,19 @@ void BaseProcessor::setExtraStep() // Run Extra Simulation Step If MCU clock spe
 
 void BaseProcessor::step()
 {
+    // One-shot diagnostic: prove the simulator is actually stepping the core and
+    // show the two gate flags plus the cycle accumulator.  Logs the first few
+    // calls only so it does not spam the ~millions of steps per second.
+    static int s_stepLog = 0;
+    if( s_stepLog < 3 )
+    {
+        qDebug() << "MCU step: loadStatus=" << m_loadStatus
+                 << "resetStatus=" << m_resetStatus
+                 << "nextCycle=" << m_nextCycle
+                 << "stepsPT=" << m_mcuStepsPT;
+        s_stepLog++;
+    }
+
     if( !m_loadStatus || m_resetStatus ) return;
 
     while( m_nextCycle >= 1 )

@@ -388,10 +388,12 @@ void Circuit::loadDomDoc( QDomDocument* doc )
                 }
                 else 
                 {
-                    qDebug() << " ERROR Creating Component: "<< type << id;
-                    QApplication::restoreOverrideCursor();
-                    m_error = 1;
-                    return;
+                    // Component type not available (e.g., Arduino/MCU components
+                    // require processor simulation which is not included in this
+                    // build). Skip it and continue loading the rest of the circuit.
+                    qDebug() << " WARNING: Skipping unavailable component: "<< type << id;
+                    node = node.nextSibling();
+                    continue;
                 }
             }
         }

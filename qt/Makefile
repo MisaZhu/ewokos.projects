@@ -41,8 +41,10 @@ QT_MKSPEC = $(QT_SRC)/mkspecs/ewokos-g++
 
 # Qt-tree probe, evaluated at parse time.  bin/moc is one of the first
 # binaries a qtbase build produces, so it doubles as the "Qt is built" marker.
-# A probe rather than $(error): $(error) would also fire for `make clean` at
-# the projects level on any tree that has not built Qt.
+# When the tree for the current ARCH/HW is missing, `make` no longer skips: it
+# bootstraps it by running build.sh and then re-invoking itself (see the
+# QT_MISSING branch below).  A probe rather than $(error) so that `make clean`
+# still works on a tree that has never built Qt.
 QT_BUILD_MOC := $(QT_BUILD)/bin/moc
 QT_MISSING   := $(if $(wildcard $(QT_BUILD_MOC)),,yes)
 
@@ -167,14 +169,30 @@ SUB_DIRS = \
 	apps/qtmesheditor \
 	apps/notepadqq \
 	apps/qucs-s \
-	apps/citybuilder
+	apps/simulide
+#	apps/citybuilder
 
-ifeq ($(QT_MISSING),yes)
-# Skip rather than fail: the image simply ships without qtdemo and the apps,
-# and everything here self-enables the next build after build.sh has run.
-all sdk plugin demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s citybuilder:
-	@echo "note: projects/qt skipped - Qt 5.15 tree not found ($(QT_BUILD_MOC) missing)."
-	@echo "      Run projects/qt/build.sh first to configure and build Qt."
+ifeq ($(QT_MISSING)$(QT_BOOTSTRAP),yes)
+# The Qt tree for this ARCH/HW has not been built yet.  Rather than skip, run
+# build.sh to syncqt + configure + compile the vendored qtbase-5.15 snapshot,
+# then re-invoke make on the same goal: the second pass finds $(QT_BUILD_MOC)
+# and takes the real branch below.  A recursive re-make rather than wiring
+# build.sh into the file-level rules, because those rules' prerequisites (e.g.
+# $(QT_BUILD)/lib/lib%.a) have no rule of their own - make would report "No
+# rule to make target" for the missing tree before any bootstrap recipe could
+# run, and under -j the serial ordering that would otherwise hide that is not
+# guaranteed.  ARCH/HW reach build.sh through the environment, which is how it
+# reads them; build.sh is bash (BASH_SOURCE, [[ ]]), so it runs under bash, and
+# if it fails make aborts here rather than recursing.  The recursion is
+# one-shot (QT_BOOTSTRAP=1 on the re-make, matched in the ifeq above) so it can
+# never run away: a real build's second pass finds moc and takes the else
+# branch, and even `make -n` - where build.sh's side effect never lands -
+# re-makes at most once.
+all sdk plugin demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s citybuilder simulide:
+	@echo "Qt 5.15 tree not found for ARCH=$(ARCH) HW=$(HW) - running build.sh"
+	@ARCH=$(ARCH) HW=$(HW) bash build.sh
+	@echo "build.sh finished - continuing with 'make $@'"
+	@$(MAKE) $@ QT_BOOTSTRAP=1
 else
 
 # Sequenced through recursive make on purpose: the plugin's moc rules use the
@@ -219,6 +237,9 @@ qucs-s: plugin
 citybuilder: plugin
 	@$(MAKE) -C apps/citybuilder
 
+simulide: plugin
+	@$(MAKE) -C apps/simulide
+
 endif
 
 # Header dependencies.  -MMD wrote them next to the objects; without this,
@@ -233,4 +254,4 @@ clean:
 	rm -rf $(QT5_INC) $(SDK_DIR)/qt5
 	@for dir in $(SUB_DIRS); do $(MAKE) -C $$dir clean; done
 
-.PHONY: all sdk plugin plugin-lib demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s citybuilder clean
+.PHONY: all sdk plugin plugin-lib demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s citybuilder simulide clean

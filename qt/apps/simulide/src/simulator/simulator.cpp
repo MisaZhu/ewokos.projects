@@ -166,8 +166,15 @@ void Simulator::runCircuit()
     for (uint64_t i = 0; i < m_circuitRate; i++) {
         m_circTime = m_step * m_stepNS; // Circuit Time in nanoseconds
 
-        if (m_runMcu)
+        if (m_runMcu) {
             BaseProcessor::self()->step(); // Run MCU
+            // Push the MCU's new GPIO state out to the circuit pins and sample
+            // inputs back into the core, once per circuit step after the CPU
+            // batch.  Guarded because m_runMcu is set from BaseProcessor::self()
+            // but the GUI component is a separate singleton.
+            if (McuComponent::self())
+                McuComponent::self()->updatePins();
+        }
 
         if (!m_simuClock.isEmpty()) // Run elements at Simulation Clock
         {
@@ -437,8 +444,11 @@ int Simulator::simuRateChanged(int rate)
         BaseProcessor::self()->setSteps(mcuSteps);
         m_mcuStepNS = 1000 / McuComponent::self()->freq();
         m_runMcu    = true;
-        // qDebug() <<"Simulator::simuRateChanged
-        // mcuSteps"<<mcuSteps<<m_mcuStepNS;
+        qDebug() << "MCU: enabled - freq=" << McuComponent::self()->freq()
+                 << "stepsPerus=" << m_stepsPerus << "mcuSteps=" << mcuSteps;
+    } else {
+        qDebug() << "MCU: BaseProcessor::self() is NULL at simuRateChanged -"
+                    " MCU will NOT run (no processor created yet)";
     }
 
     m_timerTick = 50 / m_timerSc;

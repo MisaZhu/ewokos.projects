@@ -1041,7 +1041,9 @@ class QFileSystemModelSorter
 public:
     inline QFileSystemModelSorter(int column) : sortColumn(column)
     {
-        naturalCompare.setNumericMode(true);
+        // numericMode not supported by POSIX collation (qcollator_posix.cpp),
+        // so don't enable it to avoid repeated qWarning spam.
+        // naturalCompare.setNumericMode(true);
         naturalCompare.setCaseSensitivity(Qt::CaseInsensitive);
     }
 

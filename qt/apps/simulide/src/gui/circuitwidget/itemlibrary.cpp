@@ -22,38 +22,34 @@
 #include "simuapi_apppath.h"
 #include "appiface.h"
 
-// This port carries no microcontrollers.  Six of the includes below and the
-// seven addItem() calls they served are gone, and they are all of one piece:
+// MCU support in this port is provided by a from-scratch AVR core (see avr/
+// and src/simulator/elements/processors/avrprocessor) rather than upstream's
+// simavr, which needs libelf and 81 files of C that do not fit this build.  So
+// the "Micro" group registers the AVR/Arduino parts only:
 //
-//   piccomponent.h  avrcomponent.h  arduino.h
-//                            the MCU components themselves.  Arduino is a board
-//                            wrapper around AVRComponent, not a separate thing.
+//   arduino.h  avrcomponent.h
+//                            the MCU components.  Arduino is a board wrapper
+//                            around AvrComponent, not a separate thing.
+//
+// Still absent, and deliberately so:
+//   piccomponent.h           PIC needs gpsim (glib + popt); no PIC core exists
+//                            here yet, so there is nothing to put behind it.
 //   serialport.h  serialterm.h
 //                            the MCU's serial ports.  SerialTerm is the MCU-side
 //                            half of the terminal widget; SerialPort is built on
 //                            QSerialPort, and this Qt has no SerialPort module -
 //                            it is not in qtbase at all, it is its own upstream
-//                            repository, and there is no copy of it here.
+//                            repository, and there is no copy of it here.  The
+//                            AVR core routes UART TX to a callback instead.
 //   sr04.h                 an ultrasonic rangefinder, filed under the "Sensors"
-//                            subcategory of "Micro".  It is a sensor rather than
-//                            a controller, but it was registered in that group
-//                            and has nowhere else to hang from once the group is
-//                            gone; it is not worth inventing a category for one
-//                            part.
-//
-// They are removed rather than stubbed because a stub here would still put the
-// part in the library tree, and clicking it would build a component with no
-// processor behind it.  A missing entry is honest; a dead one is not.  The
-// mcucomponent.h that five other files include IS stubbed, and the difference is
-// that those only ever ask it whether it exists - see the note in that header.
-//
-// Everything else in the list is untouched, including the alphabetical order, so
-// diffing this against upstream shows only the six lines.
+//                            subcategory of "Micro"; not worth its own category.
 
 //BEGIN Item includes
 #include "amperimeter.h"
 #include "adc.h"
+#include "arduino.h"
 #include "audio_out.h"
+#include "avrcomponent.h"
 #include "bcdto7s.h"
 #include "bcdtodec.h"
 #include "bincounter.h"
@@ -192,12 +188,12 @@ void ItemLibrary::loadItems()
     addItem( Stepper::libraryItem() );
     addItem( Servo::libraryItem() );
     addItem( AudioOut::libraryItem() );
-    // The "// Micro" group that stood here - PICComponent, AVRComponent,
-    // Arduino, the "Sensors" subcategory, SR04, SerialPort and SerialTerm - is
-    // gone; see the note above //BEGIN Item includes.  Nothing else has to be
-    // undone with it: categories are built from the items' own category strings
-    // and there is no separate table of them anywhere in the tree, so dropping
-    // the last item in a category drops the category.
+    // Micro - AVR microcontrollers.  Backed by this port's own AVR core
+    // (avr/ + processors/avrprocessor), not upstream's simavr, so only AVR/
+    // Arduino parts are offered; there is no PIC core yet.
+    addItem( new LibraryItem( tr("Micro"),tr("Micro"), "ic2.png","", 0l ) );
+    addItem( Arduino::libraryItem() );
+    addItem( AvrComponent::libraryItem() );
     // Logic
     addItem( new LibraryItem( tr("Gates"),tr("Logic"), "gates.png","", 0l ) );
     addItem( new LibraryItem( tr("Arithmetic"),tr("Logic"), "2to2.png","", 0l ) );

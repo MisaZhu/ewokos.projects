@@ -20,6 +20,8 @@
 #include <QApplication>
 #include <QTranslator>
 
+#include <qt/ewokosqt.h>
+
 #include "mainwindow.h"
 
 QString langFile( QString locale )
@@ -34,6 +36,7 @@ QString langFile( QString locale )
 
 int main(int argc, char *argv[])
 {
+    ewokosQtInit();
 
 #ifdef _WIN32
     QStringList paths = QCoreApplication::libraryPaths();

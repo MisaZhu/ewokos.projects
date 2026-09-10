@@ -32,6 +32,8 @@ class EwokosFontDatabase : public QFreeTypeFontDatabase
 public:
     void populateFontDatabase() override;
     QFont defaultFont() const override;
+    QStringList fallbacksForFamily(const QString &family, QFont::Style style,
+                                   QFont::StyleHint styleHint, QChar::Script script) const override;
 
 private:
     void resolveThemeFont(const QHash<QString, QStringList> &scanned);
@@ -42,6 +44,11 @@ private:
     QString m_themeFamily;
     int m_themePixelSize = 0;
     bool m_populated = false;
+
+    /* Every family the scan registered, lowercased - the case-insensitive form
+       Qt's own family matching uses.  Tells a request for a font that is not
+       installed from one that is. */
+    QStringList m_registeredFamilies;
 };
 
 QT_END_NAMESPACE

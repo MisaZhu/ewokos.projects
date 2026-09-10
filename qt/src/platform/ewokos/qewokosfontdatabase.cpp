@@ -59,8 +59,11 @@ void EwokosFontDatabase::populateFontDatabase()
                FreeType parse of the file the theme points at. */
             const QString path = files.at(j).absoluteFilePath();
             const QStringList families = addTTFile(QByteArray(), QFile::encodeName(path));
-            if (!families.isEmpty())
+            if (!families.isEmpty()) {
                 scanned.insert(path, families);
+                for (int k = 0; k < families.size(); ++k)
+                    m_registeredFamilies << families.at(k).toLower();
+            }
             ++found;
         }
     }
@@ -107,6 +110,8 @@ void EwokosFontDatabase::resolveThemeFont(const QHash<QString, QStringList> &sca
         if (!families.isEmpty()) {
             m_themeFamily = families.first();
             m_themePixelSize = int(theme.fontSize);
+            if (!m_registeredFamilies.contains(m_themeFamily.toLower()))
+                m_registeredFamilies << m_themeFamily.toLower();
             return;
         }
     }
@@ -130,6 +135,27 @@ QFont EwokosFontDatabase::defaultFont() const
     if (m_themePixelSize > 0)
         font.setPixelSize(m_themePixelSize);
     return font;
+}
+
+/* There is no fontconfig here, so nothing but this database stands between a
+   family name and a face.  A name the scan registered matches before fallbacks
+   are ever consulted - an application that asks for an installed font keeps
+   getting it.  A name that is not installed ("Monospace", "Sans", a family
+   from another platform) reaches the fallback list, and the base builds that
+   list as every registered family in registration order: the request would be
+   answered by whichever file sorts first, Arial, no matter what was asked for.
+   The xwin theme font is what the rest of the system draws with, so an
+   unresolvable request leads with it instead and only then degrades to the
+   rest of the list. */
+QStringList EwokosFontDatabase::fallbacksForFamily(const QString &family, QFont::Style style,
+                                                   QFont::StyleHint styleHint, QChar::Script script) const
+{
+    QStringList fallbacks = QFreeTypeFontDatabase::fallbacksForFamily(family, style, styleHint, script);
+    if (!m_themeFamily.isEmpty() && !m_registeredFamilies.contains(family.toLower())) {
+        fallbacks.removeAll(m_themeFamily);
+        fallbacks.prepend(m_themeFamily);
+    }
+    return fallbacks;
 }
 
 QT_END_NAMESPACE

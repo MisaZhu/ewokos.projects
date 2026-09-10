@@ -1,0 +1,3 @@
+// QScriptEngine shim - redirects to the minimal expression evaluator.
+// See qscriptengine_shim.h for what this provides and why.
+#include "qscriptengine_shim.h"

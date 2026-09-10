@@ -6,9 +6,6 @@
 .vscode/dryrun.log
 .vscode/targets.log
 .deps
-build*
-!previous/src/cpu/build68k.c
-!qt/build.sh
 .xmake
 *.a
 apps/macemu/host/build68k
