@@ -271,8 +271,8 @@ static int last_gw = 0, last_gh = 0, last_ox = 0, last_oy = 0;
  */
 
 static bool copy_splash = false;
-static int copy_splash_done = 0;
-static int copy_splash_total = 0;
+static off_t copy_splash_done = 0;
+static off_t copy_splash_total = 0;
 
 #define SPLASH_BG      0xff151515
 #define SPLASH_FG      0xffb8b8b8
@@ -1546,7 +1546,7 @@ void VideoQuitFullScreen(void)
  *  so xwin_repaint() pushes every update synchronously.
  */
 
-void VideoDiskCopySplash(int done, int total)
+void VideoDiskCopySplash(off_t done, off_t total)
 {
 	if (xwin == NULL)
 		return;

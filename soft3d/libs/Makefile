@@ -1,9 +1,5 @@
 
-DIRS = portablegl glcommon imgui
-#	demos
-
-# demos is not built by default, but its leftovers still need cleaning
-CLEAN_DIRS = $(DIRS) demos
+DIRS = portablegl glcommon demos # imgui
 
 .PHONY: all clean
 
@@ -13,6 +9,6 @@ all:
 	done
 
 clean: 
-	@for dir in $(CLEAN_DIRS); do \
+	@for dir in $(DIRS); do \
 		$(MAKE) -C $$dir clean; \
 	done

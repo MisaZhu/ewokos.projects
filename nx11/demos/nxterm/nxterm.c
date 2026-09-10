@@ -1888,7 +1888,7 @@ drain_output(void)
 
 static int
 console_write(vdevice_t *d, int fd, int from_pid, fsinfo_t *info,
-		const void *buf, int size, int offset, void *p)
+		const void *buf, int size, off_t offset, void *p)
 {
 	char *tmp;
 	int m;
@@ -1911,7 +1911,7 @@ console_write(vdevice_t *d, int fd, int from_pid, fsinfo_t *info,
 
 static int
 console_read(vdevice_t *d, int fd, int from_pid, fsinfo_t *info,
-		void *buf, int size, int offset, void *p)
+		void *buf, int size, off_t offset, void *p)
 {
 	int i;
 	(void)d; (void)fd; (void)offset; (void)p;

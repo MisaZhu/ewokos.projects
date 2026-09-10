@@ -1191,7 +1191,7 @@ static void autodetect_assets(void)
 
 // video_xwin.cpp splash: done/total bytes across all pending images,
 // total <= 0 hides it again
-extern void VideoDiskCopySplash(int done, int total);
+extern void VideoDiskCopySplash(off_t done, off_t total);
 
 static off_t copy_base_bytes = 0;
 static off_t copy_total_bytes = 0;
@@ -1208,7 +1208,7 @@ static void copy_progress_cb(off_t done, off_t file_size, void *arg)
 	off_t all = copy_base_bytes + done;
 	if (all > copy_total_bytes)
 		all = copy_total_bytes;
-	VideoDiskCopySplash((int)all, (int)copy_total_bytes);
+	VideoDiskCopySplash(all, copy_total_bytes);
 }
 
 // A pending copy failed: the user copy will never appear, so drop the
@@ -1271,7 +1271,7 @@ void AssetsPrepareUserDisks(void)
 
 	copy_base_bytes = 0;
 	copy_last_splash_ms = 0;
-	VideoDiskCopySplash(0, (int)copy_total_bytes);
+	VideoDiskCopySplash(0, copy_total_bytes);
 	printf("preparing %d disk image(s) in %s\n",
 		pending_disk_count, pending_dst_dir);
 
