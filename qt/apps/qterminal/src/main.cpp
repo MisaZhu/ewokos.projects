@@ -53,6 +53,100 @@
 #include "qterminalutils.h"
 #include "terminalconfig.h"
 
+/* ===== TEMPORARY DIAGNOSTIC - submenu inoperability investigation ==========
+ * Logs every event the popup QMenus receive, so the Qt side of the handoff can
+ * be read next to the [QPA] and [XS] traces on the serial console.  Set to 0 to
+ * compile out; remove once the defect is fixed. */
+#define EWOK_MENU_TRACE 1
+#if EWOK_MENU_TRACE
+#include <QAction>
+#include <QEvent>
+#include <QMenu>
+#include <QMouseEvent>
+#include <cstdio>
+
+class MenuTrace : public QObject
+{
+public:
+    bool eventFilter(QObject *o, QEvent *e) override
+    {
+        QMenu *m = qobject_cast<QMenu *>(o);
+        if (!m)
+            return false;
+        switch (e->type()) {
+        case QEvent::Enter:
+            fprintf(stdout, "[MT] %-18s ENTER\n", name(m));
+            break;
+        case QEvent::Leave:
+            fprintf(stdout, "[MT] %-18s LEAVE   act=%s\n", name(m), act(m->activeAction()));
+            break;
+        case QEvent::MouseMove: {
+            QMouseEvent *me = static_cast<QMouseEvent *>(e);
+            QAction *at = m->actionAt(me->pos());
+            fprintf(stdout, "[MT] %-18s MOVE pos=(%d,%d) g=(%d,%d) at=%s sub=%d "
+                            "act=%s vis=%d um=%d\n",
+                    name(m), me->x(), me->y(), me->globalX(), me->globalY(),
+                    act(at), (at && at->menu()) ? 1 : 0, act(m->activeAction()),
+                    (int)m->isVisible(), (int)m->underMouse());
+            break;
+        }
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonRelease: {
+            QMouseEvent *me = static_cast<QMouseEvent *>(e);
+            fprintf(stdout, "[MT] %-18s %s pos=(%d,%d) act=%s\n", name(m),
+                    e->type() == QEvent::MouseButtonPress ? "PRESS  " : "RELEASE",
+                    me->x(), me->y(), act(m->activeAction()));
+            break;
+        }
+        case QEvent::Timer:
+            fprintf(stdout, "[MT] %-18s TIMER act=%s vis=%d\n", name(m),
+                    act(m->activeAction()), (int)m->isVisible());
+            break;
+        case QEvent::Show:
+            fprintf(stdout, "[MT] %-18s SHOW  act=%s\n", name(m), act(m->activeAction()));
+            break;
+        case QEvent::Hide:
+            fprintf(stdout, "[MT] %-18s HIDE  act=%s\n", name(m), act(m->activeAction()));
+            break;
+        case QEvent::WindowActivate:
+        case QEvent::WindowDeactivate:
+            fprintf(stdout, "[MT] %-18s %s\n", name(m),
+                    e->type() == QEvent::WindowActivate ? "WIN-ACTIVATE" : "WIN-DEACTIVATE");
+            break;
+        default:
+            break;
+        }
+        fflush(stdout);
+        return false;
+    }
+
+private:
+    /* Rotating pools: several of these are arguments of one fprintf, so a
+       single static buffer would be overwritten before it was read. */
+    static const char *name(const QMenu *m)
+    {
+        static char pool[4][48];
+        static int slot = 0;
+        char *buf = pool[slot++ & 3];
+        QString t = m->objectName().isEmpty() ? m->title() : m->objectName();
+        snprintf(buf, 48, "%s@%p", qPrintable(t), (const void *)m);
+        return buf;
+    }
+
+    static const char *act(const QAction *a)
+    {
+        static char pool[4][40];
+        static int slot = 0;
+        char *buf = pool[slot++ & 3];
+        if (!a)
+            snprintf(buf, 40, "null");
+        else
+            snprintf(buf, 40, "%s", qPrintable(a->text()));
+        return buf;
+    }
+};
+#endif
+
 #define out
 
 const char* const short_options = "vhw:e:dp:";
@@ -219,6 +313,11 @@ int main(int argc, char *argv[])
 
     TerminalConfig initConfig = TerminalConfig(workdir, shell_command);
     app->newWindow(dropMode, initConfig);
+
+#if EWOK_MENU_TRACE
+    static MenuTrace menuTrace;
+    app->installEventFilter(&menuTrace);
+#endif
 
     int ret = app->exec();
     delete Properties::Instance();

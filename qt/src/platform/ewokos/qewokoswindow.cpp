@@ -17,6 +17,73 @@
 
 QT_BEGIN_NAMESPACE
 
+/* ===== TEMPORARY DIAGNOSTIC - menuprobe submenu investigation =============
+ * Set EWOK_QPA_TRACE to 0 to compile all of it out.  Everything goes to stdout
+ * so it interleaves with the probe application's own trace on the serial
+ * console.  Not a permanent addition: the window list is an unbounded static
+ * and the mouse trace is far too chatty for production. */
+#define EWOK_QPA_TRACE 1
+#if EWOK_QPA_TRACE
+#include <QtCore/qlist.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+static QList<EwokosWindow *> ewokTraceWindows;
+
+static void ewokTrace(const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    fputs("[QPA] ", stdout);
+    fputs(buf, stdout);
+    fflush(stdout);
+}
+
+static const char *ewokId(EwokosWindow *w)
+{
+    static char pool[4][128];
+    static int slot = 0;
+    char *b = pool[slot++ & 3];
+    if (!w || !w->window())
+        return "<null>";
+    snprintf(b, 128, "%s@%p", qPrintable(w->window()->title()), (const void *)w);
+    return b;
+}
+
+/* The whole window set with both sides of the geometry handoff and the two
+ * server flags the input routing depends on.  This is the line that answers
+ * "does the popup have a real xwin, is it visible, and is it focused".
+ * serverGeometry() is private, so wsr is read off the shared struct - the same
+ * thing that getter does. */
+static void ewokDumpWindows(const char *why)
+{
+    ewokTrace("---- window set @ %s ----\n", why);
+    for (int i = 0; i < ewokTraceWindows.size(); ++i) {
+        EwokosWindow *w = ewokTraceWindows.at(i);
+        const QRect q = w->geometry();
+        xwin_t *xw = w->xwin();
+        if (!xw || !xw->xinfo) {
+            ewokTrace("  [%d] %s  NO XWIN  qt=%d,%d %dx%d\n",
+                      i, ewokId(w), q.x(), q.y(), q.width(), q.height());
+            continue;
+        }
+        const xinfo_t *xi = xw->xinfo;
+        ewokTrace("  [%d] %s xwin=%p handle=%llx style=0x%x vis=%d foc=%d "
+                  "srv=%d,%d %dx%d qt=%d,%d %dx%d sync=%d\n",
+                  i, ewokId(w), (const void *)xw,
+                  (unsigned long long)xi->win, (unsigned)xi->style,
+                  (int)xi->visible, (int)xi->focused,
+                  xi->wsr.x, xi->wsr.y, xi->wsr.w, xi->wsr.h,
+                  q.x(), q.y(), q.width(), q.height(),
+                  (int)(q.x() == xi->wsr.x && q.y() == xi->wsr.y &&
+                        q.width() == xi->wsr.w && q.height() == xi->wsr.h));
+    }
+}
+#endif /* EWOK_QPA_TRACE */
+
 /* xwin_open() rejects w <= 0 or h <= 0, and QWindow's geometry before an
    application positions it is Qt's "let the platform decide" sentinel rather
    than a usable size.  These are what initialGeometry() substitutes. */
@@ -103,6 +170,16 @@ void EwokosWindow::initialize()
     QRect rect = initialGeometry(window(), geometry(),
                                  EWOK_DEFAULT_WIDTH, EWOK_DEFAULT_HEIGHT);
     QPlatformWindow::setGeometry(rect);
+#if EWOK_QPA_TRACE
+    ewokTrace("initialize %s flags=0x%llx style=0x%x want=%d,%d %dx%d "
+              "(qwindow geometry was %d,%d %dx%d)\n",
+              ewokId(this), (unsigned long long)window()->flags(),
+              ewokosWindowStyle(window()->flags()),
+              rect.x(), rect.y(), rect.width(), rect.height(),
+              geometry().x(), geometry().y(),
+              geometry().width(), geometry().height());
+    ewokTraceWindows.append(this);
+#endif
 
     EwokosIntegration *integration = EwokosIntegration::instance();
     x_t *x = integration ? integration->xContext() : nullptr;
@@ -123,6 +200,11 @@ void EwokosWindow::initialize()
         qWarning("ewokos: xwin_open failed for %dx%d+%d+%d \"%s\"",
                  rect.width(), rect.height(), rect.x(), rect.y(),
                  title.constData());
+#if EWOK_QPA_TRACE
+        ewokTrace("!! xwin_open RETURNED NULL for %s - Qt will still believe "
+                  "this window exists\n", ewokId(this));
+        ewokDumpWindows("xwin_open failed");
+#endif
         return;
     }
 
@@ -177,10 +259,24 @@ void EwokosWindow::initialize()
     m_exposed = true;
     QWindowSystemInterface::handleExposeEvent<QWindowSystemInterface::SynchronousDelivery>(
         window(), QRegion(0, 0, actual.width(), actual.height()));
+#if EWOK_QPA_TRACE
+    ewokTrace("initialize done %s xwin=%p handle=%llx srv=%d,%d %dx%d "
+              "vis=%d foc=%d\n",
+              ewokId(this), (const void *)m_xwin,
+              (unsigned long long)m_xwin->xinfo->win,
+              actual.x(), actual.y(), actual.width(), actual.height(),
+              (int)m_xwin->xinfo->visible, (int)m_xwin->xinfo->focused);
+#endif
 }
 
 void EwokosWindow::teardown()
 {
+#if EWOK_QPA_TRACE
+    /* before the m_xwin guard: a window whose xwin_open() failed still has to
+       come off the trace list, or the next dump walks freed memory */
+    ewokTrace("teardown %s xwin=%p\n", ewokId(this), (const void *)m_xwin);
+    ewokTraceWindows.removeAll(this);
+#endif
     if (!m_xwin)
         return;
 
@@ -243,6 +339,13 @@ void EwokosWindow::setGeometry(const QRect &rect)
        to the server, and asking for a resize that is already in effect would
        rebuild the canvas and throw away its contents for nothing. */
     const QRect current = serverGeometry();
+#if EWOK_QPA_TRACE
+    ewokTrace("setGeometry %s want=%d,%d %dx%d current=%d,%d %dx%d -> %s%s\n",
+              ewokId(this), rect.x(), rect.y(), rect.width(), rect.height(),
+              current.x(), current.y(), current.width(), current.height(),
+              current.size() != rect.size() ? "RESIZE " : "",
+              current.topLeft() != rect.topLeft() ? "MOVE" : "");
+#endif
     if (current.size() != rect.size())
         xwin_resize_to(m_xwin, rect.width(), rect.height());
     if (current.topLeft() != rect.topLeft())
@@ -256,6 +359,12 @@ QRect EwokosWindow::geometry() const
 
 void EwokosWindow::setVisible(bool visible)
 {
+#if EWOK_QPA_TRACE
+    const bool wasVisible = m_xwin && m_xwin->xinfo && m_xwin->xinfo->visible;
+    ewokTrace("setVisible(%d) %s xwin=%p was=%d -> xwin_set_visible is %s\n",
+              (int)visible, ewokId(this), (const void *)m_xwin, (int)wasVisible,
+              (m_xwin && wasVisible == visible) ? "A NO-OP" : "issued");
+#endif
     if (!m_xwin)
         return;
 
@@ -263,6 +372,13 @@ void EwokosWindow::setVisible(bool visible)
     m_exposed = visible;
 
     const QRect rect = serverGeometry();
+#if EWOK_QPA_TRACE
+    ewokTrace("setVisible done %s vis=%d foc=%d srv=%d,%d %dx%d\n",
+              ewokId(this), (int)m_xwin->xinfo->visible,
+              (int)m_xwin->xinfo->focused,
+              rect.x(), rect.y(), rect.width(), rect.height());
+    ewokDumpWindows(visible ? "after show" : "after hide");
+#endif
     /* An empty region is how Qt says "not exposed".  Queued delivery: this can
        be reached from inside a server event, and the expose handler repaints. */
     QWindowSystemInterface::handleExposeEvent(
@@ -352,6 +468,20 @@ WId EwokosWindow::winId() const
 bool EwokosWindow::isExposed() const
 {
     return m_exposed;
+}
+
+bool EwokosWindow::setKeyboardGrabEnabled(bool grab)
+{
+    /* xserverd has no grab primitive: keys are routed to the focused window and
+       to nothing else.  That is exactly what Qt wants a keyboard grab for -
+       QMenu grabs on popup so the open menu, not the window under it, receives
+       the keys - and on this platform the popup holds the server focus for as
+       long as it is visible (xwin_set_visible(true) asks for focus, and the
+       server re-homes it when the popup hides), so the grab is satisfied by
+       construction.  Claiming it keeps Qt from falling back to paths that
+       assume a grab-less platform and from warning on every single popup. */
+    Q_UNUSED(grab);
+    return true;
 }
 
 void EwokosWindow::setDirtyRegion(const QRegion &region)
@@ -468,6 +598,23 @@ void EwokosWindow::handleMouseEvent(xevent_t *ev)
     const QRect geo = serverGeometry();
     const QPoint global(ev->value.mouse.x, ev->value.mouse.y);
     const QPoint local(global.x() - geo.x(), global.y() - geo.y());
+#if EWOK_QPA_TRACE
+    /* One line per physical event: which xwin it landed on, and whether the
+       two geometry views agree.  Qt redirects every mouse event to
+       activePopupWidget() through mapFromGlobal(), which uses the cached
+       QPlatformWindow::geometry() - so a desync shows up here as sync=0 and
+       means the popup sees the click at the wrong place. */
+    ewokTrace("mouse st=%d on %s global=(%d,%d) local=(%d,%d) srv=%d,%d %dx%d "
+              "qt=%d,%d %dx%d sync=%d vis=%d foc=%d\n",
+              (int)ev->state, ewokId(this), global.x(), global.y(),
+              local.x(), local.y(),
+              geo.x(), geo.y(), geo.width(), geo.height(),
+              geometry().x(), geometry().y(),
+              geometry().width(), geometry().height(),
+              (int)(geo == geometry()),
+              m_xwin && m_xwin->xinfo ? (int)m_xwin->xinfo->visible : -1,
+              m_xwin && m_xwin->xinfo ? (int)m_xwin->xinfo->focused : -1);
+#endif
 
     const int rawButton = ev->value.mouse.button;
 
@@ -646,12 +793,21 @@ void EwokosWindow::moveThunk(xwin_t *xwin)
 void EwokosWindow::focusThunk(xwin_t *xwin)
 {
     EwokosWindow *self = static_cast<EwokosWindow *>(xwin->data);
+#if EWOK_QPA_TRACE
+    ewokTrace("FOCUS  -> %s vis=%d\n", ewokId(self),
+              xwin->xinfo ? (int)xwin->xinfo->visible : -1);
+#endif
     if (self && self->window())
         QWindowSystemInterface::handleWindowActivated(self->window());
 }
 
 void EwokosWindow::unfocusThunk(xwin_t *xwin)
 {
+#if EWOK_QPA_TRACE
+    EwokosWindow *self = static_cast<EwokosWindow *>(xwin->data);
+    ewokTrace("UNFOCUS-> %s vis=%d (reported to Qt: nothing)\n", ewokId(self),
+              xwin->xinfo ? (int)xwin->xinfo->visible : -1);
+#endif
     /* Deliberately nothing.  handleWindowActivated(nullptr) does not mean
        "another of our windows is active now", it means "none of them is" -
        and with the ApplicationState capability undeclared that demotes the

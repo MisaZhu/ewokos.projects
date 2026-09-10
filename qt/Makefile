@@ -165,12 +165,13 @@ SUB_DIRS = \
 	apps/nomacs \
 	apps/freecad \
 	apps/qtmesheditor \
-	apps/notepadqq
+	apps/notepadqq \
+	apps/qucs-s
 
 ifeq ($(QT_MISSING),yes)
 # Skip rather than fail: the image simply ships without qtdemo and the apps,
 # and everything here self-enables the next build after build.sh has run.
-all sdk plugin demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq:
+all sdk plugin demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s:
 	@echo "note: projects/qt skipped - Qt 5.15 tree not found ($(QT_BUILD_MOC) missing)."
 	@echo "      Run projects/qt/build.sh first to configure and build Qt."
 else
@@ -211,6 +212,9 @@ qtmesheditor: plugin
 notepadqq: plugin
 	@$(MAKE) -C apps/notepadqq
 
+qucs-s: plugin
+	@$(MAKE) -C apps/qucs-s
+
 endif
 
 # Header dependencies.  -MMD wrote them next to the objects; without this,
@@ -225,4 +229,4 @@ clean:
 	rm -rf $(QT5_INC) $(SDK_DIR)/qt5
 	@for dir in $(SUB_DIRS); do $(MAKE) -C $$dir clean; done
 
-.PHONY: all sdk plugin plugin-lib demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq clean
+.PHONY: all sdk plugin plugin-lib demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s clean
