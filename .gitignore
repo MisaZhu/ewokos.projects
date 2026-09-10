@@ -8,7 +8,9 @@
 .deps
 .xmake
 *.a
-apps/macemu/host/build68k
+build68k
+**/gen/*
+**/build/*
 apps/macemu/host/gencpu
 apps/macemu/src/uae_cpu/cpudefs.cpp
 apps/macemu/src/uae_cpu/cpuemu.cpp

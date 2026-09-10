@@ -84,19 +84,6 @@ void BaseProcessor::setExtraStep() // Run Extra Simulation Step If MCU clock spe
 
 void BaseProcessor::step()
 {
-    // One-shot diagnostic: prove the simulator is actually stepping the core and
-    // show the two gate flags plus the cycle accumulator.  Logs the first few
-    // calls only so it does not spam the ~millions of steps per second.
-    static int s_stepLog = 0;
-    if( s_stepLog < 3 )
-    {
-        qDebug() << "MCU step: loadStatus=" << m_loadStatus
-                 << "resetStatus=" << m_resetStatus
-                 << "nextCycle=" << m_nextCycle
-                 << "stepsPT=" << m_mcuStepsPT;
-        s_stepLog++;
-    }
-
     if( !m_loadStatus || m_resetStatus ) return;
 
     while( m_nextCycle >= 1 )

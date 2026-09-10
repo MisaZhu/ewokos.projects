@@ -46,12 +46,13 @@ void avr_gpio_set_pin(AvrCore *avr, uint8_t port, uint8_t pin, bool value) {
     
     uint8_t pin_reg = REG_PINB + port * 3;
     uint8_t ddr_reg = REG_DDRB + port * 3;
-    uint8_t port_reg = REG_PORTB + port * 3;
-    
+
     uint8_t ddr = avr->data[ddr_reg];
-    uint8_t port_val = avr->data[port_reg];
-    
-    // If pin is input, set the PIN register
+
+    // Only inputs are driven from the circuit; on an output pin the MCU owns
+    // the pad and an external value must not overwrite it.  The PORT bit for
+    // an input selects the internal pull-up, which the circuit resolves before
+    // calling this - it is deliberately not consulted here.
     if (!(ddr & (1 << pin))) {
         if (value)
             avr->data[pin_reg] |= (1 << pin);
@@ -108,6 +109,23 @@ void avr_usart_set_tx_callback(AvrCore *avr, AvrUsartTxCallback cb, void *data) 
     usart_tx_data = data;
 }
 
+// Remaining cycles until the byte currently in the shift register has been
+// clocked out, plus the byte itself.  0 means the transmitter is idle.
+static uint32_t usart_tx_cycles = 0;
+static uint8_t  usart_tx_byte   = 0;
+static bool     usart_tx_emit   = true;
+
+// One 10-bit frame (start + 8 data + stop) at the programmed baud rate.
+// The bit time is 16 * (UBRR + 1) CPU cycles, or 8 * (UBRR + 1) in U2X mode;
+// at 16MHz that makes UBRR=207 exactly the 9600 baud Arduino default.
+static uint32_t usart_frame_cycles(AvrCore *avr) {
+    uint16_t ubrr = (uint16_t)(avr->data[REG_UBRR0H] << 8) | avr->data[REG_UBRR0L];
+    uint32_t per_bit = (avr->data[REG_UCSR0A] & 0x02) ? 8u : 16u;   // U2X0
+    per_bit *= (uint32_t)ubrr + 1u;
+    if (per_bit == 0) per_bit = 16;                                 // UBRR unset
+    return per_bit * 10u;
+}
+
 // Timer functions
 static AvrTimerCallback timer_cb = NULL;
 static void *timer_cb_data = NULL;
@@ -130,6 +148,13 @@ void avr_irq_clear(AvrCore *avr, int vector) {
         avr->irq_pending[vector] = false;
     }
 }
+
+// Prescaler phase counters.  Declared up here, ahead of avr_periph_reset(),
+// which zeroes them: leaving them dirty across a restart gives the timers a
+// head start on the next run.
+static uint32_t timer0_presc_counter = 0;
+static uint32_t timer1_presc_counter = 0;
+static uint32_t timer2_presc_counter = 0;
 
 // Peripheral initialization
 void avr_periph_init(AvrCore *avr) {
@@ -175,6 +200,16 @@ void avr_periph_reset(AvrCore *avr) {
     avr->data[REG_TIFR2] = 0;
     
     // USART
+    // These are file-static so a reset has to clear them explicitly, otherwise
+    // restarting a simulation leaves the previous run's prescaler phase and a
+    // half-shifted TX byte in place.
+    timer0_presc_counter = 0;
+    timer1_presc_counter = 0;
+    timer2_presc_counter = 0;
+    usart_tx_cycles = 0;
+    usart_tx_byte   = 0;
+    usart_tx_emit   = true;
+
     avr->data[REG_UCSR0A] = 0x20;  // UDRE0 is set on reset
     avr->data[REG_UCSR0B] = 0;
     avr->data[REG_UCSR0C] = 0x06;  // UCSZ01:0 = 11 (8-bit)
@@ -198,11 +233,6 @@ static const uint16_t timer0_prescaler[] = { 0, 1, 8, 64, 256, 1024, 0, 0 };
 static const uint16_t timer1_prescaler[] = { 0, 1, 8, 64, 256, 1024, 0, 0 };
 static const uint16_t timer2_prescaler[] = { 0, 1, 8, 32, 64, 128, 256, 1024 };
 
-// Timer state (simplified - store in static for now)
-static uint32_t timer0_presc_counter = 0;
-static uint32_t timer1_presc_counter = 0;
-static uint32_t timer2_presc_counter = 0;
-
 void avr_periph_step(AvrCore *avr, int cycles) {
     // Step Timer 0
     uint8_t tccr0b = avr->data[REG_TCCR0B];
@@ -212,7 +242,6 @@ void avr_periph_step(AvrCore *avr, int cycles) {
         uint16_t presc = timer0_prescaler[cs0];
         while (timer0_presc_counter >= presc) {
             timer0_presc_counter -= presc;
-            uint8_t old_tcnt = avr->data[REG_TCNT0];
             avr->data[REG_TCNT0]++;
             
             // Check for overflow
@@ -331,6 +360,36 @@ void avr_periph_step(AvrCore *avr, int cycles) {
             }
         }
     }
+
+    // Step USART0 transmit.  The byte sits in the shift register for one full
+    // frame, then UDRE0 comes back and - if firmware enabled UDRIE0 - the UDRE
+    // interrupt fires.  That interrupt is what Arduino's HardwareSerial uses
+    // to drain its ring buffer, so without this Serial.print() stalls after
+    // the first byte no matter how correct the decoder is.
+    if (usart_tx_cycles > 0) {
+        if ((uint32_t)cycles >= usart_tx_cycles) {
+            usart_tx_cycles = 0;
+            if (!usart_tx_emit) {
+                // Hand the byte to the circuit only once the frame is out.
+                usart_tx_emit = true;
+                if (usart_tx_cb) usart_tx_cb(usart_tx_data, usart_tx_byte);
+            }
+            avr->data[REG_UCSR0A] |= 0x20 | 0x40;      // UDRE0, TXC0
+            avr->irq_pending[VEC_USART_UDRE] = false;  // re-arm, then request
+            if (avr->data[REG_UCSR0B] & 0x40)          // TXCIE0
+                avr_irq_request(avr, VEC_USART_TX);
+        } else {
+            usart_tx_cycles -= (uint32_t)cycles;
+            return;
+        }
+    }
+
+    // The UDRE interrupt is level-triggered: it stays pending for as long as
+    // the data register is empty and its enable bit is set.  Re-requesting it
+    // every step is what hardware does, and is harmless because taking the
+    // vector clears the pending bit.
+    if ((avr->data[REG_UCSR0B] & 0x20) && (avr->data[REG_UCSR0A] & 0x20))
+        avr_irq_request(avr, VEC_USART_UDRE);
 }
 
 void avr_periph_write(AvrCore *avr, uint16_t addr, uint8_t val) {
@@ -338,31 +397,49 @@ void avr_periph_write(AvrCore *avr, uint16_t addr, uint8_t val) {
     
     // USART
     if (addr == REG_UDR0) {
-        // Transmit byte
-        if (usart_tx_cb) {
-            usart_tx_cb(usart_tx_data, val);
-        }
-        // Set UDRE (data register empty)
-        avr->data[REG_UCSR0A] |= 0x20;
-        // Clear TXC
-        avr->data[REG_UCSR0A] &= ~0x40;
-        
-        // Request TX complete interrupt if enabled
-        if (avr->data[REG_UCSR0B] & 0x40) {  // TXCIE0
-            avr_irq_request(avr, VEC_USART_TX);
-        }
+        // The byte moves into the shift register, so UDR is no longer empty
+        // and the previous frame is no longer complete.  avr_periph_step()
+        // counts the frame down and restores UDRE0 when it ends.
+        avr->data[REG_UDR0] = val;
+        avr->data[REG_UCSR0A] &= (uint8_t)~(0x20 | 0x40);
+        avr_irq_clear(avr, VEC_USART_UDRE);
+        usart_tx_cycles = usart_frame_cycles(avr);
+        usart_tx_byte   = val;
+        usart_tx_emit   = false;
         return;
     }
     
     if (addr == REG_UCSR0A) {
-        // Writing 1 to UDRE0 clears it (actually it's read-only, but handle anyway)
-        avr->data[REG_UCSR0A] = val & ~0x20;  // UDRE0 is read-only
+        // UDRE0 (bit5) and RXC0 (bit7) are read-only: hardware sets them and
+        // firmware cannot clear them by writing.  Arduino's USART0_init()
+        // does "UCSR0A = 1<<U2X0", which writes a 0 into UDRE0 - real silicon
+        // ignores it, and HardwareSerial::write() then relies on UDRE0 still
+        // being set to take its "buffer empty and register ready" fast path.
+        // Masking the bit OFF instead of preserving it deadlocked every
+        // Serial.print(): write() buffered the byte, enabled UDRIE0 and spun
+        // waiting for an UDRE interrupt that could only follow a UDR0 write
+        // the spin loop never reached.
+        uint8_t ro = (uint8_t)(avr->io_prev & (0x20 | 0x80));
+        avr->data[REG_UCSR0A] = (uint8_t)((val & ~(0x20 | 0x80)) | ro);
         return;
     }
     
-    // Timer interrupt flags - write 1 to clear
+    if (addr == REG_UCSR0B) {
+        avr->data[REG_UCSR0B] = val;
+        // Datasheet: the UDRE interrupt is executed immediately if UDRE0 is
+        // set at the moment UDRIE0 is written to one.
+        if ((val & 0x20) && (avr->data[REG_UCSR0A] & 0x20))
+            avr_irq_request(avr, VEC_USART_UDRE);
+        if ((val & 0x80) && (avr->data[REG_UCSR0A] & 0x80))
+            avr_irq_request(avr, VEC_USART_RX);
+        return;
+    }
+
+    // Timer interrupt flags - write 1 to clear.  The new byte has already been
+    // stored, so this has to work from io_prev: data[addr] & ~val would be
+    // val & ~val, i.e. 0, wiping every flag whether firmware asked or not.
     if (addr == REG_TIFR0 || addr == REG_TIFR1 || addr == REG_TIFR2) {
-        avr->data[addr] &= ~val;
+        avr->data[addr] = (uint8_t)(avr->io_prev & ~val);
         return;
     }
     
@@ -412,14 +489,10 @@ void avr_periph_write(AvrCore *avr, uint16_t addr, uint8_t val) {
 }
 
 uint8_t avr_periph_read(AvrCore *avr, uint16_t addr) {
-    // Most registers just return their value
-    // Some have special read behavior
-    
-    // USART status - UDRE is always set when not transmitting
-    if (addr == REG_UCSR0A) {
-        // For simplicity, always report ready
-        return avr->data[addr] | 0x20;
-    }
-    
-    return avr->data[addr];
+    // avr_read_data() serves the CPU straight from avr->data[] and never calls
+    // this, so nothing here may paper over a stale flag.  In particular the old
+    // "UCSR0A always reports UDRE0 set" shortcut hid the fact that no USART
+    // step existed: a polling driver appeared to work while an interrupt-driven
+    // one (every Arduino sketch) deadlocked.  Read the modelled value.
+    return avr_read_data(avr, addr);
 }

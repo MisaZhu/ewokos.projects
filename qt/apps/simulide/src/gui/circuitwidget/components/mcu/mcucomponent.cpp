@@ -101,10 +101,7 @@ bool McuComponent::loadFirmware(QString file)
     // Keep the original (possibly relative) value for the Program property so a
     // re-saved circuit stays portable; hand the resolved path to the core.
     m_firmwareFile = file;
-    bool ok = m_processor->loadFirmware(path);
-    qDebug() << "MCU: loadFirmware resolved=" << path
-             << "exists=" << QFileInfo(path).exists() << "result=" << ok;
-    return ok;
+    return m_processor->loadFirmware(path);
 }
 
 void McuComponent::setFirmwareFile(QString file)
@@ -114,14 +111,8 @@ void McuComponent::setFirmwareFile(QString file)
 
 void McuComponent::runAutoLoad()
 {
-    qDebug() << "MCU: runAutoLoad autoLoad=" << m_autoLoad
-             << "firmwareFile=" << m_firmwareFile;
-    if (m_autoLoad && !m_firmwareFile.isEmpty()) {
+    if (m_autoLoad && !m_firmwareFile.isEmpty())
         loadFirmware(m_firmwareFile);
-        if (m_processor)
-            qDebug() << "MCU: after autoload loadStatus="
-                     << m_processor->getLoadStatus();
-    }
 }
 
 // ---- package / pins ---------------------------------------------------------
@@ -181,7 +172,6 @@ void McuComponent::initMcuPins(QString pkgRelPath)
         g.src->setImp(high_imp);
         m_gpio.append(g);
     }
-    qDebug() << "MCU:" << m_gpio.size() << "GPIO pins bound from" << pkgRelPath;
 }
 
 void McuComponent::updatePins()

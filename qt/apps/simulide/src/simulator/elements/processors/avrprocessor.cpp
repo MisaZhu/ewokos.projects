@@ -90,8 +90,6 @@ bool AvrProcessor::loadFirmware(QString file)
     
     m_firmwareLoaded = true;
 
-    qDebug() << "AVR: Loaded firmware:" << file << "(" << size << "bytes)";
-
     // Reset processor (clears PC/registers/peripherals) then mark the base
     // processor initialized so BaseProcessor::step() will actually run: step()
     // early-returns unless m_loadStatus is set, and initialized() is what sets
@@ -112,25 +110,13 @@ void AvrProcessor::reset()
 
 void AvrProcessor::stepOne()
 {
-    // Periodic diagnostic (~1/sec at typical step rates): shows whether the core
-    // is actually executing and where PC is, or why it is not stepping.
-    static uint64_t s_cnt = 0;
+    if (!m_firmwareLoaded || m_avr.halted) return;
 
-    if (!m_firmwareLoaded || m_avr.halted) {
-        if ((s_cnt++ % 1000000) == 0)
-            qDebug() << "AVR: not stepping - firmwareLoaded=" << m_firmwareLoaded
-                     << "halted=" << m_avr.halted << "pc=" << m_avr.pc;
-        return;
-    }
-    
     // Execute one instruction
     int cycles = avr_core_step(&m_avr);
-    
+
     // Step peripherals
     avr_periph_step(&m_avr, cycles);
-
-    if ((s_cnt++ % 1000000) == 0)
-        qDebug() << "AVR: running pc=" << m_avr.pc << "cycle=" << m_avr.cycle;
 }
 
 void AvrProcessor::stepCpu()

@@ -44,16 +44,22 @@
 // I/O Register addresses (ATmega328P).
 //
 // These are DATA-SPACE addresses, not the 6-bit I/O addresses used by IN/OUT.
-// AVR maps each I/O register twice: at its I/O address A (reachable only
-// through IN/OUT/SBI/CBI/SBIC/SBIS) and at data address A+0x20 (reachable
-// through LDS/STS/LD/ST).  avr->data[] is indexed by data address - that is
-// what firmware actually uses, since gcc-avr emits "sts 0x45" for TCCR0B and
-// "out 0x25" only when it can - so every define below carries the +0x20.
-// Keeping them as bare I/O addresses put the whole peripheral model one
-// window away from the CPU: a firmware write to TCCR0B landed in data[0x45]
-// while the timer step read data[0x25], and Serial.print() spun forever in
-// its UDRE poll because data[0xE0] was never the 0x20 that reset put in
-// data[0xC0].
+// avr->data[] is indexed by data address - that is what firmware actually
+// uses, since gcc-avr emits "sts 0x45" for TCCR0B and "out 0x25" only when it
+// can.
+//
+// The offset rule is NOT uniform, and this is the trap:
+//   * low I/O 0x00-0x3F  -> data address I/O + 0x20, i.e. 0x20-0x5F.
+//     These are the only registers IN/OUT/SBI/CBI can reach at all.
+//   * extended I/O 0x60-0xFF -> data address == I/O address, no offset.
+//     LDS/STS/LD/ST only.
+// So DDRB (I/O 0x04) is data[0x24], but UCSR0A (I/O 0xC0) is data[0xC0].
+// Adding +0x20 across the board moves every extended register one window
+// away from the CPU: firmware's "sts 0xC1" (TXEN) landed in data[0xC1] while
+// the USART model polled data[0xE1], so Serial never enabled and its UDRE
+// poll spun forever on a byte that reset had put at data[0xE0].  Only the
+// ADC (0x78-0x7F), Timer2/TWI (0xB0-0xBD) and USART0 (0xC0-0xC6) blocks were
+// affected - the low-I/O defines below them are right.
 #define REG_PINB    0x23
 #define REG_DDRB    0x24
 #define REG_PORTB   0x25
@@ -105,14 +111,14 @@
 #define REG_TIMSK0  0x6E
 #define REG_TIMSK1  0x6F
 #define REG_TIMSK2  0x70
-#define REG_ADCSRA  0x9A
-#define REG_ADCSRB  0x9B
-#define REG_ADMUX   0x9C
-#define REG_ADCW    0x98  // ADCL + ADCH
-#define REG_ADCL    0x98
-#define REG_ADCH    0x99
-#define REG_DIDR0   0x9E
-#define REG_DIDR1   0x9F
+#define REG_ADCSRA  0x7A
+#define REG_ADCSRB  0x7B
+#define REG_ADMUX   0x7C
+#define REG_ADCW    0x78  // ADCL + ADCH
+#define REG_ADCL    0x78
+#define REG_ADCH    0x79
+#define REG_DIDR0   0x7E
+#define REG_DIDR1   0x7F
 #define REG_TCCR1A  0xA0
 #define REG_TCCR1B  0xA1
 #define REG_TCCR1C  0xA2
@@ -124,24 +130,24 @@
 #define REG_OCR1AH  0xA9
 #define REG_OCR1BL  0xAA
 #define REG_OCR1BH  0xAB
-#define REG_TCCR2A  0xD0
-#define REG_TCCR2B  0xD1
-#define REG_TCNT2   0xD2
-#define REG_OCR2A   0xD3
-#define REG_OCR2B   0xD4
-#define REG_ASSR    0xD6
-#define REG_TWBR    0xD8
-#define REG_TWSR    0xD9
-#define REG_TWAR    0xDA
-#define REG_TWDR    0xDB
-#define REG_TWCR    0xDC
-#define REG_TWAMR   0xDD
-#define REG_UCSR0A  0xE0
-#define REG_UCSR0B  0xE1
-#define REG_UCSR0C  0xE2
-#define REG_UBRR0L  0xE4
-#define REG_UBRR0H  0xE5
-#define REG_UDR0    0xE6
+#define REG_TCCR2A  0xB0
+#define REG_TCCR2B  0xB1
+#define REG_TCNT2   0xB2
+#define REG_OCR2A   0xB3
+#define REG_OCR2B   0xB4
+#define REG_ASSR    0xB6
+#define REG_TWBR    0xB8
+#define REG_TWSR    0xB9
+#define REG_TWAR    0xBA
+#define REG_TWDR    0xBB
+#define REG_TWCR    0xBC
+#define REG_TWAMR   0xBD
+#define REG_UCSR0A  0xC0
+#define REG_UCSR0B  0xC1
+#define REG_UCSR0C  0xC2
+#define REG_UBRR0L  0xC4
+#define REG_UBRR0H  0xC5
+#define REG_UDR0    0xC6
 
 // Interrupt vectors (ATmega328P)
 enum AvrVector {
@@ -210,6 +216,16 @@ typedef struct AvrCore {
     // Callback for I/O writes (peripherals)
     void (*io_write_cb)(struct AvrCore *avr, uint16_t addr, uint8_t val);
     void *io_write_data;
+
+    // Contents of data[addr] just before the current io_write_cb call.
+    // avr_write_data() stores the new byte first so that registers with no
+    // special behaviour need no code in the callback, but that means the
+    // callback cannot otherwise see what it is overwriting - and two families
+    // of register genuinely need the old value: read-only status bits
+    // (UDRE0/RXC0 in UCSR0A, which Arduino's init clears with a whole-register
+    // write that silicon ignores) and write-1-to-clear flags (TIFR0/1/2, where
+    // the right result is old & ~val, not the 0 that val & ~val produces).
+    uint8_t io_prev;
     
     // Callback for UART transmit
     void (*uart_tx_cb)(struct AvrCore *avr, uint8_t val);
@@ -243,8 +259,10 @@ static inline uint8_t avr_read_data(AvrCore *avr, uint16_t addr) {
 
 // Write data memory
 static inline void avr_write_data(AvrCore *avr, uint16_t addr, uint8_t val) {
-    if (addr < AVR_DATA_SIZE)
+    if (addr < AVR_DATA_SIZE) {
+        avr->io_prev = avr->data[addr];
         avr->data[addr] = val;
+    }
 
     if (addr == REG_SREG) { avr->sreg = val; return; }
     if (addr == REG_SPH)  { avr->sp = (avr->sp & 0x00FF) | ((uint16_t)val << 8); return; }

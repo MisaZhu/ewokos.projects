@@ -444,11 +444,6 @@ int Simulator::simuRateChanged(int rate)
         BaseProcessor::self()->setSteps(mcuSteps);
         m_mcuStepNS = 1000 / McuComponent::self()->freq();
         m_runMcu    = true;
-        qDebug() << "MCU: enabled - freq=" << McuComponent::self()->freq()
-                 << "stepsPerus=" << m_stepsPerus << "mcuSteps=" << mcuSteps;
-    } else {
-        qDebug() << "MCU: BaseProcessor::self() is NULL at simuRateChanged -"
-                    " MCU will NOT run (no processor created yet)";
     }
 
     m_timerTick = 50 / m_timerSc;

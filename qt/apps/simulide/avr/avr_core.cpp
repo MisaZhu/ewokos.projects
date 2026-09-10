@@ -144,7 +144,7 @@ static inline uint32_t pc_mask(AvrCore *avr) { return (avr->flash_size / 2) - 1;
 static inline bool instr_is_long(uint16_t instr) {
     if ((instr & 0xFE0F) == 0x9000) return true;   // LDS Rd,k
     if ((instr & 0xFE0F) == 0x9200) return true;   // STS k,Rr
-    if ((instr & 0xFE0E) == 0x940C) return true;   // JMP k / CALL k
+    if ((instr & 0xFF0C) == 0x940C) return true;   // JMP k / CALL k
     return false;
 }
 
@@ -501,13 +501,13 @@ static int exec_instr(AvrCore *avr, uint16_t instr) {
         avr->pc = REG16(30) & pc_mask(avr);
         return 2;
     }
-    else if (instr == 0x940D) {                             // ICALL
+    else if (instr == 0x9509) {                             // ICALL
         PUSH16(avr->pc);
         avr->pc = REG16(30) & pc_mask(avr);
         return 3;
     }
     /* ---- JMP / CALL (two words).  bit1 tells them apart, bit0 is k16. ---- */
-    else if ((instr & 0xFE0E) == 0x940C) {
+    else if ((instr & 0xFF0C) == 0x940C) {
         uint32_t addr = ((uint32_t)(instr & 0x01F0) << 13)
                       | ((uint32_t)(instr & 0x0001) << 16)
                       | NEXT_WORD();
