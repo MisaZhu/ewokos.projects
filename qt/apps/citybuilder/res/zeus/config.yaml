@@ -1,0 +1,377 @@
+
+graphics:
+    tileHeight: 30
+
+buildings:
+    armory:
+        type: industrial
+        title: Armory
+        size: 2
+        rawMaterial: bronze
+        production: armor
+        productionInterval: 60
+        workers: 18
+    college:
+        type: school
+        title: College
+        size: 3
+        studentCharacter: philosopher
+        targetLaboratory: podium
+        workers: 12
+    foundry:
+        type: producer
+        title: Foundry
+        size: 2
+        rawMaterialItem: copper
+        producedItem: bronze
+        productionInterval: 10
+        minerCharacter: copperMiner
+        workers: 15
+    fountain:
+        type: sanity
+        title: Fountain
+        size: 2
+        walkerCharacter: waterBearer
+        walkerGenerationInterval: 8
+        workers: 4
+    granary:
+        type: storage
+        title: Granary
+        size: 4
+        items: [ carrots, cheese, fish, meat, onions, urchin, wheat ]
+        workers: 18
+    gymnasium:
+        type: school
+        title: Gymnasium
+        size: 3
+        studentCharacter: competitor
+        targetLaboratory: stadium
+        workers: 7
+    house:
+        type: house
+        title: House
+        size: 2
+        populationPerImmigrant: 4
+        populationCapacity: 8
+    infirmary:
+        type: sanity
+        title: Infirmary
+        size: 4
+        walkerCharacter: healer
+        walkerGenerationInterval: 8
+        workers: 11
+    maintenance:
+        type: sanity
+        title: Maintenance Office
+        size: 2
+        walkerCharacter: superintendent
+        walkerGenerationInterval: 1
+        workers: 5
+    mapEntryPoint:
+        type: mapEntryPoint
+        title: Map Entry Point
+        size: 1
+    masonryShop:
+        type: producer
+        title: Masonry Shop
+        size: 2
+        rawMaterialItem: quarry
+        producedItem: marble
+        productionInterval: 120
+        minerCharacter: stonecutter
+        maxSimultaneousMiners: 1
+        miningQuantity: 8
+        rawMaterialQuantityToProduce: 1
+        maxStoredRawMaterialQuantity: 8
+        workers: 15
+    mint:
+        type: producer
+        title: Mint
+        size: 2
+        rawMaterialItem: silver
+        producedItem: wood # NOT the good value. For testing only.
+        productionInterval: 10
+        minerCharacter: silverMiner
+        rawMaterialQuantityToProduce: 200
+        workers: 15
+    podium:
+        type: laboratory
+        title: Podium
+        size: 2
+        acceptedStudent: philosopher
+        workers: 4
+    road:
+        type: road
+        title: Road
+        size: 1
+    stadium:
+        type: laboratory
+        title: Stadium
+        area:
+            west:
+              - position: { x: 0, y: 0 }
+                size: 5
+              - position: { x: 5, y: 0 }
+                size: 5
+            south:
+              - position: { x: 0, y: 0 }
+                size: 5
+              - position: { x: 0, y: 5 }
+                size: 5
+        acceptedStudent: competitor
+        workers: 45
+    storehouse:
+        type: storage
+        title: Storehouse
+        area:
+          - position: { x: 2, y: 0 }
+            size: 1
+          - position: { x: 2, y: 1 }
+            size: 1
+          - position: { x: 2, y: 2 }
+            size: 1
+          - position: { x: 1, y: 0 }
+            size: 1
+          - position: { x: 1, y: 1 }
+            size: 1
+          - position: { x: 1, y: 2 }
+            size: 1
+          - position: { x: 0, y: 0 }
+            size: 1
+          - position: { x: 0, y: 1 }
+            size: 1
+          - position: { x: 0, y: 2 }
+            size: 1
+        items:
+          - armor
+          - bronze
+          - fleece
+          - grapes
+          - marble
+          - oliveOil
+          - olives
+          - sculpture
+          - wheat
+          - wine
+          - wood
+        workers: 12
+    taxOffice:
+        type: sanity
+        title: Tax Office
+        size: 2
+        walkerCharacter: clerk
+        walkerGenerationInterval: 8
+        workers: 8
+    timberMill:
+        type: producer
+        title: Timber Mill
+        size: 2
+        rawMaterialItem: wood
+        producedItem: wood
+        productionInterval: 2
+        minerCharacter: lumberjack
+        workers: 12
+    watchpost:
+        type: sanity
+        title: Watchpost
+        size: 2
+        walkerCharacter: watchman
+        walkerGenerationInterval: 8
+        workers: 6
+    wheatFarm:
+        type: farm
+        title: Wheat farm
+        size: 3
+        producedItem: wheat
+        harvestMonth: 7
+        workers: 10
+
+characters:
+    athlete:
+        title: Athlete
+        speed: 2.0
+        wanderingCredits: 34
+    clerk:
+        title: Clerk
+        speed: 2.0
+        wanderingCredits: 34
+    competitor:
+        title: Competitor
+        speed: 2.0
+        wanderingCredits: 34
+    copperMiner:
+        title: Copper miner
+        speed: 2.0
+        actionInterval: 20
+    deliveryMan:
+        title: Delivery man
+        speed: 2.0
+    healer:
+        title: Healer
+        speed: 2.0
+        wanderingCredits: 26
+    immigrant:
+        title: Immigrant
+        speed: 2.0
+    lumberjack:
+        title: Lumberjack
+        speed: 2.0
+        actionInterval: 12
+    philosopher:
+        title: Philosopher
+        speed: 2.0
+        wanderingCredits: 34
+    silverMiner:
+        title: Silver miner
+        speed: 2.0
+        actionInterval: 20
+    stonecutter:
+        title: Stonecutter
+        speed: 2.0
+        actionInterval: 40
+    superintendent:
+        title: Superintendent
+        speed: 2.0
+        wanderingCredits: 43
+    watchman:
+        title: Watchman
+        speed: 2.0
+        wanderingCredits: 43
+    waterBearer:
+        title: Water bearer
+        speed: 2.0
+        wanderingCredits: 26
+
+items:
+    armor:
+        title: Armor
+    bronze:
+        title: Bronze
+    carrots:
+        title: Carrots
+    cheese:
+        title: Cheese
+    fish:
+        title: Fish
+    fleece:
+        title: Fleece
+    grapes:
+        title: Grapes
+    marble:
+        title: Marble
+    meat:
+        title: Meat
+    oliveOil:
+        title: Olive oil
+    olives:
+        title: Olives
+    onions:
+        title: Onions
+    sculpture:
+        title: Sculpture
+    urchin:
+        title: Urchin
+    wheat:
+        title: Wheat
+    wine:
+        title: Wine
+    wood:
+        title: Wood
+
+natureElements:
+    copper:
+        title: Copper
+        traversable: false
+    grass:
+        title: Grass
+        traversable: true
+    quarry:
+        title: Quarry
+        traversable: true
+    silver:
+        title: Silver
+        traversable: false
+    wood:
+        title: Wood
+        traversable: true
+
+controlPanel:
+    content:
+      - title: Population
+        type: panel
+        content:
+          - title: Common Housing
+            type: button
+            building: house
+      - title: Husbandry
+        type: panel
+        content:
+          - title: Wheat farm
+            type: button
+            building: wheatFarm
+      - title: Industry
+        type: panel
+        content:
+          - title: Timber Mill
+            type: button
+            building: timberMill
+          - title: Foundry
+            type: button
+            building: foundry
+          - title: Mint
+            type: button
+            building: mint
+          - title: Masonry Shop
+            type: button
+            building: masonryShop
+          - title: Armory
+            type: button
+            building: armory
+      - title: Storage
+        type: panel
+        content:
+          - title: Granary
+            type: button
+            building: granary
+          - title: Storehouse
+            type: button
+            building: storehouse
+      - title: Hygiene/Safety
+        type: panel
+        content:
+          - title: Maintenance Office
+            type: button
+            building: maintenance
+          - title: Infirmary
+            type: button
+            building: infirmary
+          - title: Fountain
+            type: button
+            building: fountain
+          - title: Watchpost
+            type: button
+            building: watchpost
+      - title: Administration
+        type: panel
+        content:
+          - title: Tax Office
+            type: button
+            building: taxOffice
+      - title: Culture
+        type: panel
+        content:
+          - title: Gymnasium
+            type: button
+            building: gymnasium
+          - title: Stadium
+            type: button
+            building: stadium
+          - title: College
+            type: button
+            building: college
+          - title: Podium
+            type: button
+            building: podium
+      - title: Road
+        type: button
+        building: road

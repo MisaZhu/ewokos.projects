@@ -9,6 +9,7 @@
 #include <QtGui/qguiapplication.h>
 #include <QtGui/qpainter.h>
 #include <QtGui/qstylehints.h>
+#include <QtGui/qsurfaceformat.h>
 
 #include <mouse/mouse.h>
 
@@ -102,6 +103,71 @@ static int ewokosDoubleClickInterval()
 }
 
 /*
+ * Premultiplied to straight alpha.
+ *
+ * Qt paints m_surface as Format_ARGB32, which is premultiplied: every channel
+ * is already scaled by its own alpha.  xwin's compositor blends with straight
+ * alpha - graph_blt_alpha hands the raw RGB and the raw alpha byte to
+ * graph_blend_argb, which does dst*(255-a)/255 + src*a/255.  Feeding it
+ * premultiplied pixels darkens everything that is not fully opaque, most
+ * visibly the anti-aliased edge of every glyph.
+ *
+ * The conversion is a divide per channel, so it goes through 255*65536/a as a
+ * multiply and a shift instead.  Index 0 is never read: a fully transparent
+ * pixel returns before the table is consulted.
+ */
+struct EwokInverseAlpha
+{
+    uint32_t v[256];
+    EwokInverseAlpha()
+    {
+        v[0] = 0;
+        for (int a = 1; a < 256; ++a)
+            v[a] = ((255u << 16) + (uint32_t)a / 2) / (uint32_t)a;
+    }
+};
+
+static const EwokInverseAlpha &ewokInverseAlpha()
+{
+    static const EwokInverseAlpha table;
+    return table;
+}
+
+/* One premultiplied ARGB32 pixel to one straight-alpha ARGB32 pixel, with the
+   window-wide opacity folded in.  `factor` is that opacity as 0..256 fixed
+   point, so 256 means "leave the alpha alone" and the pass costs nothing but
+   the un-premultiply.
+
+   Clamping each channel to its own alpha before the multiply is both what
+   premultiplied means and what bounds it: a <= 255 gives k <= 255<<16, so the
+   product stays inside 32 bits. */
+static inline uint32_t ewokStraightAlpha(QRgb p, uint32_t factor)
+{
+    const uint32_t a = qAlpha(p);
+    if (a == 0)
+        return 0;
+
+    const uint32_t na = (a * factor) >> 8;
+    if (na == 0)
+        return 0;
+    /* Fully opaque: nothing to un-premultiply, and na == a when factor is 256,
+       so this is the identity for the pixels that make up most of a window. */
+    if (a == 255)
+        return (na << 24) | (p & 0x00ffffffu);
+
+    const uint32_t k = ewokInverseAlpha().v[a];
+    uint32_t r = qRed(p);
+    uint32_t g = qGreen(p);
+    uint32_t b = qBlue(p);
+    if (r > a) r = a;
+    if (g > a) g = a;
+    if (b > a) b = a;
+    return (na << 24) | (((r * k) >> 16) << 16)
+                    | (((g * k) >> 16) << 8)
+                    | ((b * k) >> 16);
+}
+
+/*
  * Qt window flags to an xwin style mask.
  *
  * xwin's decoration model is coarser than Qt's: there is a frame, there is a
@@ -145,6 +211,8 @@ EwokosWindow::EwokosWindow(QWindow *window)
     , m_xwin(nullptr)
     , m_closing(false)
     , m_exposed(false)
+    , m_opacityFactor(256)
+    , m_alpha(false)
     , m_buttons(Qt::NoButton)
     , m_modifiers(Qt::NoModifier)
     , m_lastPressTime(0)
@@ -237,6 +305,13 @@ void EwokosWindow::initialize()
     if (x->main_win == m_xwin)
         x_set_app_name(x, getenv("X_APP_NAME"));
 
+    /* Before the first present, so the compositor never blits a frame of this
+       window as opaque and then has to be told otherwise.  xwin_open() has just
+       zeroed xinfo, and a fresh window has no cached blend on the display to
+       invalidate, so this is the cheap case - the flag is simply right from the
+       start. */
+    updateAlpha();
+
     resurface(rect.size());
 
     /* The server is the authority on geometry from here on: xwin_open() clamps
@@ -315,6 +390,10 @@ void EwokosWindow::teardown()
     m_dirty = QRegion();
     m_exposed = false;
     m_buttons = Qt::NoButton;
+    /* The xwin that carried these is gone; a later initialize() opens one whose
+       xinfo starts zeroed again. */
+    m_alpha = false;
+    m_opacityFactor = 256;
 }
 
 QRect EwokosWindow::serverGeometry() const
@@ -429,6 +508,32 @@ void EwokosWindow::setWindowState(Qt::WindowStates state)
        "unmaximize" for a client to issue. */
 }
 
+void EwokosWindow::setOpacity(qreal level)
+{
+    Q_UNUSED(level);
+    /* QWindow::setOpacity() stores the value on itself before calling down
+       here, so updateAlpha() reads it back off the QWindow.  Reading it rather
+       than taking the argument is what also covers an opacity that was set
+       before this platform window existed - see updateAlpha(). */
+    updateAlpha();
+
+    /* The factor is applied while copying m_surface into the canvas, so the
+       frame already on screen is stale even though Qt's backing store did not
+       change and no repaint is coming.  Mark everything and push one out;
+       xwin_repaint() calls repaintThunk(), which is the only reader of both. */
+    if (m_xwin && !m_surface.isNull()) {
+        m_dirty = QRegion(0, 0, m_surface.width(), m_surface.height());
+        present();
+    }
+}
+
+QSurfaceFormat EwokosWindow::format() const
+{
+    /* QPlatformWindow's own returns QSurfaceFormat(), i.e. alphaBufferSize -1.
+       See the header for why that made WA_TranslucentBackground undetectable. */
+    return window() ? window()->requestedFormat() : QSurfaceFormat();
+}
+
 void EwokosWindow::propagateSizeHints()
 {
     /* xwin has no size-hints protocol: no minimum, maximum, base size or resize
@@ -520,10 +625,52 @@ void EwokosWindow::setDirtyRegion(const QRegion &region)
     m_dirty += region;
 }
 
+void EwokosWindow::updateAlpha()
+{
+    if (!m_xwin || !m_xwin->xinfo || !window())
+        return;
+
+    /* Both halves are re-derived rather than tracked from the calls that change
+       them.  The format half has no notification to track at all: QWidget turns
+       WA_TranslucentBackground into alphaBufferSize 8 on the QWindow's format
+       (QWidgetPrivate::create) and updateIsTranslucent() can move it later,
+       neither of which reaches a QPlatformWindow.  It reads a value worth
+       looking at only because format() above forwards the request instead of
+       inheriting QPlatformWindow's empty default.  The opacity half does have
+       setOpacity(), but only once this object exists - see the header. */
+    const qreal level = qBound(qreal(0), window()->opacity(), qreal(1));
+    m_opacityFactor = qBound(0, qRound(level * 256.0), 256);
+
+    /* An opacity below 1 needs the same server-side blend as per-pixel alpha:
+       it is applied by scaling the alpha byte in repaintInto(), and the
+       compositor only honors that byte on a window it was told about. */
+    const bool want = level < 1.0 || window()->format().alphaBufferSize() > 0;
+    if (want == m_alpha)
+        return;
+    m_alpha = want;
+
+    /* xwin_set_alpha() publishes the flag and, on a real change, asks the server
+       to refresh the display.  That refresh is not optional: the compositor
+       caches whether this window's picture already sits blended on the display
+       and, with the cache warm, copies only the fully opaque pixels - so a
+       window that turns translucent mid-life would keep showing the opaque blit
+       it got before.  A window that is still being created has no such cache
+       yet, which is why the initialize() call costs nothing. */
+    xwin_set_alpha(m_xwin, want);
+}
+
 void EwokosWindow::present()
 {
     if (!m_xwin || !m_xwin->xinfo)
         return;
+
+    /* Before the publish and outside it: this can turn into an UPDATE_INFO
+       round trip, and xwin_repaint() holds painting_lock across the whole
+       frame.  Cheap no-op on the overwhelming majority of frames - it only
+       reaches the server when the application actually changed its mind about
+       being translucent. */
+    updateAlpha();
+
     /* This is the publish, and it blocks: xwin_repaint() takes painting_lock,
        marks the canvas mid-frame, calls repaintThunk() to copy our surface in,
        then hands the frame to the server and waits until the compositor has
@@ -580,14 +727,28 @@ void EwokosWindow::repaintInto(graph_t *g)
        const QRect * into the region's rectangle array.  Iterating is also what
        keeps the cost proportional to the dirty area, which for a typical expose
        is a handful of rectangles. */
+    const uint32_t factor = (uint32_t)m_opacityFactor;
     for (const QRect &r : region) {
         for (int y = r.top(); y <= r.bottom(); ++y) {
             /* constScanLine() accounts for the surface's bytesPerLine; the
-               canvas is tightly packed at g->w pixels per row.  Both are
-               ARGB32, so a row is a memcpy and needs no conversion. */
+               canvas is tightly packed at g->w pixels per row. */
             const QRgb *src = reinterpret_cast<const QRgb *>(m_surface.constScanLine(y)) + r.left();
             uint32_t *dst = g->buffer + (size_t)y * (size_t)g->w + (size_t)r.left();
-            memcpy(dst, src, (size_t)r.width() * sizeof(uint32_t));
+
+            /* An opaque window's surface is byte-identical to the canvas - both
+               are 0xAARRGGBB words and the compositor ignores the alpha byte -
+               so a row is a memcpy.  A translucent one needs the conversion, and
+               skipping it when the compositor is going to blit opaquely anyway
+               is what keeps every non-translucent window in the tree on the fast
+               path.  m_alpha rather than xinfo->alpha because updateAlpha() is
+               the only writer of both and present() has just run it. */
+            if (!m_alpha) {
+                memcpy(dst, src, (size_t)r.width() * sizeof(uint32_t));
+                continue;
+            }
+            const int n = r.width();
+            for (int i = 0; i < n; ++i)
+                dst[i] = ewokStraightAlpha(src[i], factor);
         }
     }
 

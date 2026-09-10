@@ -1,0 +1,201 @@
+character:
+    east:
+      - file: east/1.png
+        position: { x: 15, y: -16 }
+      - file: east/2.png
+        position: { x: 16, y: -16 }
+      - file: east/3.png
+        position: { x: 17, y: -16 }
+      - file: east/4.png
+        position: { x: 20, y: -16 }
+      - file: east/5.png
+        position: { x: 22, y: -16 }
+      - file: east/6.png
+        position: { x: 22, y: -16 }
+      - file: east/7.png
+        position: { x: 20, y: -15 }
+      - file: east/8.png
+        position: { x: 20, y: -16 }
+      - file: east/9.png
+        position: { x: 21, y: -16 }
+      - file: east/10.png
+        position: { x: 20, y: -16 }
+      - file: east/11.png
+        position: { x: 17, y: -16 }
+      - file: east/12.png
+        position: { x: 16, y: -16 }
+    right:
+      - file: right/1.png
+        position: { x: 19, y: -15 }
+      - file: right/2.png
+        position: { x: 19, y: -15 }
+      - file: right/3.png
+        position: { x: 19, y: -15 }
+      - file: right/4.png
+        position: { x: 20, y: -15 }
+      - file: right/5.png
+        position: { x: 17, y: -15 }
+      - file: right/6.png
+        position: { x: 14, y: -15 }
+      - file: right/7.png
+        position: { x: 13, y: -14 }
+      - file: right/8.png
+        position: { x: 14, y: -15 }
+      - file: right/9.png
+        position: { x: 17, y: -15 }
+      - file: right/10.png
+        position: { x: 22, y: -15 }
+      - file: right/11.png
+        position: { x: 22, y: -15 }
+      - file: right/12.png
+        position: { x: 20, y: -15 }
+    south:
+      - file: south/1.png
+        position: { x: 21, y: -15 }
+      - file: south/2.png
+        position: { x: 20, y: -15 }
+      - file: south/3.png
+        position: { x: 20, y: -15 }
+      - file: south/4.png
+        position: { x: 18, y: -15 }
+      - file: south/5.png
+        position: { x: 16, y: -14 }
+      - file: south/6.png
+        position: { x: 14, y: -14 }
+      - file: south/7.png
+        position: { x: 13, y: -14 }
+      - file: south/8.png
+        position: { x: 14, y: -14 }
+      - file: south/9.png
+        position: { x: 16, y: -14 }
+      - file: south/10.png
+        position: { x: 18, y: -15 }
+      - file: south/11.png
+        position: { x: 21, y: -15 }
+      - file: south/12.png
+        position: { x: 21, y: -15 }
+    bottom:
+      - file: bottom/1.png
+        position: { x: 19, y: -14 }
+      - file: bottom/2.png
+        position: { x: 19, y: -14 }
+      - file: bottom/3.png
+        position: { x: 18, y: -15 }
+      - file: bottom/4.png
+        position: { x: 18, y: -15 }
+      - file: bottom/5.png
+        position: { x: 18, y: -15 }
+      - file: bottom/6.png
+        position: { x: 18, y: -15 }
+      - file: bottom/7.png
+        position: { x: 18, y: -14 }
+      - file: bottom/8.png
+        position: { x: 18, y: -15 }
+      - file: bottom/9.png
+        position: { x: 18, y: -15 }
+      - file: bottom/10.png
+        position: { x: 18, y: -15 }
+      - file: bottom/11.png
+        position: { x: 18, y: -15 }
+      - file: bottom/12.png
+        position: { x: 19, y: -14 }
+    west:
+      - file: west/1.png
+        position: { x: 23, y: -15 }
+      - file: west/2.png
+        position: { x: 24, y: -15 }
+      - file: west/3.png
+        position: { x: 26, y: -15 }
+      - file: west/4.png
+        position: { x: 24, y: -15 }
+      - file: west/5.png
+        position: { x: 23, y: -14 }
+      - file: west/6.png
+        position: { x: 23, y: -14 }
+      - file: west/7.png
+        position: { x: 23, y: -14 }
+      - file: west/8.png
+        position: { x: 23, y: -14 }
+      - file: west/9.png
+        position: { x: 23, y: -14 }
+      - file: west/10.png
+        position: { x: 24, y: -15 }
+      - file: west/11.png
+        position: { x: 26, y: -15 }
+      - file: west/12.png
+        position: { x: 25, y: -15 }
+    left:
+      - file: left/1.png
+        position: { x: 21, y: -15 }
+      - file: left/2.png
+        position: { x: 21, y: -15 }
+      - file: left/3.png
+        position: { x: 24, y: -15 }
+      - file: left/4.png
+        position: { x: 27, y: -15 }
+      - file: left/5.png
+        position: { x: 24, y: -15 }
+      - file: left/6.png
+        position: { x: 22, y: -15 }
+      - file: left/7.png
+        position: { x: 21, y: -14 }
+      - file: left/8.png
+        position: { x: 21, y: -15 }
+      - file: left/9.png
+        position: { x: 23, y: -15 }
+      - file: left/10.png
+        position: { x: 26, y: -15 }
+      - file: left/11.png
+        position: { x: 24, y: -15 }
+      - file: left/12.png
+        position: { x: 21, y: -15 }
+    north:
+      - file: north/1.png
+        position: { x: 22, y: -16 }
+      - file: north/2.png
+        position: { x: 22, y: -16 }
+      - file: north/3.png
+        position: { x: 22, y: -16 }
+      - file: north/4.png
+        position: { x: 24, y: -16 }
+      - file: north/5.png
+        position: { x: 26, y: -16 }
+      - file: north/6.png
+        position: { x: 26, y: -16 }
+      - file: north/7.png
+        position: { x: 23, y: -15 }
+      - file: north/8.png
+        position: { x: 24, y: -16 }
+      - file: north/9.png
+        position: { x: 25, y: -16 }
+      - file: north/10.png
+        position: { x: 24, y: -16 }
+      - file: north/11.png
+        position: { x: 22, y: -16 }
+      - file: north/12.png
+        position: { x: 22, y: -16 }
+    top:
+      - file: top/1.png
+        position: { x: 19, y: -16 }
+      - file: top/2.png
+        position: { x: 19, y: -16 }
+      - file: top/3.png
+        position: { x: 19, y: -16 }
+      - file: top/4.png
+        position: { x: 19, y: -17 }
+      - file: top/5.png
+        position: { x: 19, y: -16 }
+      - file: top/6.png
+        position: { x: 20, y: -16 }
+      - file: top/7.png
+        position: { x: 20, y: -16 }
+      - file: top/8.png
+        position: { x: 20, y: -16 }
+      - file: top/9.png
+        position: { x: 18, y: -16 }
+      - file: top/10.png
+        position: { x: 18, y: -17 }
+      - file: top/11.png
+        position: { x: 18, y: -16 }
+      - file: top/12.png
+        position: { x: 19, y: -16 }

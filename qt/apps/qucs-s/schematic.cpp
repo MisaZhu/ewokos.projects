@@ -241,6 +241,18 @@ static QString stripBrackets(const QString &line)
     return s.trimmed();
 }
 
+// The name of a line's tag, for both `<Components>` and `</Rect 1 2>`.  The
+// section tags stand alone on their line, so slicing off only the leading '<'
+// would leave the closing '>' stuck to the name and never compare equal; drop
+// the whole bracket pair first, then take the first word.
+static QString tagName(const QString &line)
+{
+    QString body = stripBrackets(line);
+    if (body.startsWith(QLatin1Char('/')))
+        body.remove(0, 1);
+    return body.section(QLatin1Char(' '), 0, 0);
+}
+
 static int fieldInt(const QStringList &f, int i, int def = 0)
 {
     if (i >= f.size())
@@ -350,7 +362,7 @@ bool Schematic::load(const QString &path, QString *error)
             continue;
 
         if (line.startsWith(QLatin1Char('<')) && !line.startsWith(QLatin1String("</"))) {
-            const QString tag = line.mid(1).section(QLatin1Char(' '), 0, 0);
+            const QString tag = tagName(line);
             if (tag == QLatin1String("Components")) { section = InComponents; continue; }
             if (tag == QLatin1String("Wires"))      { section = InWires; continue; }
             if (tag == QLatin1String("Diagrams"))   { section = InDiagrams; continue; }
@@ -374,7 +386,7 @@ bool Schematic::load(const QString &path, QString *error)
         }
 
         if (line.startsWith(QLatin1String("</"))) {
-            const QString tag = line.mid(2).section(QLatin1Char(' '), 0, 0);
+            const QString tag = tagName(line);
             if (tag == QLatin1String("Rect") || tag == QLatin1String("Tab")
                 || tag == QLatin1String("Polar")) {
                 diags.append(pending);

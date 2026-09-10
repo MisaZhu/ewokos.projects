@@ -46,6 +46,27 @@ public:
     void setVisible(bool visible) override;
     void setWindowTitle(const QString &title) override;
     void setWindowState(Qt::WindowStates state) override;
+    void setOpacity(qreal level) override;
+
+    /* The format Qt asked for, which for this platform is also the format it
+       has.
+
+       QPlatformWindow::format() returns a default-constructed QSurfaceFormat,
+       whose alphaBufferSize is -1, and QWindow::format() forwards to it as soon
+       as a platform window exists.  QWidget meanwhile writes
+       WA_TranslucentBackground into QWindowPrivate::requestedFormat -
+       QWidgetPrivate::create_sys() before the window is created, and
+       updateIsTranslucent() on every later change.  So QWindow::format()
+       reported alpha both before creation and after it only if the QPA passed
+       the request through, and without this override it did not: the alpha bit
+       was invisible to anything downstream, updateAlpha() included, which is
+       what left a window translucent only through setWindowOpacity().
+
+       Nothing here resolves or negotiates a format - the surface is a plain
+       ARGB32 QImage - so requested is actual and passing it back is the truth.
+       It also makes QWindow::format() stop changing meaning across creation. */
+    QSurfaceFormat format() const override;
+
     void propagateSizeHints() override;
     void requestActivateWindow() override;
     void raise() override;
@@ -98,6 +119,26 @@ private:
     void repaintInto(graph_t *g);
     void resurface(const QSize &size);
 
+    /* Publishes the window's translucency to the server.
+
+       xwin_open() zeroes xinfo, so xinfo->alpha starts off and the compositor
+       blits every pixel of the canvas as opaque - whatever alpha Qt painted
+       into m_surface is simply discarded.  This is what turns that around: it
+       re-reads the two things that can ask for translucency (an alpha-capable
+       surface format, which is what QWidget's WA_TranslucentBackground ends up
+       as, and a window opacity below 1) and flips xinfo->alpha to match.  The
+       format half only reads a real value because format() above passes the
+       request through instead of inheriting the base's empty one.
+
+       Re-reading rather than being told is load-bearing for the opacity half:
+       QWidget::setWindowOpacity() before the window exists only lands in
+       QWindowPrivate::opacity, and QWindowPrivate::create() never replays it to
+       the platform window, so QPlatformWindow::setOpacity() is not called for
+       it.  initialize() is the only place that value can be picked up.  Called
+       again from present(), which is where a WA_TranslucentBackground set after
+       creation shows up. */
+    void updateAlpha();
+
     /* Closes and frees the xwin, drops every callback and clears the painting
        state.  Idempotent, and called from the destructor.
 
@@ -125,6 +166,14 @@ private:
     QRegion m_dirty;
     bool m_closing;
     bool m_exposed;
+
+    /* Translucency state, both halves of what updateAlpha() derives.  The
+       factor is the window-wide opacity as 0..256 fixed point, applied while
+       copying m_surface into the canvas; m_alpha mirrors xinfo->alpha and is
+       what keeps repaintInto() from converting pixels the server would then
+       blit as opaque anyway. */
+    int m_opacityFactor;
+    bool m_alpha;
 
     /* Mouse state the server does not carry: xwin reports one button per event
        and never a button mask, but QMouseEvent wants both. */

@@ -31,11 +31,16 @@ public:
     int depth() const override { return 32; }
 
     /* graph_t's buffer is uint32_t per pixel in ARGB order, which is exactly
-       QImage::Format_ARGB32 (0xAARRGGBB, non-premultiplied).  SDL's ewokos
-       backend picks SDL_PIXELFORMAT_ABGR8888 for the same buffer - that is the
-       same layout named by byte order instead of by word value.  Format_ARGB32
-       rather than _Premultiplied because xwin's compositor blends the window
-       surface with straight alpha (graph_blt_alpha), not premultiplied. */
+       QImage::Format_ARGB32 (0xAARRGGBB).  SDL's ewokos backend picks
+       SDL_PIXELFORMAT_ABGR8888 for the same buffer - that is the same layout
+       named by byte order instead of by word value.
+
+       Note that Format_ARGB32 is premultiplied in Qt, and _Premultiplied is the
+       same layout with the tag made explicit - so this is not a choice between
+       premultiplied and straight.  xwin's compositor blends a window surface
+       with straight alpha (graph_blt_alpha), and EwokosWindow::repaintInto() is
+       where the two are reconciled.  The scan-out this describes is opaque
+       anyway: the alpha byte of a desktop pixel is always 0xff. */
     QImage::Format format() const override { return QImage::Format_ARGB32; }
 
     qreal refreshRate() const override { return m_refreshRate; }

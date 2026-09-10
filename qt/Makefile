@@ -81,7 +81,7 @@ QT_LIB_NAMES = \
 	Qt5FontDatabaseSupport Qt5EventDispatcherSupport \
 	Qt5ThemeSupport Qt5AccessibilitySupport Qt5ServiceSupport \
 	Qt5DeviceDiscoverySupport Qt5EdidSupport Qt5FbSupport \
-	Qt5Core qtharfbuzz qtlibpng qtlibjpeg qtpcre2
+	Qt5Xml Qt5Core qtharfbuzz qtlibpng qtlibjpeg qtpcre2
 
 QT_SDK_LIBS = $(patsubst %,$(SDK_DIR)/lib/lib%.a,$(QT_LIB_NAMES))
 
@@ -166,12 +166,13 @@ SUB_DIRS = \
 	apps/freecad \
 	apps/qtmesheditor \
 	apps/notepadqq \
-	apps/qucs-s
+	apps/qucs-s \
+	apps/citybuilder
 
 ifeq ($(QT_MISSING),yes)
 # Skip rather than fail: the image simply ships without qtdemo and the apps,
 # and everything here self-enables the next build after build.sh has run.
-all sdk plugin demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s:
+all sdk plugin demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s citybuilder:
 	@echo "note: projects/qt skipped - Qt 5.15 tree not found ($(QT_BUILD_MOC) missing)."
 	@echo "      Run projects/qt/build.sh first to configure and build Qt."
 else
@@ -215,6 +216,9 @@ notepadqq: plugin
 qucs-s: plugin
 	@$(MAKE) -C apps/qucs-s
 
+citybuilder: plugin
+	@$(MAKE) -C apps/citybuilder
+
 endif
 
 # Header dependencies.  -MMD wrote them next to the objects; without this,
@@ -229,4 +233,4 @@ clean:
 	rm -rf $(QT5_INC) $(SDK_DIR)/qt5
 	@for dir in $(SUB_DIRS); do $(MAKE) -C $$dir clean; done
 
-.PHONY: all sdk plugin plugin-lib demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s clean
+.PHONY: all sdk plugin plugin-lib demo pcmanfm qterminal nomacs freecad qtmesheditor notepadqq qucs-s citybuilder clean

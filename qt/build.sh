@@ -99,12 +99,62 @@
 #                            path is one that would otherwise be selected by a
 #                            test that has never been run against this libc.
 #
-#      -no-feature-{network,sql,xml,testlib,concurrent,printer}
-#                            whole modules.  The plugin and both apps need
+#      -no-feature-{network,sql,testlib,concurrent,printer}
+#                            whole modules.  The plugin and the apps need
 #                            Core, Gui and Widgets plus the platformsupport
 #                            archives; these are build time and nothing else.
 #                            Each is a real feature name, which is what the
 #                            -no-feature- builtin validates against.
+#
+#      xml is deliberately NOT in that list, though it used to be.  QtXml is
+#                            three .cpp files sitting on top of QtCore -
+#                            dom/qdom.cpp, dom/qdomhelpers.cpp, sax/qxml.cpp -
+#                            and apps/simulide reads and writes every .simu
+#                            circuit through QDomDocument: 70 call sites across
+#                            circuit.cpp, subcircuit.cpp, chip.cpp and
+#                            componentselector.cpp.  Building the module is both
+#                            cheaper and more faithful than rewriting those onto
+#                            QXmlStreamReader.
+#
+#                            It costs the rest of the tree nothing.  QT_NO_XML
+#                            appears nowhere in qtbase's sources - grep it - so
+#                            switching the feature on changes no instruction in
+#                            any existing QtCore/QtGui/QtWidgets object; the only
+#                            C++-visible effect is that qconfig_p.h's
+#                            QT_FEATURE_xml goes from -1 to 1 and a generated
+#                            QtXml/qtxml-config.h appears.  (It does make make
+#                            rebuild everything that includes qglobal_p.h, which
+#                            is most of the tree - a one-off.)  And because the
+#                            link is static and grouped, an app that never
+#                            touches QDom pulls in none of libQt5Xml.a.
+#
+#      ... and dropping the flag is only half of it.  This snapshot's
+#                            configure.json had its "subconfigs" pruned to
+#                            corelib/gui/widgets; upstream 5.15.19 lists nine.
+#                            "src/xml" has to be put back.  Two different
+#                            configure.json files are involved and they do
+#                            different jobs:
+#
+#                              the top-level "xml" feature is a privateFeature.
+#                                It writes QT_FEATURE_xml into qconfig_p.h, and
+#                                that is what src.pro:179's qtConfig(xml) reads to
+#                                decide whether src/xml joins SUBDIRS.  Removing
+#                                -no-feature-xml gets you this far, and this far
+#                                only.
+#                              src/xml/configure.json holds the "dom" feature, a
+#                                publicFeature.  configure only walks a subconfig
+#                                that "subconfigs" names - qtConfProcessOutput in
+#                                mkspecs/features/qt_configure.prf is what writes
+#                                build/src/<module>/qt<module>-config.h, and it is
+#                                never reached for a module nobody listed.
+#
+#                            Leave it out and the failure is not "xml is off":
+#                            src.pro has already put the module in SUBDIRS, so
+#                            make enters src/xml, and qtxmlglobal.h:45 dies with
+#                            "QtXml/qtxml-config.h: No such file or directory" on
+#                            the first of the three compiles.  A configure-time
+#                            omission that surfaces as a build error two
+#                            directories away from its cause.
 #
 #      -no-{opengl,egl,eglfs,xcb,evdev,libinput,tslib,mtdev,linuxfb,kms,gbm,
 #           vulkan,directfb,fontconfig,xkbcommon,openvg,angle}
@@ -333,7 +383,6 @@ else
             -no-dbus \
             -no-feature-network \
             -no-feature-sql \
-            -no-feature-xml \
             -no-feature-testlib \
             -no-feature-concurrent \
             -no-feature-printer \

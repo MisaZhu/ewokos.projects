@@ -10,6 +10,7 @@
     "subconfigs": [
         "src/corelib",
         "src/gui",
+        "src/xml",
         "src/widgets"
     ],
 

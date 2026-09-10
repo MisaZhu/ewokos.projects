@@ -68,6 +68,7 @@ QT_DEFS = \
 	-DQT_CORE_LIB \
 	-DQT_GUI_LIB \
 	-DQT_WIDGETS_LIB \
+	-DQT_XML_LIB \
 	-DQT_FONTDATABASE_SUPPORT_LIB
 
 # Four levels per module, and all four are needed:
@@ -89,7 +90,22 @@ QT_INCS = \
 	-I$(QT5_INC)/QtWidgets \
 	-I$(QT5_INC)/QtWidgets/$(QT_VER) \
 	-I$(QT5_INC)/QtWidgets/$(QT_VER)/QtWidgets \
+	-I$(QT5_INC)/QtXml \
 	-I$(QT5_INC)/QtFontDatabaseSupport/$(QT_VER)
+
+# QtXml gets one level, not four.  <QtXml/qtxmlglobal.h> and the generated
+# <QtXml/qtxml-config.h> already resolve through the bare qt5/ entry above;
+# qt5/QtXml/ is here for the class forwarders - <QDomDocument>, <QDomElement> -
+# which is all an app ever spells.  The two versioned levels are skipped because
+# nothing outside the Qt build itself includes <QtXml/private/...>: qdom_p.h and
+# qxml_p.h are consumed by qdom.cpp and qxml.cpp, which are compiled inside
+# qtbase-5.15, not here.  Adding them would be a path that can never be taken.
+#
+# QDom is in the shared list rather than simulide's own Makefile because it is
+# a module of the SDK like the other three, and an app that wants <QDomDocument>
+# should not have to rediscover the -I.  The link side is free for the same
+# reason: libQt5Xml.a is inside the --start-group below, so an app that never
+# references a QDom symbol pulls in none of its objects.
 
 # -Wextra and -pedantic are dropped for the same reason the mkspec drops them:
 # Qt 5.15's own private headers are not clean under them at this GCC version,
@@ -103,7 +119,7 @@ QT_LIBS = \
 	-lQt5FontDatabaseSupport -lQt5EventDispatcherSupport \
 	-lQt5ThemeSupport -lQt5AccessibilitySupport -lQt5ServiceSupport \
 	-lQt5DeviceDiscoverySupport -lQt5EdidSupport -lQt5FbSupport \
-	-lQt5Core -lqtharfbuzz -lqtlibpng -lqtlibjpeg -lqtpcre2
+	-lQt5Xml -lQt5Core -lqtharfbuzz -lqtlibpng -lqtlibjpeg -lqtpcre2
 
 # One group rather than a careful order: QtCore, QtGui, libx, libewoksys and
 # libc are mutually recursive (make.rule already spells the libc part as a
