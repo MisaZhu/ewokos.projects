@@ -55,9 +55,11 @@
 
 /* ===== TEMPORARY DIAGNOSTIC - submenu inoperability investigation ==========
  * Logs every event the popup QMenus receive, so the Qt side of the handoff can
- * be read next to the [QPA] and [XS] traces on the serial console.  Set to 0 to
- * compile out; remove once the defect is fixed. */
-#define EWOK_MENU_TRACE 1
+ * be read next to the [QPA] and [XS] traces on the serial console.  Set to 1 to
+ * compile it back in.  The defect this was chasing is fixed - the ewokos QPA now
+ * honours the popup mouse grab, so submenus get the redirected event stream and
+ * an outside press closes the whole cascade - so it stays off. */
+#define EWOK_MENU_TRACE 0
 #if EWOK_MENU_TRACE
 #include <QAction>
 #include <QEvent>

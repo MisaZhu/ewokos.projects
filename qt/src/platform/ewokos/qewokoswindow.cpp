@@ -18,11 +18,13 @@
 QT_BEGIN_NAMESPACE
 
 /* ===== TEMPORARY DIAGNOSTIC - menuprobe submenu investigation =============
- * Set EWOK_QPA_TRACE to 0 to compile all of it out.  Everything goes to stdout
- * so it interleaves with the probe application's own trace on the serial
+ * Set EWOK_QPA_TRACE to 1 to compile the tracing back in.  Everything goes to
+ * stdout so it interleaves with the probe application's own trace on the serial
  * console.  Not a permanent addition: the window list is an unbounded static
- * and the mouse trace is far too chatty for production. */
-#define EWOK_QPA_TRACE 1
+ * and the mouse trace is far too chatty for production.  The submenu breakage
+ * this was chasing is fixed - the platform now honours the popup mouse grab
+ * (see setMouseGrabEnabled) - so it stays off. */
+#define EWOK_QPA_TRACE 0
 #if EWOK_QPA_TRACE
 #include <QtCore/qlist.h>
 #include <stdarg.h>
@@ -482,6 +484,35 @@ bool EwokosWindow::setKeyboardGrabEnabled(bool grab)
        assume a grab-less platform and from warning on every single popup. */
     Q_UNUSED(grab);
     return true;
+}
+
+bool EwokosWindow::setMouseGrabEnabled(bool grab)
+{
+    /* xserverd does have a persistent pointer grab (XWIN_CNTL_GRAB_MOUSE, via
+       xwin_grab_mouse): while it is held the server routes every mouse event
+       to this window regardless of what the cursor is physically over, which
+       is exactly the pointer-grab semantics Qt's popup menus are built on.
+
+       QApplication grabs the mouse on the top-level popup when a menu opens
+       (grabForPopup -> stealMouseGrab -> here) and QWidgetWindow::handleMouseEvent
+       then redirects that raw global-coordinate stream to the topmost popup -
+       the open submenu - through mapFromGlobal, and QMenu::mousePressEvent closes
+       the whole cascade with hideUpToMenuBar() when a press lands outside it.
+
+       Returning false here (the QPlatformWindow default) is what broke second
+       level menus: popupGrabOk stayed false, so a submenu only received events
+       while the cursor happened to sit over its own window, the outside-click
+       dismiss and the replay path were skipped, and focus was left dangling when
+       the cascade closed.  The grab is per-window and released by this same
+       window when the last popup closes, so there is no state to track here.
+
+       The window is already visible when Qt arms the grab (show_sys() runs
+       before openPopup()), so xwin_grab_mouse() succeeds; its -1 - window gone,
+       or somehow not visible - is reported back as a failed grab rather than
+       claimed, so Qt does not assume routing that is not in effect. */
+    if (!m_xwin)
+        return false;
+    return xwin_grab_mouse(m_xwin, grab) == 0;
 }
 
 void EwokosWindow::setDirtyRegion(const QRegion &region)

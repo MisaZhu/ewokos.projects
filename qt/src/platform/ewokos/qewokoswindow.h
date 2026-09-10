@@ -53,6 +53,7 @@ public:
     WId winId() const override;
     bool isExposed() const override;
     bool setKeyboardGrabEnabled(bool grab) override;
+    bool setMouseGrabEnabled(bool grab) override;
 
     /* The xwin this window owns.  Null before initialize() and after teardown(). */
     xwin_t *xwin() const { return m_xwin; }

@@ -224,7 +224,7 @@ bool Chip::initChip()
         {
             xpos = CHIP_CELL*d.pos;
             ypos = -CHIP_CELL;
-            angle = 90;
+            angle = 270;
         }
         else if( d.side == QLatin1String( "right" ) )
         {
@@ -236,7 +236,7 @@ bool Chip::initChip()
         {
             xpos = CHIP_CELL*d.pos;
             ypos = CHIP_CELL*m_height + CHIP_CELL;
-            angle = 270;
+            angle = 90;
         }
 
         addChipPin( d.id, d.type, d.label, xpos, ypos, angle );
