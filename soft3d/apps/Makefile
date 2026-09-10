@@ -1,5 +1,5 @@
 
-DIRS = 3ddemo Fireworks matrix gears imgui_demo
+DIRS = 3ddemo Fireworks matrix gears # imgui_demo
 
 all: $(DIRS)
 
