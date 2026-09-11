@@ -5,7 +5,6 @@ DIRS = macemu \
 	doom \
 	cards \
 	mine \
-	browser \
 	qt
 #	previous video saver minivmac nx11
 
