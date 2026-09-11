@@ -140,6 +140,28 @@ QT_LDFLAGS = \
 	-lewoksys -lc -lgloss -lcxx \
 	-Wl,--end-group
 
+# -s drops .symtab/.strtab - and the little .debug_* that reaches here from
+# objects built with -g - from the finished executables.  Nothing in the system
+# looks at any of it: the kernel's loader works from program headers alone
+# (every macro in kernel/kernel/include/kernel/elf.h is an ELF_P* one, and the
+# shoff/shnum fields are there only to size the struct), the link is fully
+# static so there is no runtime symbol resolution to fail, -fno-exceptions means
+# nothing ever unwinds, and no debugger here attaches to a target's symbol
+# table.  What they do cost is transfer - on qterminal, 2.9MB of a 17.9MB file,
+# 16% of everything that has to come off the SD card before the first window is
+# up.
+#
+# Checked by relinking the same objects both ways: e_entry, both PT_LOAD program
+# headers and the whole data segment come out identical, and the loaded text
+# differs in seven bytes - e_shoff, e_shnum and e_shstrndx, the ELF header's
+# pointers at the section table being dropped.
+#
+# Gated on make.rule's existing DEBUG switch, which already decides -g vs -O2,
+# so "make DEBUG=yes" keeps the symbols for anyone who needs them.
+ifneq ($(DEBUG),yes)
+QT_LDFLAGS += -Wl,-s
+endif
+
 # SDK probe, evaluated at parse time.  moc is installed by the top-level
 # Makefile's sdk target, so it doubles as the "Qt SDK is installed" marker;
 # demo/ and apps/* skip themselves when it is absent instead of diving into

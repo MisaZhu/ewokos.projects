@@ -7,6 +7,8 @@
 #include <QtCore/qstring.h>
 #include <QtCore/qstringlist.h>
 
+#include "qewokosfontscan.h"
+
 QT_BEGIN_NAMESPACE
 
 /*
@@ -26,6 +28,10 @@ QT_BEGIN_NAMESPACE
  * answers "Helvetica" - which does not exist here and degrades to whichever
  * family the matcher happens to hit first.  xwin's theme already picks the UI
  * font; this override hands Qt the same one.
+ *
+ * Registration goes through ewokSfntPeek() first and only reaches the base
+ * class's addTTFile() when the peek declines a file; see qewokosfontscan.h for
+ * why, and registerScannedFont() for the two being kept in step.
  */
 class EwokosFontDatabase : public QFreeTypeFontDatabase
 {
@@ -36,6 +42,9 @@ public:
                                    QFont::StyleHint styleHint, QChar::Script script) const override;
 
 private:
+    QStringList registerFontFile(const QString &path);
+    QStringList registerScannedFont(const QString &path, const EwokFontMeta &meta);
+
     void resolveThemeFont(const QHash<QString, QStringList> &scanned);
 
     /* The family Qt registered for the xwin theme's font file, and the theme's

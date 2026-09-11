@@ -114,6 +114,7 @@ PLUGIN_SRCS = \
 	src/platform/ewokos/qewokoswindow.cpp \
 	src/platform/ewokos/qewokosbackingstore.cpp \
 	src/platform/ewokos/qewokosfontdatabase.cpp \
+	src/platform/ewokos/qewokosfontscan.cpp \
 	src/platform/ewokos/qewokosintegration.cpp \
 	src/platform/ewokos/qewokoseventdispatcher.cpp \
 	src/platform/ewokos/main.cpp

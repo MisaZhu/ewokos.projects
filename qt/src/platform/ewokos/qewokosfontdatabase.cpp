@@ -53,12 +53,11 @@ void EwokosFontDatabase::populateFontDatabase()
         }
         const QList<QFileInfo> files = dir.entryInfoList(filters, QDir::Files);
         for (int j = 0; j < files.size(); ++j) {
-            /* Empty fontData plus a path is the "load it from disk" form; that is
-               exactly how the base class registers the files it finds.  The
-               families come back too, which saves resolveThemeFont() a second
-               FreeType parse of the file the theme points at. */
+            /* The families come back from registration, which saves
+               resolveThemeFont() a second parse of the file the theme points
+               at. */
             const QString path = files.at(j).absoluteFilePath();
-            const QStringList families = addTTFile(QByteArray(), QFile::encodeName(path));
+            const QStringList families = registerFontFile(path);
             if (!families.isEmpty()) {
                 scanned.insert(path, families);
                 for (int k = 0; k < families.size(); ++k)
@@ -79,6 +78,137 @@ void EwokosFontDatabase::populateFontDatabase()
 
     resolveThemeFont(scanned);
     m_populated = true;
+}
+
+/* One file, registered.  The peek goes first because that is how nearly every
+   file here can be registered - 39 of the 40 in /usr/system/fonts - and it
+   reads 118 KB where FreeType reads 802 KB, over 290 reads instead of 1597,
+   to arrive at the same answer.  EwokOS's stdio is unbuffered, so those read
+   counts are also the number of IPC round trips to the filesystem server, and
+   they are all on the path to the first painted character.
+
+   What the peek declines, it declines because it cannot vouch for the file -
+   a collection, a variable font, a face carrying bitmaps, a table it will not
+   guess at - and the base class gets those.  The slow path stays the correct
+   one, just no longer the only one. */
+QStringList EwokosFontDatabase::registerFontFile(const QString &path)
+{
+    const QByteArray encoded = QFile::encodeName(path);
+    EwokFontMeta meta;
+    if (ewokSfntPeek(encoded.constData(), &meta))
+        return registerScannedFont(path, meta);
+
+    /* Empty fontData plus a path is the "load it from disk" form, and is
+       exactly how the base class registers the files its own scan finds. */
+    return addTTFile(QByteArray(), encoded);
+}
+
+/* The Qt half of a registration whose reading the peek already did.
+
+   Every branch here is the matching branch of addTTFile(), in the same order
+   and on the same conditions, with the FT_Face fields swapped for the
+   EwokFontMeta ones - including two quirks that are easier to copy than to
+   argue with.  writingSystems is assigned rather than extended, so the Symbol
+   bit the charmap scan found is discarded the moment there is an os2 table to
+   answer from.  And weight is set from the style flags and then replaced, not
+   refined, by usWeightClass or by panose[2].  Keeping this a transcription is
+   the point: the peek was checked against a real FT_New_Face() field by field
+   over every shipped font, and this is the half that has to stay put for that
+   check to still mean anything. */
+QStringList EwokosFontDatabase::registerScannedFont(const QString &path, const EwokFontMeta &meta)
+{
+    QFont::Style style = meta.italic ? QFont::StyleItalic : QFont::StyleNormal;
+    QFont::Weight weight = meta.bold ? QFont::Bold : QFont::Normal;
+
+    QSupportedWritingSystems writingSystems;
+    if (meta.symbol)
+        writingSystems.setSupported(QFontDatabase::Symbol);
+
+    QFont::Stretch stretch = QFont::Unstretched;
+    if (meta.hasOs2) {
+        quint32 unicodeRange[4] = {
+            quint32(meta.unicodeRange[0]),
+            quint32(meta.unicodeRange[1]),
+            quint32(meta.unicodeRange[2]),
+            quint32(meta.unicodeRange[3])
+        };
+        quint32 codePageRange[2] = {
+            quint32(meta.codePageRange[0]),
+            quint32(meta.codePageRange[1])
+        };
+
+        writingSystems = QPlatformFontDatabase::writingSystemsFromTrueTypeBits(unicodeRange, codePageRange);
+
+        if (meta.weightClass) {
+            weight = QPlatformFontDatabase::weightFromInteger(int(meta.weightClass));
+        } else if (meta.panose2) {
+            const int w = int(meta.panose2);
+            if (w <= 1)
+                weight = QFont::Thin;
+            else if (w <= 2)
+                weight = QFont::ExtraLight;
+            else if (w <= 3)
+                weight = QFont::Light;
+            else if (w <= 5)
+                weight = QFont::Normal;
+            else if (w <= 6)
+                weight = QFont::Medium;
+            else if (w <= 7)
+                weight = QFont::DemiBold;
+            else if (w <= 8)
+                weight = QFont::Bold;
+            else if (w <= 9)
+                weight = QFont::ExtraBold;
+            else if (w <= 10)
+                weight = QFont::Black;
+        }
+
+        switch (meta.widthClass) {
+        case 1:
+            stretch = QFont::UltraCondensed;
+            break;
+        case 2:
+            stretch = QFont::ExtraCondensed;
+            break;
+        case 3:
+            stretch = QFont::Condensed;
+            break;
+        case 4:
+            stretch = QFont::SemiCondensed;
+            break;
+        case 5:
+            stretch = QFont::Unstretched;
+            break;
+        case 6:
+            stretch = QFont::SemiExpanded;
+            break;
+        case 7:
+            stretch = QFont::Expanded;
+            break;
+        case 8:
+            stretch = QFont::ExtraExpanded;
+            break;
+        case 9:
+            stretch = QFont::UltraExpanded;
+            break;
+        }
+    }
+
+    /* The handle is nothing but a file name and a face index:
+       QFreeTypeFontDatabase::fontEngine() turns it back into a FaceId and
+       QFontEngineFT::create() opens the file then, on the first engine that
+       actually needs it.  Registering a font never reads its outlines, which
+       is what lets the peek stand in for FreeType here - and what makes the
+       fonts an application never uses cost nothing beyond the name. */
+    FontFile *fontFile = new FontFile;
+    fontFile->fileName = path;
+    fontFile->indexValue = 0;
+
+    const QString family = QString::fromLatin1(meta.family);
+    registerFont(family, QString::fromLatin1(meta.style), QString(), weight, style, stretch,
+                 true, true, 0, meta.fixedPitch, writingSystems, fontFile);
+
+    return QStringList() << family;
 }
 
 /* The xwin theme names the UI font ("font" in theme.json) and its size
@@ -106,7 +236,7 @@ void EwokosFontDatabase::resolveThemeFont(const QHash<QString, QStringList> &sca
            handle registered twice, so registering a file the scan already saw
            is harmless. */
         if (families.isEmpty() && QFileInfo::exists(path))
-            families = addTTFile(QByteArray(), QFile::encodeName(path));
+            families = registerFontFile(path);
         if (!families.isEmpty()) {
             m_themeFamily = families.first();
             m_themePixelSize = int(theme.fontSize);
