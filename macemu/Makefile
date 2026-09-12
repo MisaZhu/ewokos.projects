@@ -73,7 +73,7 @@ $(TASK): $(TASK_OBJS) \
 		$(BUILD_DIR)/lib/libwidget++.a \
 		$(BUILD_DIR)/lib/libcxx.a
 	mkdir -p $(TASK_DIR)
-	$(LD) -Ttext=100 $(TASK_OBJS) -o $(TASK_DIR)/$(TASK) $(LDFLAGS) $(EWOK_LIB_X) $(EWOK_LIB_GRAPH) $(EWOK_LIBC) -lcxx
+	$(LD) -Ttext=100 $(TASK_OBJS) -o $(TASK_DIR)/$(TASK) $(LDFLAGS) $(EWOK_LIB_X) -lsocket $(EWOK_LIB_GRAPH) $(EWOK_LIBC) -lcxx
 	# Clean copy: BSD cp nests into res/res when the target exists,
 	# and stale shipped images (e.g. an old uncompressed .dsk) must
 	# not survive next to the current ones
