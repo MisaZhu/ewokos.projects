@@ -1,3 +1,0 @@
-// QAudioOutput shim - redirects to the minimal audio stub.
-// See qaudiooutput_shim.h for what this provides and why.
-#include "qaudiooutput_shim.h"

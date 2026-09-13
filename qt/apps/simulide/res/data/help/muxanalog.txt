@@ -1,5 +1,0 @@
-Analog Multiplexer:
-
-To configure number of channels, set "Address Bits" property.
-N nChannels = 2^n
-

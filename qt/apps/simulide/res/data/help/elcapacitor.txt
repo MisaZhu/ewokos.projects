@@ -1,3 +1,0 @@
-Electrolytic Capacitor:
-
-This Capacitor will blink if polarity is wrong.

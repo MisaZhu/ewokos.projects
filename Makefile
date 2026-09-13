@@ -4,8 +4,7 @@ DIRS = macemu \
 	soft3d \
 	doom \
 	cards \
-	mine \
-	qt
+	mine
 #	previous video saver minivmac nx11
 
 # qt needs the Qt tree that projects/qt/build.sh produces; if it is missing for
