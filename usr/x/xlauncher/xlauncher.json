@@ -3,9 +3,9 @@
     "item_size": 64,
     "icon_size": 32,
     "apps": [
-        {"name":"pcmanfm-qt", "file": "/apps/pcmanfm-qt/pcmanfm-qt"},
+        {"name":"xfinder", "file": "/apps/xfinder/xfinder"},
         {"name":"xapps", "file": "/apps/xapps/xapps"},
-        {"name":"qterminal", "file": "/apps/qterminal/qterminal"},
+        {"name":"macemu", "file": "/apps/macemu/macemu"},
         {"name":"xcores", "file": "/apps/xcores/xcores"},
         {"name":"xwm_theme", "file": "/apps/xwm_theme/xwm_theme"}
     ]
