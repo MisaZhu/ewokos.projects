@@ -156,17 +156,17 @@ static void render_mesh() {
 
     mat4 view_mat, proj_mat, model_mat, mvp_mat, scale_mat;
 
-    // 摄像机围绕模型水平旋转（类似gears）
+    // Camera orbits the model horizontally (like gears)
     float cam_radius = 4.0f;
     float cam_x = sinf(camera_angle) * cam_radius;
     float cam_z = cosf(camera_angle) * cam_radius;
     float cam_y = 1.0f;
     
-    // 摄像机始终看向模型中心
+    // Camera always looks at the model center
     lookAt(view_mat, make_v3(cam_x, cam_y, cam_z), make_v3(0.0f, 0.0f, 0.0f), make_v3(0.0f, 1.0f, 0.0f));
     make_perspective_m4(proj_mat, DEG_TO_RAD(60.0f), win_width / (float)win_height, 0.1f, 100.0f);
 
-    // 模型不旋转，只缩放（模型中心已通过顶点数据偏移）
+    // The model does not rotate, only scales (the model center is already offset via the vertex data)
     scale_m4(scale_mat, 1.0f, 1.0f, 1.0f);
     memcpy(model_mat, scale_mat, sizeof(mat4));
 

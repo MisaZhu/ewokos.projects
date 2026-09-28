@@ -341,7 +341,7 @@ void draw_dotted_trail(float x0, float y0, float x1, float y1,
     float dot_spacing = 3.5f;
     int num_dots = (int)(dist / dot_spacing);
     if (num_dots < 1) num_dots = 1;
-    if (num_dots > 30) num_dots = 30; // 限制最大点数
+    if (num_dots > 30) num_dots = 30; // cap the max number of dots
     
     for (int i = 0; i <= num_dots; i++) {
         float t = (float)i / num_dots;
