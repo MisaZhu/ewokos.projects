@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <string.h>
+#include <sched.h>
 #include <ewoksys/proc.h>
 #include <ewoksys/kernel_tic.h>
 #include <ewoksys/keydef.h>
