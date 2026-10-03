@@ -12,7 +12,7 @@
  * The loop is a non-blocking poll: XCheckWindowEvent() -> GrGetTypedEvent()
  * calls GsSelect(GR_TIMEOUT_POLL) on every invocation, which runs the screen
  * driver PreSelect and therefore flushes and presents whatever was drawn on the
- * previous iteration.  proc_usleep() between polls yields the CPU.
+ * previous iteration.  usleep() between polls yields the CPU.
  *
  * Controls:  Button1 reveal / chord, Button3 (or Button2) flag, click the
  *            smiley to restart.  Keys 1/2/3 pick Beginner/Intermediate/Expert,
@@ -26,7 +26,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-#include <ewoksys/proc.h>		/* proc_usleep   */
+#include <ewoksys/proc.h>		/* usleep   */
 #include <ewoksys/kernel_tic.h>		/* kernel_tic_ms */
 
 #define TITLE		"Minesweeper (NX11)"
@@ -903,7 +903,7 @@ main(int argc, char **argv)
 		tick();
 		if (need_draw)
 			redraw();
-		proc_usleep(POLL_US);
+		usleep(POLL_US);
 	}
 
 	XFreeGC(dpy, gc);

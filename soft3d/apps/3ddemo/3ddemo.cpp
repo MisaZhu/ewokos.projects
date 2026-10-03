@@ -209,7 +209,7 @@ static void on_resize(xwin_t* xwin) {
 static void loop(void* p) {
     xwin_t* xwin = (xwin_t*)p;
     xwin_repaint(xwin);
-    proc_usleep(3000);
+    usleep(3000);
 }
 
 int main(int argc, char** argv) {

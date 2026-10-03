@@ -12,7 +12,7 @@
  * The loop is a non-blocking poll: XCheckWindowEvent() -> GrGetTypedEvent()
  * calls GsSelect(GR_TIMEOUT_POLL) on every invocation, which runs the screen
  * driver PreSelect and therefore flushes and presents whatever was drawn on
- * the previous iteration.  proc_usleep() between polls yields the CPU, so this
+ * the previous iteration.  usleep() between polls yields the CPU, so this
  * is not a busy spin.
  *
  * Controls:  Left/Right move, Down soft drop, Up/X rotate CW, Z rotate CCW,
@@ -26,7 +26,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-#include <ewoksys/proc.h>		/* proc_usleep   */
+#include <ewoksys/proc.h>		/* usleep   */
 #include <ewoksys/kernel_tic.h>		/* kernel_tic_ms */
 
 #define TITLE		"Tetris (NX11)"
@@ -691,7 +691,7 @@ main(int argc, char **argv)
 		tick();
 		if (need_draw)
 			redraw();
-		proc_usleep(TICK_US);
+		usleep(TICK_US);
 	}
 
 	XFreeGC(dpy, gc);

@@ -201,7 +201,7 @@ public:
         kernel_tic(NULL, &now);
         wait = 16667 - (now - lastTs);
         if(wait > 0)
-            proc_usleep(wait);
+            usleep(wait);
 	lastTs = now;
     }
 };

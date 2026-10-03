@@ -226,7 +226,7 @@ static int pcm_write(struct pcm_t *pcm, const void* data, unsigned int count) {
             pcm->prepared = 0;
             pcm->running = 0;
             if (pcm_prepare(pcm) != 0) {
-                proc_usleep(10000);
+                usleep(10000);
             }
             continue;
         }
@@ -396,7 +396,7 @@ static void* audio_thread_entry(void* arg) {
             break;
         }
 
-        proc_usleep(2000);
+        usleep(2000);
     }
 
     return NULL;
@@ -706,7 +706,7 @@ class NesEmu : public Widget {
         while (!emuThreadExit) {
             uint64_t now = now_usec();
             if (now + 1000 < nextFrameUsec) {
-                proc_usleep((uint32_t)(nextFrameUsec - now));
+                usleep((uint32_t)(nextFrameUsec - now));
                 continue;
             }
 
@@ -721,7 +721,7 @@ class NesEmu : public Widget {
             if (now > (nextFrameUsec + EMU_RESYNC_LAG_USEC)) {
                 nextFrameUsec = now + EMU_FRAME_USEC;
             } else if (catchupFrames == 0) {
-                proc_yield();
+                sched_yield();
             }
         }
     }

@@ -936,7 +936,7 @@ nx11x_flush_presents(void)
 		xwin_retry_pending_presents();
 		if (!nx11x_present_pending())
 			break;
-		proc_usleep(2000);
+		usleep(2000);
 		waited += 2;
 	}
 }
@@ -962,7 +962,7 @@ nx11x_wait(int ms)
 		PF->clear(&out);
 	}
 	if (_xctx.evt_node == 0) {
-		proc_usleep(ms < 0 ? 10000 : 1000);
+		usleep(ms < 0 ? 10000 : 1000);
 		return;
 	}
 
@@ -1007,7 +1007,7 @@ nx11x_select(int timeout)
 	int events;
 
 	if (!_ready) {
-		proc_usleep(10000);
+		usleep(10000);
 		return;
 	}
 

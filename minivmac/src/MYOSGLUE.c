@@ -1685,7 +1685,7 @@ static int pcm_write(struct pcm *pcm, const void* data, unsigned int count) {
             pcm->prepared = 0;
             pcm->running = 0;
             if (pcm_prepare(pcm) != 0) {
-                proc_usleep(100);
+                usleep(100);
             }
             continue;
         }
@@ -1805,7 +1805,7 @@ static void *audio_thread(void *arg)
     while (data->enabled &&
         (ui4b)(TheFillOffset - ThePlayOffset) <
             (ui4b)((DesiredMinFilledSoundBuffs + 4) << kLnOneBuffLen)) {
-        proc_usleep(100);
+        usleep(100);
     }
 
     while (data->enabled) {
@@ -1818,7 +1818,7 @@ static void *audio_thread(void *arg)
         int wr;
 
         if (!HaveStartedPlaying) {
-            proc_usleep(6000);
+            usleep(6000);
             continue;
         }
 
@@ -1883,7 +1883,7 @@ static void *audio_thread(void *arg)
             if (accepted == 0) {
                 /* device error path: back off one period instead of
                    hammering the driver with re-prepare requests */
-                proc_usleep(period_frames * 1000000 / SOUND_SAMPLERATE);
+                usleep(period_frames * 1000000 / SOUND_SAMPLERATE);
             }
         }
     }
@@ -2317,7 +2317,7 @@ static void xwin_loop(void* p) {
     uint32_t gap = (uint32_t)(kernel_tic_ms(0) - tik);
     if(gap < tm) {
         gap = tm - gap;
-        proc_usleep(gap*1000);
+        usleep(gap*1000);
     }
 }
 
@@ -2709,7 +2709,7 @@ LOCALFUNC void *emu_thread_entry(void *arg)
         if (ForceMacOff || CurSpeedStopped) {
             /* still publish control-mode/message screen changes */
             PublishFrameChanges();
-            proc_usleep(16000);
+            usleep(16000);
             continue;
         }
 
@@ -2739,9 +2739,9 @@ LOCALFUNC void *emu_thread_entry(void *arg)
                 if (wait_ms > 20) {
                     wait_ms = 20;
                 }
-                proc_usleep(wait_ms * 1000);
+                usleep(wait_ms * 1000);
             } else {
-                proc_yield();
+                sched_yield();
             }
         }
     }

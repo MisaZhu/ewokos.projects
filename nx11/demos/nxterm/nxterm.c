@@ -1703,7 +1703,7 @@ int main(int argc, char **argv)
         while (set_stdio(dev_name) != 0) {
             if (child_uuid == 0 || proc_get_uuid(pid) != child_uuid)
                 exit(1);
-            proc_usleep(10000);
+            usleep(10000);
         }
         if (startprogram) {
             char *pargv[2];
@@ -1962,7 +1962,7 @@ console_loop(vdevice_t *d, void *p)
 	else
 		vfs_wakeup(d->mnt_info.node, VFS_EVT_RD);
 
-	proc_usleep(20000);
+	usleep(20000);
 	return 0;
 }
 
@@ -1981,7 +1981,7 @@ service_thread(void *arg)
 	(void)arg;
 
 	while (!win_opened)
-		proc_usleep(50000);
+		usleep(50000);
 
 	memset(&term_dev, 0, sizeof(term_dev));
 	strcpy(term_dev.desc, "nxterm");

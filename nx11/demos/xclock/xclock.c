@@ -15,7 +15,7 @@
  *
  * The loop is a non-blocking poll: XCheckWindowEvent() -> GsSelect(POLL) also
  * flushes and presents the previous frame; time() detects the second boundary
- * and marks a redraw.  proc_usleep() between polls yields the CPU.
+ * and marks a redraw.  usleep() between polls yields the CPU.
  *
  * Controls:  d = digital-only, a = analogue, Q/Esc quits, the window manager
  *            close box quits, and the window is freely resizable.
@@ -30,7 +30,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-#include <ewoksys/proc.h>		/* proc_usleep */
+#include <ewoksys/proc.h>		/* usleep */
 
 #define TITLE		"Clock (NX11)"
 #define FONT_NAME	"fixed"		/* mapped to the builtin SystemFixed font */
@@ -361,7 +361,7 @@ main(int argc, char **argv)
 			redraw();
 			need_draw = 0;
 		}
-		proc_usleep(POLL_US);
+		usleep(POLL_US);
 	}
 
 	XFreeGC(dpy, gc);

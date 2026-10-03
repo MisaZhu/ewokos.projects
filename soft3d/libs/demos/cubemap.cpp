@@ -421,7 +421,7 @@ static void loop(void* p)
 {
     xwin_t* xwin = (xwin_t*)p;
     xwin_repaint(xwin);
-    proc_usleep(16000);
+    usleep(16000);
 }
 
 int main(int argc, char** argv)

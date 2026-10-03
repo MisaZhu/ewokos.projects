@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <vector>
 
 #include <ewoksys/kernel_tic.h>
@@ -1169,7 +1170,7 @@ static void loop(void* p) {
 	xwin_t* xwin = (xwin_t*)p;
 	xwin_repaint(xwin);
 	g_restart_pressed = false;
-	proc_usleep(12000);
+	usleep(12000);
 }
 
 int main(int argc, char** argv) {

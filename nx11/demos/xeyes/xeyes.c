@@ -5,7 +5,7 @@
  * turns every call into a Nano-X server call and the top-level window becomes a
  * real EwokOS xwin window (NANOWM=0), so the desktop window manager owns the
  * frame and the move/resize/close gestures.  Nothing here knows about EwokOS
- * except proc_usleep(), used to pace the poll loop.
+ * except usleep(), used to pace the poll loop.
  *
  * The pointer is sampled with XQueryPointer() on a non-blocking poll: each
  * XCheckWindowEvent() -> GsSelect(GR_TIMEOUT_POLL) runs the screen driver
@@ -28,7 +28,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-#include <ewoksys/proc.h>		/* proc_usleep */
+#include <ewoksys/proc.h>		/* usleep */
 
 #define TITLE		"Eyes (NX11)"
 #define FULL_CIRCLE	23040		/* 360 * 64 */
@@ -263,7 +263,7 @@ main(int argc, char **argv)
 			last_px = ptr_x;
 			last_py = ptr_y;
 		}
-		proc_usleep(POLL_US);
+		usleep(POLL_US);
 	}
 
 	XFreeGC(dpy, gc);

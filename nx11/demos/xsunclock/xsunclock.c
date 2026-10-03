@@ -19,7 +19,7 @@
  * The loop is a non-blocking poll (XCheckWindowEvent() -> GsSelect(POLL) also
  * flushes and presents the previous frame).  The map is repainted when the
  * minute rolls over (the terminator moves only ~0.25 deg/min) and the status
- * bar every second.  proc_usleep() paces the loop.
+ * bar every second.  usleep() paces the loop.
  *
  * Controls:  l = city labels, g = graticule, a = analemma, space = redraw now,
  *            Q/Esc quits, the window manager close box quits, freely resizable.
@@ -34,7 +34,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-#include <ewoksys/proc.h>		/* proc_usleep */
+#include <ewoksys/proc.h>		/* usleep */
 
 #define TITLE		"Sun Clock (NX11)"
 #define FONT_NAME	"fixed"
@@ -634,7 +634,7 @@ main(int argc, char **argv)
 		}
 		last_sec = sec;
 		last_min = min;
-		proc_usleep(POLL_US);
+		usleep(POLL_US);
 	}
 
 	XFreeGC(dpy, gc);

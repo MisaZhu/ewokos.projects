@@ -143,7 +143,7 @@ static int pcm_write(struct pcm *pcm, const void *data, unsigned int count)
 			pcm->prepared = 0;
 			pcm->running = 0;
 			if (pcm_prepare(pcm) != 0)
-				proc_usleep(100);
+				usleep(100);
 			continue;
 		}
 		if (ret <= 0)
@@ -381,7 +381,7 @@ static void *feeder_func(void *arg)
 	while (feeder_running) {
 		if (!AudioStatus.num_sources) {
 			// No stream at all: let the device idle
-			proc_usleep(20 * 1000);
+			usleep(20 * 1000);
 			continue;
 		}
 		if (quiet_blocks >= QUIET_PARK_BLOCKS) {
@@ -393,7 +393,7 @@ static void *feeder_func(void *arg)
 			if (audio_playback_active())
 				quiet_blocks = 0;
 			else {
-				proc_usleep(20 * 1000);
+				usleep(20 * 1000);
 				continue;
 			}
 		}
@@ -417,7 +417,7 @@ static void *feeder_func(void *arg)
 		while (feeder_running && !irq_ack) {
 			if (kernel_tic_ms(0) - t0 > 20)
 				break;
-			proc_usleep(2000);
+			usleep(2000);
 		}
 		if (!feeder_running)
 			break;
@@ -427,7 +427,7 @@ static void *feeder_func(void *arg)
 			// either — back off to the idle cadence and retry.  The
 			// next iteration re-triggers the IRQ, so a guest that
 			// starts playing is picked up within ~40ms.
-			proc_usleep(20 * 1000);
+			usleep(20 * 1000);
 			continue;
 		}
 		D(bug("stream: ack received\n"));
@@ -487,7 +487,7 @@ silence:
 		uint64_t block_us = (uint64_t)(out_bytes / 4) * 1000000 /
 			(AudioStatus.sample_rate >> 16);
 		if (block_us > done_us - iter_us)
-			proc_usleep((uint32_t)(block_us - (done_us - iter_us)));
+			usleep((uint32_t)(block_us - (done_us - iter_us)));
 	}
 	return NULL;
 }

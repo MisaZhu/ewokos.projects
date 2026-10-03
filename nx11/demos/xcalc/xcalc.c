@@ -12,7 +12,7 @@
  * and hit-testing, exactly like the xmine/xfreecell demos.
  *
  * The loop is a non-blocking poll (XCheckWindowEvent() -> GsSelect(POLL) also
- * flushes and presents the previous frame); proc_usleep() paces it.  Division by
+ * flushes and presents the previous frame); usleep() paces it.  Division by
  * zero, sqrt of a negative and 1/0 show "Error"; AC clears it.
  *
  * Controls:  click the buttons, or use the keyboard -- 0-9 . + - * / = Return,
@@ -27,7 +27,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-#include <ewoksys/proc.h>		/* proc_usleep */
+#include <ewoksys/proc.h>		/* usleep */
 
 #define TITLE		"Calculator (NX11)"
 #define FONT_NAME	"fixed"
@@ -560,7 +560,7 @@ main(int argc, char **argv)
 			redraw();
 			need_draw = 0;
 		}
-		proc_usleep(POLL_US);
+		usleep(POLL_US);
 	}
 
 	XFreeGC(dpy, gc);

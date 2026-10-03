@@ -28,7 +28,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-#include <ewoksys/proc.h>		/* proc_usleep */
+#include <ewoksys/proc.h>		/* usleep */
 
 #define TITLE		"Magnifier (NX11)"
 #define FONT_NAME	"fixed"
@@ -571,7 +571,7 @@ main(int argc, char **argv)
 			draw_status();
 			redraw_view = 0;
 		}
-		proc_usleep(POLL_US);
+		usleep(POLL_US);
 	}
 
 	if (source_pm != None)

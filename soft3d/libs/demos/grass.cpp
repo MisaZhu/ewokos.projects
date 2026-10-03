@@ -219,7 +219,7 @@ static void loop(void* p)
 {
     xwin_t* xwin = (xwin_t*)p;
     xwin_repaint(xwin);
-    proc_usleep(16000); // ~60 FPS
+    usleep(16000); // ~60 FPS
 }
 
 int main(int argc, char** argv)

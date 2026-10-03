@@ -438,7 +438,7 @@ static int pcm_wait_avail(widget_video_audio_t* audio, int* avail, int timeout_m
 		}
 		if(try_count++ >= max_try_count)
 			return ret;
-		proc_usleep(AUDIO_WAIT_SLEEP_MS * 1000);
+		usleep(AUDIO_WAIT_SLEEP_MS * 1000);
 	}
 }
 
@@ -611,7 +611,7 @@ static int audio_queue_write(widget_video_audio_t* audio, const uint8_t* data, s
 		if(stop || (audio->owner != NULL && audio->owner->isStopRequested()))
 			return -1;
 		if(chunk == 0) {
-			proc_usleep(AUDIO_QUEUE_WAIT_US);
+			usleep(AUDIO_QUEUE_WAIT_US);
 			continue;
 		}
 		offset += chunk;
@@ -657,7 +657,7 @@ static void* audio_output_thread_entry(void* p) {
 		}
 		if(stop)
 			break;
-		proc_usleep(AUDIO_QUEUE_WAIT_US);
+		usleep(AUDIO_QUEUE_WAIT_US);
 	}
 
 	pthread_mutex_lock(&audio->queue_mutex);
@@ -989,7 +989,7 @@ static void wait_if_paused(WidgetVideo* video, widget_video_clock_t* clock) {
 
 	begin = now_ms();
 	while(video->isPausedState() && !video->isStopRequested() && !video->hasPendingSeek())
-		proc_usleep(50000);
+		usleep(50000);
 	delta = now_ms() - begin;
 	if(clock != NULL && clock->started)
 		clock->start_ticks_ms += delta;
@@ -1025,9 +1025,9 @@ static bool sync_video_clock(WidgetVideo* video, widget_video_clock_t* clock,
 			if(target_ms <= now)
 				break;
 			if(target_ms - now > 10)
-				proc_usleep(10000);
+				usleep(10000);
 			else
-				proc_usleep((target_ms - now) * 1000);
+				usleep((target_ms - now) * 1000);
 		}
 		return true;
 	}
@@ -1037,11 +1037,11 @@ static bool sync_video_clock(WidgetVideo* video, widget_video_clock_t* clock,
 		if(video->isStopRequested())
 			return false;
 		if(fallback_delay_ms > 10) {
-			proc_usleep(10000);
+			usleep(10000);
 			fallback_delay_ms -= 10;
 		}
 		else {
-			proc_usleep(fallback_delay_ms * 1000);
+			usleep(fallback_delay_ms * 1000);
 			break;
 		}
 	}
@@ -1953,7 +1953,7 @@ void WidgetVideo::decodeLoop() {
 		if(video_backlog >= VIDEO_PACKET_HIGH_WATER ||
 				(audio_worker.thread_running &&
 				 audio_backlog >= AUDIO_PACKET_HIGH_WATER)) {
-			proc_usleep(DEMUX_BACKPRESSURE_US);
+			usleep(DEMUX_BACKPRESSURE_US);
 			continue;
 		}
 

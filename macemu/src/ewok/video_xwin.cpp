@@ -1028,7 +1028,7 @@ static void xwin_loop(void *p)
 	uint32_t budget =
 		(last_input_ms != 0 && now - last_input_ms < 100) ? 5 : 1000 / 60;
 	if (gap < budget)
-		proc_usleep((budget - gap) * 1000);
+		usleep((budget - gap) * 1000);
 }
 
 static void *present_thread_func(void *arg)
@@ -1062,7 +1062,7 @@ static void *present_thread_func(void *arg)
 			last_present_ms = kernel_tic_ms(0);
 		}
 
-		proc_usleep(2000);
+		usleep(2000);
 	}
 	return NULL;
 }
@@ -1631,7 +1631,7 @@ int VideoBootChooser(const char *const *labels, const int *icons, int count)
 			PF->clear(&out);
 		}
 		if (!got) {
-			proc_usleep(16 * 1000);
+			usleep(16 * 1000);
 			continue;
 		}
 
