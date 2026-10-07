@@ -40,9 +40,13 @@
 #include <Widget/Widget.h>
 #include <Widget/WidgetWin.h>
 #include <Widget/WidgetX.h>
-#include <WidgetEx/Menubar.h>
-#include <WidgetEx/FileDialog.h>
+#include <Widget/List.h>
+#include <Widget/RootWidget.h>
 #include <graph/graph_image.h>
+#include <font/font.h>
+#include <dirent.h>
+#include <vector>
+#include <algorithm>
 
 // PCM Audio Driver
 #define CTRL_PCM_DEV_HW         (0xF0)
@@ -695,6 +699,7 @@ class NesEmu : public Widget {
     pthread_t emuThread;
     bool emuThreadCreated;
     bool emuThreadExit;
+    Widget* listView;
 
     static void* emuThreadEntry(void* arg) {
         ((NesEmu*)arg)->emuLoop();
@@ -749,17 +754,14 @@ public:
         loaded = false;
         emuThreadCreated = false;
         emuThreadExit = false;
+        listView = NULL;
 		padState = 0;
         frame_sync_init();
 		paint = graph_new(NULL, 256, 240);
 	}
 	
 	inline ~NesEmu() {
-        stopEmuThread();
-        if (loaded) {
-            InfoNES_Fin();
-            loaded = false;
-        }
+        unloadGame();
         if(paint)
     		graph_free(paint);
 
@@ -767,12 +769,33 @@ public:
             graph_free(logo);
 	}
 
-    bool loadGame(const char* path){
+    /* stop emulation and release the loaded rom, if any */
+    void unloadGame() {
         stopEmuThread();
         if (loaded) {
             InfoNES_Fin();
             loaded = false;
         }
+    }
+
+    inline void setListView(Widget* view) { listView = view; }
+
+    /* leave the running game and go back to the rom list */
+    void backToList() {
+        if (listView == NULL) {
+            return;
+        }
+        unloadGame();
+        RootWidget* root = getRoot();
+        hide();
+        listView->show();
+        if (root != NULL) {
+            root->focus(listView);
+        }
+    }
+
+    bool loadGame(const char* path){
+        unloadGame();
 
 		int i = InfoNES_Load(path);
         if(i != 0) {
@@ -787,6 +810,15 @@ public:
 
 protected:
     bool onIM(xevent_t* ev) {
+        if(ev->state == XIM_STATE_PRESS &&
+                (ev->value.im.value == KEY_ESC ||
+                 ev->value.im.value == KEY_HOME ||
+                 ev->value.im.value == KEY_END)) {
+            /* esc/home/end leave the game and return to the rom list */
+            backToList();
+            return true;
+        }
+
         if(ev->state == XIM_STATE_PRESS){
             switch(ev->value.im.value){
                 case JOYSTICK_A:
@@ -859,7 +891,7 @@ protected:
 
     void onRepaint(graph_t* g, XTheme* theme, const grect_t& r) {
         if(!loaded) {
-            graph_fill_rect(g, r.x, r.y, r.w, r.h, theme->basic.bgColor);
+            graph_fill_rect(g, r.x, r.y, r.w, r.h, 0xff000000);
             if(!logo)
                 logo = graph_image_new(X::getResFullName("logo.png").c_str());
             if(logo) {
@@ -874,6 +906,7 @@ protected:
             InfoNES_Cycle();
         }
 
+        graph_fill_rect(g, r.x, r.y, r.w, r.h, 0xff000000);
         frame_sync_init();
         pthread_mutex_lock(&frameLock);
         graph_scale_fix_center(paint, g, r);
@@ -903,78 +936,168 @@ protected:
     }
 };
 
-class PlayerWin : public WidgetWin {
-    FileDialog fdialog;
+/* A simple list of the .nes files found in the roms resource folder. It is
+ * shown in the window when no rom file was passed on the command line, so the
+ * user can pick a game directly. Selecting an entry loads it into the emulator
+ * and swaps the view over to the running game. */
+struct RomEntry {
+    string name;
+    string path;
+};
+
+class RomList : public List {
     NesEmu* emu;
-protected:
-    void onDialoged(XWin* from, int res, void* arg) {
-        if (res == Dialog::RES_OK && from == &fdialog) {
-            string path = fdialog.getResult();
-            if (path.length() > 0 && emu != NULL) {
-                // Load game
-                emu->loadGame(path.c_str());
-            }
+    vector<RomEntry> roms;
+
+    static bool isNesFile(const string& name) {
+        if(name.length() < 4)
+            return false;
+        string ext = name.substr(name.length() - 4);
+        for(size_t i = 0; i < ext.length(); i++) {
+            if(ext[i] >= 'A' && ext[i] <= 'Z')
+                ext[i] = ext[i] - 'A' + 'a';
         }
+        return ext == ".nes";
+    }
+
+    static bool byName(const RomEntry& a, const RomEntry& b) {
+        return a.name < b.name;
+    }
+
+protected:
+    void drawBG(graph_t* g, XTheme* theme, const grect_t& r) {
+        (void)theme;
+        graph_fill_rect(g, r.x, r.y, r.w, r.h, 0xff000000);
+    }
+
+    void drawItem(graph_t* g, XTheme* theme, int32_t index, const grect_t& r) {
+        if(index < 0 || index >= (int32_t)roms.size())
+            return;
+
+        font_t* font = theme->getFont();
+        if(font == NULL)
+            return;
+
+        uint32_t fg = 0xffdddddd;
+        if(index == itemSelected) {
+            graph_fill_rect(g, r.x, r.y, r.w, r.h, 0xff3050a0);
+            fg = 0xffffffff;
+        }
+
+        int th = font_get_height(font, theme->basic.fontSize);
+        int y = r.y + (r.h - th) / 2;
+        graph_draw_text_font(g, r.x + 6, y, roms[index].name.c_str(),
+                font, theme->basic.fontSize, fg);
+    }
+
+    void onEnter(int sel) {
+        if(emu == NULL || sel < 0 || sel >= (int32_t)roms.size())
+            return;
+        if(!emu->loadGame(roms[sel].path.c_str()))
+            return;
+
+        RootWidget* root = getRoot();
+        hide();
+        emu->show();
+        if(root != NULL)
+            root->focus(emu);
+    }
+
+    bool onIM(xevent_t* ev) {
+        if(ev->state == XIM_STATE_PRESS &&
+                (ev->value.im.value == KEY_ESC ||
+                 ev->value.im.value == KEY_HOME ||
+                 ev->value.im.value == KEY_END)) {
+            /* esc/home/end quit the app from the rom list */
+            WidgetWin* w = getWin();
+            if(w != NULL)
+                w->close();
+            return true;
+        }
+        return List::onIM(ev);
     }
 
 public:
-    PlayerWin() {
+    RomList() {
         emu = NULL;
-        fdialog.setInitPath(X::getResFullName("roms"));
+        setItemMargin(1);
     }
 
-    inline void setEmu(NesEmu* emu) {
-        this->emu = emu;
-    }
+    void setEmu(NesEmu* e) { emu = e; }
 
-    ~PlayerWin() {
-    }
+    void loadDir(const string& dir) {
+        roms.clear();
 
-    FileDialog* getFileDialog() { return &fdialog; }
+        DIR* dp = opendir(dir.c_str());
+        if(dp != NULL) {
+            struct dirent* it;
+            while((it = readdir(dp)) != NULL) {
+                if(it->d_name[0] == '.')
+                    continue;
+                string name = it->d_name;
+                if(!isNesFile(name))
+                    continue;
+                RomEntry e;
+                e.name = name.substr(0, name.length() - 4);
+                e.path = dir + "/" + name;
+                roms.push_back(e);
+            }
+            closedir(dp);
+        }
+
+        sort(roms.begin(), roms.end(), byName);
+        setItemNum(roms.size());
+        select(0);
+        update();
+    }
 };
 
-static void onOpenFunc(MenuItem* it, void* p) {
-    PlayerWin* win = (PlayerWin*)p;
-    win->getFileDialog()->popup(win, 320, 240, "files", XWIN_STYLE_NORMAL);
-}
-
 int main(int argc, char *argv[]) {
-	string path;
-	NesEmu *emu = new NesEmu();
-
-	//init emulator
-	if(argc < 2){
-		path = X::getResFullName("roms/nes1200in1.nes");
-	}else{
-		path = argv[1];
-	}
-
-	/*if(emu->loadGame((char*)path.c_str()) != true){
-        printf("Error load rom file:%s\n", path.c_str());
-        delete emu;
-        return -1;
-	}
-    */
-
     X x;
-    PlayerWin win;
-    win.setEmu(emu);
+    WidgetWin win;
+
+    /* black window background so the letterboxed picture blends in */
+    win.getTheme()->basic.bgColor = 0xff000000;
+
+    NesEmu* emu = new NesEmu();
+    RomList* romList = new RomList();
+    romList->setEmu(emu);
+    emu->setListView(romList);
 
     RootWidget* root = win.getRoot();
-    root->setType(Container::VERTICAL);
-
-    Menubar* menubar = new Menubar();
-    root->add(menubar);
-    menubar->fix(0, 24);
-    menubar->setItemSize(50);
-    menubar->add(0, "Open", NULL, NULL, onOpenFunc, &win);
-
+    root->setType(Container::OVERLAP);
     root->add(emu);
-    root->focus(emu);
+    root->add(romList);
 
-	scale = 1.0;
-    win.open(&x, -1, -1, -1, 256*scale, 240*scale+24, "NesEmu", XWIN_STYLE_NORMAL);
+    scale = 1.0;
+    win.open(&x, -1, -1, -1, 256*scale, 240*scale, "NesEmu", XWIN_STYLE_NORMAL);
     win.setTimer(60);
+
+    /* always populate the rom list so esc/home/end from a game can return to it */
+    romList->setItemSize(20);
+    romList->loadDir(X::getResFullName("roms"));
+
+    if(argc >= 2) {
+        /* a rom file was given: start it right away */
+        romList->hide();
+        emu->show();
+        root->focus(emu);
+        if(!emu->loadGame(argv[1])) {
+            printf("Error load rom file:%s\n", argv[1]);
+            /* fall back to the rom list so the user can still pick one */
+            emu->hide();
+            romList->show();
+            root->focus(romList);
+        }
+    } else {
+        /* no rom given: show the file list to pick from */
+        emu->hide();
+        romList->show();
+        root->focus(romList);
+    }
+
     widgetXRun(&x, &win);
-	return 0;
+
+    /* emu and romList are owned by the root container and freed with win */
+    return 0;
 }
