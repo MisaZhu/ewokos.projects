@@ -1096,6 +1096,8 @@ int main(int argc, char *argv[]) {
         root->focus(romList);
     }
 
+    win.fullscreen();
+    win.hideCursor(true);
     widgetXRun(&x, &win);
 
     /* emu and romList are owned by the root container and freed with win */
