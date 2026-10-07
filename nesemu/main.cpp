@@ -812,8 +812,7 @@ protected:
     bool onIM(xevent_t* ev) {
         if(ev->state == XIM_STATE_PRESS &&
                 (ev->value.im.value == KEY_ESC ||
-                 ev->value.im.value == KEY_HOME ||
-                 ev->value.im.value == KEY_END)) {
+                 ev->value.im.value == JOYSTICK_Y)) {
             /* esc/home/end leave the game and return to the rom list */
             backToList();
             return true;
