@@ -992,6 +992,15 @@ protected:
     void onEnter(int sel) {
         if(emu == NULL || sel < 0 || sel >= (int32_t)roms.size())
             return;
+
+        /* the last entry is a sentinel that quits the app */
+        if(roms[sel].path.empty()) {
+            WidgetWin* w = getWin();
+            if(w != NULL)
+                w->close();
+            return;
+        }
+
         if(!emu->loadGame(roms[sel].path.c_str()))
             return;
 
@@ -1045,6 +1054,12 @@ public:
         }
 
         sort(roms.begin(), roms.end(), byName);
+
+        /* append a sentinel entry so the user can quit from the list */
+        RomEntry exitEntry;
+        exitEntry.name = "Exit";
+        roms.push_back(exitEntry);
+
         setItemNum(roms.size());
         select(0);
         update();
