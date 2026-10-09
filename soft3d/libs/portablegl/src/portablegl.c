@@ -239,19 +239,25 @@ static int get_max_vertices(void)
 // unlike LD1/ST1 they require 16-byte alignment even with A=0.
 // ---------------------------------------------------------------------------
 #if defined(__aarch64__) && defined(__GNUC__) && !defined(__clang__)
+// The accessed memory is passed as a "Q" operand (single base register, no
+// offset -- the only addressing mode LD1/ST1 have) rather than a blanket
+// "memory" clobber, so GCC knows exactly which bytes are touched and can keep
+// unrelated values in registers across the access. The operand types carry
+// aligned(4) so no 16-byte alignment is implied, and may_alias so the typed
+// wrappers can be mixed on the same buffer.
 #define PGL_NEON_LD(name, type, arr) \
+typedef type name ## _mem_t __attribute__((aligned(4), may_alias)); \
 static inline type name(const void* p) \
 { \
     type v; \
-    /* "memory" is required even for a pure load so GCC cannot hoist it above
-       preceding plain-C stores to the same buffer. */ \
-    __asm__("ld1 {%0." arr "}, [%1]" : "=w"(v) : "r"(p) : "memory"); \
+    __asm__("ld1 {%0." arr "}, %1" : "=w"(v) : "Q"(*(const name ## _mem_t*)p)); \
     return v; \
 }
 #define PGL_NEON_ST(name, type, arr) \
+typedef type name ## _mem_t __attribute__((aligned(4), may_alias)); \
 static inline void name(void* p, type v) \
 { \
-    __asm__("st1 {%1." arr "}, [%0]" :: "r"(p), "w"(v) : "memory"); \
+    __asm__("st1 {%1." arr "}, %0" : "=Q"(*(name ## _mem_t*)p) : "w"(v)); \
 }
 #else
 #define PGL_NEON_LD(name, type, arr) \
@@ -268,6 +274,8 @@ PGL_NEON_LD(pgl_vld1q_u32, uint32x4_t,  "4s")
 PGL_NEON_ST(pgl_vst1q_u32, uint32x4_t,  "4s")
 PGL_NEON_LD(pgl_vld1q_u16, uint16x8_t,  "8h")
 PGL_NEON_ST(pgl_vst1q_u16, uint16x8_t,  "8h")
+PGL_NEON_LD(pgl_vld1_u16,  uint16x4_t,  "4h")
+PGL_NEON_ST(pgl_vst1_u16,  uint16x4_t,  "4h")
 PGL_NEON_LD(pgl_vld1q_u8,  uint8x16_t,  "16b")
 PGL_NEON_ST(pgl_vst1q_u8,  uint8x16_t,  "16b")
 PGL_NEON_LD(pgl_vld1_u8,   uint8x8_t,   "8b")
@@ -275,6 +283,34 @@ PGL_NEON_ST(pgl_vst1_u8,   uint8x8_t,   "8b")
 
 #undef PGL_NEON_LD
 #undef PGL_NEON_ST
+
+// any lane of a 4x32 mask set?
+static inline int pgl_neon_any_u32(uint32x4_t m)
+{
+#ifdef __aarch64__
+    return vmaxvq_u32(m) != 0;
+#else
+    uint32x2_t t = vorr_u32(vget_low_u32(m), vget_high_u32(m));
+    t = vpmax_u32(t, t);
+    return vget_lane_u32(t, 0) != 0;
+#endif
+}
+
+// Multiply-accumulate for the rasterizer hot path. vmlaq_* lowers to a
+// separate fmul+fadd pair; AArch64 always has vector FMA so use the fused
+// form there (one instruction, and it matches what GCC contracts the scalar
+// path to). The arm32 build is -mfpu=neon-vfpv3 which has no vector FMA.
+#ifdef __aarch64__
+#define pgl_neon_mla(acc, v, w)         vfmaq_f32((acc), (v), (w))
+#define pgl_neon_mla_n(acc, v, s)       vfmaq_n_f32((acc), (v), (s))
+#define pgl_neon_mul_lane(v, s, l)      vmulq_laneq_f32((v), (s), (l))
+#define pgl_neon_mla_lane(acc, v, s, l) vfmaq_laneq_f32((acc), (v), (s), (l))
+#else
+#define pgl_neon_mla(acc, v, w)         vmlaq_f32((acc), (v), (w))
+#define pgl_neon_mla_n(acc, v, s)       vmlaq_n_f32((acc), (v), (s))
+#define pgl_neon_mul_lane(v, s, l)      vmulq_lane_f32((v), ((l) < 2 ? vget_low_f32(s) : vget_high_f32(s)), (l) & 1)
+#define pgl_neon_mla_lane(acc, v, s, l) vmlaq_lane_f32((acc), (v), ((l) < 2 ? vget_low_f32(s) : vget_high_f32(s)), (l) & 1)
+#endif
 
 // ---------------------------------------------------------------------------
 // Buffer fills / copies (glClear, glBufferData, format conversion)
@@ -489,9 +525,11 @@ static inline float32x4_t pgl_neon_blend_eq(GLenum eq, float32x4_t Cs, float32x4
 // Per-triangle interpolation plan: vertex outputs are processed in blocks of
 // 4 components. For each block a lane mask selects PGL_SMOOTH (perspective
 // correct), PGL_NOPERSPECTIVE or flat (provoking vertex) per component so the
-// per-pixel loop is branch free.
+// per-pixel work is branch free. The common all-PGL_SMOOTH case skips the
+// nopersp/flat/select work entirely.
 typedef struct pgl_neon_interp_plan {
     int nblocks;
+    int all_smooth;
     // perspective-divided vertex outputs: v->vs_out[i] * (1/w)
     float persp[3][GL_MAX_VERTEX_OUTPUT_COMPONENTS];
     // raw (non-perspective) vertex outputs, padded copies so block loads
@@ -509,69 +547,45 @@ static inline void pgl_neon_interp_plan_init(pgl_neon_interp_plan* p,
 {
     int padded = (size + 3) & ~3;
     p->nblocks = padded >> 2;
+    p->all_smooth = 1;
 
     pgl_neon_scale_f32(p->persp[0], vs0, inv_w0, size);
     pgl_neon_scale_f32(p->persp[1], vs1, inv_w1, size);
     pgl_neon_scale_f32(p->persp[2], vs2, inv_w2, size);
-    pgl_neon_memcpy(p->nopersp[0], vs0, size * sizeof(float));
-    pgl_neon_memcpy(p->nopersp[1], vs1, size * sizeof(float));
-    pgl_neon_memcpy(p->nopersp[2], vs2, size * sizeof(float));
-    pgl_neon_memcpy(p->flat, flat, size * sizeof(float));
 
     for (int i = 0; i < padded; ++i) {
         if (i >= size) {
-            // padding lanes: route to flat so garbage never reaches fs_input
+            // padding lanes: zero everywhere so garbage never reaches fs_input
             p->smooth_mask[i] = 0;
             p->nopersp_mask[i] = 0;
             p->flat[i] = 0.0f;
             p->persp[0][i] = p->persp[1][i] = p->persp[2][i] = 0.0f;
             p->nopersp[0][i] = p->nopersp[1][i] = p->nopersp[2][i] = 0.0f;
+        } else if (interpolation[i] == PGL_SMOOTH) {
+            p->smooth_mask[i] = 0xFFFFFFFFu;
+            p->nopersp_mask[i] = 0;
         } else {
-            p->smooth_mask[i] = (interpolation[i] == PGL_SMOOTH) ? 0xFFFFFFFFu : 0;
+            p->all_smooth = 0;
+            p->smooth_mask[i] = 0;
             p->nopersp_mask[i] = (interpolation[i] == PGL_NOPERSPECTIVE) ? 0xFFFFFFFFu : 0;
         }
     }
-}
-
-static inline void pgl_neon_interp_attribs(float* fs_input, const pgl_neon_interp_plan* p,
-                                           float alpha, float beta, float gamma, float inv_wsum)
-{
-    float32x4_t av = vdupq_n_f32(alpha);
-    float32x4_t bv = vdupq_n_f32(beta);
-    float32x4_t gv = vdupq_n_f32(gamma);
-    float32x4_t iw = vdupq_n_f32(inv_wsum);
-
-    for (int b = 0; b < p->nblocks; ++b) {
-        int i = b * 4;
-        float32x4_t s = vmulq_f32(pgl_vld1q_f32(&p->persp[0][i]), av);
-        s = vmlaq_f32(s, pgl_vld1q_f32(&p->persp[1][i]), bv);
-        s = vmlaq_f32(s, pgl_vld1q_f32(&p->persp[2][i]), gv);
-        s = vmulq_f32(s, iw);
-
-        float32x4_t n = vmulq_f32(pgl_vld1q_f32(&p->nopersp[0][i]), av);
-        n = vmlaq_f32(n, pgl_vld1q_f32(&p->nopersp[1][i]), bv);
-        n = vmlaq_f32(n, pgl_vld1q_f32(&p->nopersp[2][i]), gv);
-
-        float32x4_t f = pgl_vld1q_f32(&p->flat[i]);
-        uint32x4_t sm = pgl_vld1q_u32(&p->smooth_mask[i]);
-        uint32x4_t nm = pgl_vld1q_u32(&p->nopersp_mask[i]);
-
-        float32x4_t r = vbslq_f32(nm, n, f);
-        r = vbslq_f32(sm, s, r);
-        pgl_vst1q_f32(fs_input + i, r);
+    if (!p->all_smooth) {
+        pgl_neon_memcpy(p->nopersp[0], vs0, size * sizeof(float));
+        pgl_neon_memcpy(p->nopersp[1], vs1, size * sizeof(float));
+        pgl_neon_memcpy(p->nopersp[2], vs2, size * sizeof(float));
+        pgl_neon_memcpy(p->flat, flat, size * sizeof(float));
     }
 }
 
-// Evaluate the barycentric setup for 4 horizontally adjacent pixel centers
-// (ix+0.5 .. ix+3.5). Outputs alpha/beta/gamma, the interpolated depth, the
-// 1/w sum and an inside mask per lane (0 or 0xFFFFFFFF).
+// Barycentric setup for 4 horizontally adjacent pixel centers
+// (ix+0.5 .. ix+3.5), one lane per pixel. Everything stays in registers; the
+// caller extracts lanes with constant indices.
 typedef struct pgl_neon_span4 {
-    float alpha[4];
-    float beta[4];
-    float gamma[4];
-    float z[4];
-    float wsum[4];
-    uint32_t inside[4];
+    float32x4_t a, b, g;    // barycentrics
+    float32x4_t z;          // window depth
+    float32x4_t wsum;       // 1/w interpolated (gl_FragCoord.w)
+    uint32x4_t inside;      // 0 / 0xFFFFFFFF per lane
 } pgl_neon_span4;
 
 typedef struct pgl_neon_tri_setup {
@@ -594,8 +608,8 @@ static inline void pgl_neon_eval_span4(pgl_neon_span4* out, const pgl_neon_tri_s
     float32x4_t zero = vdupq_n_f32(0.0f);
 
     // line_func(l, x, y) = A*x + B*y + C evaluated at this row
-    float32x4_t g = vmlaq_n_f32(vdupq_n_f32(t->b01 * y + t->c01), x, t->a01);
-    float32x4_t b = vmlaq_n_f32(vdupq_n_f32(t->b20 * y + t->c20), x, t->a20);
+    float32x4_t g = pgl_neon_mla_n(vdupq_n_f32(t->b01 * y + t->c01), x, t->a01);
+    float32x4_t b = pgl_neon_mla_n(vdupq_n_f32(t->b20 * y + t->c20), x, t->a20);
     g = vmulq_n_f32(g, t->inv_denom01);
     b = vmulq_n_f32(b, t->inv_denom20);
     float32x4_t a = vsubq_f32(vsubq_f32(vdupq_n_f32(1.0f), b), g);
@@ -611,20 +625,125 @@ static inline void pgl_neon_eval_span4(pgl_neon_span4* out, const pgl_neon_tri_s
     inside = vandq_u32(inside, vcltq_u32(lane_idx, vdupq_n_u32((uint32_t)lanes_valid)));
 
     float32x4_t wsum = vmulq_n_f32(a, t->inv_w0);
-    wsum = vmlaq_n_f32(wsum, b, t->inv_w1);
-    wsum = vmlaq_n_f32(wsum, g, t->inv_w2);
+    wsum = pgl_neon_mla_n(wsum, b, t->inv_w1);
+    wsum = pgl_neon_mla_n(wsum, g, t->inv_w2);
 
-    float32x4_t z = vmlaq_n_f32(vdupq_n_f32(t->poly_offset), a, t->z0);
-    z = vmlaq_n_f32(z, b, t->z1);
-    z = vmlaq_n_f32(z, g, t->z2);
-    z = vmlaq_n_f32(vdupq_n_f32(t->depth_near), vaddq_f32(z, vdupq_n_f32(1.0f)), t->depth_scale_half);
+    float32x4_t z = pgl_neon_mla_n(vdupq_n_f32(t->poly_offset), a, t->z0);
+    z = pgl_neon_mla_n(z, b, t->z1);
+    z = pgl_neon_mla_n(z, g, t->z2);
+    z = pgl_neon_mla_n(vdupq_n_f32(t->depth_near), vaddq_f32(z, vdupq_n_f32(1.0f)), t->depth_scale_half);
 
-    pgl_vst1q_f32(out->alpha, a);
-    pgl_vst1q_f32(out->beta, b);
-    pgl_vst1q_f32(out->gamma, g);
-    pgl_vst1q_f32(out->z, z);
-    pgl_vst1q_f32(out->wsum, wsum);
-    pgl_vst1q_u32(out->inside, inside);
+    out->a = a; out->b = b; out->g = g;
+    out->z = z; out->wsum = wsum; out->inside = inside;
+}
+
+// Conservative per-row pixel range of the triangle. Each barycentric is
+// linear in x, so alpha,beta,gamma >= 0 bound x to an interval; the result is
+// widened by a pixel on both sides and the exact inside mask of
+// pgl_neon_eval_span4 still decides per pixel, this only skips spans that
+// cannot contain any fragment. Returns 0 if the row is empty.
+static inline int pgl_neon_row_range(const pgl_neon_tri_setup* t, float y,
+                                     int ix_min, int ix_max, int* lo_out, int* hi_out)
+{
+    float cg = t->a01 * t->inv_denom01, kg = (t->b01 * y + t->c01) * t->inv_denom01;
+    float cb = t->a20 * t->inv_denom20, kb = (t->b20 * y + t->c20) * t->inv_denom20;
+    float ca = -(cg + cb), ka = 1.0f - kg - kb;
+    float lo = -1e9f, hi = 1e9f;
+
+#define PGL_ROW_BOUND(cf, k) \
+    if ((cf) > 1e-20f) { float r = -(k) / (cf); if (r > lo) lo = r; } \
+    else if ((cf) < -1e-20f) { float r = -(k) / (cf); if (r < hi) hi = r; }
+    PGL_ROW_BOUND(cg, kg)
+    PGL_ROW_BOUND(cb, kb)
+    PGL_ROW_BOUND(ca, ka)
+#undef PGL_ROW_BOUND
+
+    if (lo > hi) return 0;
+    lo = MAX(lo, -1e9f); hi = MIN(hi, 1e9f);
+    // pixel centers x = ix + 0.5 in [lo, hi], widened by one pixel each side
+    int ilo = (int)floorf(lo - 0.5f) - 1;
+    int ihi = (int)ceilf(hi - 0.5f) + 2;
+    if (ilo < ix_min) ilo = ix_min;
+    if (ihi > ix_max) ihi = ix_max;
+    if (ilo >= ihi) return 0;
+    *lo_out = ilo;
+    *hi_out = ihi;
+    return 1;
+}
+
+// Interpolate the vertex outputs for the inside lanes of a span into
+// fs_in[lane][]. The plan vectors are loaded once per block and reused for
+// all 4 lanes; perspective correction is folded into the barycentrics
+// (a*inv_wsum etc.) so a smooth attribute is 3 multiply-adds per lane.
+static inline void pgl_neon_interp_span(float fs_in[4][GL_MAX_VERTEX_OUTPUT_COMPONENTS],
+                                        const pgl_neon_interp_plan* p, const pgl_neon_span4* sp)
+{
+    uint32x4_t m = sp->inside;
+#ifdef __aarch64__
+    float32x4_t iw = vdivq_f32(vdupq_n_f32(1.0f), sp->wsum);
+#else
+    float32x4_t iw = vrecpeq_f32(sp->wsum);
+    iw = vmulq_f32(iw, vrecpsq_f32(sp->wsum, iw));
+    iw = vmulq_f32(iw, vrecpsq_f32(sp->wsum, iw));
+#endif
+    float32x4_t pa = vmulq_f32(sp->a, iw);
+    float32x4_t pb = vmulq_f32(sp->b, iw);
+    float32x4_t pg = vmulq_f32(sp->g, iw);
+    int l0 = vgetq_lane_u32(m, 0), l1 = vgetq_lane_u32(m, 1);
+    int l2 = vgetq_lane_u32(m, 2), l3 = vgetq_lane_u32(m, 3);
+
+    if (p->all_smooth) {
+        for (int b = 0; b < p->nblocks; ++b) {
+            int i = b * 4;
+            float32x4_t p0 = pgl_vld1q_f32(&p->persp[0][i]);
+            float32x4_t p1 = pgl_vld1q_f32(&p->persp[1][i]);
+            float32x4_t p2 = pgl_vld1q_f32(&p->persp[2][i]);
+#define PGL_SMOOTH_LANE(L) \
+            if (l##L) { \
+                float32x4_t s = pgl_neon_mul_lane(p0, pa, L); \
+                s = pgl_neon_mla_lane(s, p1, pb, L); \
+                s = pgl_neon_mla_lane(s, p2, pg, L); \
+                pgl_vst1q_f32(&fs_in[L][i], s); \
+            }
+            PGL_SMOOTH_LANE(0)
+            PGL_SMOOTH_LANE(1)
+            PGL_SMOOTH_LANE(2)
+            PGL_SMOOTH_LANE(3)
+#undef PGL_SMOOTH_LANE
+        }
+        return;
+    }
+
+    float32x4_t a = sp->a, bb = sp->b, g = sp->g;
+    for (int b = 0; b < p->nblocks; ++b) {
+        int i = b * 4;
+        float32x4_t p0 = pgl_vld1q_f32(&p->persp[0][i]);
+        float32x4_t p1 = pgl_vld1q_f32(&p->persp[1][i]);
+        float32x4_t p2 = pgl_vld1q_f32(&p->persp[2][i]);
+        float32x4_t n0 = pgl_vld1q_f32(&p->nopersp[0][i]);
+        float32x4_t n1 = pgl_vld1q_f32(&p->nopersp[1][i]);
+        float32x4_t n2 = pgl_vld1q_f32(&p->nopersp[2][i]);
+        float32x4_t f = pgl_vld1q_f32(&p->flat[i]);
+        uint32x4_t sm = pgl_vld1q_u32(&p->smooth_mask[i]);
+        uint32x4_t nm = pgl_vld1q_u32(&p->nopersp_mask[i]);
+#define PGL_MIXED_LANE(L) \
+        if (l##L) { \
+            float32x4_t s = pgl_neon_mul_lane(p0, pa, L); \
+            s = pgl_neon_mla_lane(s, p1, pb, L); \
+            s = pgl_neon_mla_lane(s, p2, pg, L); \
+            float32x4_t n = pgl_neon_mul_lane(n0, a, L); \
+            n = pgl_neon_mla_lane(n, n1, bb, L); \
+            n = pgl_neon_mla_lane(n, n2, g, L); \
+            float32x4_t r = vbslq_f32(nm, n, f); \
+            r = vbslq_f32(sm, s, r); \
+            pgl_vst1q_f32(&fs_in[L][i], r); \
+        }
+        PGL_MIXED_LANE(0)
+        PGL_MIXED_LANE(1)
+        PGL_MIXED_LANE(2)
+        PGL_MIXED_LANE(3)
+#undef PGL_MIXED_LANE
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4938,6 +5057,52 @@ static float calc_poly_offset(vec3 hp0, vec3 hp1, vec3 hp2)
 #undef SMALLEST_INCR
 }
 
+#if PGL_NEON_ENABLED
+#ifndef PGL_NO_DEPTH_NO_STENCIL
+// 4-wide depth test + conditional depth write for a full span (ix..ix+3 all
+// inside the row). Same arithmetic as fragment_processing(): z*PGL_MAX_Z
+// truncated to u32, compared with the stored depth. Only valid when stencil
+// is off and the shader can neither discard nor write gl_FragDepth, i.e. the
+// depth result is final before the shader runs.
+static inline uint32x4_t pgl_neon_depth_test4(uint32x4_t inside, float32x4_t z, int ix, int iy)
+{
+    int i = -iy * c->zbuf.w + ix;
+#ifdef PGL_D16
+    u16* zp = &((u16*)c->zbuf.lastrow)[i];
+    uint16x4_t old16 = pgl_vld1_u16(zp);
+    uint32x4_t dst = vmovl_u16(old16);
+#else
+    u32* zp = &((u32*)c->zbuf.lastrow)[i];
+    uint32x4_t old = pgl_vld1q_u32(zp);
+    uint32x4_t dst = vshrq_n_u32(old, PGL_ZSHIFT);
+#endif
+    uint32x4_t src = vcvtq_u32_f32(vmulq_n_f32(z, (float)PGL_MAX_Z));
+    uint32x4_t pass;
+    switch (c->depth_func) {
+    case GL_LESS:     pass = vcltq_u32(src, dst); break;
+    case GL_LEQUAL:   pass = vcleq_u32(src, dst); break;
+    case GL_GREATER:  pass = vcgtq_u32(src, dst); break;
+    case GL_GEQUAL:   pass = vcgeq_u32(src, dst); break;
+    case GL_EQUAL:    pass = vceqq_u32(src, dst); break;
+    case GL_NOTEQUAL: pass = vmvnq_u32(vceqq_u32(src, dst)); break;
+    case GL_ALWAYS:   pass = vdupq_n_u32(0xFFFFFFFFu); break;
+    default:          pass = vdupq_n_u32(0); break;
+    }
+    pass = vandq_u32(pass, inside);
+    if (c->depth_mask && pgl_neon_any_u32(pass)) {
+#ifdef PGL_D16
+        pgl_vst1_u16(zp, vbsl_u16(vmovn_u32(pass), vmovn_u32(src), old16));
+#else
+        uint32x4_t nw = vorrq_u32(vandq_u32(old, vdupq_n_u32(PGL_STENCIL_MASK)),
+                                  vshlq_n_u32(src, PGL_ZSHIFT));
+        pgl_vst1q_u32(zp, vbslq_u32(pass, nw, old));
+#endif
+    }
+    return pass;
+}
+#endif
+#endif
+
 static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigned int provoke)
 {
     vec4 p0 = v0->screen_space;
@@ -5020,7 +5185,7 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
     builtins.gl_InstanceID = c->builtins.gl_InstanceID;
 
 #if PGL_NEON_ENABLED
-    (void)alpha; (void)beta; (void)gamma; (void)tmp;
+    (void)alpha; (void)beta; (void)gamma; (void)tmp; (void)fs_input;
 
     pgl_neon_interp_plan plan;
     pgl_neon_interp_plan_init(&plan, v0->vs_out, v1->vs_out, v2->vs_out,
@@ -5040,43 +5205,87 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
     ts.depth_scale_half = depth_scale_half;
     ts.depth_near = depth_near;
 
+    // Depth/stencil strategy for a span, decided once per triangle:
+    //   span_depth : stencil off, shader can't discard/write depth -> test and
+    //                write 4 lanes at once before any shader runs
+    //   lane_frag  : anything else that needs per-pixel fragment_processing()
+    //                before the shader (stencil, or partial spans at the
+    //                right edge that must not touch pixels past ix_max)
+#ifndef PGL_NO_DEPTH_NO_STENCIL
+#ifndef PGL_NO_STENCIL
+    int stencil_on = c->stencil_test;
+#else
+    int stencil_on = 0;
+#endif
+    int span_depth = !fragdepth_or_discard && c->depth_test && !stencil_on;
+    int lane_frag = !fragdepth_or_discard && (c->depth_test || stencil_on);
+#else
+    int span_depth = 0;
+    int lane_frag = 0;
+#endif
+    void (*fragment_shader)(float*, Shader_Builtins*, void*) = c->programs.a[c->cur_program].fragment_shader;
+    void* uniform = c->programs.a[c->cur_program].uniform;
+
+    float fs_in[4][GL_MAX_VERTEX_OUTPUT_COMPONENTS];
     int ix_min = x_min;
     for (int iy = y_min; iy<iy_max; ++iy) {
         float y = iy + 0.5f;
 
-        // 4 pixel centers per step; the inside mask, barycentrics, depth and
-        // 1/w sum are all computed in parallel, only the shader runs per lane.
-        for (int ix = ix_min; ix<ix_max; ix += 4) {
+        int row_lo, row_hi;
+        if (!pgl_neon_row_range(&ts, y, ix_min, ix_max, &row_lo, &row_hi)) {
+            continue;
+        }
+
+        // 4 pixel centers per step; the inside mask, barycentrics, depth test
+        // and attribute interpolation are all 4-wide, only the shader and the
+        // final pixel write run per lane.
+        for (int ix = row_lo; ix<row_hi; ix += 4) {
+            int lanes = ix_max - ix;
             pgl_neon_span4 sp;
-            pgl_neon_eval_span4(&sp, &ts, ix, y, ix_max - ix);
-            if (!(sp.inside[0] | sp.inside[1] | sp.inside[2] | sp.inside[3])) {
+            pgl_neon_eval_span4(&sp, &ts, ix, y, lanes);
+            if (!pgl_neon_any_u32(sp.inside)) {
                 continue;
             }
 
-            for (int l = 0; l < 4; ++l) {
-                if (!sp.inside[l]) {
-                    continue;
+#ifndef PGL_NO_DEPTH_NO_STENCIL
+            if (span_depth && lanes >= 4) {
+                sp.inside = pgl_neon_depth_test4(sp.inside, sp.z, ix, iy);
+            } else if (lane_frag) {
+                uint32_t m[4];
+                pgl_vst1q_u32(m, sp.inside);
+                float zl[4];
+                pgl_vst1q_f32(zl, sp.z);
+                for (int l = 0; l < 4; ++l) {
+                    if (m[l] && !fragment_processing(ix + l, iy, zl[l])) {
+                        m[l] = 0;
+                    }
                 }
-                int px = ix + l;
-                float x = px + 0.5f;
-                z = sp.z[l];
-                tmp2 = sp.wsum[l];
-
-                if (!fragdepth_or_discard && !fragment_processing(px, iy, z)) {
-                    continue;
-                }
-
-                pgl_neon_interp_attribs(fs_input, &plan, sp.alpha[l], sp.beta[l], sp.gamma[l], 1.0f / tmp2);
-
-                SET_V4(builtins.gl_FragCoord, x, y, z, tmp2);
-                builtins.discard = GL_FALSE;
-                builtins.gl_FragDepth = z;
-
-                c->programs.a[c->cur_program].fragment_shader(fs_input, &builtins, c->programs.a[c->cur_program].uniform);
-                if (!builtins.discard) {
-                    draw_pixel(builtins.gl_FragColor, px, iy, builtins.gl_FragDepth, fragdepth_or_discard);
-                }
+                sp.inside = pgl_vld1q_u32(m);
             }
+            if (!pgl_neon_any_u32(sp.inside)) {
+                continue;
+            }
+#endif
+
+            pgl_neon_interp_span(fs_in, &plan, &sp);
+
+#define PGL_NEON_FRAG_LANE(L) \
+            if (vgetq_lane_u32(sp.inside, L)) { \
+                z = vgetq_lane_f32(sp.z, L); \
+                tmp2 = vgetq_lane_f32(sp.wsum, L); \
+                SET_V4(builtins.gl_FragCoord, (ix + L) + 0.5f, y, z, tmp2); \
+                builtins.discard = GL_FALSE; \
+                builtins.gl_FragDepth = z; \
+                fragment_shader(fs_in[L], &builtins, uniform); \
+                if (!builtins.discard) { \
+                    draw_pixel(builtins.gl_FragColor, ix + L, iy, builtins.gl_FragDepth, fragdepth_or_discard); \
+                } \
+            }
+            PGL_NEON_FRAG_LANE(0)
+            PGL_NEON_FRAG_LANE(1)
+            PGL_NEON_FRAG_LANE(2)
+            PGL_NEON_FRAG_LANE(3)
+#undef PGL_NEON_FRAG_LANE
         }
     }
 #else
