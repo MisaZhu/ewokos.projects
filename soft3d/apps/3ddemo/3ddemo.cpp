@@ -14,6 +14,7 @@
 #include <x/x.h>
 #include <x/xwin.h>
 #include <graph/graph.h>
+#include <font/font.h>
 
 #define sinf pgl_fast_sin
 #define cosf pgl_fast_cos
@@ -29,6 +30,7 @@ static int win_height = 480;
 static glContext the_Context;
 static pix_t* backbuf = NULL;
 static xwin_t* g_xwin = NULL;
+static font_t* font = NULL;
 
 #include "src/obj.c"
 #include "src/texture.c"
@@ -50,13 +52,14 @@ void basic_transform_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins*
     vs_output[1] = 1.0f - vertex_attribs[1].y; // Flip V coordinate
 }
 
-void texture_frag_fp(float* fs_input, Shader_Builtins* builtins, void* uniforms) {
-    My_Uniforms* u = (My_Uniforms*)uniforms;
-    float u_coord = fs_input[0];
-    float v_coord = fs_input[1];
-    GLuint tex = u->tex0;
-    builtins->gl_FragColor = texture2D(tex, u_coord, v_coord);
-}
+/* Phase D: the fragment shader is the built-in pgl_ff_tex_modulate (declared in
+   portablegl.h), which calls texture2D(uniforms->tex0, fs_input[0], fs_input[1]).
+   My_Uniforms { mat4 mvp_mat; GLuint tex0; } is byte-layout-identical to
+   pgl_ff_tex_modulate_uniform, so the demo keeps its own VS (which flips V) and
+   just swaps the FS pointer.  On raspi5 with PGL_VC3D the matching triangles are
+   offloaded to the V3D GPU's TEX_MOD kernel (point-sampled, CLAMP-to-edge,
+   tightly-packed RGBA8); the texture params below are set to NEAREST +
+   CLAMP_TO_EDGE so the GPU gate accepts them. */
 
 static void init_mesh() {
     float* vertex_data = (float*)malloc(num_faces * 3 * 5 * sizeof(float));
@@ -124,17 +127,17 @@ static void init_texture() {
     }
 
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture_width, texture_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba_data);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     free(rgba_data);
 }
 
 void init_gl() {
 	GLenum interpolation[2] = { PGL_SMOOTH, PGL_SMOOTH };
-	program = CreateProgram(basic_transform_vp, texture_frag_fp, 2, interpolation, GL_FALSE);
+	program = CreateProgram(basic_transform_vp, pgl_ff_tex_modulate, 2, interpolation, GL_FALSE);
 	glUseProgram(program);
 	SetUniform(&the_uniforms);
 
@@ -149,6 +152,23 @@ void init_gl() {
 }
 
 static float camera_angle = 0;
+
+static int fps = 0;
+static int count = 0;
+static uint32_t last_tic = 0;
+
+static void update_fps() {
+    uint32_t low;
+    kernel_tic32(NULL, NULL, &low);
+
+    /* Update FPS statistics once per second */
+    if (last_tic == 0 || (low - last_tic) >= 1000000) {
+        last_tic = low;
+        fps = count;
+        count = 0;
+    }
+    count++;
+}
 
 static void render_mesh() {
     glClearColor(0.1f, 0.1f, 0.2f, 1.0f);
@@ -187,6 +207,13 @@ static void on_repaint(xwin_t* xwin, graph_t* g) {
     graph_t bg;
     graph_init(&bg, backbuf, win_width, win_height);
     graph_blt(&bg, 0, 0, win_width, win_height, g, 0, 0, win_width, win_height);
+    update_fps();
+
+    if (font != NULL) {
+        char txt[32];
+        snprintf(txt, sizeof(txt), "FPS: %d", fps);
+        graph_draw_text_font(g, 8, 8, txt, font, 16, 0xff00ff00);
+    }
 }
 
 static void on_event(xwin_t* xwin, xevent_t* ev) {
@@ -209,7 +236,7 @@ static void on_resize(xwin_t* xwin) {
 static void loop(void* p) {
     xwin_t* xwin = (xwin_t*)p;
     xwin_repaint(xwin);
-    usleep(3000);
+    usleep(1000);
 }
 
 int main(int argc, char** argv) {
@@ -236,9 +263,12 @@ int main(int argc, char** argv) {
     }
 
     init_gl();
+    font = font_new(DEFAULT_SYSTEM_FONT, true);
     xwin_set_visible(xwin, true);
     x_run(&x, xwin);
     xwin_destroy(xwin);
+    if (font != NULL)
+        font_free(font);
     free_glContext(&the_Context);
     return 0;
 }

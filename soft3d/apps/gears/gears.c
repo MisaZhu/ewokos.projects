@@ -66,6 +66,7 @@
 #include <x/x.h>
 #include <x/xwin.h>
 #include <graph/graph.h>
+#include <font/font.h>
 
 #include "glcommon/gltools.h"
 
@@ -87,6 +88,7 @@ static int win_height = 480;
 
 static glContext the_context;
 static pix_t* backbuf = NULL;
+static font_t* font = NULL;
 
 #define STRIPS_PER_TOOTH 7
 #define VERTICES_PER_TOOTH 34
@@ -354,10 +356,18 @@ static struct gear *create_gear(GLfloat inner_radius, GLfloat outer_radius, GLfl
     return gear;
 }
 
-/* PortableGL vertex shader */
+/* PortableGL vertex shader.
+ *
+ * gears lights per vertex (Gouraud shading), so the lit colour is written to
+ * vs_output[0..3] as a vec4 RGBA and the program pairs this VS with the
+ * built-in pgl_ff_gouraud fragment shader.  That makes the fragment stage
+ * semantically identical to the previous hand-written fragment_shader (which
+ * just emitted the interpolated colour) while letting the raspi5 V3D back end
+ * offload rasterization + interpolation + depth/cull to the GPU; on every other
+ * platform it runs unchanged on the CPU rasterizer. */
 void vertex_shader(float* vs_output, vec4* v_attrs, Shader_Builtins* builtins, void* uniforms)
 {
-    vec3* vs_out = (vec3*)vs_output;
+    vec4* vs_out = (vec4*)vs_output;
     My_Uniforms* u = uniforms;
 
     vec4 v4 = mult_m4_v4(u->normal_mat, v_attrs[1]);
@@ -370,20 +380,10 @@ void vertex_shader(float* vs_output, vec4* v_attrs, Shader_Builtins* builtins, v
     float tmp = dot_v3s(N, L);
     float diff_intensity = MAX(tmp, 0.0f);
 
-    vs_out[0] = scale_v3(u->material_color, diff_intensity);
+    vec3 c = scale_v3(u->material_color, diff_intensity);
+    vs_out[0] = make_v4(c.x, c.y, c.z, 1.0f);
 
     builtins->gl_Position = mult_m4_v4(u->mvp_mat, v_attrs[0]);
-}
-
-/* PortableGL fragment shader */
-void fragment_shader(float* fs_input, Shader_Builtins* builtins, void* uniforms)
-{
-    vec3 color = ((vec3*)fs_input)[0];
-
-    builtins->gl_FragColor.x = color.x;
-    builtins->gl_FragColor.y = color.y;
-    builtins->gl_FragColor.w = 1.0f;
-    builtins->gl_FragColor.z = color.z;
 }
 
 static void draw_gear(struct gear *gear, GLfloat *transform,
@@ -508,10 +508,11 @@ static void init_gears(void)
     glEnable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
 
-    GLenum smooth[3] = { PGL_SMOOTH, PGL_SMOOTH, PGL_SMOOTH };
+    GLenum smooth[4] = { PGL_SMOOTH4 };
 
-    /* Create the shader program using PortableGL function-based shaders */
-    program = CreateProgram(vertex_shader, fragment_shader, 3, smooth, GL_FALSE);
+    /* Create the shader program: gears' own per-vertex-lighting VS paired with
+     * the built-in pgl_ff_gouraud FS (4 smooth RGBA varyings). */
+    program = CreateProgram(vertex_shader, pgl_ff_gouraud, 4, smooth, GL_FALSE);
     if (program == 0) {
         klog("init_gears: failed to create program\n");
         return;
@@ -562,9 +563,10 @@ static void update_fps(void)
     uint32_t low;
     kernel_tic32(NULL, NULL, &low);
     
-    if (last_tic == 0 || (low - last_tic) >= 3000000) {
+    /* Update FPS statistics once per second */
+    if (last_tic == 0 || (low - last_tic) >= 1000000) {
         last_tic = low;
-        fps = count / 3;
+        fps = count;
         count = 0;
     }
     count++;
@@ -605,6 +607,12 @@ static void on_repaint(xwin_t* xwin, graph_t* g)
     graph_init(&bg, backbuf, win_width, win_height);
     graph_blt(&bg, 0, 0, win_width, win_height, g, 0, 0, win_width, win_height);
     update_fps();
+
+    if (font != NULL) {
+        char txt[32];
+        snprintf(txt, sizeof(txt), "FPS: %d", fps);
+        graph_draw_text_font(g, 8, 8, txt, font, 16, 0xff00ff00);
+    }
 }
 
 static void on_event(xwin_t* xwin, xevent_t* ev)
@@ -630,7 +638,7 @@ static void loop(void* p)
 {
     xwin_t* xwin = (xwin_t*)p;
     xwin_repaint(xwin);
-    usleep(3000);
+    usleep(1000);
 }
 
 int main(int argc, char* argv[])
@@ -668,6 +676,9 @@ int main(int argc, char* argv[])
     /* Initialize gears */
     init_gears();
 
+    /* Load system font for the on-screen FPS readout */
+    font = font_new(DEFAULT_SYSTEM_FONT, true);
+
     /* Make window visible after all initialization is done */
     xwin_set_visible(xwin, true);
     
@@ -675,6 +686,8 @@ int main(int argc, char* argv[])
     
     /* Cleanup */
     xwin_destroy(xwin);
+    if (font != NULL)
+        font_free(font);
     free_glContext(&the_context);
     
     return 0;

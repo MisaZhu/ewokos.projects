@@ -3729,6 +3729,58 @@ PGLDEF void put_aa_line(vec4 c, float x1, float y1, float x2, float y2);
 PGLDEF void put_aa_line_interp(vec4 c1, vec4 c2, float x1, float y1, float x2, float y2);
 
 
+/* ---- Built-in fixed-function shader set ---------------------------------
+ * Shipped so a demo can opt into the raspi5 VideoCore (V3D) GPU fast path: on
+ * a PGL_VC3D build, a triangle whose program uses one of these fragment
+ * shaders AND stays inside the supported state subset (depth off, blend off,
+ * cull off, no stencil/scissor) is rasterized by the GPU instead of the CPU.
+ * They are always compiled, so the same demo also runs unchanged on the CPU
+ * rasterizer on every other platform (and as the GPU fallback here).
+ *
+ * Each program pairs one of the *_vs vertex shaders with the matching
+ * fragment shader and passes the matching uniform struct as the program's
+ * uniform.  Attribute 0 is the vertex position (vec4); gouraud also reads
+ * attribute 1 as the per-vertex colour (vec4). */
+typedef struct {
+	mat4 mvp_matrix;   /* model-view-projection, applied to attribute 0 */
+	vec4 color;        /* constant fragment colour (RGBA, [0,1]) */
+} pgl_ff_solid_uniform;
+
+typedef struct {
+	mat4 mvp_matrix;   /* model-view-projection, applied to attribute 0 */
+} pgl_ff_gouraud_uniform;
+
+/* Phase D: texture-modulate uniform.  Byte-layout-identical to 3ddemo's
+   My_Uniforms { mat4 mvp_mat; GLuint tex0; } so the demo can swap its
+   fragment shader pointer to pgl_ff_tex_modulate without changing its
+   uniform struct.  tex0 is the GL texture name bound to unit 0. */
+typedef struct {
+	mat4 mvp_matrix;   /* model-view-projection, applied to attribute 0 */
+	GLuint tex0;       /* texture object bound to unit 0 */
+} pgl_ff_tex_modulate_uniform;
+
+/* solid: every fragment is uniform->color */
+PGLDEF void pgl_ff_solid_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
+PGLDEF void pgl_ff_solid(float* fs_input, Shader_Builtins* builtins, void* uniforms);
+
+/* gouraud: per-vertex colour (attribute 1) smoothly interpolated.  vs_output
+ * must hold 4 components (RGBA) and the program's interpolation[0..3] default
+ * to PGL_SMOOTH. */
+PGLDEF void pgl_ff_gouraud_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
+PGLDEF void pgl_ff_gouraud(float* fs_input, Shader_Builtins* builtins, void* uniforms);
+
+/* tex_modulate: point-sampled texture lookup at (vs_output[0], vs_output[1]).
+ * The VS passes attribute 1 (texcoord vec4) through as 2 varyings (u, v);
+ * the FS calls texture2D(tex0, u, v).  On raspi5 with PGL_VC3D the matching
+ * triangles are offloaded to the V3D GPU's TEX_MOD fragment shader (linear
+ * RGBA8, point filtering, CLAMP-to-edge); elsewhere the CPU rasterizer runs
+ * the same C code.  Attribute 0 = position (vec4), attribute 1 = texcoord (vec4,
+ * only .xy used).  vs_output must hold at least 2 floats; the program's
+ * interpolation[0..1] default to PGL_SMOOTH. */
+PGLDEF void pgl_ff_tex_modulate_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
+PGLDEF void pgl_ff_tex_modulate(float* fs_input, Shader_Builtins* builtins, void* uniforms);
+
+
 #ifdef __cplusplus
 }
 #endif

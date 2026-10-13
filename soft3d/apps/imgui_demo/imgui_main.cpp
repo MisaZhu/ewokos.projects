@@ -72,16 +72,6 @@ typedef struct My_Uniforms
     vec4 v_color;
 } My_Uniforms;
 
-void normal_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms)
-{
-    builtins->gl_Position = mult_m4_v4(*((mat4*)uniforms), vertex_attribs[0]);
-}
-
-void normal_fs(float* fs_input, Shader_Builtins* builtins, void* uniforms)
-{
-    builtins->gl_FragColor = ((My_Uniforms*)uniforms)->v_color;
-}
-
 static void init_imgui(void)
 {
     // Setup Dear ImGui context
@@ -441,8 +431,11 @@ int main(int argc, char* argv[])
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
     
-    // Create shader
-    GLuint myshader = CreateProgram(normal_vs, normal_fs, 0, NULL, GL_FALSE);
+    // Create shader.  The background triangle is a plain solid colour, so use
+    // the built-in pgl_ff_solid_vs / pgl_ff_solid pair (My_Uniforms is layout-
+    // compatible with pgl_ff_solid_uniform) to let the raspi5 V3D back end
+    // offload it; ImGui's own draw data still renders on the CPU afterwards.
+    GLuint myshader = CreateProgram(pgl_ff_solid_vs, pgl_ff_solid, 0, NULL, GL_FALSE);
     glUseProgram(myshader);
     
     // Enable depth test for proper clearing

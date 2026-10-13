@@ -259,6 +259,14 @@ static void on_event(xwin_t* xwin, xevent_t* ev)
 			}
 		}
 	}
+	else if (ev->type == XEVT_MOUSE) {
+		// Left click switches to the next scene
+		if (ev->state == MOUSE_STATE_DOWN && ev->value.mouse.button == MOUSE_BUTTON_LEFT) {
+			cur_shader = (cur_shader + 1) % NUM_SHADERS;
+			start_time = kernel_tic_ms(0);
+			glUseProgram(shaders[cur_shader]);
+		}
+	}
 }
 
 static void on_resize(xwin_t* xwin)

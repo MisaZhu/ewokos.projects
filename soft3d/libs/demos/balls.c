@@ -493,7 +493,7 @@ static void sphere_idle(void)
 
 void vertex_shader(float* vs_output, vec4* v_attrs, Shader_Builtins* builtins, void* uniforms)
 {
-    vec3* vs_out = (vec3*)vs_output;
+    vec4* vs_out = (vec4*)vs_output;
     My_Uniforms* u = uniforms;
     
     vec4 v4 = mult_m4_v4(u->normal_mat, v_attrs[1]);
@@ -517,21 +517,15 @@ void vertex_shader(float* vs_output, vec4* v_attrs, Shader_Builtins* builtins, v
     float total_intensity = diff_intensity + ambient;
     if (total_intensity > 1.0f) total_intensity = 1.0f;
     
-    // Use material color from uniforms
-    vs_out[0] = scale_v3(u->material_color, total_intensity);
+    // Use material color from uniforms.  balls lights per vertex (Gouraud), so
+    // the lit colour is written as a vec4 RGBA and the program pairs this VS
+    // with the built-in pgl_ff_gouraud FS (lets the raspi5 V3D back end offload
+    // rasterization + interpolation + depth/cull to the GPU; identical output on
+    // the CPU rasterizer everywhere else).
+    vec3 c = scale_v3(u->material_color, total_intensity);
+    vs_out[0] = make_v4(c.x, c.y, c.z, 1.0f);
     
     builtins->gl_Position = mult_m4_v4(u->mvp_mat, v_attrs[0]);
-}
-
-void fragment_shader(float* fs_input, Shader_Builtins* builtins, void* uniforms)
-{
-    vec3 color = ((vec3*)fs_input)[0];
-    
-    // ARGB format - no swap needed
-    builtins->gl_FragColor.x = color.x;
-    builtins->gl_FragColor.y = color.y;
-    builtins->gl_FragColor.z = color.z;
-    builtins->gl_FragColor.w = 1;
 }
 
 static void sphere_init(void)
@@ -541,9 +535,9 @@ static void sphere_init(void)
     glEnable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
     
-    GLenum smooth[3] = { PGL_SMOOTH3 };
+    GLenum smooth[4] = { PGL_SMOOTH4 };
     
-    program = pglCreateProgram(vertex_shader, fragment_shader, 3, smooth, GL_FALSE);
+    program = pglCreateProgram(vertex_shader, pgl_ff_gouraud, 4, smooth, GL_FALSE);
     if (program == 0) {
         printf("sphere_init: pglCreateProgram failed!\n");
         return;

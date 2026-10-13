@@ -132,7 +132,6 @@ int random(int seed, int iterations) {
 }
 
 void grass_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
-void simple_color_fs(float* fs_input, Shader_Builtins* builtins, void* uniforms);
 
 static void on_repaint(xwin_t* xwin, graph_t* g)
 {
@@ -274,7 +273,11 @@ int main(int argc, char** argv)
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
 
-    GLuint myshader = CreateProgram(grass_vs, simple_color_fs, 0, NULL, GL_FALSE);
+    /* Fragment stage is the built-in pgl_ff_solid: every fragment is the
+     * uniform colour, which lets the raspi5 V3D back end offload rasterization.
+     * My_Uniforms is layout-compatible with pgl_ff_solid_uniform (mvp_mat[16]
+     * then color[4]), and the per-instance grass_vs still runs on the CPU. */
+    GLuint myshader = CreateProgram(grass_vs, pgl_ff_solid, 0, NULL, GL_FALSE);
     glUseProgram(myshader);
 
     mat4_perspective(proj_mat, 45.0f * M_PI / 180.0f, (float)win_width/(float)win_height, 0.01f, 100.0f);
@@ -332,8 +335,3 @@ void grass_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins,
     builtins->gl_Position.w = m[3]*pos.x + m[7]*pos.y + m[11]*pos.z + m[15]*pos.w;
 }
 
-void simple_color_fs(float* fs_input, Shader_Builtins* builtins, void* uniforms) {
-    (void)fs_input;
-    My_Uniforms* u = (My_Uniforms*)uniforms;
-    builtins->gl_FragColor = make_v4(u->color[0], u->color[1], u->color[2], u->color[3]);
-}

@@ -1,5 +1,8 @@
 #define PGLDEF
 #include "../include/portablegl/portablegl.h"
+#ifdef PGL_VC3D
+#include "../include/portablegl/pgl_vc3d.h"
+#endif
 
 // Fast math function implementations
 #ifndef M_PI
@@ -3541,6 +3544,457 @@ void cvec_free_glVertex(void* vec)
 
 static glContext* c;
 
+/* ---- Built-in fixed-function shaders (declared in portablegl.h) -----------
+ * Always compiled so a demo using them runs on the CPU rasterizer everywhere;
+ * on a PGL_VC3D build the matching triangles are offloaded to the V3D GPU (see
+ * the pgl_gpu_* helpers below). */
+PGLDEF void pgl_ff_solid_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms)
+{
+    (void)vs_output;
+    builtins->gl_Position = mult_m4_v4(((pgl_ff_solid_uniform*)uniforms)->mvp_matrix, vertex_attribs[0]);
+}
+
+PGLDEF void pgl_ff_solid(float* fs_input, Shader_Builtins* builtins, void* uniforms)
+{
+    (void)fs_input;
+    builtins->gl_FragColor = ((pgl_ff_solid_uniform*)uniforms)->color;
+}
+
+PGLDEF void pgl_ff_gouraud_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms)
+{
+    ((vec4*)vs_output)[0] = vertex_attribs[1];   /* pass per-vertex colour */
+    builtins->gl_Position = mult_m4_v4(((pgl_ff_gouraud_uniform*)uniforms)->mvp_matrix, vertex_attribs[0]);
+}
+
+PGLDEF void pgl_ff_gouraud(float* fs_input, Shader_Builtins* builtins, void* uniforms)
+{
+    (void)uniforms;
+    builtins->gl_FragColor = ((vec4*)fs_input)[0];
+}
+
+PGLDEF void pgl_ff_tex_modulate_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms)
+{
+    vs_output[0] = vertex_attribs[1].x;
+    vs_output[1] = vertex_attribs[1].y;
+    builtins->gl_Position = mult_m4_v4(((pgl_ff_tex_modulate_uniform*)uniforms)->mvp_matrix, vertex_attribs[0]);
+}
+
+PGLDEF void pgl_ff_tex_modulate(float* fs_input, Shader_Builtins* builtins, void* uniforms)
+{
+    builtins->gl_FragColor = texture2D(((pgl_ff_tex_modulate_uniform*)uniforms)->tex0,
+                                       fs_input[0], fs_input[1]);
+}
+
+#ifdef PGL_VC3D
+/* ---- raspi5 VideoCore (V3D) GPU fast path -------------------------------
+ * Eligibility is decided here (this TU owns the context `c`); pgl_vc3d.c owns
+ * the shm target/staging and the g2d marshalling.  A primitive is offloaded only
+ * when its program uses a built-in FF fragment shader AND the state is inside
+ * the subset the back end renders today (depth test+write, back-face cull,
+ * scissor, polygon offset and the colour write mask are all marshalled as of
+ * Phase B2c; blend, stencil and fragdepth/discard are not).  Everything else
+ * keeps the CPU NEON path, and any CPU primitive flushes the pending GPU batch
+ * first so painter's order is preserved across the two engines sharing one back
+ * buffer. */
+static int _pgl_gpu_active;   /* back buffer adopted the GPU shm target */
+static int _pgl_gpu_off;      /* latched off; stop probing */
+/* Set for a frame whose glClear was scissored or colour-masked: the GPU folds
+ * the frame clear into its first draw dispatch as a FULL-FRAME, unmasked
+ * CLEAR_RENDER_TARGETS that would clobber the precise CPU clear, so the whole
+ * frame is pinned to the CPU (re-evaluated at the next glClear). */
+static int _pgl_gpu_frame_cpu;
+
+static int pgl_c255(float f, int max)
+{
+    int v = (int)(f * (float)max + 0.5f);
+    return v < 0 ? 0 : (v > max ? max : v);
+}
+
+/* pack a portablegl pixel into the back end's 0xAABBGGRR rgba8 convention */
+static uint32_t pgl_rgba8_from_pixel(pix_t p)
+{
+#if PGL_BITDEPTH == 32
+    Color col = PIXEL_TO_COLOR(p);
+    return ((uint32_t)col.a << 24) | ((uint32_t)col.b << 16) |
+           ((uint32_t)col.g << 8) | (uint32_t)col.r;
+#else
+    (void)p;
+    return 0;   /* GPU target is RGBA8; only 32-bit back buffers are supported */
+#endif
+}
+
+static uint32_t pgl_rgba8_from_vec4(vec4 v)
+{
+#if PGL_BITDEPTH == 32
+    return pgl_rgba8_from_pixel(RGBA_TO_PIXEL(pgl_c255(v.x, 255), pgl_c255(v.y, 255),
+                                              pgl_c255(v.z, 255), pgl_c255(v.w, 255)));
+#else
+    (void)v;
+    return 0;
+#endif
+}
+
+/* perspective-divide a clip-space position to NDC (the back end's vtx shader
+ * applies the viewport scale with a constant w, so the divide is done here) */
+static void pgl_gpu_ndc(vec4 clip, float* out)
+{
+    float iw = (clip.w != 0.0f) ? 1.0f / clip.w : 0.0f;
+    out[0] = clip.x * iw;
+    out[1] = clip.y * iw;
+    out[2] = clip.z * iw;
+}
+
+/* Lazily bring up the GPU target and adopt it as the back buffer so CPU and GPU
+ * draws land in the same surface (and the demo's present blit stays zero-copy).
+ * Returns 1 when the GPU path is live. */
+static int pgl_gpu_begin(int w, int h)
+{
+#if PGL_BITDEPTH != 32
+    (void)w; (void)h;
+    return 0;
+#else
+    if (_pgl_gpu_active)
+        return pgl_vc3d_enabled();
+    if (_pgl_gpu_off)
+        return 0;
+    if (w <= 0 || h <= 0)
+        return 0;
+    if (!pgl_vc3d_init(w, h)) {
+        _pgl_gpu_off = 1;
+        return 0;
+    }
+    {
+        u8* px = (u8*)pgl_vc3d_pixels();
+        size_t bytes = (size_t)w * (size_t)h * sizeof(pix_t);
+        if (c->back_buffer.buf) {
+            /* carry over whatever the CPU already drew (e.g. a prior clear) */
+            PGL_MEMMOVE(px, c->back_buffer.buf, bytes);
+            if (!c->user_alloced_backbuf)
+                PGL_FREE(c->back_buffer.buf);
+        }
+        c->back_buffer.buf = px;
+        c->back_buffer.w = w;
+        c->back_buffer.h = h;
+        c->back_buffer.lastrow = px + (h-1)*w*sizeof(pix_t);
+        c->user_alloced_backbuf = GL_TRUE;   /* pgl_vc3d owns/frees the shm */
+    }
+    _pgl_gpu_active = 1;
+    return 1;
+#endif
+}
+
+/* flush a pending GPU batch before any CPU-side drawing (painter's order) */
+static void pgl_gpu_fence(void)
+{
+    if (_pgl_gpu_active)
+        pgl_vc3d_flush();
+}
+
+/* Phase D texture cache: map a GL texture name to a pgl_vc3d slot, re-uploading
+ * only when the id, size, or data pointer change.  PGL_VC3D_MAX_TEX slots;
+ * a miss evicts round-robin.  Returns the slot index, or -1 when the texture
+ * cannot be represented by the GPU TEX_MOD kernel (unbound / not 2D / not
+ * tightly-packed RGBA8 / non-NEAREST filter / non-CLAMP_TO_EDGE wrap) so the
+ * caller declines the GPU path and rasterizes on the CPU.  glTexSubImage2D
+ * that mutates data in place without reallocating is NOT detected - the caller
+ * must pgl_vc3d_free_texture the slot (or resize) to force a re-upload. */
+typedef struct {
+    GLuint      tex_id;   /* 0 = free slot */
+    GLsizei     w, h;
+    const void* data;     /* glTexture.data pointer, to catch realloc-on-resize */
+    int         slot;
+} pgl_gpu_tex_entry_t;
+static pgl_gpu_tex_entry_t _pgl_gpu_tex[PGL_VC3D_MAX_TEX];
+static int _pgl_gpu_tex_next;
+
+static int pgl_gpu_tex_slot(GLuint tex_id)
+{
+    int i;
+    glTexture* t;
+
+    if (tex_id == 0 || !c)
+        return -1;
+    if ((int)tex_id >= c->textures.size)
+        return -1;
+    t = &c->textures.a[tex_id];
+    if (t->deleted || t->type != GL_TEXTURE_2D || t->data == NULL)
+        return -1;
+    if (t->w <= 0 || t->h <= 0)
+        return -1;
+    /* GPU TEX_MOD is point-sampled, CLAMP-to-edge, tightly-packed RGBA8. */
+    if (t->format != GL_RGBA)
+        return -1;
+    if (t->mag_filter != GL_NEAREST || t->min_filter != GL_NEAREST)
+        return -1;
+    if (t->wrap_s != GL_CLAMP_TO_EDGE || t->wrap_t != GL_CLAMP_TO_EDGE)
+        return -1;
+
+    for (i = 0; i < PGL_VC3D_MAX_TEX; i++) {
+        if (_pgl_gpu_tex[i].tex_id == tex_id &&
+            _pgl_gpu_tex[i].w == t->w && _pgl_gpu_tex[i].h == t->h &&
+            _pgl_gpu_tex[i].data == (const void*)t->data) {
+            return _pgl_gpu_tex[i].slot;
+        }
+    }
+
+    /* Miss: prefer a free slot, else round-robin evict. */
+    for (i = 0; i < PGL_VC3D_MAX_TEX; i++) {
+        if (_pgl_gpu_tex[i].tex_id == 0) {
+            _pgl_gpu_tex_next = i;
+            break;
+        }
+    }
+    i = _pgl_gpu_tex_next;
+    if (_pgl_gpu_tex[i].tex_id != 0)
+        pgl_vc3d_free_texture(_pgl_gpu_tex[i].slot);
+    if (!pgl_vc3d_upload_texture(i, t->w, t->h, t->data))
+        return -1;
+    _pgl_gpu_tex[i].tex_id = tex_id;
+    _pgl_gpu_tex[i].w = t->w;
+    _pgl_gpu_tex[i].h = t->h;
+    _pgl_gpu_tex[i].data = (const void*)t->data;
+    _pgl_gpu_tex[i].slot = i;
+    _pgl_gpu_tex_next = (i + 1) % PGL_VC3D_MAX_TEX;
+    return i;
+}
+
+/* Resolve the built-in fixed-function fragment shader plus the eligibility gates
+ * and the mapped depth/cull/scissor/polygon-offset/colour-mask render state
+ * shared by the triangle/point/line offload paths.  poly_off is the polygon-
+ * offset enable relevant to the primitive being drawn (fill/point/line); as of
+ * Phase B2c it is marshalled into ext rather than declined, as are an active
+ * scissor and a partial colour mask.  blend, stencil and fragdepth/discard still
+ * keep the primitive on the CPU.  want_cull is 0 for points/lines (facing is
+ * meaningless there) and 1 for triangles.  Returns 1 and fills the fs_id, solid,
+ * depth_func, depth_mask, cull_cfg, tex_slot and ext outputs when the GPU may
+ * draw the primitive, 0 when the CPU must.  tex_slot is -1 for SOLID/GOURAUD
+ * and the pgl_vc3d slot index for TEX_MOD (points/lines never take TEX_MOD). */
+static int pgl_gpu_state(int poly_off, int want_cull, int* fs_id,
+                         uint32_t* solid, uint32_t* depth_func,
+                         uint32_t* depth_mask, uint32_t* cull_cfg,
+                         int* tex_slot, pgl_vc3d_ext_t* ext)
+{
+    glProgram* p;
+
+    if (!_pgl_gpu_active && _pgl_gpu_off)
+        return 0;
+    if (!c)
+        return 0;
+    if (_pgl_gpu_frame_cpu)
+        return 0;   /* this frame's glClear was scissored/colour-masked: the GPU
+                     * full-frame first-dispatch clear would clobber it, so the
+                     * whole frame stays on the CPU */
+
+    *tex_slot = -1;
+    p = &c->programs.a[c->cur_program];
+    if (p->fragment_shader == pgl_ff_solid) {
+        *fs_id = PGL_VC3D_FS_SOLID;
+        *solid = pgl_rgba8_from_vec4(((pgl_ff_solid_uniform*)p->uniform)->color);
+    } else if (p->fragment_shader == pgl_ff_gouraud) {
+        *fs_id = PGL_VC3D_FS_GOURAUD;
+    } else if (p->fragment_shader == pgl_ff_tex_modulate) {
+        int slot = pgl_gpu_tex_slot(((pgl_ff_tex_modulate_uniform*)p->uniform)->tex0);
+        if (slot < 0)
+            return 0;
+        *fs_id = PGL_VC3D_FS_TEX_MOD;
+        *tex_slot = slot;
+    } else {
+        return 0;   /* arbitrary C fragment shader stays on the CPU */
+    }
+
+    /* blend / stencil / fragdepth-or-discard are outside the fixed-function
+     * back end and stay on the CPU.  Scissor (CLIP_WINDOW), polygon offset
+     * (CFG_BITS bit3 + Depth Offset) and the colour write mask
+     * (COLOR_WRITE_MASKS) ARE rendered on the GPU as of Phase B2c, so they are
+     * marshalled into ext below; depth test+write and back-face cull are
+     * likewise mapped rather than declined. */
+    if (c->blend || c->stencil_test || c->fragdepth_or_discard)
+        return 0;
+
+    *depth_func = PGL_VC3D_DEPTH_NONE;
+    *depth_mask = 0;
+    *cull_cfg = PGL_VC3D_CULL_NONE;
+
+    if (c->depth_test) {
+        switch (c->depth_func) {
+        case GL_NEVER:    *depth_func = PGL_VC3D_DEPTH_NEVER;    break;
+        case GL_LESS:     *depth_func = PGL_VC3D_DEPTH_LESS;     break;
+        case GL_EQUAL:    *depth_func = PGL_VC3D_DEPTH_EQUAL;    break;
+        case GL_LEQUAL:   *depth_func = PGL_VC3D_DEPTH_LEQUAL;   break;
+        case GL_GREATER:  *depth_func = PGL_VC3D_DEPTH_GREATER;  break;
+        case GL_NOTEQUAL: *depth_func = PGL_VC3D_DEPTH_NOTEQUAL; break;
+        case GL_GEQUAL:   *depth_func = PGL_VC3D_DEPTH_GEQUAL;   break;
+        case GL_ALWAYS:   *depth_func = PGL_VC3D_DEPTH_ALWAYS;   break;
+        default:          return 0;   /* unknown func stays on the CPU */
+        }
+        *depth_mask = c->depth_mask ? 1u : 0u;
+    }
+
+    if (want_cull && c->cull_face) {
+        /* encode the full FRONT/BACK x CW/CCW matrix into a PGL_VC3D_CULL_*
+         * config code; the back end maps it onto the CFG_BITS facing bits. */
+        int cw = (c->front_face == GL_CW);
+        switch (c->cull_mode) {
+        case GL_BACK:  *cull_cfg = cw ? PGL_VC3D_CULL_BACK_CW
+                                      : PGL_VC3D_CULL_BACK_CCW;  break;
+        case GL_FRONT: *cull_cfg = cw ? PGL_VC3D_CULL_FRONT_CW
+                                      : PGL_VC3D_CULL_FRONT_CCW; break;
+        case GL_FRONT_AND_BACK: *cull_cfg = PGL_VC3D_CULL_BOTH;  break;
+        default:       return 0;   /* unknown cull mode stays on the CPU */
+        }
+    }
+
+    /* Phase B2c extended state.  Zeroed first so the struct padding is
+     * deterministic (it joins the client batch homogeneity key) and the
+     * defaults are scissor-off / no-offset / write-all. */
+    memset(ext, 0, sizeof(*ext));
+
+    if (poly_off) {
+        ext->poly_enable = 1;
+        ext->poly_factor = c->poly_factor;
+        ext->poly_units = c->poly_units;
+    }
+
+    if (c->scissor_test) {
+        /* c->lx/ly/ux/uy are the clamped scissor rect in GL window coords
+         * (origin bottom-left, y up); the render target is y-down, so the
+         * CLIP_WINDOW Bottom field is fb_h - uy.  An empty rect draws nothing,
+         * which a clip window cannot express - keep that frame on the CPU. */
+        if (c->ux <= c->lx || c->uy <= c->ly)
+            return 0;
+        ext->scissor_x = c->lx;
+        ext->scissor_y = c->back_buffer.h - c->uy;
+        ext->scissor_w = c->ux - c->lx;
+        ext->scissor_h = c->uy - c->ly;
+    }
+
+#ifndef PGL_DISABLE_COLOR_MASK
+    {
+        /* c->color_mask is a packed pix_t mask; convert it to the 4-bit GL-order
+         * write-enable nibble the back end inverts into COLOR_WRITE_MASKS. */
+        uint32_t cm = 0;
+        if (c->color_mask & PGL_RMASK) cm |= 0x1u;
+        if (c->color_mask & PGL_GMASK) cm |= 0x2u;
+        if (c->color_mask & PGL_BMASK) cm |= 0x4u;
+        if (c->color_mask & PGL_AMASK) cm |= 0x8u;
+        /* all-disabled (write nothing) is degenerate and ext.color_mask == 0
+         * means write-all downstream, so keep such a frame on the CPU. */
+        if (cm == 0)
+            return 0;
+        ext->color_mask = cm;
+    }
+#else
+    ext->color_mask = 0xFu;   /* colour masks compiled out: write all four */
+#endif
+
+    return 1;
+}
+
+/* Try to offload one post-VS triangle to the GPU.  Returns 1 when it was
+ * batched (caller must NOT rasterize it), 0 when the CPU must draw it. */
+static int pgl_gpu_tri(glVertex* v0, glVertex* v1, glVertex* v2)
+{
+    int fs_id, tex_slot;
+    uint32_t solid = 0, depth_func, depth_mask, cull_cfg;
+    const float *c0 = NULL, *c1 = NULL, *c2 = NULL;
+    float n0[3], n1[3], n2[3];
+    pgl_vc3d_ext_t ext;
+
+    if (!pgl_gpu_state(c->poly_offset_fill, 1, &fs_id, &solid,
+                       &depth_func, &depth_mask, &cull_cfg, &tex_slot, &ext))
+        return 0;
+    if (fs_id == PGL_VC3D_FS_GOURAUD) {
+        c0 = v0->vs_out; c1 = v1->vs_out; c2 = v2->vs_out;
+    }
+
+    if (!pgl_gpu_begin(c->back_buffer.w, c->back_buffer.h))
+        return 0;
+
+    pgl_gpu_ndc(v0->clip_space, n0);
+    pgl_gpu_ndc(v1->clip_space, n1);
+    pgl_gpu_ndc(v2->clip_space, n2);
+
+    if (fs_id == PGL_VC3D_FS_TEX_MOD) {
+        /* pgl_ff_tex_modulate_vs writes u/v into vs_out[0..1]; the GPU TEX_MOD
+         * kernel is point-sampled CLAMP-to-edge, matching the CPU path when the
+         * texture is NEAREST + CLAMP_TO_EDGE (enforced by pgl_gpu_tex_slot). */
+        float uv0[2], uv1[2], uv2[2];
+        uv0[0] = v0->vs_out[0]; uv0[1] = v0->vs_out[1];
+        uv1[0] = v1->vs_out[0]; uv1[1] = v1->vs_out[1];
+        uv2[0] = v2->vs_out[0]; uv2[1] = v2->vs_out[1];
+        return pgl_vc3d_batch_tri_tex(tex_slot, n0, n1, n2, uv0, uv1, uv2,
+                                      depth_func, depth_mask, cull_cfg, &ext);
+    }
+    return pgl_vc3d_batch_tri(fs_id, solid, n0, n1, n2, c0, c1, c2,
+                              depth_func, depth_mask, cull_cfg, &ext);
+}
+
+/* Try to offload one post-VS point (GL_POINTS) to the GPU.  Only a point_size
+ * <= 1 rasterizes a deterministic single pixel on both engines; larger points and
+ * point sprites are a multi-pixel quad the fixed-function back end does not model,
+ * so they stay on the CPU.  Culling is meaningless for points.  Returns 1 when
+ * batched, 0 when the CPU must draw it. */
+static int pgl_gpu_point(glVertex* v)
+{
+    int fs_id, tex_slot;
+    uint32_t solid = 0, depth_func, depth_mask, cull_cfg;
+    const float* c0 = NULL;
+    float n0[3];
+    pgl_vc3d_ext_t ext;
+
+    if (c->point_size > 1.0f)
+        return 0;
+    if (!pgl_gpu_state(c->poly_offset_pt, 0, &fs_id, &solid,
+                       &depth_func, &depth_mask, &cull_cfg, &tex_slot, &ext))
+        return 0;
+    if (fs_id == PGL_VC3D_FS_TEX_MOD)
+        return 0;   /* points carry no uv; keep TEX_MOD points on the CPU */
+    if (fs_id == PGL_VC3D_FS_GOURAUD)
+        c0 = v->vs_out;
+
+    if (!pgl_gpu_begin(c->back_buffer.w, c->back_buffer.h))
+        return 0;
+
+    pgl_gpu_ndc(v->clip_space, n0);
+    return pgl_vc3d_batch_point(fs_id, solid, n0, c0,
+                                depth_func, depth_mask, cull_cfg, &ext);
+}
+
+/* Try to offload one post-VS line segment to the GPU.  Called only for a fully
+ * unclipped segment (both endpoints inside the clip volume), so the raw vertex
+ * clip positions ARE the segment.  Only a 1px non-smooth line matches the back
+ * end's fixed LINE_WIDTH=1 rasterizer; AA and thick lines stay on the CPU.
+ * Culling is meaningless for lines.  Returns 1 when batched, 0 when the CPU must
+ * draw it. */
+static int pgl_gpu_line(glVertex* v1, glVertex* v2)
+{
+    int fs_id, tex_slot;
+    uint32_t solid = 0, depth_func, depth_mask, cull_cfg;
+    const float *c0 = NULL, *c1 = NULL;
+    float n0[3], n1[3];
+    pgl_vc3d_ext_t ext;
+
+    if (c->line_smooth || c->line_width > 1.0f)
+        return 0;
+    if (!pgl_gpu_state(c->poly_offset_line, 0, &fs_id, &solid,
+                       &depth_func, &depth_mask, &cull_cfg, &tex_slot, &ext))
+        return 0;
+    if (fs_id == PGL_VC3D_FS_TEX_MOD)
+        return 0;   /* lines carry no uv; keep TEX_MOD lines on the CPU */
+    if (fs_id == PGL_VC3D_FS_GOURAUD) {
+        c0 = v1->vs_out; c1 = v2->vs_out;
+    }
+
+    if (!pgl_gpu_begin(c->back_buffer.w, c->back_buffer.h))
+        return 0;
+
+    pgl_gpu_ndc(v1->clip_space, n0);
+    pgl_gpu_ndc(v2->clip_space, n1);
+    return pgl_vc3d_batch_line(fs_id, solid, n0, n1, c0, c1,
+                               depth_func, depth_mask, cull_cfg, &ext);
+}
+#endif /* PGL_VC3D */
+
 #if !(PGL_NEON_ENABLED && PGL_BITDEPTH == 32)
 static Color blend_pixel(vec4 src, vec4 dst);
 #endif
@@ -3860,6 +4314,13 @@ static void run_pipeline(GLenum mode, const GLvoid* indices, GLsizei count, GLsi
 
             c->glverts.a[i].screen_space = mult_m4_v4(c->vp_mat, c->glverts.a[i].clip_space);
 
+#ifdef PGL_VC3D
+            /* GPU fast path: offload the point when eligible, otherwise flush
+             * any pending GPU batch so this CPU point lands in painter's order. */
+            if (pgl_gpu_point(&c->glverts.a[i]))
+                continue;
+            pgl_gpu_fence();
+#endif
             draw_point(&c->glverts.a[i], 0.0f);
         }
     } else if (mode == GL_LINES) {
@@ -3905,6 +4366,11 @@ static void run_pipeline(GLenum mode, const GLvoid* indices, GLsizei count, GLsi
             draw_triangle(&c->glverts.a[0], &c->glverts.a[i-1], &c->glverts.a[i], i+provoke);
         }
     }
+#ifdef PGL_VC3D
+    /* submit this draw call's batched triangles before returning */
+    if (_pgl_gpu_active)
+        pgl_vc3d_flush();
+#endif
 }
 
 
@@ -4023,6 +4489,14 @@ static void draw_line_clip(glVertex* v1, glVertex* v2)
         hp1 = v4_to_v3h(t1);
         hp2 = v4_to_v3h(t2);
 
+#ifdef PGL_VC3D
+        /* GPU fast path: the segment is fully unclipped, so the raw vertex clip
+         * positions ARE the line.  Offload it when eligible, otherwise flush any
+         * pending GPU batch so this CPU line lands in painter's order. */
+        if (pgl_gpu_line(v1, v2))
+            return;
+        pgl_gpu_fence();
+#endif
         if (c->line_smooth) {
             draw_aa_line(hp1, hp2, t1.w, t2.w, v1->vs_out, v2->vs_out, provoke, 0.0f);
         } else {
@@ -5105,6 +5579,13 @@ static inline uint32x4_t pgl_neon_depth_test4(uint32x4_t inside, float32x4_t z, 
 
 static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigned int provoke)
 {
+#ifdef PGL_VC3D
+    /* GPU fast path: offload the triangle when eligible, otherwise flush any
+     * pending GPU batch so this CPU triangle lands in painter's order. */
+    if (pgl_gpu_tri(v0, v1, v2))
+        return;
+    pgl_gpu_fence();
+#endif
     vec4 p0 = v0->screen_space;
     vec4 p1 = v1->screen_space;
     vec4 p2 = v2->screen_space;
@@ -6141,6 +6622,15 @@ PGLDEF GLboolean init_glContext(glContext* context, pix_t** back, GLsizei w, GLs
 PGLDEF void free_glContext(glContext* ctx)
 {
     int i;
+#ifdef PGL_VC3D
+    /* release the shm render target the GPU path adopted as the back buffer
+     * (portablegl treats it as user-owned and will not free it) */
+    if (ctx == c) {
+        pgl_vc3d_shutdown();
+        _pgl_gpu_active = 0;
+        _pgl_gpu_off = 0;
+    }
+#endif
 #ifndef PGL_NO_DEPTH_NO_STENCIL
     PGL_FREE(ctx->zbuf.buf);
 #  if defined(PGL_D16) && !defined(PGL_NO_STENCIL)
@@ -6255,6 +6745,34 @@ PGLDEF GLboolean pglResizeFramebuffer(GLsizei w, GLsizei h)
         c->ux = w;
         c->uy = h;
     }
+
+#ifdef PGL_VC3D
+    /* Keep the GPU shm target in step with the (user-owned) back buffer.  On
+     * failure the GPU latches off and the back buffer moves to a fresh CPU
+     * allocation of the new size. */
+    if (_pgl_gpu_active) {
+        if (pgl_vc3d_resize(w, h)) {
+            u8* px = (u8*)pgl_vc3d_pixels();
+            c->back_buffer.buf = px;
+            c->back_buffer.w = w;
+            c->back_buffer.h = h;
+            c->back_buffer.lastrow = px + (h-1)*w*sizeof(pix_t);
+            c->user_alloced_backbuf = GL_TRUE;
+        } else {
+            u8* nb = (u8*)PGL_MALLOC((size_t)w * (size_t)h * sizeof(pix_t));
+            if (nb) {
+                c->back_buffer.buf = nb;
+                c->back_buffer.w = w;
+                c->back_buffer.h = h;
+                c->back_buffer.lastrow = nb + (h-1)*w*sizeof(pix_t);
+                c->user_alloced_backbuf = GL_FALSE;
+                pgl_vc3d_shutdown();
+            }
+            _pgl_gpu_active = 0;
+            _pgl_gpu_off = 1;
+        }
+    }
+#endif
 
     return GL_TRUE;
 }
@@ -7634,6 +8152,35 @@ PGLDEF void glClear(GLbitfield mask)
     // right now they're all always present
 
     PGL_ERR((mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)), GL_INVALID_VALUE);
+
+#ifdef PGL_VC3D
+    /* Phase A2 persistent depth.  glClear marks the frame boundary: it records
+     * the clear colour/depth and flags the NEXT GPU draw dispatch as the frame's
+     * first, so that dispatch clears the persistent colour+Z surfaces (later
+     * dispatches LOAD them, letting a multi-draw frame accumulate instead of
+     * each erasing the last).  No GPU dispatch is issued here.  The CPU clear
+     * below still runs in full: it keeps c->z_buf correct for any CPU-drawn
+     * primitive that may follow GPU draws in the same frame, and guarantees the
+     * shared back_buffer is cleared even for a frame that issues no GPU draw. */
+    if (_pgl_gpu_active) {
+        /* A scissored or colour-masked glClear is performed precisely by the CPU
+         * below, but the GPU folds the frame clear into its first draw dispatch
+         * as a FULL-FRAME, unmasked clear that would clobber it.  Pin such a
+         * frame to the CPU (pgl_gpu_state declines while _pgl_gpu_frame_cpu is
+         * set); begin_frame still runs so any batch pending from the previous
+         * frame is flushed in painter's order. */
+        _pgl_gpu_frame_cpu = 0;
+#ifndef PGL_DISABLE_COLOR_MASK
+        if (c->scissor_test || c->color_mask != (GLuint)~(GLuint)0)
+            _pgl_gpu_frame_cpu = 1;
+#else
+        if (c->scissor_test)
+            _pgl_gpu_frame_cpu = 1;
+#endif
+        pgl_vc3d_begin_frame(pgl_rgba8_from_pixel(c->clear_color),
+                             (float)c->clear_depth);
+    }
+#endif
 
     // NOTE: All buffers should have the same dimensions/size
     int sz = c->ux * c->uy;

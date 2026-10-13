@@ -346,9 +346,8 @@ int polygon_mode;
 GLuint shaders[NUM_SHADERS];
 int cur_shader;
 My_Uniforms the_uniforms;
+pgl_ff_solid_uniform line_uniforms;   /* solid-colour floor grid (basic_shader) */
 
-void basic_transform_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
-void uniform_color_fp(float* fs_input, Shader_Builtins* builtins, void* uniforms);
 void gouraud_ads_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
 void gouraud_ads_fp(float* fs_input, Shader_Builtins* builtins, void* uniforms);
 void phong_ads_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
@@ -499,11 +498,15 @@ int main(int argc, char** argv) {
 
     GLenum interpolation[5] = { PGL_SMOOTH3 };
 
-    GLuint basic_shader = pglCreateProgram(basic_transform_vp, uniform_color_fp, 0, NULL, GL_FALSE);
+    /* The floor grid is a plain solid-colour GL_LINES pass: use the built-in
+     * pgl_ff_solid_vs / pgl_ff_solid pair so the raspi5 V3D back end can offload
+     * it.  It needs a pgl_ff_solid_uniform (mvp_matrix + color); the_uniforms is
+     * not layout-compatible (normal_mat sits between them), so it gets its own. */
+    GLuint basic_shader = pglCreateProgram(pgl_ff_solid_vs, pgl_ff_solid, 0, NULL, GL_FALSE);
     glUseProgram(basic_shader);
-    pglSetUniform(&the_uniforms);
+    pglSetUniform(&line_uniforms);
 
-    shaders[0] = pglCreateProgram(gouraud_ads_vp, gouraud_ads_fp, 3, interpolation, GL_FALSE);
+    shaders[0] = pglCreateProgram(gouraud_ads_vp, pgl_ff_gouraud, 4, interpolation, GL_FALSE);
     glUseProgram(shaders[0]);
     pglSetUniform(&the_uniforms);
 
@@ -525,6 +528,7 @@ int main(int argc, char** argv) {
     vec3 sphere_specular = make_v3(1, 1, 1);
 
     the_uniforms.color = floor_color;
+    line_uniforms.color = floor_color;
     the_uniforms.shininess = 128.0f;
     vec3 light_direction = make_v3(0, 10, 5);
     vec3_normalize(light_direction);
@@ -565,7 +569,7 @@ int main(int argc, char** argv) {
         mat4_multiply(mvp_mat, proj_mat, view_mat);
 
         glUseProgram(basic_shader);
-        memcpy(the_uniforms.mvp_mat, mvp_mat, sizeof(mvp_mat));
+        memcpy(line_uniforms.mvp_matrix, mvp_mat, sizeof(mvp_mat));
         glBindVertexArray(line_vao);
         glDrawArrays(GL_LINES, 0, line_verts.size());
 
@@ -679,22 +683,8 @@ int handle_events(Camera& camera, unsigned int last_time, unsigned int cur_time)
     return 0;
 }
 
-void basic_transform_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms) {
-    My_Uniforms* u = (My_Uniforms*)uniforms;
-    vec4 v = vertex_attribs[0];
-    builtins->gl_Position.x = u->mvp_mat[0]*v.x + u->mvp_mat[4]*v.y + u->mvp_mat[8]*v.z + u->mvp_mat[12]*v.w;
-    builtins->gl_Position.y = u->mvp_mat[1]*v.x + u->mvp_mat[5]*v.y + u->mvp_mat[9]*v.z + u->mvp_mat[13]*v.w;
-    builtins->gl_Position.z = u->mvp_mat[2]*v.x + u->mvp_mat[6]*v.y + u->mvp_mat[10]*v.z + u->mvp_mat[14]*v.w;
-    builtins->gl_Position.w = u->mvp_mat[3]*v.x + u->mvp_mat[7]*v.y + u->mvp_mat[11]*v.z + u->mvp_mat[15]*v.w;
-}
-
-void uniform_color_fp(float* fs_input, Shader_Builtins* builtins, void* uniforms) {
-    My_Uniforms* u = (My_Uniforms*)uniforms;
-    builtins->gl_FragColor.x = u->color.x;
-    builtins->gl_FragColor.y = u->color.y;
-    builtins->gl_FragColor.z = u->color.z;
-    builtins->gl_FragColor.w = u->color.w;
-}
+/* basic_transform_vp / uniform_color_fp were replaced by the built-in
+ * pgl_ff_solid_vs / pgl_ff_solid (see basic_shader setup in main). */
 
 void gouraud_ads_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms) {
     My_Uniforms* u = (My_Uniforms*)uniforms;
@@ -733,6 +723,10 @@ void gouraud_ads_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* bui
     vs_output[0] = out_light.x;
     vs_output[1] = out_light.y;
     vs_output[2] = out_light.z;
+    vs_output[3] = 1.0f;   /* alpha: the program pairs this VS with the built-in
+                            * pgl_ff_gouraud FS, which reads a vec4 RGBA varying
+                            * (lets the raspi5 V3D back end offload gouraud +
+                            * depth/cull to the GPU; identical on the CPU). */
 
     vec4 v = vertex_attribs[ATTR_VERTEX];
     vec4 inst = vertex_attribs[ATTR_INSTANCE];
