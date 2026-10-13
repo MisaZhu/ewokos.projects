@@ -110,7 +110,22 @@ struct gear {
 };
 
 static GLfloat view_rot[3] = { 20.0f, 30.0f, 0.0f };
-static struct gear *gear1, *gear2, *gear3;
+
+/* All gears share one module so their teeth interleave: pitch radius R = 0.2 * teeth
+ * (pitch circle sits at create_gear()'s outer_radius).  A sun gear at the origin is
+ * the driver; every planet meshes with it, its centre placed at R_sun + R_planet. */
+#define MAX_GEARS 8
+#define R_PER_TOOTH 0.2f
+
+struct gear_instance {
+    struct gear *g;
+    GLfloat x, y;          /* centre position (world units) */
+    GLfloat color[4];      /* material colour */
+    GLfloat speed;         /* rotation = speed * angle + phase (degrees) */
+    GLfloat phase;
+};
+static struct gear_instance gears[MAX_GEARS];
+static int n_gears = 0;
 static GLfloat angle = 0.0f;
 
 // Camera orbit parameters
@@ -480,31 +495,93 @@ static void look_at(GLfloat *m, GLfloat eye_x, GLfloat eye_y, GLfloat eye_z,
 
 static void draw_gears(void)
 {
-    static const GLfloat red[4] = { 0.8f, 0.1f, 0.0f, 1.0f };
-    static const GLfloat green[4] = { 0.0f, 0.8f, 0.2f, 1.0f };
-    static const GLfloat blue[4] = { 0.2f, 0.2f, 1.0f, 1.0f };
     GLfloat transform[16];
+    int i;
 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // Camera orbits around the gears
-    // Calculate camera position on a circular path - closer for larger appearance
-    float cam_x = sinf(camera_angle * M_PI / 180.0f) * 16.0f;
-    float cam_y = 6.0f;  // Slightly above the gears
-    float cam_z = cosf(camera_angle * M_PI / 180.0f) * 16.0f;
-    
+    // Camera orbits the gear cluster, close enough that it nearly fills the frame.
+    // The cluster's outermost tooth reaches ~9.6 units from the origin; with a 60 deg
+    // vertical FOV a distance of 16.5 gives a half-height of ~9.5, so the gears span
+    // almost the whole window.  cam_y is kept low for a near face-on view (a higher
+    // camera would tilt the circles into ellipses and waste vertical space).
+    float cam_x = sinf(camera_angle * M_PI / 180.0f) * 16.5f;
+    float cam_y = 4.0f;  // Slightly above the gears
+    float cam_z = cosf(camera_angle * M_PI / 180.0f) * 16.5f;
+
     // Build look-at matrix to always face the center (0, 0, 0)
     look_at(transform, cam_x, cam_y, cam_z, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f);
 
-    // Keep gear positions fixed - projection matrix handles aspect ratio
-    draw_gear(gear1, transform, -3.0f, -2.0f, angle, red);
-    draw_gear(gear2, transform, 3.1f, -2.0f, -2.0f * angle - 9.0f, green);
-    draw_gear(gear3, transform, -3.1f, 4.2f, -2.0f * angle - 25.0f, blue);
+    for (i = 0; i < n_gears; i++)
+        draw_gear(gears[i].g, transform, gears[i].x, gears[i].y,
+                  gears[i].speed * angle + gears[i].phase, gears[i].color);
+}
+
+/* Add a gear meshing with the driver sun gear.  The planet is placed with its
+ * centre at exactly R_sun + R_planet along phi_deg, spun at -N_sun/N_planet
+ * times the sun's angle (external gears counter-rotate), and given the phase
+ *
+ *   phi = phi_deg*(1 + N_sun/N_planet) + 180 - 5*180/(2*N_planet)
+ *
+ * that drops each tooth into the mating gap.  This reproduces the original
+ * hand-tuned offsets exactly (gear2: phi=0 -> 135 deg == -9 deg mod one tooth
+ * pitch of 36 deg; gear3 -> 407.7 deg == -25 deg), so the whole train meshes. */
+static void add_planet_gear(GLint teeth, GLfloat phi_deg, GLfloat width,
+                            const GLfloat color[4])
+{
+    static const GLint sun_teeth = 20;   // must match the sun created in init_gears()
+    GLfloat dist, rad, phi, inner, outer;
+
+    if (n_gears >= MAX_GEARS)
+        return;
+
+    dist = R_PER_TOOTH * (sun_teeth + teeth);   // centre distance = R_sun + R_planet
+    outer = R_PER_TOOTH * teeth;                // pitch radius = outer_radius
+    inner = outer * 0.25f;
+
+    phi = phi_deg * (1.0f + (GLfloat)sun_teeth / (GLfloat)teeth)
+          + 180.0f - 5.0f * 180.0f / (2.0f * teeth);
+    while (phi < 0.0f) phi += 360.0f;
+    while (phi >= 360.0f) phi -= 360.0f;
+
+    rad = phi_deg * M_PI / 180.0f;
+    gears[n_gears].g = create_gear(inner, outer, width, teeth, 0.7f);
+    gears[n_gears].x = dist * cosf(rad);
+    gears[n_gears].y = dist * sinf(rad);
+    memcpy(gears[n_gears].color, color, sizeof(gears[n_gears].color));
+    gears[n_gears].speed = -(GLfloat)sun_teeth / (GLfloat)teeth;
+    gears[n_gears].phase = phi;
+    if (gears[n_gears].g != NULL)
+        n_gears++;
+}
+
+static void add_sun_gear(GLint teeth, GLfloat width, const GLfloat color[4])
+{
+    GLfloat outer, inner;
+    if (n_gears >= MAX_GEARS)
+        return;
+    outer = R_PER_TOOTH * teeth;
+    inner = outer * 0.25f;
+    gears[n_gears].g = create_gear(inner, outer, width, teeth, 0.7f);
+    gears[n_gears].x = 0.0f;
+    gears[n_gears].y = 0.0f;
+    memcpy(gears[n_gears].color, color, sizeof(gears[n_gears].color));
+    gears[n_gears].speed = 1.0f;   // driver: rotation = angle
+    gears[n_gears].phase = 0.0f;
+    if (gears[n_gears].g != NULL)
+        n_gears++;
 }
 
 static void init_gears(void)
 {
+    static const GLfloat red[4]     = { 0.8f, 0.1f, 0.0f, 1.0f };
+    static const GLfloat green[4]   = { 0.0f, 0.8f, 0.2f, 1.0f };
+    static const GLfloat blue[4]    = { 0.2f, 0.3f, 1.0f, 1.0f };
+    static const GLfloat yellow[4]  = { 1.0f, 0.8f, 0.0f, 1.0f };
+    static const GLfloat magenta[4] = { 0.9f, 0.2f, 0.8f, 1.0f };
+    static const GLfloat cyan[4]    = { 0.1f, 0.8f, 0.9f, 1.0f };
+
     glEnable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
 
@@ -525,12 +602,17 @@ static void init_gears(void)
     perspective(projection_matrix, 60.0f, (GLfloat)win_width / (GLfloat)win_height, 1.0f, 1024.0f);
     glViewport(0, 0, win_width, win_height);
 
-    gear1 = create_gear(1.0f, 4.0f, 1.0f, 20, 0.7f);
-    gear2 = create_gear(0.5f, 2.0f, 2.0f, 10, 0.7f);
-    gear3 = create_gear(1.3f, 2.0f, 0.5f, 10, 0.7f);
+    /* One red sun gear at the origin drives five differently-coloured planets
+     * spread around it; each meshes with the sun and none overlap its neighbour. */
+    add_sun_gear(20, 1.2f, red);
+    add_planet_gear(10,   0.0f, 0.9f, green);
+    add_planet_gear(14,  72.0f, 1.1f, blue);
+    add_planet_gear(10, 144.0f, 0.8f, yellow);
+    add_planet_gear(12, 216.0f, 1.0f, magenta);
+    add_planet_gear(10, 288.0f, 0.9f, cyan);
 
-    if (gear1 == NULL || gear2 == NULL || gear3 == NULL) {
-        printf("Failed to create gears\n");
+    if (n_gears != 6) {
+        printf("Failed to create gears (%d/6)\n", n_gears);
     }
 }
 
