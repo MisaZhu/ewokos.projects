@@ -14,6 +14,14 @@
 #include <x/x.h>
 #include <x/xwin.h>
 #include <graph/graph.h>
+#include <font/font.h>
+
+#ifdef PGL_G3D
+#include <portablegl/pgl_g3d.h>
+#include "shadertoy_glsl.h"
+/* libv3dcompiler knob: compute workgroup shape for the GPU path (A/B tuning). */
+extern "C" void v3d_compile_set_cs_local_size(unsigned x, unsigned y);
+#endif
 
 #define sinf pgl_fast_sin
 #define cosf pgl_fast_cos
@@ -31,9 +39,32 @@ static int win_height = 480;
 static glContext the_Context;
 static pix_t* backbuf = NULL;
 static xwin_t* g_xwin = NULL;
+static font_t* font = NULL;
 
 float iGlobalTime;
 
+/* "check" mode (argv): render every effect at a fixed iGlobalTime, print an
+ * FNV-1a checksum + sample pixels of the back buffer once per effect, then
+ * exit after the last one.  Used to compare GPU workgroup shapes / CPU path
+ * output on a headless device.  "cpu" pins frames to the CPU rasteriser via a
+ * full-window scissor (pgl_gpu_state declines scissored frames). */
+static int g_check_mode = 0;
+static int g_check_cpu = 0;
+static int g_check_done[32];
+
+static void check_frame(const pix_t* buf, int w, int h, int effect)
+{
+	uint32_t hsh = 2166136261u;
+	int n = w * h, i;
+	for (i = 0; i < n; i++) {
+		hsh ^= (uint32_t)buf[i];
+		hsh *= 16777619u;
+	}
+	printf("SHADERTOY CHECK: effect %d %dx%d sum=%08x px0=%08x pxc=%08x pxq=%08x pxl=%08x\n",
+	       effect, w, h, hsh, (uint32_t)buf[0], (uint32_t)buf[(h / 2) * w + w / 2],
+	       (uint32_t)buf[(h / 4) * w + w / 4 + 3], (uint32_t)buf[n - 1]);
+	fflush(stdout);
+}
 // FPS counter
 static int fps = 0;
 static int frame_count = 0;
@@ -44,10 +75,15 @@ static void update_fps(void)
     uint32_t low;
     kernel_tic32(NULL, NULL, &low);
 
-    if (last_tic == 0 || (low - last_tic) >= 3000000) {
+    /* Update FPS statistics once per second */
+    if (last_tic == 0 || (low - last_tic) >= 1000000) {
         last_tic = low;
-        fps = frame_count / 3;
-        printf("FPS: %d\n", fps);
+        fps = frame_count;
+#ifdef PGL_G3D
+        printf("FPS: %d (gpu=%d)\n", fps, pgl_g3d_enabled()); fflush(stdout);
+#else
+        printf("FPS: %d\n", fps); fflush(stdout);
+#endif
         frame_count = 0;
     }
     frame_count++;
@@ -68,6 +104,12 @@ GLuint textures[NUM_TEXTURES];
 
 #define NUM_SHADERS 11
 GLuint shaders[NUM_SHADERS];
+#ifdef PGL_G3D
+// On-device-compiled GLSL ES programs (VideoCore VII QPU via libv3dcompiler).
+// Indexed identically to frag_funcs[]/shadertoy_fs_glsl[]; PGL_G3D_PROG_INVALID
+// when a shader fails to compile. Populated in init_shaders().
+static pgl_g3d_prog gpu_progs[NUM_SHADERS];
+#endif
 int cur_shader = 0;
 uint32_t start_time = 0;
 
@@ -193,6 +235,51 @@ static void init_textures(void)
 	the_uniforms.tex9 = textures[4];
 }
 
+#ifdef PGL_G3D
+// Pack the per-draw uniform blob for a compiled effect BY NAME.
+//
+// mesa's linker dead-strips default-block uniforms an effect never reads, so the
+// dword offset the compiled FS assigns to iGlobalTime / iResolution shifts per
+// effect (verified with the WS6 host oracle: effects that never read iGlobalTime
+// put iResolution.x at dword 0, the rest put iGlobalTime at 0 and iResolution.x
+// at 1).  Resolve each offset through the compiler's exported reflection
+// (pgl_g3d_shader_uniform_dword) rather than a fixed layout, write the float bit
+// patterns at blob[offset + component], and set *count to one past the highest
+// dword written so the staged blob covers every QUNIFORM_UNIFORM slot.
+static void shadertoy_pack_uniforms(uint32_t* blob, uint32_t* count,
+                                    void* uniforms, int w, int h, int prog)
+{
+	My_Uniforms* u = (My_Uniforms*)uniforms;
+	uint32_t off = 0, comps = 0, n, i;
+	int d;
+
+	memset(blob, 0, PGL_G3D_MAX_UNIF * sizeof(uint32_t));
+
+	// iGlobalTime: scalar float, seconds since this effect was selected.
+	d = pgl_g3d_shader_uniform_dword(prog, "iGlobalTime", &comps);
+	if (d >= 0 && comps >= 1) {
+		float gt = u->globaltime;
+		memcpy(&blob[d], &gt, sizeof(gt));
+		if ((uint32_t)d + 1u > off) off = (uint32_t)d + 1u;
+	}
+
+	// iResolution: vec3 viewport size (width, height, and 1.0 for unused z).
+	d = pgl_g3d_shader_uniform_dword(prog, "iResolution", &comps);
+	if (d >= 0 && comps >= 1) {
+		float res[3];
+		res[0] = (float)w;
+		res[1] = (float)h;
+		res[2] = 1.0f;
+		n = (comps < 3u) ? comps : 3u;
+		for (i = 0; i < n; i++)
+			memcpy(&blob[d + i], &res[i], sizeof(res[i]));
+		if ((uint32_t)d + n > off) off = (uint32_t)d + n;
+	}
+
+	*count = off;
+}
+#endif
+
 static void init_shaders(void)
 {
 	for (int i=0; i<NUM_SHADERS; ++i) {
@@ -200,6 +287,61 @@ static void init_shaders(void)
 		glUseProgram(shaders[i]);
 		SetUniform(&the_uniforms);
 	}
+#ifdef PGL_G3D
+	// Compile the GLSL ES ports to VideoCore VII QPU on-device (cached). This
+	// validates each source against the mesa frontend and front-loads the
+	// compile cost. Each successfully-compiled effect is registered so
+	// pglDrawFrame2 dispatches its full-screen frame on the GPU; the CPU
+	// frag_func path above remains the automatic fallback whenever the GPU is
+	// off, the program failed to compile, or the daemon declines the upload.
+	printf("SHADERTOY BUILD2: GPU-compiling %d effects...\n", NUM_SHADERS); fflush(stdout);
+	for (int i=0; i<NUM_SHADERS; ++i) {
+		char errlog[512];
+		errlog[0] = 0;
+		printf("SHADERTOY BUILD2: compile effect %d...\n", i); fflush(stdout);
+		gpu_progs[i] = pgl_g3d_program_compile(shadertoy_vs_glsl,
+											   shadertoy_fs_glsl[i],
+											   errlog, sizeof(errlog));
+		printf("SHADERTOY BUILD2: effect %d -> prog %d\n", i, (int)gpu_progs[i]); fflush(stdout);
+		if (gpu_progs[i] == PGL_G3D_PROG_INVALID) {
+			printf("shadertoy[%d]: GPU GLSL compile failed: %s\n", i, errlog);
+		} else {
+			pglRegisterFrameGPU(frag_funcs[i], gpu_progs[i],
+			                    shadertoy_pack_uniforms);
+			// WS4 texture effects: declare each effect's iChannelN -> GL texture
+			// binding (unit N = iChannelN, per the shadertoy_glsl.h declaration
+			// order) so the compiled FS samples the SAME image the CPU frag_func
+			// uses.  The mapping mirrors the *_fs channel assignments:
+			//   [3] running_in_the_night  iChannel0 = tex2
+			//   [4] square_tunnel         iChannel0 = tex0
+			//   [5] deform_tunnel         iChannel0 = tex2, iChannel1 = tex0
+			//   [9] the_cave              iChannel0 = tex6, iChannel1 = tex1,
+			//                             iChannel2 = tex9
+			// Non-texture effects declare none (a compiled FS with no sampler
+			// never emits a TMU_CONFIG slot).
+			{
+				GLuint units[PGL_G3D_MAX_TEX_UNITS];
+				int n = 0;
+				switch (i) {
+				case 3:
+					units[0] = the_uniforms.tex2; n = 1; break;
+				case 4:
+					units[0] = the_uniforms.tex0; n = 1; break;
+				case 5:
+					units[0] = the_uniforms.tex2; units[1] = the_uniforms.tex0;
+					n = 2; break;
+				case 9:
+					units[0] = the_uniforms.tex6; units[1] = the_uniforms.tex1;
+					units[2] = the_uniforms.tex9; n = 3; break;
+				default:
+					n = 0; break;
+				}
+				if (n > 0)
+					pglRegisterFrameGPUTextures(frag_funcs[i], units, n);
+			}
+		}
+	}
+#endif
 	glUseProgram(shaders[cur_shader]);
 }
 
@@ -208,9 +350,42 @@ static void on_repaint(xwin_t* xwin, graph_t* g)
 	(void)xwin;
 	
 	uint32_t new_time = kernel_tic_ms(0);
+	const uint32_t switch_ms = g_check_mode ? 1500 : 5000;
+	
+	/* V3DC-DIAG (temporary): auto-advance effects every 5s so a single
+	 * headless run exercises all 11 and reveals which scene latches the
+	 * GPU off (pgl_g3d_enabled() is sticky: once 0, CPU forever). */
+	{
+		static uint32_t _diag_last_switch = 0;
+		if (_diag_last_switch == 0)
+			_diag_last_switch = new_time;
+		if (new_time - _diag_last_switch >= switch_ms) {
+			if (g_check_mode && cur_shader == NUM_SHADERS - 1) {
+				printf("SHADERTOY CHECK: done\n"); fflush(stdout);
+				exit(0);
+			}
+			_diag_last_switch = new_time;
+			cur_shader = (cur_shader + 1) % NUM_SHADERS;
+			start_time = new_time;
+			glUseProgram(shaders[cur_shader]);
+#ifdef PGL_G3D
+			printf("SHADERTOY DIAG: -> effect %d (gpu=%d)\n", cur_shader, pgl_g3d_enabled()); fflush(stdout);
+#else
+			printf("SHADERTOY DIAG: -> effect %d\n", cur_shader); fflush(stdout);
+#endif
+		}
+	}
 	
 	iGlobalTime = (new_time - start_time) / 1000.0f;  // convert ms to seconds
 	the_uniforms.globaltime = (new_time - start_time) / 1000.0f;  // convert ms to seconds
+	if (g_check_mode) {
+		iGlobalTime = 1.5f;
+		the_uniforms.globaltime = 1.5f;
+		if (g_check_cpu) {
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(0, 0, win_width, win_height);
+		}
+	}
 
 	// Set viewport to match window size
 	glViewport(0, 0, win_width, win_height);
@@ -222,6 +397,18 @@ static void on_repaint(xwin_t* xwin, graph_t* g)
 	// Draw the shader
 	pglDrawFrame2(frag_funcs[cur_shader], &the_uniforms);
 
+	/* The GPU path adopts pgl_g3d_pixels() as the back buffer on its first
+	 * draw (pgl_gpu_begin frees the CPU buffer init_glContext handed us), so
+	 * re-read the live pointer every frame instead of only in on_resize -
+	 * otherwise the first frames blit a stale, freed buffer and the window
+	 * stays black until a resize. */
+	backbuf = (pix_t*)GetBackBuffer();
+
+	if (g_check_mode && !g_check_done[cur_shader] && new_time - start_time >= 800) {
+		g_check_done[cur_shader] = 1;
+		check_frame(backbuf, win_width, win_height, cur_shader);
+	}
+
 	// Clear destination graph with black before blitting
 	graph_fill_rect(g, 0, 0, win_width, win_height, 0xFF000000);
 	
@@ -231,6 +418,16 @@ static void on_repaint(xwin_t* xwin, graph_t* g)
 	graph_blt(&bg, 0, 0, win_width, win_height, g, 0, 0, win_width, win_height);
 	
 	update_fps();
+
+	if (font != NULL) {
+		char txt[48];
+#ifdef PGL_G3D
+		snprintf(txt, sizeof(txt), "FPS: %d  %s", fps, pgl_g3d_enabled() ? "GPU" : "CPU");
+#else
+		snprintf(txt, sizeof(txt), "FPS: %d", fps);
+#endif
+		graph_draw_text_font(g, 8, 8, txt, font, 16, 0xff00ff00);
+	}
 }
 
 static void on_event(xwin_t* xwin, xevent_t* ev)
@@ -302,10 +499,53 @@ static void loop(void* p)
 	usleep(1000);
 }
 
+/* EwokOS demo binaries are linked with ld directly and the C runtime _start
+ * never calls __libc_init_array, so the C++ static constructors gathered in
+ * .init_array are never run. The on-device mesa GLSL->QPU compiler depends on
+ * two of them (_GLOBAL__sub_I_builtin_types.cpp builds the glsl type system,
+ * _GLOBAL__sub_I_builtin_functions.cpp builds the built-in function table);
+ * without them the first v3d_compile_glsl() call dereferences unconstructed
+ * globals and faults. Run them here, before any shader is compiled. */
+extern "C" void (*__init_array_start[])(void);
+extern "C" void (*__init_array_end[])(void);
+
+static void shadertoy_run_static_ctors(void)
+{
+	void (**p)(void);
+	int n = 0;
+	for (p = __init_array_start; p < __init_array_end; ++p) {
+		if (*p != 0) {
+			printf("SHADERTOY BUILD2: ctor[%d]=%p...\n", n, (void*)*p); fflush(stdout);
+			(*p)();
+			printf("SHADERTOY BUILD2: ctor[%d] done\n", n); fflush(stdout);
+			n++;
+		}
+	}
+}
+
 int main(int argc, char** argv)
 {
-	(void)argc;
-	(void)argv;
+	printf("SHADERTOY BUILD2: enter main\n"); fflush(stdout);
+	/* argv: "WxH" compute workgroup shape (GPU build), "check" checksum mode,
+	 * "cpu" pin check frames to the CPU rasteriser. */
+	for (int ai = 1; ai < argc && argv[ai]; ai++) {
+		unsigned lx = 0, ly = 0;
+		if (strcmp(argv[ai], "check") == 0) {
+			g_check_mode = 1;
+		} else if (strcmp(argv[ai], "cpu") == 0) {
+			g_check_cpu = 1;
+		} else if (sscanf(argv[ai], "%ux%u", &lx, &ly) == 2 && lx > 0 && ly > 0) {
+#ifdef PGL_G3D
+			v3d_compile_set_cs_local_size(lx, ly);
+			printf("SHADERTOY BUILD2: cs local_size %ux%u\n", lx, ly); fflush(stdout);
+#endif
+		}
+	}
+	if (g_check_mode) {
+		printf("SHADERTOY BUILD2: check mode%s\n", g_check_cpu ? " (cpu)" : ""); fflush(stdout);
+	}
+	shadertoy_run_static_ctors();
+	printf("SHADERTOY BUILD2: static ctors done\n"); fflush(stdout);
 	
 	x_t x;
 	x_init(&x, NULL);
@@ -353,19 +593,28 @@ int main(int argc, char** argv)
 	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
 	
 	// Initialize textures and shaders
+	printf("SHADERTOY BUILD2: init_textures...\n"); fflush(stdout);
 	init_textures();
+	printf("SHADERTOY BUILD2: init_shaders...\n"); fflush(stdout);
 	init_shaders();
+	printf("SHADERTOY BUILD2: init_shaders done\n"); fflush(stdout);
 	
+	/* Load system font for the on-screen FPS readout */
+	font = font_new(DEFAULT_SYSTEM_FONT, true);
+
 	// Record start time
 	start_time = kernel_tic_ms(0);
 	
 	// Make window visible
+	printf("SHADERTOY BUILD2: entering run loop\n"); fflush(stdout);
 	xwin_set_visible(xwin, true);
 	
 	x_run(&x, xwin);
 	
 	// Cleanup
 	xwin_destroy(xwin);
+	if (font != NULL)
+		font_free(font);
 	free_glContext(&the_Context);
 	
 	return 0;

@@ -3730,8 +3730,8 @@ PGLDEF void put_aa_line_interp(vec4 c1, vec4 c2, float x1, float y1, float x2, f
 
 
 /* ---- Built-in fixed-function shader set ---------------------------------
- * Shipped so a demo can opt into the raspi5 VideoCore (V3D) GPU fast path: on
- * a PGL_VC3D build, a triangle whose program uses one of these fragment
+ * Shipped so a demo can opt into the GPU 3D-offload fast path: on
+ * a PGL_G3D build, a triangle whose program uses one of these fragment
  * shaders AND stays inside the supported state subset (depth off, blend off,
  * cull off, no stencil/scissor) is rasterized by the GPU instead of the CPU.
  * They are always compiled, so the same demo also runs unchanged on the CPU
@@ -3771,14 +3771,73 @@ PGLDEF void pgl_ff_gouraud(float* fs_input, Shader_Builtins* builtins, void* uni
 
 /* tex_modulate: point-sampled texture lookup at (vs_output[0], vs_output[1]).
  * The VS passes attribute 1 (texcoord vec4) through as 2 varyings (u, v);
- * the FS calls texture2D(tex0, u, v).  On raspi5 with PGL_VC3D the matching
- * triangles are offloaded to the V3D GPU's TEX_MOD fragment shader (linear
+ * the FS calls texture2D(tex0, u, v).  On a PGL_G3D build the matching
+ * triangles are offloaded to the GPU's TEX_MOD fragment shader (linear
  * RGBA8, point filtering, CLAMP-to-edge); elsewhere the CPU rasterizer runs
  * the same C code.  Attribute 0 = position (vec4), attribute 1 = texcoord (vec4,
  * only .xy used).  vs_output must hold at least 2 floats; the program's
  * interpolation[0..1] default to PGL_SMOOTH. */
 PGLDEF void pgl_ff_tex_modulate_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
 PGLDEF void pgl_ff_tex_modulate(float* fs_input, Shader_Builtins* builtins, void* uniforms);
+
+
+#ifdef PGL_G3D
+/* Force the GPU 3D target live and adopt pgl_g3d_pixels() as portablegl's back
+ * buffer, so an app's compiled-mesh draws (which render into pgl_g3d_pixels())
+ * and its CPU glDrawArrays fallback share ONE surface and the present blit stays
+ * zero-copy.  Call once after pglInitContext with the back-buffer size; on
+ * success (returns 1) refresh any cached back-buffer pointer via
+ * pglGetBackBuffer().  Returns 0 when the GPU path is off/unavailable, leaving
+ * the CPU back buffer untouched so the app can fall back cleanly.  Idempotent. */
+PGLDEF int pglGpuBegin(int w, int h);
+
+/* ---- On-device-compiled full-screen-frame GPU offload (WS4/WS5) -----------
+ * A shadertoy-style effect renders a full-screen frame with a CPU frag_func via
+ * pglDrawFrame()/pglDrawFrame2().  When the SAME effect has also been compiled
+ * to VideoCore VII QPU (pgl_g3d_program_compile) and registered here, those
+ * calls dispatch the frame on the GPU instead: portablegl packs the per-draw
+ * uniform blob through the caller's pack callback, binds the compiled program,
+ * and draws the full-screen quad as two pos-only triangles.  The CPU frag_func
+ * stays the fallback whenever the GPU is off, the program is invalid, or the
+ * daemon declines the upload, so the demo runs unchanged on every platform.
+ *
+ * pack(blob, count, uniforms, w, h, prog) fills blob[0..*count-1] with the u32
+ * words (float bit patterns for float uniforms) that the compiled program's
+ * QUNIFORM stream indexes for its QUNIFORM_UNIFORM slots.  The dword offset of
+ * each named default-block uniform (iGlobalTime / iResolution) MUST be resolved
+ * with pgl_g3d_shader_uniform_dword(prog, name, &n), never assumed from a fixed
+ * declaration-order layout: mesa's linker dead-strips uniforms an effect never
+ * reads, shifting the surviving offsets per effect.  Write each component to
+ * blob[offset + i]; set *count to one past the highest dword written (<=
+ * PGL_G3D_MAX_UNIF) so the staged blob covers every referenced slot.  pack runs
+ * once per frame in the caller's context; uniforms is the pointer passed to
+ * pglDrawFrame2 (or the current program's uniform for pglDrawFrame), w/h the
+ * back-buffer size in pixels, prog the registered pgl_g3d_prog handle.
+ *
+ * `prog` is a pgl_g3d_prog handle (typedef int); pass PGL_G3D_PROG_INVALID to
+ * register the CPU fallback only.  Registering the same frag_func again replaces
+ * its program/pack; a full registry (PGL_FRAME_GPU_MAX) leaves the effect on the
+ * CPU. */
+typedef void (*pgl_frame_pack_fn)(uint32_t* blob, uint32_t* count,
+                                  void* uniforms, int w, int h, int prog);
+PGLDEF void pglRegisterFrameGPU(frag_func fs, int prog, pgl_frame_pack_fn pack);
+PGLDEF void pglUnregisterFrameGPU(frag_func fs);
+
+/* Declare the sampler-unit -> GL texture-name bindings a GPU frame effect
+ * samples, so a compiled FS that reads iChannelN is hardware-accelerated too.
+ * tex_units[u] is the GL texture name bound to sampler unit u (iChannelU) and
+ * n the number of units (clamped to PGL_G3D_MAX_TEX_UNITS); pass 0 for a unit
+ * the effect leaves unbound.  Call AFTER pglRegisterFrameGPU for the same fs
+ * (it updates that entry).  Each frame pgl_gpu_frame resolves every name to a
+ * pgl_g3d texture slot (uploading on demand) and binds it before dispatch; the
+ * back end's fixed sampler record is GL_NEAREST + GL_REPEAT, so a name whose
+ * texture is not 2D RGBA8, NEAREST-filtered and REPEAT-wrapped cannot back a
+ * GPU sampler and leaves its unit unbound - a sample the FS makes from an
+ * unbound unit declines the draw back to the CPU (correct, never wrong).  A
+ * NULL tex_units or n <= 0 clears the bindings.  No-op when fs is not
+ * registered or the GPU path is off. */
+PGLDEF void pglRegisterFrameGPUTextures(frag_func fs, const GLuint* tex_units, int n);
+#endif /* PGL_G3D */
 
 
 #ifdef __cplusplus

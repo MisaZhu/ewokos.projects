@@ -8,6 +8,13 @@ EXTRA_LIBS_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 CXXFLAGS += -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/glcommon
 LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib -lSDL2_image -lSDL2_mixer -lSDL2_gfx -lSDL2_ttf -lSDL2
 
+# PGL_G3D (raspi5): the portablegl GPU backend pulls in pgl_g3d_shader.o, which
+# references the on-device mesa compiler (v3d_compile_glsl) in libv3dcompiler.a;
+# group it with libc/libm/cxx so its refs resolve (mirrors libs/demos/Makefile).
+ifeq ($(PGL_G3D),yes)
+LDFLAGS += --start-group -lv3dcompiler $(EWOK_LIBC) -lcxx -lopenlibm -lm --end-group
+endif
+
 GLCOMMON_LIB = $(EXTRA_LIBS_DIR)/lib/libglcommon.a \
 	$(EXTRA_LIBS_DIR)/lib/libportablegl.a
 

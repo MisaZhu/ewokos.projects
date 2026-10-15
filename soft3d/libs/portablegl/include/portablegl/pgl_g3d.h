@@ -1,14 +1,15 @@
 /*
- * pgl_vc3d.h - portablegl VideoCore (V3D 7.1) 3D-pipeline GPU back end.
+ * pgl_g3d.h - portablegl GPU 3D-offload back end (client half).
  *
- * Compiled ONLY when portablegl is built with -DPGL_VC3D (the raspi5 Makefile
- * gate); every other HW builds the pure CPU/NEON rasterizer with none of this
- * code present.  It is the client half of the GPU offload: it owns the shared
- * render target and the vertex/varying staging buffers, batches the CPU-computed
- * post-vertex-shader triangles, and marshals them into the stateless
- * g2dclient /dev/g2d protocol (G2D_DEV_CNTL_PGL_CLEAR / _PGL_DRAW).  The raspi5
- * g2dd daemon forwards those ops to the V3D 3D driver in libvideocore; portablegl
- * itself never maps V3D (all MMIO is root-daemon-only).
+ * Compiled ONLY when portablegl is built with -DPGL_G3D (a platform opts in by
+ * exporting PGL_G3D=yes from its system/make.inc); every other platform builds
+ * the pure CPU/NEON rasterizer with none of this code present.  It is the client
+ * half of the GPU offload: it owns the shared render target and the
+ * vertex/varying staging buffers, batches the CPU-computed post-vertex-shader
+ * triangles, and marshals them into the stateless g2dclient /dev/g2d protocol
+ * (G2D_DEV_CNTL_PGL_CLEAR / _PGL_DRAW).  The g2dd daemon forwards those ops to
+ * the platform 3D driver through the bsp_g3d interface; portablegl itself never
+ * maps any GPU MMIO (all of it is root-daemon-only).
  *
  * Division of labour (see the plan): the CPU runs portablegl's ARBITRARY vertex
  * shader per vertex and hands this layer the resulting clip-space positions plus
@@ -22,58 +23,69 @@
  * CPU rasterizer for the rest of the process lifetime.
  */
 
-#ifndef PGL_VC3D_H
-#define PGL_VC3D_H
+#ifndef PGL_G3D_H
+#define PGL_G3D_H
 
-#ifdef PGL_VC3D
+#ifdef PGL_G3D
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Built-in fixed-function fragment-shader ids, matching the g2dclient
-   G2D_PGL_FS_* / libvideocore VC_PGL3D_FS_* values exactly.  SOLID and
-   GOURAUD reuse the vertex-colour attribute path; TEX_MOD (Phase D) samples
-   a linear RGBA8 texture image uploaded via pgl_vc3d_upload_texture with
-   point filtering and CLAMP-to-edge addressing. */
-#define PGL_VC3D_FS_SOLID   0
-#define PGL_VC3D_FS_GOURAUD 1
-#define PGL_VC3D_FS_TEX_MOD 2
+   G2D_PGL_FS_* protocol values exactly.  SOLID and GOURAUD reuse the
+   vertex-colour attribute path; TEX_MOD (Phase D) samples a linear RGBA8
+   texture image uploaded via pgl_g3d_upload_texture with point filtering and
+   CLAMP-to-edge addressing. */
+#define PGL_G3D_FS_SOLID   0
+#define PGL_G3D_FS_GOURAUD 1
+#define PGL_G3D_FS_TEX_MOD 2
 
 /* Phase D texture table: a small fixed number of contig-shm RGBA8 texture
    images addressable by slot index.  Uploading a slot twice replaces its
    image (the previous shm segment is freed).  A TEX_MOD batch references one
    slot; changing the slot mid-frame flushes the batch first (a batch is
    homogeneous in fs_id AND tex_slot). */
-#define PGL_VC3D_MAX_TEX 4
+#define PGL_G3D_MAX_TEX 4
 
-/* Depth-function codes, value-identical to the g2dclient G2D_PGL_DEPTH_* /
-   libvideocore VC_PGL3D_DEPTH_* sets.  NONE disables the depth test; all eight
-   GL compare functions are covered. */
-#define PGL_VC3D_DEPTH_NONE     0
-#define PGL_VC3D_DEPTH_LESS     1
-#define PGL_VC3D_DEPTH_LEQUAL   2
-#define PGL_VC3D_DEPTH_GREATER  3
-#define PGL_VC3D_DEPTH_GEQUAL   4
-#define PGL_VC3D_DEPTH_ALWAYS   5
-#define PGL_VC3D_DEPTH_NEVER    6
-#define PGL_VC3D_DEPTH_EQUAL    7
-#define PGL_VC3D_DEPTH_NOTEQUAL 8
+/* WS4 compiled-shader sampler units: the number of texture units (iChannel0..)
+   a compiled fragment shader may sample, value-identical to the g2dclient
+   G2D_PGL_MAX_TEX_UNITS protocol constant and the back end's
+   V3D_3D_MAX_TEX_UNITS.  A compiled draw binds up to this many uploaded
+   texture slots via pgl_g3d_bind_tex_unit. */
+#define PGL_G3D_MAX_TEX_UNITS 4
+
+/* Depth-function codes, value-identical to the g2dclient G2D_PGL_DEPTH_*
+   protocol set.  NONE disables the depth test; all eight GL compare functions
+   are covered. */
+#define PGL_G3D_DEPTH_NONE     0
+#define PGL_G3D_DEPTH_LESS     1
+#define PGL_G3D_DEPTH_LEQUAL   2
+#define PGL_G3D_DEPTH_GREATER  3
+#define PGL_G3D_DEPTH_GEQUAL   4
+#define PGL_G3D_DEPTH_ALWAYS   5
+#define PGL_G3D_DEPTH_NEVER    6
+#define PGL_G3D_DEPTH_EQUAL    7
+#define PGL_G3D_DEPTH_NOTEQUAL 8
 
 /* Back-face-cull config codes carried in the cull_en argument (0 = draw both
-   facings), value-identical to the G2D_PGL_CULL_* / VC_PGL3D_CULL_* sets. */
-#define PGL_VC3D_CULL_NONE       0
-#define PGL_VC3D_CULL_BACK_CCW   1
-#define PGL_VC3D_CULL_BACK_CW    2
-#define PGL_VC3D_CULL_FRONT_CCW  3
-#define PGL_VC3D_CULL_FRONT_CW   4
-#define PGL_VC3D_CULL_BOTH       5
+   facings), value-identical to the g2dclient G2D_PGL_CULL_* protocol set. */
+#define PGL_G3D_CULL_NONE       0
+#define PGL_G3D_CULL_BACK_CCW   1
+#define PGL_G3D_CULL_BACK_CW    2
+#define PGL_G3D_CULL_FRONT_CCW  3
+#define PGL_G3D_CULL_FRONT_CW   4
+#define PGL_G3D_CULL_BOTH       5
 
 /* Primitive-mode codes carried to the back end, value-identical to the
-   g2dclient G2D_PGL_MODE_* / libvideocore V3D_3D_MODE_* sets.  A batch is
-   homogeneous in mode too, so points/lines/triangles never mix in one
-   dispatch (the GPU primitive-list format is per-dispatch render state). */
-#define PGL_VC3D_MODE_POINTS    0
-#define PGL_VC3D_MODE_LINES     1
-#define PGL_VC3D_MODE_TRIANGLES 4
+   g2dclient G2D_PGL_MODE_* protocol set.  A batch is homogeneous in mode too,
+   so points/lines/triangles never mix in one dispatch (the GPU primitive-list
+   format is per-dispatch render state). */
+#define PGL_G3D_MODE_POINTS    0
+#define PGL_G3D_MODE_LINES     1
+#define PGL_G3D_MODE_TRIANGLES 4
 
 /* Per-draw extended render state (Phase B2c): the scissor clip window, polygon
    offset and colour write mask, mirrored field-for-field from the g2dclient
@@ -88,49 +100,49 @@ typedef struct {
     uint8_t  poly_enable;
     float    poly_factor, poly_units;
     uint32_t color_mask;
-} pgl_vc3d_ext_t;
+} pgl_g3d_ext_t;
 
 /* Bring the GPU path up for a w x h RGBA8 target: allocate the contig-shm
    render target plus the fixed vertex/varying staging, then probe-clear it to
    confirm the daemon actually has a 3D path.  Returns 1 when the GPU is usable
-   (pgl_vc3d_enabled() then stays true until a later op latches it off), 0 when
+   (pgl_g3d_enabled() then stays true until a later op latches it off), 0 when
    it is not (the caller keeps the CPU rasterizer and must not call again). */
-int  pgl_vc3d_init(int w, int h);
+int  pgl_g3d_init(int w, int h);
 
 /* Non-zero while the GPU path is engaged (init succeeded and no op has latched
    it off).  Once it returns 0 it never returns 1 again for this process. */
-int  pgl_vc3d_enabled(void);
+int  pgl_g3d_enabled(void);
 
 /* The contig-shm render-target pixels: portablegl points its back_buffer here so
    CPU and GPU draws land in the SAME buffer and the demo's present blit goes
    through the existing GPU path for free.  Valid only while enabled. */
-void* pgl_vc3d_pixels(void);
+void* pgl_g3d_pixels(void);
 
 /* Reallocate the render target for a new w x h (viewport resize), preserving
    nothing (the caller re-clears).  Returns 1 on success, 0 (latched off) if the
    allocation fails. */
-int  pgl_vc3d_resize(int w, int h);
+int  pgl_g3d_resize(int w, int h);
 
 /* Full-frame GPU clear of the target to the packed rgba8 colour (0xAABBGGRR).
    Returns 1 when the GPU ran it, 0 when the caller must clear on the CPU (and
    the GPU has just latched off). */
-int  pgl_vc3d_clear(uint32_t rgba8);
+int  pgl_g3d_clear(uint32_t rgba8);
 
 /* Add one triangle to the current batch.  n0/n1/n2 are the perspective-divided
    clip positions (NDC xyz, 3 floats each); col0/col1/col2 are the per-vertex
    RGBA colours as 4 normalized floats in [0,1] (GOURAUD) or NULL (SOLID, which
-   uses solid_rgba for all three).  depth_func (PGL_VC3D_DEPTH_*), depth_mask
-   (Z-write) and cull_cfg (PGL_VC3D_CULL_*) are the per-dispatch render state.
+   uses solid_rgba for all three).  depth_func (PGL_G3D_DEPTH_*), depth_mask
+   (Z-write) and cull_cfg (PGL_G3D_CULL_*) are the per-dispatch render state.
    ext (NULL or all-zero for none) carries the Phase B2c scissor / polygon-
    offset / colour-mask state.  A change of fs_id/solid_rgba/depth/cull/ext
    state, or a full batch, flushes first so a batch is always homogeneous.
    Returns 1 when the triangle was batched, 0 when the caller must rasterize it
    on the CPU (GPU off / latched off during this call). */
-int  pgl_vc3d_batch_tri(int fs_id, uint32_t solid_rgba,
+int  pgl_g3d_batch_tri(int fs_id, uint32_t solid_rgba,
                         const float* n0, const float* n1, const float* n2,
                         const float* col0, const float* col1, const float* col2,
                         uint32_t depth_func, uint32_t depth_mask,
-                        uint32_t cull_cfg, const pgl_vc3d_ext_t* ext);
+                        uint32_t cull_cfg, const pgl_g3d_ext_t* ext);
 
 /* Add one point (GL_POINTS) to the current batch.  n0 is the perspective-divided
    clip position (NDC xyz); col0 is the per-vertex RGBA as 4 normalized floats
@@ -138,55 +150,64 @@ int  pgl_vc3d_batch_tri(int fs_id, uint32_t solid_rgba,
    homogeneity/flush rules as batch_tri; the primitive mode joins the batch key
    so a point batch never mixes with lines or triangles.  Returns 1 when the
    point was batched, 0 when the caller must draw it on the CPU. */
-int  pgl_vc3d_batch_point(int fs_id, uint32_t solid_rgba, const float* n0,
+int  pgl_g3d_batch_point(int fs_id, uint32_t solid_rgba, const float* n0,
                           const float* col0, uint32_t depth_func,
                           uint32_t depth_mask, uint32_t cull_cfg,
-                          const pgl_vc3d_ext_t* ext);
+                          const pgl_g3d_ext_t* ext);
 
 /* Add one line segment (GL_LINES/LINE_STRIP/LINE_LOOP) to the current batch:
    two endpoints n0/n1 (NDC xyz) with per-vertex colours col0/col1 (GOURAUD) or
    NULL (SOLID).  Same rules as batch_point; the GPU renders a line batch as a
    list of independent 2-vertex segments.  Returns 1 when the segment was
    batched, 0 when the caller must draw it on the CPU. */
-int  pgl_vc3d_batch_line(int fs_id, uint32_t solid_rgba,
+int  pgl_g3d_batch_line(int fs_id, uint32_t solid_rgba,
                          const float* n0, const float* n1,
                          const float* col0, const float* col1,
                          uint32_t depth_func, uint32_t depth_mask,
-                         uint32_t cull_cfg, const pgl_vc3d_ext_t* ext);
+                         uint32_t cull_cfg, const pgl_g3d_ext_t* ext);
 
 /* Submit the pending batch to the GPU (no-op when empty).  Any non-OK g2d
    result latches the GPU off; a lost batch cannot be replayed, so the caller
    redraws on the CPU from the next primitive onward. */
-void pgl_vc3d_flush(void);
+void pgl_g3d_flush(void);
 
 /* Phase D texture upload: allocate (or replace) a w x h linear RGBA8 texture
-   image in slot [0, PGL_VC3D_MAX_TEX) and copy the caller's tightly-packed
+   image in slot [0, PGL_G3D_MAX_TEX) and copy the caller's tightly-packed
    rgba8 pixels (w*h*4 bytes) into it.  The image is contig-shm so the GPU can
    address it by physical base with no per-draw copy.  Returns 1 on success, 0
    when the GPU path is off, the slot is out of range, w/h are non-positive,
    or the allocation failed (the GPU is NOT latched off by an allocation
    failure - only a submitted dispatch failure latches). */
-int  pgl_vc3d_upload_texture(int slot, int w, int h, const void* rgba8);
+int  pgl_g3d_upload_texture(int slot, int w, int h, const void* rgba8);
+
+/* Same as pgl_g3d_upload_texture, but store the image in the V3D texture
+   memory layout (LT / UBLINEAR / UIF, chosen from w x h exactly as mesa's
+   v3d_setup_slices does) instead of raster order.  The V3D TMU cannot sample
+   a raster 2D image, so a slot bound to a compiled-shader sampler unit with
+   pgl_g3d_bind_tex_unit MUST be filled by this variant; a tiled slot is in
+   turn unusable by the fixed-function TEX_MOD kernel (which reads raster
+   rows), so pgl_g3d_batch_tri_tex ignores it.  Same return contract. */
+int  pgl_g3d_upload_texture_tiled(int slot, int w, int h, const void* rgba8);
 
 /* Release a texture slot's shm segment (safe on an unused slot).  Any open
    TEX_MOD batch referencing the slot is flushed first so the driver never
    sees a dangling physical base. */
-void pgl_vc3d_free_texture(int slot);
+void pgl_g3d_free_texture(int slot);
 
 /* Add one TEX_MOD triangle to the current batch.  n0/n1/n2 are the
    perspective-divided clip positions (NDC xyz, 3 floats each); uv0/uv1/uv2
    are texture coordinates (2 floats each, s/t in [0,1] - values outside are
    CLAMPed by the frag shader).  tex_slot selects a previously-uploaded image
-   from the PGL_VC3D_MAX_TEX table; depth_func/depth_mask/cull_cfg/ext are the
+   from the PGL_G3D_MAX_TEX table; depth_func/depth_mask/cull_cfg/ext are the
    per-dispatch render state (identical semantics to batch_tri).  A change of
    tex_slot or any other batch-key field flushes first.  Returns 1 when the
    triangle was batched, 0 when the caller must rasterize it on the CPU (GPU
    off, slot empty, or the batch just latched the GPU off). */
-int  pgl_vc3d_batch_tri_tex(int tex_slot,
+int  pgl_g3d_batch_tri_tex(int tex_slot,
                             const float* n0, const float* n1, const float* n2,
                             const float* uv0, const float* uv1, const float* uv2,
                             uint32_t depth_func, uint32_t depth_mask,
-                            uint32_t cull_cfg, const pgl_vc3d_ext_t* ext);
+                            uint32_t cull_cfg, const pgl_g3d_ext_t* ext);
 
 /* Mark the start of a new frame: flush any batch pending from the previous
    frame, then record the colour (0xAABBGGRR) and [0,1] depth that the frame's
@@ -194,11 +215,179 @@ int  pgl_vc3d_batch_tri_tex(int tex_slot,
    dispatches of the same frame LOAD them, so a multi-draw frame accumulates
    instead of each dispatch erasing the last.  No dispatch is issued here (the
    clear rides along with the first draw).  No-op when the GPU path is off. */
-void pgl_vc3d_begin_frame(uint32_t clear_rgba, float clear_z);
+void pgl_g3d_begin_frame(uint32_t clear_rgba, float clear_z);
 
 /* Free the shm target and staging and latch the GPU off.  Safe to call when
-   never initialised. */
-void pgl_vc3d_shutdown(void);
+   never initialised.  Also releases every cached GLSL shader program
+   (pgl_g3d_program_free_all). */
+void pgl_g3d_shutdown(void);
 
-#endif /* PGL_VC3D */
-#endif /* PGL_VC3D_H */
+/* === On-device GLSL shader programs (WS4 arbitrary-shader GPU path) =========
+   A "program" is a GLSL vertex+fragment pair compiled IN-PROCESS to VideoCore
+   V3D 7.1 QPU by libv3dcompiler.a (linked into the app) and cached here.  The
+   cached QPU words are later marshalled through the g2dclient protocol to the
+   g2dd daemon, which uploads them to the GPU and dispatches: a compiled-shader
+   draw is real VideoCore hardware execution, never CPU rasterization.  This is
+   the app-side half of the GPU wiring (the app compiles; only the root daemon
+   may touch the V3D MMIO).
+
+   pgl_g3d_prog is an opaque non-negative handle; PGL_G3D_PROG_INVALID (< 0)
+   signals an error.  Handles are process-global and stay valid until freed. */
+typedef int pgl_g3d_prog;
+#define PGL_G3D_PROG_INVALID (-1)
+
+/* Compile (or return the cached handle for) a GLSL vertex+fragment pair.
+   vert_glsl/frag_glsl are NUL-terminated GLSL source strings; both are
+   required.  Returns a non-negative handle on success, PGL_G3D_PROG_INVALID on
+   failure (and, when errlog != NULL, copies up to errsz bytes of the compiler
+   diagnostic).  Compiling the same source pair again returns the same handle
+   with no recompilation, so it is cheap to call per frame.  The compile is pure
+   CPU work in this process and does NOT require the GPU probe to have run; a
+   failure is per-shader and does NOT latch the GPU off (the caller keeps its
+   CPU fragment shader for that one effect). */
+pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_glsl,
+                                     char* errlog, int errsz);
+
+/* Non-zero when p is a valid, successfully-compiled cached handle. */
+int pgl_g3d_program_valid(pgl_g3d_prog p);
+
+/* Non-zero when the daemon has (stickily) declined p - its upload or a draw
+   referencing it returned NOT_SUPPORTED - so compiled draws of p stay on the
+   caller's CPU path while the GPU remains available to other programs. */
+int pgl_g3d_program_declined(pgl_g3d_prog p);
+
+/* Release one cached program (safe on an invalid handle) or every cached
+   program.  pgl_g3d_shutdown() calls pgl_g3d_program_free_all(). */
+void pgl_g3d_program_free(pgl_g3d_prog p);
+void pgl_g3d_program_free_all(void);
+
+/* === WS4 compiled-shader draw path (full-screen-quad scoped) ================
+   These drive a draw with an on-device-compiled program instead of the
+   built-in fixed-function fragment shaders.  The path is scoped to the
+   shadertoy full-screen-quad case: a pos-only triangle strip whose fragment
+   colour the compiled FS derives procedurally (from uniforms such as
+   iGlobalTime / iResolution), so no per-vertex colour or uv is staged.  The
+   program's QPU is uploaded to the daemon lazily on the first batched triangle
+   (see pgl_g3d_shader_upload); a declined upload keeps THAT effect on the
+   caller's CPU rasterizer without latching the whole GPU off. */
+
+/* Maximum per-draw uniform words the client stages for the daemon's QUNIFORM
+   interpreter (matches V3D_3D_PROG_MAX_UNIF on the back end). */
+#define PGL_G3D_MAX_UNIF 128u
+
+/* Select the active compiled program for subsequent pgl_g3d_batch_tri_compiled
+   draws; PGL_G3D_PROG_INVALID clears it back to the fixed-function path.  A
+   program change flushes any open batch (a batch is homogeneous in its
+   program).  No-op when the GPU path is off. */
+void pgl_g3d_set_shader_program(pgl_g3d_prog p);
+
+/* Stage the per-draw GL uniform blob (count u32 values, clamped to
+   PGL_G3D_MAX_UNIF) that the daemon's QUNIFORM interpreter indexes for
+   QUNIFORM_UNIFORM slots.  Any open batch is flushed FIRST so it keeps the
+   uniforms it was batched with; the new blob then applies to subsequent
+   batches.  No-op when the GPU path is off or the uniform staging is absent. */
+void pgl_g3d_set_uniforms(const uint32_t* data, uint32_t count);
+
+/* Look up the dword offset - within the per-draw uniform blob staged by
+   pgl_g3d_set_uniforms - that program p's FRAGMENT shader assigned to a named
+   default-block uniform (e.g. "iGlobalTime", "iResolution").  The offset is
+   exactly the QUNIFORM_UNIFORM data value the compiled FS reads, so the client
+   writes data[offset..offset+num_components-1] with the uniform's components.
+   The value MUST be resolved by name through this query, never assumed from a
+   fixed [iGlobalTime, iResolution.xyz] layout: mesa's linker dead-strips
+   uniforms a given effect never reads, which shifts the surviving uniforms'
+   dword offsets per effect (verified with the WS6 host oracle - effects that
+   never read iGlobalTime place iResolution.x at dword 0, while effects that do
+   place iGlobalTime at 0 and iResolution.x at 1).  Returns the non-negative
+   dword offset, or -1 when p is invalid, no such default-block uniform exists,
+   or name is NULL.  When num_components != NULL it receives the uniform's
+   consecutive-dword width (scalar = 1, vec3 = 3).  Opaque uniforms (samplers /
+   images) ride the texture path, never the uniform blob, so they are not
+   reported here. */
+int  pgl_g3d_shader_uniform_dword(pgl_g3d_prog p, const char* name,
+                                  uint32_t* num_components);
+
+/* Add one triangle of the active compiled program to the current batch:
+   n0/n1/n2 are the clip-space positions (NDC xyz, 3 floats each).  Requires an
+   active program (pgl_g3d_set_shader_program) whose daemon upload succeeds;
+   depth_func/depth_mask/cull_cfg/ext carry the per-dispatch render state
+   (identical semantics to pgl_g3d_batch_tri).  Returns 1 when the triangle was
+   batched, 0 when the caller must rasterize it on the CPU (no active program,
+   upload declined, GPU off, or the batch just latched the GPU off). */
+int  pgl_g3d_batch_tri_compiled(const float* n0, const float* n1, const float* n2,
+                                uint32_t depth_func, uint32_t depth_mask,
+                                uint32_t cull_cfg, const pgl_g3d_ext_t* ext);
+
+/* Bind an uploaded texture slot to a compiled-shader sampler unit
+   [0, PGL_G3D_MAX_TEX_UNITS) for subsequent pgl_g3d_batch_tri_compiled draws:
+   unit u corresponds to the FS's iChannelU / sampler u whose QUNIFORM_TMU_CONFIG
+   pair the back end expands against the bound image.  tex_slot must name a slot
+   filled by pgl_g3d_upload_texture_tiled; a tex_slot < 0, an out-of-range slot,
+   an empty slot or a raster (pgl_g3d_upload_texture) slot UNBINDS the unit (a
+   sample from an unbound unit the FS references
+   declines the draw back to the CPU).  The binding persists until changed (like
+   GL texture-unit state) and is marshalled into the draw request on flush.  Call
+   after pgl_g3d_set_shader_program and before the batch/flush.  No-op when the
+   GPU path is off or unit is out of range. */
+void pgl_g3d_bind_tex_unit(int unit, int tex_slot);
+
+/* === WS4 generic compiled-mesh draw path (arbitrary 3D geometry) ============
+   These drive a static vertex mesh with an on-device-compiled program whose
+   VERTEX shader runs the model/view/projection transform AND lighting on the
+   QPU (not the CPU): the app uploads its geometry once, packs the per-draw
+   uniform blob by name (pgl_g3d_set_uniforms + pgl_g3d_shader_uniform_dword,
+   which resolves vertex-stage uniforms such as mvp / modelview / normal matrix
+   / material / light), and issues sub-range triangle draws against the compiled
+   program.  This is the generic-geometry half of the compiled path (the
+   full-screen-quad pgl_g3d_batch_tri_compiled above is the other half); the V3D
+   binner runs the program's coordinate-shader variant so a transformed mesh bins
+   correctly.  Two vertex attributes are staged per vertex: position (float3,
+   attribute location 0) and normal (float3, location 1). */
+
+/* Opaque non-negative handle to an uploaded static mesh;
+   PGL_G3D_MESH_INVALID (< 0) signals an error. */
+typedef int pgl_g3d_mesh;
+#define PGL_G3D_MESH_INVALID (-1)
+
+/* Stage a static pos+normal mesh for pgl_g3d_draw_mesh_compiled.  `interleaved`
+   is nverts vertices of stride_floats floats each, laid out position float3 at
+   element 0 followed by normal float3 at element 3 (so stride_floats >= 6; any
+   extra trailing floats per vertex, e.g. uv, are ignored).  The mesh is
+   de-interleaved into separate position/normal float3 arrays held in CPU memory
+   and copied once; each draw re-stages its sub-range into the fixed GPU staging
+   (a static GPU VBO addressed by per-draw phy offset is not usable here because
+   the daemon's attach cache is keyed by segment id and returns the cached base
+   physical address, ignoring a per-draw offset).  Returns a non-negative mesh
+   handle, or PGL_G3D_MESH_INVALID when the GPU path is off, the arguments are
+   bad, the mesh table is full, or allocation failed (none of which latch the GPU
+   off - the caller keeps its CPU path for that mesh). */
+pgl_g3d_mesh pgl_g3d_upload_mesh(const float* interleaved, uint32_t nverts,
+                                 uint32_t stride_floats);
+
+/* Release an uploaded mesh (safe on an invalid handle). */
+void pgl_g3d_free_mesh(pgl_g3d_mesh m);
+
+/* Draw vertices [first, first+count) of an uploaded mesh with a compiled program
+   as one GPU dispatch: the program's compiled VS/coord QPU runs the transform +
+   lighting on the QPU and its FS shades the fragments.  The per-draw uniform
+   blob is the one last staged by pgl_g3d_set_uniforms (call it, and
+   pgl_g3d_set_shader_program is NOT needed - `prog` is passed explicitly).
+   depth_func (PGL_G3D_DEPTH_*), depth_mask (Z-write) and cull (PGL_G3D_CULL_*)
+   are the per-dispatch render state.  The frame's first dispatch clears the
+   persistent colour+Z surfaces to the values recorded by pgl_g3d_begin_frame;
+   later dispatches LOAD them, so a multi-draw frame accumulates.  Any pending
+   batch is flushed first to preserve painter's order.  Returns 1 when the GPU
+   ran the draw, 0 when the caller must draw it on the CPU (GPU off, bad
+   prog/mesh/range, a sub-range larger than the staging, program upload declined,
+   or the dispatch just latched the GPU off). */
+int  pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
+                                uint32_t first, uint32_t count,
+                                uint32_t depth_func, uint32_t depth_mask,
+                                uint32_t cull);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* PGL_G3D */
+#endif /* PGL_G3D_H */

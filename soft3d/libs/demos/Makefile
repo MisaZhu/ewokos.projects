@@ -10,6 +10,16 @@ CXXFLAGS += -I.. -I../external -I $(BUILD_DIR)/include/SDL2 -I../glcommon/includ
 # Common LDFLAGS
 LDFLAGS += -lSDL2_image -lSDL2_mixer -lSDL2_gfx -lSDL2_ttf -lSDL2 -lfreetype -lpng -lvorbis -logg -lz -lm -lopenlibm -lportablegl $(EWOK_LIB_X) $(EWOK_LIB_GRAPH) $(EWOK_LIBC) -lcxx
 
+# raspi5 (PGL_G3D=yes): shadertoy.cpp compiles its GLSL ES ports to VideoCore
+# VII QPU via pgl_g3d_program_compile, which pulls pgl_g3d_shader.o out of
+# libportablegl.a and with it libv3dcompiler.a (the on-device mesa compiler).
+# Group the compiler with libc/libm/cxx so its ~160 undefined refs resolve
+# regardless of archive order. No-op on targets without the 3D capability.
+ifeq ($(PGL_G3D),yes)
+CXXFLAGS += -DPGL_G3D
+LDFLAGS += --start-group -lv3dcompiler $(EWOK_LIBC) -lcxx -lopenlibm -lm --end-group
+endif
+
 # glcommon library
 GLCOMMON_LIB = $(BUILD_DIR)/lib/libglcommon.a \
 	$(BUILD_DIR)/lib/libportablegl.a

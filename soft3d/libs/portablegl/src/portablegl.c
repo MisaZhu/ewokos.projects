@@ -1,7 +1,7 @@
 #define PGLDEF
 #include "../include/portablegl/portablegl.h"
-#ifdef PGL_VC3D
-#include "../include/portablegl/pgl_vc3d.h"
+#ifdef PGL_G3D
+#include "../include/portablegl/pgl_g3d.h"
 #endif
 
 // Fast math function implementations
@@ -3546,7 +3546,7 @@ static glContext* c;
 
 /* ---- Built-in fixed-function shaders (declared in portablegl.h) -----------
  * Always compiled so a demo using them runs on the CPU rasterizer everywhere;
- * on a PGL_VC3D build the matching triangles are offloaded to the V3D GPU (see
+ * on a PGL_G3D build the matching triangles are offloaded to the GPU (see
  * the pgl_gpu_* helpers below). */
 PGLDEF void pgl_ff_solid_vs(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms)
 {
@@ -3585,9 +3585,9 @@ PGLDEF void pgl_ff_tex_modulate(float* fs_input, Shader_Builtins* builtins, void
                                        fs_input[0], fs_input[1]);
 }
 
-#ifdef PGL_VC3D
-/* ---- raspi5 VideoCore (V3D) GPU fast path -------------------------------
- * Eligibility is decided here (this TU owns the context `c`); pgl_vc3d.c owns
+#ifdef PGL_G3D
+/* ---- GPU 3D-offload fast path (PGL_G3D) ---------------------------------
+ * Eligibility is decided here (this TU owns the context `c`); pgl_g3d.c owns
  * the shm target/staging and the g2d marshalling.  A primitive is offloaded only
  * when its program uses a built-in FF fragment shader AND the state is inside
  * the subset the back end renders today (depth test+write, back-face cull,
@@ -3654,91 +3654,129 @@ static int pgl_gpu_begin(int w, int h)
     return 0;
 #else
     if (_pgl_gpu_active)
-        return pgl_vc3d_enabled();
+        return pgl_g3d_enabled();
     if (_pgl_gpu_off)
         return 0;
     if (w <= 0 || h <= 0)
         return 0;
-    if (!pgl_vc3d_init(w, h)) {
+    if (!pgl_g3d_init(w, h)) {
         _pgl_gpu_off = 1;
         return 0;
     }
     {
-        u8* px = (u8*)pgl_vc3d_pixels();
+        u8* px = (u8*)pgl_g3d_pixels();
         size_t bytes = (size_t)w * (size_t)h * sizeof(pix_t);
         if (c->back_buffer.buf) {
-            /* carry over whatever the CPU already drew (e.g. a prior clear) */
-            PGL_MEMMOVE(px, c->back_buffer.buf, bytes);
-            if (!c->user_alloced_backbuf)
+            if (c->user_alloced_backbuf) {
+                /* user filled their own buffer before GPU bring-up
+                   (e.g. a pre-rendered CPU frame); carry it over to
+                   the GPU target so the first frame is not blank */
+                PGL_MEMMOVE(px, c->back_buffer.buf, bytes);
+            }
+            else {
+                /* internally allocated by init_glContext (malloc):
+                   holds uninitialised data, so copying it would
+                   overwrite the probe-clear's clean black with
+                   garbage and cause a startup noise flash on the
+                   desktop.  just free it. */
                 PGL_FREE(c->back_buffer.buf);
+            }
         }
         c->back_buffer.buf = px;
         c->back_buffer.w = w;
         c->back_buffer.h = h;
         c->back_buffer.lastrow = px + (h-1)*w*sizeof(pix_t);
-        c->user_alloced_backbuf = GL_TRUE;   /* pgl_vc3d owns/frees the shm */
+        c->user_alloced_backbuf = GL_TRUE;   /* pgl_g3d owns/frees the shm */
     }
     _pgl_gpu_active = 1;
     return 1;
 #endif
 }
 
+/* Public bring-up: force the GPU target live and adopt pgl_g3d_pixels() as the
+ * back buffer, so an app's compiled-mesh draws (which render into pgl_g3d_pixels())
+ * and its CPU glDrawArrays fallback share ONE surface and the present blit stays
+ * zero-copy.  Returns 1 when the GPU path is live (then pglGetBackBuffer() is the
+ * adopted GPU pixels), 0 when it is off / unavailable (CPU back buffer unchanged).
+ * Idempotent: a second call just reports pgl_g3d_enabled(). */
+PGLDEF int pglGpuBegin(int w, int h)
+{
+    return pgl_gpu_begin(w, h);
+}
+
 /* flush a pending GPU batch before any CPU-side drawing (painter's order) */
 static void pgl_gpu_fence(void)
 {
     if (_pgl_gpu_active)
-        pgl_vc3d_flush();
+        pgl_g3d_flush();
 }
 
-/* Phase D texture cache: map a GL texture name to a pgl_vc3d slot, re-uploading
- * only when the id, size, or data pointer change.  PGL_VC3D_MAX_TEX slots;
+/* Phase D texture cache: map a GL texture name to a pgl_g3d slot, re-uploading
+ * only when the id, size, or data pointer change.  PGL_G3D_MAX_TEX slots;
  * a miss evicts round-robin.  Returns the slot index, or -1 when the texture
  * cannot be represented by the GPU TEX_MOD kernel (unbound / not 2D / not
  * tightly-packed RGBA8 / non-NEAREST filter / non-CLAMP_TO_EDGE wrap) so the
  * caller declines the GPU path and rasterizes on the CPU.  glTexSubImage2D
  * that mutates data in place without reallocating is NOT detected - the caller
- * must pgl_vc3d_free_texture the slot (or resize) to force a re-upload. */
+ * must pgl_g3d_free_texture the slot (or resize) to force a re-upload. */
 typedef struct {
     GLuint      tex_id;   /* 0 = free slot */
     GLsizei     w, h;
     const void* data;     /* glTexture.data pointer, to catch realloc-on-resize */
     int         slot;
+    int         tiled;    /* 1 = V3D tiled layout (compiled samplers), 0 = raster (TEX_MOD) */
 } pgl_gpu_tex_entry_t;
-static pgl_gpu_tex_entry_t _pgl_gpu_tex[PGL_VC3D_MAX_TEX];
+static pgl_gpu_tex_entry_t _pgl_gpu_tex[PGL_G3D_MAX_TEX];
 static int _pgl_gpu_tex_next;
 
-static int pgl_gpu_tex_slot(GLuint tex_id)
+/* Resolve tex_id to its glTexture, or NULL when it cannot back any GPU sampler
+ * (unbound / out of range / deleted / not a 2D tightly-packed RGBA8 image with
+ * data / not NEAREST-filtered).  The wrap mode is NOT checked here: the TEX_MOD
+ * and compiled resolvers apply their own (CLAMP_TO_EDGE vs REPEAT). */
+static glTexture* pgl_gpu_tex_get(GLuint tex_id)
 {
-    int i;
     glTexture* t;
 
     if (tex_id == 0 || !c)
-        return -1;
+        return NULL;
     if ((int)tex_id >= c->textures.size)
-        return -1;
+        return NULL;
     t = &c->textures.a[tex_id];
-    if (t->deleted || t->type != GL_TEXTURE_2D || t->data == NULL)
-        return -1;
+    /* glBindTexture stores type as target-(GL_TEXTURE_UNBOUND+1) (see the
+     * pglDrawFrame tex check), NOT the raw GL_TEXTURE_2D enum. */
+    if (t->deleted || t->type != GL_TEXTURE_2D-(GL_TEXTURE_UNBOUND+1) || t->data == NULL)
+        return NULL;
     if (t->w <= 0 || t->h <= 0)
-        return -1;
-    /* GPU TEX_MOD is point-sampled, CLAMP-to-edge, tightly-packed RGBA8. */
+        return NULL;
     if (t->format != GL_RGBA)
-        return -1;
+        return NULL;
     if (t->mag_filter != GL_NEAREST || t->min_filter != GL_NEAREST)
-        return -1;
-    if (t->wrap_s != GL_CLAMP_TO_EDGE || t->wrap_t != GL_CLAMP_TO_EDGE)
-        return -1;
+        return NULL;
+    return t;
+}
 
-    for (i = 0; i < PGL_VC3D_MAX_TEX; i++) {
+/* Shared cache+upload tail for both GPU texture resolvers: return the slot
+ * already holding tex_id (same id/size/data/layout), else upload into a free
+ * slot (round-robin evict on a full table).  tiled selects the V3D tiled
+ * layout a compiled-shader sampler needs (the TMU cannot read raster rows)
+ * versus the raster image the fixed-function TEX_MOD kernel reads; the same GL
+ * texture used by both paths therefore occupies two slots.  Returns the slot,
+ * or -1 on an upload failure (which does NOT latch the GPU off). */
+static int pgl_gpu_tex_cache(GLuint tex_id, glTexture* t, int tiled)
+{
+    int i, ok;
+
+    for (i = 0; i < PGL_G3D_MAX_TEX; i++) {
         if (_pgl_gpu_tex[i].tex_id == tex_id &&
             _pgl_gpu_tex[i].w == t->w && _pgl_gpu_tex[i].h == t->h &&
-            _pgl_gpu_tex[i].data == (const void*)t->data) {
+            _pgl_gpu_tex[i].data == (const void*)t->data &&
+            _pgl_gpu_tex[i].tiled == tiled) {
             return _pgl_gpu_tex[i].slot;
         }
     }
 
     /* Miss: prefer a free slot, else round-robin evict. */
-    for (i = 0; i < PGL_VC3D_MAX_TEX; i++) {
+    for (i = 0; i < PGL_G3D_MAX_TEX; i++) {
         if (_pgl_gpu_tex[i].tex_id == 0) {
             _pgl_gpu_tex_next = i;
             break;
@@ -3746,16 +3784,50 @@ static int pgl_gpu_tex_slot(GLuint tex_id)
     }
     i = _pgl_gpu_tex_next;
     if (_pgl_gpu_tex[i].tex_id != 0)
-        pgl_vc3d_free_texture(_pgl_gpu_tex[i].slot);
-    if (!pgl_vc3d_upload_texture(i, t->w, t->h, t->data))
+        pgl_g3d_free_texture(_pgl_gpu_tex[i].slot);
+    ok = tiled ? pgl_g3d_upload_texture_tiled(i, t->w, t->h, t->data)
+               : pgl_g3d_upload_texture(i, t->w, t->h, t->data);
+    if (!ok) {
+        _pgl_gpu_tex[i].tex_id = 0;
         return -1;
+    }
     _pgl_gpu_tex[i].tex_id = tex_id;
     _pgl_gpu_tex[i].w = t->w;
     _pgl_gpu_tex[i].h = t->h;
     _pgl_gpu_tex[i].data = (const void*)t->data;
     _pgl_gpu_tex[i].slot = i;
-    _pgl_gpu_tex_next = (i + 1) % PGL_VC3D_MAX_TEX;
+    _pgl_gpu_tex[i].tiled = tiled;
+    _pgl_gpu_tex_next = (i + 1) % PGL_G3D_MAX_TEX;
     return i;
+}
+
+static int pgl_gpu_tex_slot(GLuint tex_id)
+{
+    glTexture* t = pgl_gpu_tex_get(tex_id);
+    if (!t)
+        return -1;
+    /* GPU TEX_MOD is point-sampled, CLAMP-to-edge, and reads raster rows. */
+    if (t->wrap_s != GL_CLAMP_TO_EDGE || t->wrap_t != GL_CLAMP_TO_EDGE)
+        return -1;
+    return pgl_gpu_tex_cache(tex_id, t, 0);
+}
+
+/* Compiled-shader sampler-unit resolver.  The raspi5 back end's fixed
+ * SAMPLER_STATE record is GL_NEAREST + GL_REPEAT (see pack_sampler_state_nearest
+ * in v3d_3d.c), so accept exactly that wrap - shadertoy's textures are all
+ * NEAREST/REPEAT.  Shares the slot cache with the TEX_MOD path but asks for
+ * the V3D tiled layout (the TMU samples LT/UBLINEAR/UIF images, never raster
+ * rows; filter/wrap live in the sampler record, not the image).  Returns the
+ * slot, or -1 when tex_id cannot back a compiled sampler (leaving its unit
+ * unbound -> the draw declines to CPU). */
+static int pgl_gpu_ctex_slot(GLuint tex_id)
+{
+    glTexture* t = pgl_gpu_tex_get(tex_id);
+    if (!t)
+        return -1;
+    if (t->wrap_s != GL_REPEAT || t->wrap_t != GL_REPEAT)
+        return -1;
+    return pgl_gpu_tex_cache(tex_id, t, 1);
 }
 
 /* Resolve the built-in fixed-function fragment shader plus the eligibility gates
@@ -3768,11 +3840,11 @@ static int pgl_gpu_tex_slot(GLuint tex_id)
  * meaningless there) and 1 for triangles.  Returns 1 and fills the fs_id, solid,
  * depth_func, depth_mask, cull_cfg, tex_slot and ext outputs when the GPU may
  * draw the primitive, 0 when the CPU must.  tex_slot is -1 for SOLID/GOURAUD
- * and the pgl_vc3d slot index for TEX_MOD (points/lines never take TEX_MOD). */
+ * and the pgl_g3d slot index for TEX_MOD (points/lines never take TEX_MOD). */
 static int pgl_gpu_state(int poly_off, int want_cull, int* fs_id,
                          uint32_t* solid, uint32_t* depth_func,
                          uint32_t* depth_mask, uint32_t* cull_cfg,
-                         int* tex_slot, pgl_vc3d_ext_t* ext)
+                         int* tex_slot, pgl_g3d_ext_t* ext)
 {
     glProgram* p;
 
@@ -3788,15 +3860,15 @@ static int pgl_gpu_state(int poly_off, int want_cull, int* fs_id,
     *tex_slot = -1;
     p = &c->programs.a[c->cur_program];
     if (p->fragment_shader == pgl_ff_solid) {
-        *fs_id = PGL_VC3D_FS_SOLID;
+        *fs_id = PGL_G3D_FS_SOLID;
         *solid = pgl_rgba8_from_vec4(((pgl_ff_solid_uniform*)p->uniform)->color);
     } else if (p->fragment_shader == pgl_ff_gouraud) {
-        *fs_id = PGL_VC3D_FS_GOURAUD;
+        *fs_id = PGL_G3D_FS_GOURAUD;
     } else if (p->fragment_shader == pgl_ff_tex_modulate) {
         int slot = pgl_gpu_tex_slot(((pgl_ff_tex_modulate_uniform*)p->uniform)->tex0);
         if (slot < 0)
             return 0;
-        *fs_id = PGL_VC3D_FS_TEX_MOD;
+        *fs_id = PGL_G3D_FS_TEX_MOD;
         *tex_slot = slot;
     } else {
         return 0;   /* arbitrary C fragment shader stays on the CPU */
@@ -3811,35 +3883,35 @@ static int pgl_gpu_state(int poly_off, int want_cull, int* fs_id,
     if (c->blend || c->stencil_test || c->fragdepth_or_discard)
         return 0;
 
-    *depth_func = PGL_VC3D_DEPTH_NONE;
+    *depth_func = PGL_G3D_DEPTH_NONE;
     *depth_mask = 0;
-    *cull_cfg = PGL_VC3D_CULL_NONE;
+    *cull_cfg = PGL_G3D_CULL_NONE;
 
     if (c->depth_test) {
         switch (c->depth_func) {
-        case GL_NEVER:    *depth_func = PGL_VC3D_DEPTH_NEVER;    break;
-        case GL_LESS:     *depth_func = PGL_VC3D_DEPTH_LESS;     break;
-        case GL_EQUAL:    *depth_func = PGL_VC3D_DEPTH_EQUAL;    break;
-        case GL_LEQUAL:   *depth_func = PGL_VC3D_DEPTH_LEQUAL;   break;
-        case GL_GREATER:  *depth_func = PGL_VC3D_DEPTH_GREATER;  break;
-        case GL_NOTEQUAL: *depth_func = PGL_VC3D_DEPTH_NOTEQUAL; break;
-        case GL_GEQUAL:   *depth_func = PGL_VC3D_DEPTH_GEQUAL;   break;
-        case GL_ALWAYS:   *depth_func = PGL_VC3D_DEPTH_ALWAYS;   break;
+        case GL_NEVER:    *depth_func = PGL_G3D_DEPTH_NEVER;    break;
+        case GL_LESS:     *depth_func = PGL_G3D_DEPTH_LESS;     break;
+        case GL_EQUAL:    *depth_func = PGL_G3D_DEPTH_EQUAL;    break;
+        case GL_LEQUAL:   *depth_func = PGL_G3D_DEPTH_LEQUAL;   break;
+        case GL_GREATER:  *depth_func = PGL_G3D_DEPTH_GREATER;  break;
+        case GL_NOTEQUAL: *depth_func = PGL_G3D_DEPTH_NOTEQUAL; break;
+        case GL_GEQUAL:   *depth_func = PGL_G3D_DEPTH_GEQUAL;   break;
+        case GL_ALWAYS:   *depth_func = PGL_G3D_DEPTH_ALWAYS;   break;
         default:          return 0;   /* unknown func stays on the CPU */
         }
         *depth_mask = c->depth_mask ? 1u : 0u;
     }
 
     if (want_cull && c->cull_face) {
-        /* encode the full FRONT/BACK x CW/CCW matrix into a PGL_VC3D_CULL_*
+        /* encode the full FRONT/BACK x CW/CCW matrix into a PGL_G3D_CULL_*
          * config code; the back end maps it onto the CFG_BITS facing bits. */
         int cw = (c->front_face == GL_CW);
         switch (c->cull_mode) {
-        case GL_BACK:  *cull_cfg = cw ? PGL_VC3D_CULL_BACK_CW
-                                      : PGL_VC3D_CULL_BACK_CCW;  break;
-        case GL_FRONT: *cull_cfg = cw ? PGL_VC3D_CULL_FRONT_CW
-                                      : PGL_VC3D_CULL_FRONT_CCW; break;
-        case GL_FRONT_AND_BACK: *cull_cfg = PGL_VC3D_CULL_BOTH;  break;
+        case GL_BACK:  *cull_cfg = cw ? PGL_G3D_CULL_BACK_CW
+                                      : PGL_G3D_CULL_BACK_CCW;  break;
+        case GL_FRONT: *cull_cfg = cw ? PGL_G3D_CULL_FRONT_CW
+                                      : PGL_G3D_CULL_FRONT_CCW; break;
+        case GL_FRONT_AND_BACK: *cull_cfg = PGL_G3D_CULL_BOTH;  break;
         default:       return 0;   /* unknown cull mode stays on the CPU */
         }
     }
@@ -3898,12 +3970,12 @@ static int pgl_gpu_tri(glVertex* v0, glVertex* v1, glVertex* v2)
     uint32_t solid = 0, depth_func, depth_mask, cull_cfg;
     const float *c0 = NULL, *c1 = NULL, *c2 = NULL;
     float n0[3], n1[3], n2[3];
-    pgl_vc3d_ext_t ext;
+    pgl_g3d_ext_t ext;
 
     if (!pgl_gpu_state(c->poly_offset_fill, 1, &fs_id, &solid,
                        &depth_func, &depth_mask, &cull_cfg, &tex_slot, &ext))
         return 0;
-    if (fs_id == PGL_VC3D_FS_GOURAUD) {
+    if (fs_id == PGL_G3D_FS_GOURAUD) {
         c0 = v0->vs_out; c1 = v1->vs_out; c2 = v2->vs_out;
     }
 
@@ -3914,7 +3986,7 @@ static int pgl_gpu_tri(glVertex* v0, glVertex* v1, glVertex* v2)
     pgl_gpu_ndc(v1->clip_space, n1);
     pgl_gpu_ndc(v2->clip_space, n2);
 
-    if (fs_id == PGL_VC3D_FS_TEX_MOD) {
+    if (fs_id == PGL_G3D_FS_TEX_MOD) {
         /* pgl_ff_tex_modulate_vs writes u/v into vs_out[0..1]; the GPU TEX_MOD
          * kernel is point-sampled CLAMP-to-edge, matching the CPU path when the
          * texture is NEAREST + CLAMP_TO_EDGE (enforced by pgl_gpu_tex_slot). */
@@ -3922,10 +3994,10 @@ static int pgl_gpu_tri(glVertex* v0, glVertex* v1, glVertex* v2)
         uv0[0] = v0->vs_out[0]; uv0[1] = v0->vs_out[1];
         uv1[0] = v1->vs_out[0]; uv1[1] = v1->vs_out[1];
         uv2[0] = v2->vs_out[0]; uv2[1] = v2->vs_out[1];
-        return pgl_vc3d_batch_tri_tex(tex_slot, n0, n1, n2, uv0, uv1, uv2,
+        return pgl_g3d_batch_tri_tex(tex_slot, n0, n1, n2, uv0, uv1, uv2,
                                       depth_func, depth_mask, cull_cfg, &ext);
     }
-    return pgl_vc3d_batch_tri(fs_id, solid, n0, n1, n2, c0, c1, c2,
+    return pgl_g3d_batch_tri(fs_id, solid, n0, n1, n2, c0, c1, c2,
                               depth_func, depth_mask, cull_cfg, &ext);
 }
 
@@ -3940,23 +4012,23 @@ static int pgl_gpu_point(glVertex* v)
     uint32_t solid = 0, depth_func, depth_mask, cull_cfg;
     const float* c0 = NULL;
     float n0[3];
-    pgl_vc3d_ext_t ext;
+    pgl_g3d_ext_t ext;
 
     if (c->point_size > 1.0f)
         return 0;
     if (!pgl_gpu_state(c->poly_offset_pt, 0, &fs_id, &solid,
                        &depth_func, &depth_mask, &cull_cfg, &tex_slot, &ext))
         return 0;
-    if (fs_id == PGL_VC3D_FS_TEX_MOD)
+    if (fs_id == PGL_G3D_FS_TEX_MOD)
         return 0;   /* points carry no uv; keep TEX_MOD points on the CPU */
-    if (fs_id == PGL_VC3D_FS_GOURAUD)
+    if (fs_id == PGL_G3D_FS_GOURAUD)
         c0 = v->vs_out;
 
     if (!pgl_gpu_begin(c->back_buffer.w, c->back_buffer.h))
         return 0;
 
     pgl_gpu_ndc(v->clip_space, n0);
-    return pgl_vc3d_batch_point(fs_id, solid, n0, c0,
+    return pgl_g3d_batch_point(fs_id, solid, n0, c0,
                                 depth_func, depth_mask, cull_cfg, &ext);
 }
 
@@ -3972,16 +4044,16 @@ static int pgl_gpu_line(glVertex* v1, glVertex* v2)
     uint32_t solid = 0, depth_func, depth_mask, cull_cfg;
     const float *c0 = NULL, *c1 = NULL;
     float n0[3], n1[3];
-    pgl_vc3d_ext_t ext;
+    pgl_g3d_ext_t ext;
 
     if (c->line_smooth || c->line_width > 1.0f)
         return 0;
     if (!pgl_gpu_state(c->poly_offset_line, 0, &fs_id, &solid,
                        &depth_func, &depth_mask, &cull_cfg, &tex_slot, &ext))
         return 0;
-    if (fs_id == PGL_VC3D_FS_TEX_MOD)
+    if (fs_id == PGL_G3D_FS_TEX_MOD)
         return 0;   /* lines carry no uv; keep TEX_MOD lines on the CPU */
-    if (fs_id == PGL_VC3D_FS_GOURAUD) {
+    if (fs_id == PGL_G3D_FS_GOURAUD) {
         c0 = v1->vs_out; c1 = v2->vs_out;
     }
 
@@ -3990,10 +4062,208 @@ static int pgl_gpu_line(glVertex* v1, glVertex* v2)
 
     pgl_gpu_ndc(v1->clip_space, n0);
     pgl_gpu_ndc(v2->clip_space, n1);
-    return pgl_vc3d_batch_line(fs_id, solid, n0, n1, c0, c1,
+    return pgl_g3d_batch_line(fs_id, solid, n0, n1, c0, c1,
                                depth_func, depth_mask, cull_cfg, &ext);
 }
-#endif /* PGL_VC3D */
+
+/* ---- On-device-compiled full-screen-frame GPU offload (WS4/WS5) -----------
+ * Registry mapping a CPU full-screen frag_func to its compiled VideoCore
+ * program + a per-frame uniform-blob packer.  pglDrawFrame()/pglDrawFrame2()
+ * consult it and, when the GPU is live and the program is valid, dispatch the
+ * frame as a pos-only full-screen quad (pgl_g3d_batch_tri_compiled) instead of
+ * the CPU per-pixel loop.  See portablegl.h for the public registration API. */
+#define PGL_FRAME_GPU_MAX 16
+typedef struct {
+    int               used;
+    frag_func         fs;
+    int               prog;   /* a pgl_g3d_prog (typedef int) */
+    pgl_frame_pack_fn pack;
+    /* Sampler-unit -> GL texture-name bindings (iChannelU -> unit U) declared
+     * via pglRegisterFrameGPUTextures; 0 = unbound.  Resolved to pgl_g3d slots
+     * and bound each frame in pgl_gpu_frame. */
+    GLuint            tex_units[PGL_G3D_MAX_TEX_UNITS];
+    int               n_tex_units;
+} pgl_frame_gpu_entry_t;
+static pgl_frame_gpu_entry_t _pgl_frame_gpu[PGL_FRAME_GPU_MAX];
+static pgl_frame_gpu_entry_t* pgl_frame_gpu_find(frag_func fs);
+
+PGLDEF void pglRegisterFrameGPU(frag_func fs, int prog, pgl_frame_pack_fn pack)
+{
+    int i, free_i = -1;
+    if (!fs)
+        return;
+    for (i = 0; i < PGL_FRAME_GPU_MAX; i++) {
+        if (_pgl_frame_gpu[i].used && _pgl_frame_gpu[i].fs == fs) {
+            _pgl_frame_gpu[i].prog = prog;
+            _pgl_frame_gpu[i].pack = pack;
+            return;
+        }
+        if (free_i < 0 && !_pgl_frame_gpu[i].used)
+            free_i = i;
+    }
+    if (free_i < 0)
+        return;   /* registry full: the effect simply stays on the CPU */
+    _pgl_frame_gpu[free_i].used = 1;
+    _pgl_frame_gpu[free_i].fs   = fs;
+    _pgl_frame_gpu[free_i].prog = prog;
+    _pgl_frame_gpu[free_i].pack = pack;
+}
+
+PGLDEF void pglRegisterFrameGPUTextures(frag_func fs, const GLuint* tex_units, int n)
+{
+    pgl_frame_gpu_entry_t* e = pgl_frame_gpu_find(fs);
+    int u;
+    if (!e)
+        return;
+    if (n < 0)
+        n = 0;
+    if (n > PGL_G3D_MAX_TEX_UNITS)
+        n = PGL_G3D_MAX_TEX_UNITS;
+    for (u = 0; u < PGL_G3D_MAX_TEX_UNITS; u++)
+        e->tex_units[u] = (tex_units && u < n) ? tex_units[u] : 0;
+    e->n_tex_units = n;
+}
+
+PGLDEF void pglUnregisterFrameGPU(frag_func fs)
+{
+    int i, u;
+    for (i = 0; i < PGL_FRAME_GPU_MAX; i++) {
+        if (_pgl_frame_gpu[i].used && _pgl_frame_gpu[i].fs == fs) {
+            _pgl_frame_gpu[i].used = 0;
+            _pgl_frame_gpu[i].fs   = NULL;
+            _pgl_frame_gpu[i].prog = PGL_G3D_PROG_INVALID;
+            _pgl_frame_gpu[i].pack = NULL;
+            for (u = 0; u < PGL_G3D_MAX_TEX_UNITS; u++)
+                _pgl_frame_gpu[i].tex_units[u] = 0;
+            _pgl_frame_gpu[i].n_tex_units = 0;
+        }
+    }
+}
+
+static pgl_frame_gpu_entry_t* pgl_frame_gpu_find(frag_func fs)
+{
+    int i;
+    if (!fs)
+        return NULL;
+    for (i = 0; i < PGL_FRAME_GPU_MAX; i++)
+        if (_pgl_frame_gpu[i].used && _pgl_frame_gpu[i].fs == fs)
+            return &_pgl_frame_gpu[i];
+    return NULL;
+}
+
+/* Try to render one full-screen frame on the GPU with the compiled program
+ * registered for fs.  Returns 1 when the frame was dispatched on the GPU (the
+ * caller must NOT run the CPU loop), 0 when the CPU must draw it (no
+ * registration, GPU off/latched, invalid program, or a declined upload). */
+static int pgl_gpu_frame(frag_func fs, void* uniforms)
+{
+    pgl_frame_gpu_entry_t* e = pgl_frame_gpu_find(fs);
+    uint32_t blob[PGL_G3D_MAX_UNIF];
+    uint32_t count = 0;
+    int w, h;
+    /* NDC full-screen quad (z=0) as two pos-only triangles; the GPU derives
+     * gl_FragCoord from the rasterized window position.
+     *
+     * ORIENTATION (WS6 hardware check): the CPU path feeds the frag shader
+     * gl_FragCoord.y = the row index from the TOP (y-down back buffer).  V3D
+     * window coords are y-up, so this quad is wound so NDC y=+1 (top) lands on
+     * the target's row 0 to match the CPU convention; if a physical Pi5 shows
+     * the effect vertically flipped against the CPU reference, swap the y sign
+     * of the four corners here. */
+    static const float qa[3] = { -1.0f, -1.0f, 0.0f };
+    static const float qb[3] = {  1.0f, -1.0f, 0.0f };
+    static const float qc[3] = {  1.0f,  1.0f, 0.0f };
+    static const float qd[3] = { -1.0f,  1.0f, 0.0f };
+
+    {
+        static int _gf_diag = 0;
+        if (!_gf_diag) { _gf_diag = 1;
+            printf("PGLGPUFRAME: e=%p prog=%d valid=%d active=%d off=%d c=%p frame_cpu=%d wh=%dx%d\n",
+                   (void*)e, e ? e->prog : -99, e ? pgl_g3d_program_valid(e->prog) : -1,
+                   _pgl_gpu_active, _pgl_gpu_off, (void*)c, _pgl_gpu_frame_cpu,
+                   c ? c->back_buffer.w : -1, c ? c->back_buffer.h : -1); fflush(stdout); }
+    }
+    if (!e)
+        return 0;
+    if (e->prog < 0 || !pgl_g3d_program_valid(e->prog))
+        return 0;
+    if (!_pgl_gpu_active && _pgl_gpu_off)
+        return 0;
+    if (!c)
+        return 0;
+    if (_pgl_gpu_frame_cpu)
+        return 0;   /* scissored/masked clear pinned this frame to the CPU */
+
+    w = c->back_buffer.w;
+    h = c->back_buffer.h;
+    if (w <= 0 || h <= 0)
+        return 0;
+    if (!pgl_gpu_begin(w, h))
+        return 0;
+
+    if (e->pack)
+        e->pack(blob, &count, uniforms, w, h, e->prog);
+    if (count > PGL_G3D_MAX_UNIF)
+        count = PGL_G3D_MAX_UNIF;
+
+    pgl_g3d_set_shader_program(e->prog);
+    pgl_g3d_set_uniforms(count ? blob : NULL, count);
+
+    /* WS4: bind this effect's sampler-unit textures (iChannelU -> unit U) so the
+     * compiled FS's QUNIFORM_TMU_CONFIG slots resolve to the uploaded images.
+     * A texture that cannot back a compiled sampler (pgl_gpu_ctex_slot < 0)
+     * leaves its unit unbound, which declines the draw back to the CPU rather
+     * than sampling a wrong image.  Bound before batching: pgl_g3d_bind_tex_unit
+     * only records state (no flush), read at the flush below. */
+    {
+        int u;
+        for (u = 0; u < e->n_tex_units; u++) {
+            int slot = pgl_gpu_ctex_slot(e->tex_units[u]);
+            pgl_g3d_bind_tex_unit(u, slot);
+            if (slot < 0) {
+                static int _gf_unb = 0;
+                glTexture* t = (e->tex_units[u] && c && (int)e->tex_units[u] < c->textures.size)
+                               ? &c->textures.a[e->tex_units[u]] : NULL;
+                if (_gf_unb < 8) { _gf_unb++;
+                    printf("PGLGPUFRAME: prog %d unit %d tex %u -> slot -1 (t=%p w=%d h=%d type=0x%x fmt=0x%x filt=0x%x/0x%x wrap=0x%x/0x%x data=%p enabled=%d)\n",
+                           e->prog, u, (unsigned)e->tex_units[u], (void*)t,
+                           t ? t->w : 0, t ? t->h : 0, t ? (unsigned)t->type : 0u,
+                           t ? (unsigned)t->format : 0u,
+                           t ? (unsigned)t->mag_filter : 0u, t ? (unsigned)t->min_filter : 0u,
+                           t ? (unsigned)t->wrap_s : 0u, t ? (unsigned)t->wrap_t : 0u,
+                           t ? (void*)t->data : NULL, pgl_g3d_enabled()); fflush(stdout); }
+            }
+        }
+    }
+
+    /* First triangle: a declined upload (or a GPU latched off mid-call) returns
+     * 0 with nothing dispatched, so the caller cleanly falls back to the CPU
+     * loop for THIS frame too. */
+    if (!pgl_g3d_batch_tri_compiled(qa, qb, qc,
+                                    PGL_G3D_DEPTH_NONE, 0u, PGL_G3D_CULL_NONE, NULL)) {
+        static int _gf_decl = 0;
+        if (_gf_decl < 4) { _gf_decl++;
+            printf("PGLGPUFRAME: prog %d batch declined -> CPU frame\n", e->prog); fflush(stdout); }
+        return 0;
+    }
+    pgl_g3d_batch_tri_compiled(qa, qc, qd,
+                               PGL_G3D_DEPTH_NONE, 0u, PGL_G3D_CULL_NONE, NULL);
+    /* A flush whose dispatch fails latches the GPU off, or - for a back-end
+     * pre-submission NOT_SUPPORTED - latches just this program as declined;
+     * report either so the caller redraws the frame on the CPU (the full-screen
+     * loop overwrites the partial GPU result).  Subsequent frames of a declined
+     * program then take the CPU path straight from the batch call above. */
+    pgl_g3d_flush();
+    if (pgl_g3d_program_declined(e->prog))
+        return 0;
+    {
+        static int _gf_ok = 0;
+        if (_gf_ok < 2) { _gf_ok++;
+            printf("PGLGPUFRAME: prog %d dispatched enabled=%d\n", e->prog, pgl_g3d_enabled()); fflush(stdout); }
+    }
+    return pgl_g3d_enabled();
+}
+#endif /* PGL_G3D */
 
 #if !(PGL_NEON_ENABLED && PGL_BITDEPTH == 32)
 static Color blend_pixel(vec4 src, vec4 dst);
@@ -4314,7 +4584,7 @@ static void run_pipeline(GLenum mode, const GLvoid* indices, GLsizei count, GLsi
 
             c->glverts.a[i].screen_space = mult_m4_v4(c->vp_mat, c->glverts.a[i].clip_space);
 
-#ifdef PGL_VC3D
+#ifdef PGL_G3D
             /* GPU fast path: offload the point when eligible, otherwise flush
              * any pending GPU batch so this CPU point lands in painter's order. */
             if (pgl_gpu_point(&c->glverts.a[i]))
@@ -4366,10 +4636,10 @@ static void run_pipeline(GLenum mode, const GLvoid* indices, GLsizei count, GLsi
             draw_triangle(&c->glverts.a[0], &c->glverts.a[i-1], &c->glverts.a[i], i+provoke);
         }
     }
-#ifdef PGL_VC3D
+#ifdef PGL_G3D
     /* submit this draw call's batched triangles before returning */
     if (_pgl_gpu_active)
-        pgl_vc3d_flush();
+        pgl_g3d_flush();
 #endif
 }
 
@@ -4489,7 +4759,7 @@ static void draw_line_clip(glVertex* v1, glVertex* v2)
         hp1 = v4_to_v3h(t1);
         hp2 = v4_to_v3h(t2);
 
-#ifdef PGL_VC3D
+#ifdef PGL_G3D
         /* GPU fast path: the segment is fully unclipped, so the raw vertex clip
          * positions ARE the line.  Offload it when eligible, otherwise flush any
          * pending GPU batch so this CPU line lands in painter's order. */
@@ -5579,7 +5849,7 @@ static inline uint32x4_t pgl_neon_depth_test4(uint32x4_t inside, float32x4_t z, 
 
 static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigned int provoke)
 {
-#ifdef PGL_VC3D
+#ifdef PGL_G3D
     /* GPU fast path: offload the triangle when eligible, otherwise flush any
      * pending GPU batch so this CPU triangle lands in painter's order. */
     if (pgl_gpu_tri(v0, v1, v2))
@@ -6622,11 +6892,11 @@ PGLDEF GLboolean init_glContext(glContext* context, pix_t** back, GLsizei w, GLs
 PGLDEF void free_glContext(glContext* ctx)
 {
     int i;
-#ifdef PGL_VC3D
+#ifdef PGL_G3D
     /* release the shm render target the GPU path adopted as the back buffer
      * (portablegl treats it as user-owned and will not free it) */
     if (ctx == c) {
-        pgl_vc3d_shutdown();
+        pgl_g3d_shutdown();
         _pgl_gpu_active = 0;
         _pgl_gpu_off = 0;
     }
@@ -6746,13 +7016,13 @@ PGLDEF GLboolean pglResizeFramebuffer(GLsizei w, GLsizei h)
         c->uy = h;
     }
 
-#ifdef PGL_VC3D
+#ifdef PGL_G3D
     /* Keep the GPU shm target in step with the (user-owned) back buffer.  On
      * failure the GPU latches off and the back buffer moves to a fresh CPU
      * allocation of the new size. */
     if (_pgl_gpu_active) {
-        if (pgl_vc3d_resize(w, h)) {
-            u8* px = (u8*)pgl_vc3d_pixels();
+        if (pgl_g3d_resize(w, h)) {
+            u8* px = (u8*)pgl_g3d_pixels();
             c->back_buffer.buf = px;
             c->back_buffer.w = w;
             c->back_buffer.h = h;
@@ -6766,7 +7036,7 @@ PGLDEF GLboolean pglResizeFramebuffer(GLsizei w, GLsizei h)
                 c->back_buffer.h = h;
                 c->back_buffer.lastrow = nb + (h-1)*w*sizeof(pix_t);
                 c->user_alloced_backbuf = GL_FALSE;
-                pgl_vc3d_shutdown();
+                pgl_g3d_shutdown();
             }
             _pgl_gpu_active = 0;
             _pgl_gpu_off = 1;
@@ -8153,7 +8423,7 @@ PGLDEF void glClear(GLbitfield mask)
 
     PGL_ERR((mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)), GL_INVALID_VALUE);
 
-#ifdef PGL_VC3D
+#ifdef PGL_G3D
     /* Phase A2 persistent depth.  glClear marks the frame boundary: it records
      * the clear colour/depth and flags the NEXT GPU draw dispatch as the frame's
      * first, so that dispatch clears the persistent colour+Z surfaces (later
@@ -8177,7 +8447,7 @@ PGLDEF void glClear(GLbitfield mask)
         if (c->scissor_test)
             _pgl_gpu_frame_cpu = 1;
 #endif
-        pgl_vc3d_begin_frame(pgl_rgba8_from_pixel(c->clear_color),
+        pgl_g3d_begin_frame(pgl_rgba8_from_pixel(c->clear_color),
                              (float)c->clear_depth);
     }
 #endif
@@ -9864,6 +10134,12 @@ PGLDEF void pglDrawFrame(void)
     void* uniforms = c->programs.a[c->cur_program].uniform;
 
     Shader_Builtins builtins;
+#ifdef PGL_G3D
+    /* WS4/WS5: dispatch the frame on the VideoCore GPU when this frag shader has
+     * a registered compiled program; fall through to the CPU loop otherwise. */
+    if (pgl_gpu_frame(frag_shader, uniforms))
+        return;
+#endif
     //#pragma omp parallel for private(builtins)
     for (int y=0; y<c->back_buffer.h; ++y) {
         for (int x=0; x<c->back_buffer.w; ++x) {
@@ -9884,6 +10160,12 @@ PGLDEF void pglDrawFrame(void)
 PGLDEF void pglDrawFrame2(frag_func frag_shader, void* uniforms)
 {
     Shader_Builtins builtins;
+#ifdef PGL_G3D
+    /* WS4/WS5: dispatch the frame on the VideoCore GPU when this frag shader has
+     * a registered compiled program; fall through to the CPU loop otherwise. */
+    if (pgl_gpu_frame(frag_shader, uniforms))
+        return;
+#endif
     //#pragma omp parallel for private(builtins)
     for (int y=0; y<c->back_buffer.h; ++y) {
         for (int x=0; x<c->back_buffer.w; ++x) {

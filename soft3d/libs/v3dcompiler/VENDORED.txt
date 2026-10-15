@@ -1,0 +1,71 @@
+Vendored mesa compiler source tree (front half + back half)
+===========================================================
+
+PURPOSE
+  On-device GLSL -> NIR -> VIR -> QPU compiler for V3D 7.1 (raspi5), used by
+  libvideocore to compile shadertoy fragment shaders at runtime. See the plan
+  "shadertoy On-Device NIR->QPU Compiler Port (V3D 7.1)".
+
+UPSTREAM PIN  (version-consistency anchor)
+  repo    : https://gitlab.freedesktop.org/mesa/mesa.git  (branch main)
+  commit  : f45825a0c724d06f231a1210484fe9af71a3ffab
+  date    : 2026-09-04 01:24:43 +0000
+  subject : Revert "intel/brw: keep texture ops in large loops"
+
+  WHY THIS COMMIT: the back half bundled in
+  .tmp/videocore7-exps/g2d/third_party/mesa-src/src/broadcom/compiler is a
+  clean mesa-main snapshot. At this commit ALL 28 bundled back-half .c/.h files
+  (nir_to_vir.c, vir_to_qpu.c, vir_register_allocate.c, qpu_schedule.c,
+  v3d_compiler.h, every v3d_nir_lower_*.c, ...) are BYTE-IDENTICAL to the
+  bundled copies, and nir_opt_gcm has the 3-arg signature
+  (nir_opt_gcm(shader, value_number, keep_texture_ops_in_large_loops)) that the
+  bundled nir_to_vir.c calls. The very next commit (859fcc3b) reverts that
+  nir_opt_gcm option back to 2 args, so this is the exact last-consistent pin.
+
+VENDORED SUBTREES  (under mesa/src/, preserving mesa's include layout)
+  compiler/nir/        NIR (all passes) + generated opcode/intrinsic sources
+  compiler/glsl/       GLSL -> NIR frontend, incl. glcpp/ preprocessor
+  compiler/*.c/*.h     glsl_types, shader_enums, shader_info, list, builtin_types
+  util/                ralloc, hash_table, dynarray, math, format/, ...
+  c11/                 threads/compat headers
+  broadcom/compiler/   V3D back half (nir_to_vir, vir_to_qpu, reg alloc, sched)
+  broadcom/qpu/        QPU instruction pack/unpack
+  broadcom/cle/        v3d_packet.xml + generated v21/v42/v71 pack headers
+  broadcom/common/     v3d_device_info
+
+  Include roots needed by the build:  -I mesa/src   and   -I mesa/src/broadcom
+  (compiler/nir/nir.h, util/ralloc.h, util/format/u_format.h resolve via -I src;
+   common/v3d_device_info.h, cle/v3d_packet_v71_pack.h, qpu/* resolve via
+   -I src/broadcom).
+
+HOST-GENERATED FILES  (device build has NO python/bison/flex/mako)
+  mesa reproduces these at build time; here they are pre-generated on the host
+  and committed. Regenerate with ./regen_codegen.sh (see that script for the
+  exact commands). Tools used: GNU bison 3.8.2, flex 2.6.4, python 3.9 +
+  mako 1.3.12 + PyYAML 6.0.3.
+    compiler/builtin_types.{h,c}              compiler/ir_expression_operation.h
+    compiler/nir/nir_opcodes.{h,c}            compiler/nir/nir_builder_opcodes.h
+    compiler/nir/nir_constant_expressions.c   compiler/nir/nir_intrinsics*.h/.c
+    compiler/glsl/glsl_parser.{cpp,h}  (bison) compiler/glsl/glsl_lexer.cpp (flex)
+    compiler/glsl/ir_expression_operation_{constant,strings}.h
+    compiler/glsl/{float64,bc1,bc4,etc2_rgba_stitch,astc}_glsl.h,
+                  cross_platform_settings_piece_all.h   (xxd-embedded .glsl)
+    compiler/glsl/glcpp/glcpp-parse.{c,h} (bison) glcpp-lex.c (flex)
+    util/format/u_format_{gen.h,pack.h,table.c}  util/format_srgb.c
+    broadcom/compiler/v3d_nir_lower_algebraic.c
+    broadcom/cle/v3d_packet_v{21,42,71}_pack.h
+
+DELIBERATE DEVIATIONS FROM UPSTREAM
+  * nir_opt_algebraic.c NOT vendored: the generated file is ~49 MB / 3.76 M
+    lines, impractical to commit and to compile on-device. WS2 supplies a stub
+    defining the six entry points (nir_opt_algebraic, _before_ffma,
+    _before_lower_int64, _late, _distribute_src_mods, _integer_promotion) as
+    no-op "return false". Correctness is preserved; only the generic algebraic
+    optimisation is skipped (broadcom's own smaller v3d_nir_lower_algebraic
+    still runs). Regenerate the full file with regen_codegen.sh if a beefier
+    build host is available.
+  * NOT vendored: compiler/spirv/ (the GLSL frontend does not reference it;
+    SPIR-V is out of scope), gtest/ and every tests/ subdir (unit tests only).
+  * NOT generated (stub in WS2 only if a vendored file references them):
+    util/driconf_static.h, util/shader_stats.h, broadcom/cle/v3d_xml.h
+    (v3d_decoder debug path), git_sha1.h (build stamp).

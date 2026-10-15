@@ -7,14 +7,16 @@ CFLAGS += -Iinclude -I $(TARGET_DIR)/include
 
 LIB_PORTABLEGL_OBJS = $(ARCH)/src/portablegl.o
 
-# raspi5 only: compile the VideoCore V3D 3D-pipeline GPU backend and enable
-# the GPU fast paths in portablegl.c.  The backend drives /dev/g2d through
-# libg2dclient (headers installed under $(SDK_DIR)/include), which the raspi5
-# g2dd daemon forwards to the V3D 3D driver in libvideocore.  Every other HW
-# keeps the pure CPU/NEON rasterizer with no GPU code compiled in.
-ifeq ($(HW),raspi5)
-CFLAGS += -DPGL_VC3D
-LIB_PORTABLEGL_OBJS += $(ARCH)/src/pgl_vc3d.o
+# The GPU 3D-offload backend is opt-in per platform: a machine with 3D
+# hardware acceleration exports PGL_G3D=yes from its system/make.inc, which
+# compiles pgl_g3d.o and enables the GPU fast paths in portablegl.c.  The
+# backend marshals clears/draws over libg2dclient (headers installed under
+# $(SDK_DIR)/include); the g2dd daemon forwards them to the platform 3D driver
+# through the bsp_g3d interface.  Platforms without the flag keep the pure
+# CPU/NEON rasterizer with no GPU code compiled in.
+ifeq ($(PGL_G3D),yes)
+CFLAGS += -DPGL_G3D
+LIB_PORTABLEGL_OBJS += $(ARCH)/src/pgl_g3d.o $(ARCH)/src/pgl_g3d_shader.o
 endif
 
 PORTABLEGL = $(BUILD_DIR)/lib/libportablegl.a
