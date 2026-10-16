@@ -87,17 +87,30 @@ static ewokos_addr_t _nrm_phy;
 
 /* WS4 compiled-mesh table: a static pos+normal mesh staged once by
    pgl_g3d_upload_mesh and drawn in sub-ranges by pgl_g3d_draw_mesh_compiled.
-   The de-interleaved source arrays are plain CPU memory (malloc); each draw
-   re-stages its sub-range into the fixed base-phy _pos/_nrm GPU staging.  A
-   static GPU VBO addressed by a per-draw phy offset is NOT usable: g2dd's
-   attach cache is keyed by shm_id and returns the cached base phy on a hit,
-   ignoring canvas->phy, so an offset sub-range would resolve to the stale base.
-   A slot is "used" iff .pos != NULL. */
+   The de-interleaved source arrays are plain CPU memory (malloc); each
+   sub-range draw re-stages its range into the fixed base-phy _pos/_nrm GPU
+   staging.  A WHOLE-mesh geom draw (first == 0 && count == nverts - the
+   teapot/gears shape) instead stages the mesh ONCE into the slot's own
+   GPU-resident segments (gpos/gnrm, laid out exactly as the geom kernel
+   consumes them) and sends those base phys, skipping the per-frame re-stage
+   entirely.  A static GPU VBO addressed by a per-draw phy offset is NOT
+   usable: g2dd's attach cache is keyed by shm_id and returns the cached base
+   phy on a hit, ignoring canvas->phy, so an offset sub-range would resolve to
+   the stale base - hence dedicated base-addressed segments.  glayout records
+   the kernel layout gpos/gnrm hold (0 = not staged, 1 = gouraud float3+float3,
+   2 = tex interleaved stride-6).  A slot is "used" iff .pos != NULL. */
 typedef struct {
 	int      used;
 	uint32_t nverts;
 	float*   pos;   /* float3 per vertex */
 	float*   nrm;   /* float3 per vertex */
+	int            glayout;
+	int            gpos_shm;
+	float*         gpos;
+	ewokos_addr_t  gpos_phy;
+	int            gnrm_shm;
+	float*         gnrm;
+	ewokos_addr_t  gnrm_phy;
 } pgl_g3d_mesh_slot_t;
 #define PGL_G3D_MAX_MESH 8
 static pgl_g3d_mesh_slot_t _mesh[PGL_G3D_MAX_MESH];
@@ -171,6 +184,10 @@ static ewokos_addr_t _z_phy;
 static int      _first_frame;
 static uint32_t _clear_rgba;
 static float    _clear_z;
+/* WS4 geom route: set once the frame's first geom draw has succeeded with the
+   daemon clearing fb+depth GPU-side (draw_compute_geom's first_frame fills);
+   later frames skip the ~2.5MB NOCACHE CPU clear in pgl_g3d_draw_mesh_compiled. */
+static int      _geom_fill_live;
 
 int pgl_g3d_enabled(void)
 {
@@ -712,8 +729,84 @@ pgl_g3d_mesh pgl_g3d_upload_mesh(const float* interleaved, uint32_t nverts,
 		m->nrm[v*3u + 2u] = src[5];
 	}
 	m->nverts = nverts;
+	/* the GPU-resident staging builds lazily on the first whole-mesh draw
+	   (mesh_gpu_stage); a reused slot was scrubbed by pgl_g3d_free_mesh. */
+	m->glayout = 0;
+	m->gpos_shm = m->gnrm_shm = 0;
+	m->gpos = m->gnrm = NULL;
+	m->gpos_phy = m->gnrm_phy = 0;
 	m->used = 1;
 	return (pgl_g3d_mesh)slot;
+}
+
+/* Free a slot's GPU-resident staging (never the CPU pos/nrm copies: those
+   back the sub-range re-stage and the caller's CPU fallback). */
+static void mesh_gpu_free(pgl_g3d_mesh_slot_t* s)
+{
+	if (s->gpos != NULL) { g2d_shm_free((uint32_t*)s->gpos); s->gpos = NULL; }
+	if (s->gnrm != NULL) { g2d_shm_free((uint32_t*)s->gnrm); s->gnrm = NULL; }
+	s->gpos_shm = s->gnrm_shm = 0;
+	s->gpos_phy = s->gnrm_phy = 0;
+	s->glayout = 0;
+}
+
+/* Build (or rebuild) the slot's GPU-resident staging in the geom kernel
+   layout the draw needs: layout 1 = gouraud (gpos float3 pos, gnrm float3
+   nrm), layout 2 = tex (gpos interleaved pos.xyz+uv.xy+pad stride 6, gnrm
+   unused - the kernel has only 4 SSBO bindings).  A layout mismatch frees the
+   old staging first.  Returns 0 on allocation failure; the draw then keeps
+   the per-draw re-stage into _pos/_nrm (an alloc failure never latches the
+   GPU off).  The staged bytes are written through NOCACHE shm, so they are
+   DRAM-visible as-is; the daemon's ranged pass-1 PRE invalidate covers the
+   first dispatch after (re)staging. */
+static int mesh_gpu_stage(pgl_g3d_mesh_slot_t* s, int layout)
+{
+	uint32_t* px;
+	ewokos_addr_t phy;
+	int shm;
+	uint32_t v;
+
+	if (s->glayout == layout && s->gpos != NULL)
+		return 1;   /* already staged in this kernel's layout */
+	mesh_gpu_free(s);
+
+	if (layout == 2) {
+		if (g2d_shm_alloc_phy(s->nverts * 24u, &shm, &px, &phy) != 0 ||
+		    shm <= 0 || px == NULL)
+			return 0;
+		s->gpos_shm = shm;
+		s->gpos = (float*)px;
+		s->gpos_phy = phy;
+		for (v = 0; v < s->nverts; v++) {
+			s->gpos[v*6u + 0u] = s->pos[v*3u + 0u];
+			s->gpos[v*6u + 1u] = s->pos[v*3u + 1u];
+			s->gpos[v*6u + 2u] = s->pos[v*3u + 2u];
+			s->gpos[v*6u + 3u] = s->nrm[v*3u + 0u];   /* uv rides the */
+			s->gpos[v*6u + 4u] = s->nrm[v*3u + 1u];   /* nrm array    */
+			s->gpos[v*6u + 5u] = 0.0f;
+		}
+		s->glayout = 2;
+		return 1;
+	}
+
+	if (g2d_shm_alloc_phy(s->nverts * 12u, &shm, &px, &phy) != 0 ||
+	    shm <= 0 || px == NULL)
+		return 0;
+	s->gpos_shm = shm;
+	s->gpos = (float*)px;
+	s->gpos_phy = phy;
+	if (g2d_shm_alloc_phy(s->nverts * 12u, &shm, &px, &phy) != 0 ||
+	    shm <= 0 || px == NULL) {
+		mesh_gpu_free(s);
+		return 0;
+	}
+	s->gnrm_shm = shm;
+	s->gnrm = (float*)px;
+	s->gnrm_phy = phy;
+	memcpy(s->gpos, s->pos, (size_t)s->nverts * 12u);
+	memcpy(s->gnrm, s->nrm, (size_t)s->nverts * 12u);
+	s->glayout = 1;
+	return 1;
 }
 
 void pgl_g3d_free_mesh(pgl_g3d_mesh m)
@@ -723,6 +816,7 @@ void pgl_g3d_free_mesh(pgl_g3d_mesh m)
 	if (m < 0 || m >= PGL_G3D_MAX_MESH || !_mesh[m].used)
 		return;
 	s = &_mesh[m];
+	mesh_gpu_free(s);
 	free(s->pos);
 	free(s->nrm);
 	s->pos = NULL;
@@ -744,6 +838,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	int dh, res;
 	int geom;
 	int geom_tex;
+	int mgpu = 0;
 
 	if (!_enabled)
 		return 0;
@@ -785,7 +880,18 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 
 	geom = pgl_g3d_shader_is_geom(prog);
 	geom_tex = geom && pgl_g3d_shader_geom_tex(prog);
-	if (geom_tex) {
+	/* A whole-mesh geom draw (the teapot/gears shape: first == 0 and count ==
+	   nverts) stages the mesh ONCE into the slot's dedicated GPU-resident
+	   segments and reuses it frame after frame, skipping this per-draw CPU
+	   re-stage entirely; a sub-range draw keeps the re-stage because it
+	   re-bases the range to vertex 0, which a base-addressed whole-mesh
+	   segment cannot do. */
+	if (geom && first == 0 && count == m->nverts)
+		mgpu = mesh_gpu_stage(m, geom_tex ? 2 : 1);
+	if (mgpu) {
+		/* nothing to re-stage: gpos/gnrm already hold the whole mesh in the
+		   kernel's layout. */
+	} else if (geom_tex) {
 		/* Textured variant: V3D compute has only 4 SSBO bindings, so pos and
 		   uv SHARE the pos staging as one interleaved stream, stride 6 floats
 		   (pos.xyz, uv.xy, pad); the normal staging is unused. */
@@ -818,19 +924,32 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	   base phy is always the staging base (never an offset) so g2dd's
 	   shm_id-keyed attach cache stays correct.  The geom-tex draw interleaves
 	   pos+uv in the pos staging (count*24 bytes, modelled w=count h=6) and
-	   sends a zero col canvas (the kernel has no separate uv buffer). */
-	if (geom_tex) {
+	   sends a zero col canvas (the kernel has no separate uv buffer).  A
+	   GPU-resident whole-mesh draw (mgpu) models the same canvases on the mesh
+	   slot's own segments, whose allocation IS the exact extent. */
+	if (mgpu) {
+		if (geom_tex) {
+			pos = g2d_canvas(m->gpos_shm, count * 24u, count, 6, 1);
+			col = g2d_canvas(0, 0, 0, 0, 0);
+		} else {
+			pos = g2d_canvas(m->gpos_shm, count * 12u, count, 3, 1);
+			col = g2d_canvas(m->gnrm_shm, count * 12u, count, 3, 1);
+			col.phy = m->gnrm_phy;
+		}
+		pos.phy = m->gpos_phy;
+	} else if (geom_tex) {
 		/* pos+uv interleaved stride-6: the g2dd handler requires
 		 * pos.w == nverts, so model the canvas w=count h=6 (the
 		 * size>=w*h*4 attach check still encodes count*24 bytes). */
 		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 6, 1);
 		col = g2d_canvas(0, 0, 0, 0, 0);
+		pos.phy = _pos_phy;
 	} else {
 		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 3, 1);
 		col = g2d_canvas(_nrm_shm, PGL_G3D_NRM_BYTES, count, 3, 1);
 		col.phy = _nrm_phy;
+		pos.phy = _pos_phy;
 	}
-	pos.phy = _pos_phy;
 	z = z_canvas();
 
 	/* Geometry-rasterizer route: the program's compute stage is the fixed
@@ -842,11 +961,14 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	     staged uniform blob here, resolved by name from the compute stage's
 	     bindings - the app packs only its lighting uniforms, and the staging
 	     re-bases every sub-range to vertex 0 so the draw's first triangle is 0;
-	   - the frame's first geom draw clears the fb + depth canvases CPU-side,
-	     because the kernel writes only covered pixels and has no render-pass
-	     clear (NOCACHE shm makes the CPU clear visible to the GPU as-is).
-	     _clear_rgba is the back end's 0xAABBGGRR; the kernel's fb layout is
-	     the shadertoy-route 0xAARRGGBB, so R and B swap. */
+	   - the frame's first geom draw clears the fb + depth canvases, because
+	     the kernel writes only covered pixels and has no render-pass clear.
+	     The daemon clears them GPU-side (draw_compute_geom's first_frame
+	     fills); the VERY FIRST geom frame also clears CPU-side (until that
+	     first daemon clear has succeeded, _geom_fill_live stays 0 and this
+	     loop runs - NOCACHE shm makes the CPU clear visible to the GPU
+	     as-is).  _clear_rgba is the back end's 0xAABBGGRR; the kernel's fb
+	     layout is the shadertoy-route 0xAARRGGBB, so R and B swap. */
 	geom = pgl_g3d_shader_is_geom(prog);
 	geom_tex = geom && pgl_g3d_shader_geom_tex(prog);
 	unif_n = _unif_count;
@@ -901,7 +1023,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		if (span > unif_n)
 			unif_n = span;
 
-		if (_first_frame && _fb != NULL) {
+		if (_first_frame && _fb != NULL && !_geom_fill_live) {
 			uint32_t c = _clear_rgba;
 			uint32_t px = (c & 0xFF000000u) |
 			              ((c & 0x000000FFu) << 16) |
@@ -985,6 +1107,9 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			_enabled = 0;   /* sticky: never replay, fall back to CPU */
 		return 0;
 	}
+	if (geom && _first_frame)
+		_geom_fill_live = 1;   /* the daemon clears fb+depth GPU-side from the
+		                          next frame on; the CPU clear is skipped. */
 	_first_frame = 0;   /* this frame's clear has been consumed */
 	return 1;
 }
@@ -1127,6 +1252,7 @@ static void free_all(void)
 		_tex[i].w = _tex[i].h = 0;
 	}
 	for (i = 0; i < PGL_G3D_MAX_MESH; i++) {
+		mesh_gpu_free(&_mesh[i]);
 		if (_mesh[i].pos) { free(_mesh[i].pos); _mesh[i].pos = NULL; }
 		if (_mesh[i].nrm) { free(_mesh[i].nrm); _mesh[i].nrm = NULL; }
 		_mesh[i].nverts = 0;
@@ -1135,6 +1261,7 @@ static void free_all(void)
 	_fb_shm = _z_shm = _pos_shm = _col_shm = _uv_shm = _nrm_shm = _unif_shm = 0;
 	_fb_phy = _z_phy = _pos_phy = _col_phy = _uv_phy = _nrm_phy = 0;
 	_nverts = 0;
+	_geom_fill_live = 0;
 	_batch_tex_slot = -1;
 	{
 		int u;

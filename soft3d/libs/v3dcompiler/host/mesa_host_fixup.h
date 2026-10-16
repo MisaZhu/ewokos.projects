@@ -26,4 +26,9 @@
 #undef getc
 #include <stdio.h>
 
+/* Marks the host-oracle build for sources shared with the device (e.g. lets
+ * v3dcompiler_backend.c's debug sink echo the shader-db stats here while
+ * staying a no-op on the device). */
+#define V3D_HOST_ORACLE 1
+
 #endif /* V3DCOMPILER_MESA_HOST_FIXUP_H */

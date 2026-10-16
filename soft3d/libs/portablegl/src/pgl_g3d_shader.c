@@ -65,10 +65,14 @@ typedef struct {
 	   gears directional), sniffed from the app VS's uLightEye declaration.
 	   geom_tex selects the TEXTURED kernel variant (geom_raster_tex_cs_glsl:
 	   attr1 = uv, SSBO 4 = linear texture image), attached when the app FS
-	   declares a sampler. */
+	   declares a sampler.  geom_tpw is the raster pass's triangles-per-
+	   workgroup geometry (64 = V4 8x8 one-lane-per-tri, 256 = V5 16x16,
+	   0 = the legacy one-workgroup-per-triangle kernels V0..V3); the daemon
+	   derives its pass-2 grid from it (wire byte cs_geom_tpw). */
 	int      is_geom;
 	int      geom_model;
 	int      geom_tex;
+	int      geom_tpw;
 	struct v3d_compiled_program prog;
 	/* Two-pass geometry rasterizer: the VERTEX-TRANSFORM kernel (pass 1) is
 	   stored here as its own compiled program (its COMPUTE stage), separate
@@ -180,6 +184,34 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 		if (strstr(vert_glsl, "uMVP") != NULL) {
 			struct v3d_compiled_program gres, xres;
 			int tex = strstr(frag_glsl, "sampler") != NULL;
+			/* Raster-kernel variant gate (see geom_raster_cs.h V1..V4).  Default is
+			   V4 (one lane per triangle): the on-device bisect proved the raster
+			   pass cost is the per-workgroup fixed dispatch overhead (~3us x 6400
+			   workgroups), so the production kernel must cover the mesh with
+			   ntris/64 workgroups.  /tmp/rastvar ('0'..'3') selects a diagnostic
+			   variant; absent/unparseable -> V4.  NOTE the daemon must dispatch
+			   the matching workgroup count (cs_geom_tpw in the program blob). */
+			static int _rast_variant = -1;
+			const char* rsrc;
+			if (_rast_variant < 0) {
+				FILE* vf = fopen("/tmp/rastvar", "r");
+				_rast_variant = 5;
+				if (vf != NULL) {
+					int vc = fgetc(vf);
+					if (vc >= '0' && vc <= '4')
+						_rast_variant = vc - '0';
+					fclose(vf);
+				}
+				fprintf(stderr, "PGLG3D: raster variant V%d\n", _rast_variant);
+			}
+			switch (_rast_variant) {
+			case 0: rsrc = geom_raster_cs_glsl; break;
+			case 1: rsrc = geom_raster_cs_glsl_v1; break;
+			case 2: rsrc = geom_raster_cs_glsl_v2; break;
+			case 3: rsrc = geom_raster_cs_glsl_v3; break;
+			case 4: rsrc = geom_raster_cs_glsl_v4; break;
+			default: rsrc = geom_raster_cs_glsl_v5; break;
+			}
 			memset(&gres, 0, sizeof(gres));
 			memset(&xres, 0, sizeof(xres));
 			/* BOTH kernels must compile: the raster pass reads the vout
@@ -188,7 +220,7 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			   (prog.stage[COMPUTE] stays empty -> has_compute == 0) and the
 			   mesh draws on the CPU rasterizer. */
 			if (v3d_compile_compute_raw(tex ? geom_raster_tex_cs_glsl
-			                                : geom_raster_cs_glsl, &gres) &&
+			                                : rsrc, &gres) &&
 			    v3d_compile_compute_raw(tex ? geom_xform_tex_cs_glsl
 			                                : geom_xform_cs_glsl, &xres)) {
 				/* raster kernel (pass 2) -> prog.stage[COMPUTE] */
@@ -203,6 +235,11 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 				       sizeof(xres.stage[V3D_STAGE_COMPUTE]));
 				_progs[slot].is_geom = 1;
 				_progs[slot].geom_tex = tex;
+				/* the tex kernel is the legacy one-workgroup-per-triangle shape
+				   (0); the gouraud V4/V5 kernels cover 64/256 triangles per
+				   workgroup and the daemon must dispatch the matching grid. */
+				_progs[slot].geom_tpw = tex ? 0 :
+					(_rast_variant == 5 ? 256 : (_rast_variant == 4 ? 64 : 0));
 				_progs[slot].geom_model =
 					strstr(vert_glsl, "uLightEye") != NULL ? 1 : 0;
 			}
@@ -511,6 +548,10 @@ static int program_upload(const prog_entry_t* e)
 	   on this byte: 1 = gouraud (fb/pos/nrm/depth), 2 = textured
 	   (fb/interleaved pos+uv/depth/tex). */
 	hdr.cs_is_geom       = e->is_geom ? (e->geom_tex ? 2 : 1) : 0;
+	/* raster-pass workgroup geometry (rides the VERSION-3 reserved byte):
+	   0 = one workgroup per triangle; 64/256 = the V4/V5 one-lane-per-triangle
+	   kernels, so the daemon dispatches ceil(ntris/tpw) workgroups instead. */
+	hdr.cs_geom_tpw      = (uint8_t)e->geom_tpw;
 	/* VERSION 4 second compute stage (cs2): the VERTEX-TRANSFORM pass of the
 	   two-pass geometry rasterizer (zero when absent - a single-pass or
 	   non-geom program).  cs2_uniform_blob_dwords is the xform region's span,

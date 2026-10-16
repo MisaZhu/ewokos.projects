@@ -95,6 +95,9 @@ v3d_be_debug_sink(const char *msg, void *data)
 {
    (void)msg;
    (void)data;
+#ifdef V3D_HOST_ORACLE
+   fprintf(stderr, "SHADERDB %s\n", msg);
+#endif
 }
 
 static void

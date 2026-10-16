@@ -308,6 +308,29 @@ static int dump_geom(void)
    }
    v3d_compiled_program_free(&res);
    printf("=== geom checks %s ===\n", fail ? "FAILED" : "PASSED");
+
+   /* Perf-bisect variants: compile all five and print the CS stats line
+    * (threads is the occupancy signal V3 is aimed at). */
+   static const char *const vsrc[5] = {
+      geom_raster_cs_glsl_v1, geom_raster_cs_glsl_v2, geom_raster_cs_glsl_v3,
+      geom_raster_cs_glsl_v4, geom_raster_cs_glsl_v5
+   };
+   for (int v = 0; v < 5; v++) {
+      struct v3d_compiled_program vres;
+      bool vok = v3d_compile_compute_raw(vsrc[v], &vres);
+      if (!vok) {
+         printf("  V%d compile FAIL: %s\n", v + 1, vres.log);
+         fail++;
+         continue;
+      }
+      const struct v3d_compiled_stage *vc = &vres.stage[V3D_STAGE_COMPUTE];
+      printf("  V%d CS qpu_instr=%u num_uniforms=%u threads=%u single_seg=%d "
+             "local_size=%ux%ux%u shared=%u\n", v + 1,
+             vc->qpu_instr_count, vc->num_uniforms, vc->threads,
+             (int)vc->single_seg, vc->local_size[0], vc->local_size[1],
+             vc->local_size[2], vc->shared_size);
+      v3d_compiled_program_free(&vres);
+   }
    return fail;
 }
 
