@@ -320,6 +320,14 @@ void pgl_g3d_set_uniforms(const uint32_t* data, uint32_t count);
 int  pgl_g3d_shader_uniform_dword(pgl_g3d_prog p, const char* name,
                                   uint32_t* num_components);
 
+/* Report whether program p attached the INSTANCED geometry xform kernel (the
+   PGL_G3D_INSTANCED variant that reads a per-vertex instance index from pos.w
+   and its per-instance matrices from a 4th SSBO).  Returns 1 only when the
+   compute stage is present and is the instanced variant, so an app that staged
+   an instanced mesh can assert the matching kernel bound before relying on it
+   (a plain or textured geom kernel, or the CPU fallback, returns 0). */
+int  pgl_g3d_shader_geom_inst(pgl_g3d_prog p);
+
 /* Add one triangle of the active compiled program to the current batch:
    n0/n1/n2 are the clip-space positions (NDC xyz, 3 floats each).  Requires an
    active program (pgl_g3d_set_shader_program) whose daemon upload succeeds;
@@ -377,8 +385,38 @@ typedef int pgl_g3d_mesh;
 pgl_g3d_mesh pgl_g3d_upload_mesh(const float* interleaved, uint32_t nverts,
                                  uint32_t stride_floats);
 
+/* Stage a static INSTANCED pos+normal+index mesh for a single-dispatch
+   multi-model draw (gears).  Identical to pgl_g3d_upload_mesh except each
+   vertex additionally carries a per-vertex INSTANCE INDEX at element 6 (so
+   stride_floats >= 7): position float3 at element 0, normal float3 at element
+   3, instance index (a small non-negative integer stored as a float) at
+   element 6.  The index selects one entry of the per-frame instance-matrix
+   buffer staged by pgl_g3d_set_instances, so ONE pgl_g3d_draw_mesh_compiled
+   dispatch transforms a whole multi-model mesh whose per-vertex model
+   transform differs.  Requires a program compiled from a vertex shader
+   carrying the PGL_G3D_INSTANCED marker (which selects the instanced xform
+   kernel); drawn with any other program the index is ignored.  Same return
+   contract as pgl_g3d_upload_mesh. */
+pgl_g3d_mesh pgl_g3d_upload_mesh_instanced(const float* interleaved,
+                                           uint32_t nverts,
+                                           uint32_t stride_floats);
+
 /* Release an uploaded mesh (safe on an invalid handle). */
 void pgl_g3d_free_mesh(pgl_g3d_mesh m);
+
+/* Stage the per-frame INSTANCE-MATRIX buffer an instanced mesh draw reads
+   (binding 3 of the instanced xform kernel).  `data` is nfloats consecutive
+   floats - one 36-float record per instance, laid out exactly as the kernel
+   indexes it:
+     data[i*36 + 0..15]  = model-view-projection matrix (column-major mat4)
+     data[i*36 + 16..31] = normal matrix               (column-major mat4)
+     data[i*36 + 32..34] = material rgb,  [35] = pad
+   The buffer is copied into a GPU-resident segment (grown on demand, never on
+   a same-or-smaller refill) and marshalled as ctex unit 0 by the next instanced
+   pgl_g3d_draw_mesh_compiled, so it must be re-staged every frame the matrices
+   change.  Returns 1 on success, 0 when the GPU path is off, the arguments are
+   bad, or the allocation failed (none of which latch the GPU off). */
+int  pgl_g3d_set_instances(const float* data, uint32_t nfloats);
 
 /* Draw vertices [first, first+count) of an uploaded mesh with a compiled program
    as one GPU dispatch: the program's compiled VS/coord QPU runs the transform +

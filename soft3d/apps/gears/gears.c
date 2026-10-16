@@ -148,29 +148,31 @@ static GLuint program;
 /* Full-GPU path (mirrors teapot.c): the gears' vertex stage (MVP transform +
  * diffuse lighting) is compiled to VideoCore VII QPU and runs on the V3D GPU,
  * with the gouraud-passthrough FS shading the fragments.  g3d_active latches on
- * only after the program compiles, every VS uniform resolves by name, and all
- * six gear meshes upload; any decline leaves it 0 and the CPU vertex_shader +
- * pgl_ff_gouraud path below renders the identical design.  Each gear keeps its
- * own compiled mesh (its triangle strips expanded once to a GL_TRIANGLES list,
- * since pgl_g3d_draw_mesh_compiled issues triangles only) and is drawn with its
- * own per-gear uniform blob. */
+ * only after the program compiles, the INSTANCED geom kernel attaches, its two
+ * lighting uniforms resolve by name, and the merged mesh uploads; any decline
+ * leaves it 0 and the CPU vertex_shader + pgl_ff_gouraud path below renders the
+ * identical design.  All six gears' triangle strips are expanded once to a
+ * GL_TRIANGLES list and MERGED into ONE instanced mesh (each vertex carries its
+ * gear index at element 6), so the whole train is transformed, lit and
+ * rasterised in a single dispatch; the per-gear MVP/normal/material matrices
+ * ride a 4th SSBO refilled every frame (pgl_g3d_set_instances). */
 static int          g3d_active = 0;
 static pgl_g3d_prog g3d_prog   = PGL_G3D_PROG_INVALID;
-static pgl_g3d_mesh g3d_meshes[MAX_GEARS] = {
-    PGL_G3D_MESH_INVALID, PGL_G3D_MESH_INVALID, PGL_G3D_MESH_INVALID,
-    PGL_G3D_MESH_INVALID, PGL_G3D_MESH_INVALID, PGL_G3D_MESH_INVALID,
-    PGL_G3D_MESH_INVALID, PGL_G3D_MESH_INVALID
-};
-static uint32_t     g3d_mesh_counts[MAX_GEARS];
+static pgl_g3d_mesh g3d_mesh   = PGL_G3D_MESH_INVALID;
+static uint32_t     g3d_mesh_count = 0;
 
-/* VS uniform dword offsets within the per-draw blob, resolved by name at init
- * (never assumed: mesa dead-strips/renumbers per program).  -1 = unresolved. */
-static int g3d_off_mvp = -1, g3d_off_nm = -1, g3d_off_mat = -1;
-/* Geom-kernel-only slots (absent on the binner route, so never declined on):
- * the kernel widens uMaterial to vec4 and adds uLightEye (.w==0 selects its
- * directional-light model) plus uShade (ambient/diffuse/specular weights). */
+/* Per-gear matrix record staged into the instanced kernel's 4th SSBO every
+ * frame: MVP mat4 (16) + normal mat4 (16) + material rgb (3) + pad (1) = 36
+ * floats, matching geom_xform_inst_cs_glsl's gearMat4(g*36) read layout. */
+#define G3D_GEARMAT_FLOATS 36
+static float g3d_gearmat[MAX_GEARS * G3D_GEARMAT_FLOATS];
+
+/* Geom-kernel lighting uniforms, resolved by name at init (never assumed: mesa
+ * dead-strips/renumbers per program).  The instanced kernel derives every
+ * per-gear matrix from the SSBO, so uMVP/uNormalMat/uMaterial are gone and only
+ * these two remain: uLightEye (.w==0 selects its directional-light model) and
+ * uShade (ambient/diffuse/specular weights).  -1 = unresolved. */
 static int g3d_off_light = -1, g3d_off_shade = -1;
-static uint32_t g3d_comps_mat = 3;
 
 /* The per-draw uniform blob staged for the daemon's QUNIFORM interpreter. */
 static uint32_t g3d_unif[PGL_G3D_MAX_UNIF];
@@ -472,70 +474,82 @@ static void g3d_set_f(int off, float v)
         g3d_unif_count = (uint32_t)off + 1u;
 }
 
-static void g3d_set_mat4(int off, const GLfloat* m)
+/* Write one mat4 into the per-gear SSBO staging array at `off` in portablegl's
+ * column-major flat order (bit-identical to the C mult_m4_v4 path; see
+ * gears_glsl.h).  The instanced kernel reads it back with gearMat4(off). */
+static void g3d_gm_mat4(int off, const GLfloat* m)
 {
     int i;
     for (i = 0; i < 16; i++)
-        g3d_set_f(off + i, m[i]);
+        g3d_gearmat[off + i] = m[i];
 }
 
-static void g3d_set_v3(int off, const GLfloat* v)
+/* Merge all six gears into ONE instanced GL_TRIANGLES mesh.  Each gear's
+ * GL_TRIANGLE_STRIP list is expanded to triangles (the compiled-mesh draw path
+ * issues triangles only) with the same winding the CPU path uses - for the i-th
+ * triangle of a strip emit (v[i], v[i+1], v[i+2]) when i is even and
+ * (v[i+1], v[i], v[i+2]) when odd, so front-facing and back-face culling match
+ * the strips exactly.  Every emitted vertex is pos float3 + normal float3 + its
+ * gear index at element 6 (stride 7), which is pgl_g3d_upload_mesh_instanced's
+ * contract; the index selects that gear's matrices from the per-frame SSBO, so
+ * a single pgl_g3d_draw_mesh_compiled transforms+lights+rasterises the whole
+ * train in one dispatch. */
+static void g3d_build_merged_mesh(void)
 {
-    g3d_set_f(off + 0, v[0]);
-    g3d_set_f(off + 1, v[1]);
-    g3d_set_f(off + 2, v[2]);
-}
+    float* out;
+    uint32_t nverts, o = 0;
+    int total_tri = 0, gi, s;
 
-/* Expand one gear's GL_TRIANGLE_STRIP list into a GL_TRIANGLES vertex array
- * (the compiled-mesh draw path issues triangles only) and stage it as a mesh.
- * Strip->list winding: for the i-th triangle of a strip, emit
- * (v[i], v[i+1], v[i+2]) when i is even and (v[i+1], v[i], v[i+2]) when odd, so
- * the front facing of every triangle matches the strip the CPU path draws and
- * back-face culling stays identical.  Each GearVertex is already pos float3 +
- * normal float3 (stride 6), exactly pgl_g3d_upload_mesh's contract. */
-static void g3d_build_mesh(int gi)
-{
-    struct gear* g = gears[gi].g;
-    GearVertex* out;
-    int total_tri = 0, s, o = 0, nverts;
-
-    if (g == NULL || g->strips == NULL || g->vertices == NULL)
-        return;
-    for (s = 0; s < g->nstrips; s++)
-        if (g->strips[s].count >= 3)
-            total_tri += g->strips[s].count - 2;
-    nverts = total_tri * 3;
+    for (gi = 0; gi < n_gears; gi++) {
+        struct gear* g = gears[gi].g;
+        if (g == NULL || g->strips == NULL || g->vertices == NULL)
+            continue;
+        for (s = 0; s < g->nstrips; s++)
+            if (g->strips[s].count >= 3)
+                total_tri += g->strips[s].count - 2;
+    }
+    nverts = (uint32_t)total_tri * 3u;
     if (nverts == 0)
         return;
 
-    out = (GearVertex*)malloc((size_t)nverts * sizeof(GearVertex));
+    out = (float*)malloc((size_t)nverts * 7u * sizeof(float));
     if (out == NULL)
         return;
-    for (s = 0; s < g->nstrips; s++) {
-        int first = g->strips[s].first, c = g->strips[s].count, i;
-        for (i = 0; i + 2 < c; i++) {
-            int a, b, d;
-            if ((i & 1) == 0) { a = first + i; b = first + i + 1; d = first + i + 2; }
-            else              { a = first + i + 1; b = first + i; d = first + i + 2; }
-            memcpy(out[o++], g->vertices[a], sizeof(GearVertex));
-            memcpy(out[o++], g->vertices[b], sizeof(GearVertex));
-            memcpy(out[o++], g->vertices[d], sizeof(GearVertex));
+
+    for (gi = 0; gi < n_gears; gi++) {
+        struct gear* g = gears[gi].g;
+        if (g == NULL || g->strips == NULL || g->vertices == NULL)
+            continue;
+        for (s = 0; s < g->nstrips; s++) {
+            int first = g->strips[s].first, c = g->strips[s].count, i;
+            for (i = 0; i + 2 < c; i++) {
+                int idx[3], k;
+                if ((i & 1) == 0) { idx[0] = first + i;     idx[1] = first + i + 1; idx[2] = first + i + 2; }
+                else              { idx[0] = first + i + 1; idx[1] = first + i;     idx[2] = first + i + 2; }
+                for (k = 0; k < 3; k++) {
+                    const GLfloat* src = g->vertices[idx[k]];
+                    float* dv = out + (size_t)(o++) * 7u;
+                    dv[0] = src[0]; dv[1] = src[1]; dv[2] = src[2];
+                    dv[3] = src[3]; dv[4] = src[4]; dv[5] = src[5];
+                    dv[6] = (float)gi;   /* per-vertex instance (gear) index */
+                }
+            }
         }
     }
 
-    g3d_meshes[gi] = pgl_g3d_upload_mesh((const float*)out, (uint32_t)nverts, 6u);
-    g3d_mesh_counts[gi] = (uint32_t)nverts;
+    g3d_mesh = pgl_g3d_upload_mesh_instanced(out, nverts, 7u);
+    g3d_mesh_count = nverts;
     free(out);
 }
 
-/* Compile the gears VS+FS to QPU, resolve the VS uniforms by name, and stage
- * every gear's expanded mesh.  On any decline g3d_active stays 0 and the CPU
- * path renders.  Called once after init_gears() (and after pglGpuBegin()). */
+/* Compile the gears VS+FS to QPU, confirm the INSTANCED geom kernel attached,
+ * resolve its two lighting uniforms by name, and stage the merged instanced
+ * mesh.  On any decline g3d_active stays 0 and the CPU path renders.  Called
+ * once after init_gears() (and after pglGpuBegin()). */
 static void g3d_init(void)
 {
     char errlog[512];
-    uint32_t comps;
-    int i;
+    uint32_t comps = 0;
 
     g3d_active = 0;
     errlog[0] = '\0';
@@ -547,88 +561,101 @@ static void g3d_init(void)
         return;
     }
 
-    /* Resolve every VS uniform by name; a mat4 reports 16 components, a vec3
-     * reports 3, the geom kernel's widened vec4 material slot reports 4.  A
-     * missing/mis-sized uniform means the blob cannot feed the QPU, so decline
-     * to the CPU path rather than draw with garbage.  uLightEye/uShade exist
-     * only on the geom kernel, so their absence (binner route) never declines. */
-    g3d_off_mvp = pgl_g3d_shader_uniform_dword(g3d_prog, "uMVP", &comps);
-    if (g3d_off_mvp < 0 || comps != 16) { slog("gears: uMVP unresolved\n"); return; }
-    g3d_off_nm = pgl_g3d_shader_uniform_dword(g3d_prog, "uNormalMat", &comps);
-    if (g3d_off_nm < 0 || comps != 16) { slog("gears: uNormalMat unresolved\n"); return; }
-    g3d_off_mat = pgl_g3d_shader_uniform_dword(g3d_prog, "uMaterial", &g3d_comps_mat);
-    if (g3d_off_mat < 0 || (g3d_comps_mat != 3 && g3d_comps_mat != 4)) { slog("gears: uMaterial unresolved\n"); return; }
+    /* The merged mesh is staged with a per-vertex instance index (layout 3) and
+     * the per-gear matrices ride the 4th SSBO, which ONLY the instanced xform
+     * kernel reads.  If that kernel did not attach (marker missing, or a
+     * plain/textured geom kernel bound instead) the mesh layout would not match
+     * the kernel, so decline to the CPU path rather than draw garbage. */
+    if (!pgl_g3d_shader_geom_inst(g3d_prog)) {
+        slog("gears: instanced geom kernel not attached\n");
+        return;
+    }
+
+    /* The instanced kernel derives every per-gear matrix from the SSBO, so only
+     * its two lighting uniforms live in the named blob; both must resolve. */
     g3d_off_light = pgl_g3d_shader_uniform_dword(g3d_prog, "uLightEye", &comps);
     g3d_off_shade = pgl_g3d_shader_uniform_dword(g3d_prog, "uShade", &comps);
+    (void)comps;
+    if (g3d_off_light < 0 || g3d_off_shade < 0) {
+        slog("gears: instanced light uniforms unresolved\n");
+        return;
+    }
 
-    for (i = 0; i < n_gears; i++)
-        g3d_build_mesh(i);
-    /* Every live gear must have its mesh on the GPU; a single upload decline
-     * means the frame cannot be composed entirely on the QPU, so stay on CPU. */
-    for (i = 0; i < n_gears; i++)
-        if (gears[i].g != NULL && g3d_meshes[i] == PGL_G3D_MESH_INVALID) {
-            slog("gears: GPU mesh upload declined for gear %d\n", i);
-            return;
-        }
+    g3d_build_merged_mesh();
+    if (g3d_mesh == PGL_G3D_MESH_INVALID || g3d_mesh_count == 0) {
+        slog("gears: GPU merged-mesh upload declined\n");
+        return;
+    }
 
     g3d_active = 1;
-    slog("gears: GPU compiled-mesh path active (prog=%d, %d gears)\n",
-         g3d_prog, n_gears);
+    slog("gears: GPU instanced-mesh path active (prog=%d, %u verts, %d gears)\n",
+         g3d_prog, g3d_mesh_count, n_gears);
 }
 
-/* Draw one gear entirely on the QPU: recompute its model/MVP/normal matrices
- * exactly as draw_gear() does, pack the per-gear uniform blob, and issue the
- * compiled-mesh triangles (GL_LESS depth + Z-write, back-face cull to match the
+/* Draw the whole gear train in ONE QPU dispatch: recompute each gear's
+ * model/MVP/normal matrices exactly as draw_gear() does, pack them into that
+ * gear's 36-float SSBO record, stage the two lighting uniforms, then issue the
+ * merged instanced mesh (GL_LESS depth + Z-write, back-face cull to match the
  * CPU path's glEnable(GL_CULL_FACE)).  Returns 1 on success, 0 on any decline. */
-static int g3d_draw_gear(int gi, const GLfloat* transform)
+static int g3d_draw_all(const GLfloat* transform)
 {
-    struct gear_instance* inst = &gears[gi];
-    GLfloat model_view[16];
-    GLfloat normal_matrix[16];
-    GLfloat mvp[16];
+    int gi;
 
-    if (inst->g == NULL)
-        return 1;   /* empty slot: nothing to draw, not a failure */
-    if (g3d_meshes[gi] == PGL_G3D_MESH_INVALID || g3d_mesh_counts[gi] == 0)
+    if (g3d_mesh == PGL_G3D_MESH_INVALID || g3d_mesh_count == 0)
         return 0;
 
-    memcpy(model_view, transform, sizeof(model_view));
-    translate(model_view, inst->x, inst->y, 0);
-    rotate(model_view, inst->speed * angle + inst->phase, 0, 0, 1);
+    /* Refill every gear's matrix SSBO record for this frame's angles. */
+    for (gi = 0; gi < n_gears; gi++) {
+        struct gear_instance* inst = &gears[gi];
+        GLfloat model_view[16], normal_matrix[16], mvp[16];
+        int base = gi * G3D_GEARMAT_FLOATS;
 
-    memcpy(mvp, projection_matrix, sizeof(mvp));
-    multiply(mvp, model_view);
+        if (inst->g == NULL) {
+            /* empty slot: zero its record (no vertex references this index). */
+            memset(&g3d_gearmat[base], 0, G3D_GEARMAT_FLOATS * sizeof(float));
+            continue;
+        }
 
-    memcpy(normal_matrix, model_view, sizeof(normal_matrix));
-    invert(normal_matrix);
-    transpose(normal_matrix);
+        memcpy(model_view, transform, sizeof(model_view));
+        translate(model_view, inst->x, inst->y, 0);
+        rotate(model_view, inst->speed * angle + inst->phase, 0, 0, 1);
 
+        memcpy(mvp, projection_matrix, sizeof(mvp));
+        multiply(mvp, model_view);
+
+        memcpy(normal_matrix, model_view, sizeof(normal_matrix));
+        invert(normal_matrix);
+        transpose(normal_matrix);
+
+        g3d_gm_mat4(base, mvp);              /* [+0..15]  MVP */
+        g3d_gm_mat4(base + 16, normal_matrix); /* [+16..31] normal matrix */
+        g3d_gearmat[base + 32] = inst->color[0];
+        g3d_gearmat[base + 33] = inst->color[1];
+        g3d_gearmat[base + 34] = inst->color[2];
+        g3d_gearmat[base + 35] = 0.0f;        /* pad */
+    }
+    if (!pgl_g3d_set_instances(g3d_gearmat,
+                               (uint32_t)n_gears * G3D_GEARMAT_FLOATS))
+        return 0;
+
+    /* The instanced kernel needs only the two lighting uniforms as named blob
+     * entries; every per-gear matrix/material is derived from the SSBO above. */
     g3d_unif_count = 0;
-    g3d_set_mat4(g3d_off_mvp, mvp);
-    g3d_set_mat4(g3d_off_nm, normal_matrix);
-    g3d_set_v3(g3d_off_mat, inst->color);
-    if (g3d_comps_mat == 4)
-        g3d_set_f(g3d_off_mat + 3, 0.0f);   /* geom kernel reads .rgb only */
-    if (g3d_off_light >= 0) {
-        /* geom kernel's directional model (.w == 0): the VS's fixed world
-         * direction (5,5,10); the kernel normalizes it. */
-        g3d_set_f(g3d_off_light + 0, 5.0f);
-        g3d_set_f(g3d_off_light + 1, 5.0f);
-        g3d_set_f(g3d_off_light + 2, 10.0f);
-        g3d_set_f(g3d_off_light + 3, 0.0f);
-    }
-    if (g3d_off_shade >= 0) {
-        /* geom kernel gouraud weights, mirroring the VS exactly: no ambient,
-         * pure material*diffuse, no specular. */
-        g3d_set_f(g3d_off_shade + 0, 0.0f);
-        g3d_set_f(g3d_off_shade + 1, 1.0f);
-        g3d_set_f(g3d_off_shade + 2, 0.0f);
-        g3d_set_f(g3d_off_shade + 3, 0.0f);
-    }
+    /* directional model (.w == 0): the VS's fixed world direction (5,5,10),
+     * which the kernel normalizes. */
+    g3d_set_f(g3d_off_light + 0, 5.0f);
+    g3d_set_f(g3d_off_light + 1, 5.0f);
+    g3d_set_f(g3d_off_light + 2, 10.0f);
+    g3d_set_f(g3d_off_light + 3, 0.0f);
+    /* gouraud weights, mirroring the VS exactly: no ambient, pure
+     * material*diffuse, no specular. */
+    g3d_set_f(g3d_off_shade + 0, 0.0f);
+    g3d_set_f(g3d_off_shade + 1, 1.0f);
+    g3d_set_f(g3d_off_shade + 2, 0.0f);
+    g3d_set_f(g3d_off_shade + 3, 0.0f);
     pgl_g3d_set_uniforms(g3d_unif, g3d_unif_count);
 
-    return pgl_g3d_draw_mesh_compiled(g3d_prog, g3d_meshes[gi], 0u,
-                                      g3d_mesh_counts[gi],
+    return pgl_g3d_draw_mesh_compiled(g3d_prog, g3d_mesh, 0u, g3d_mesh_count,
                                       PGL_G3D_DEPTH_LESS, 1u,
                                       PGL_G3D_CULL_BACK_CCW);
 }
@@ -747,19 +774,15 @@ static void draw_gears(void)
     look_at(transform, cam_x, cam_y, cam_z, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f);
 
 #ifdef PGL_G3D
-    /* Full-GPU path: draw every gear with its compiled mesh (VS transform +
-     * lighting on the QPU).  glClear above already drove pgl_g3d_begin_frame,
-     * so this frame's first dispatch clears the persistent colour+Z and the
-     * rest LOAD/accumulate.  If any gear declines, latch the GPU off, re-clear
-     * and fall through to the CPU loop so the frame is not left half GPU /
-     * half CPU (every later frame stays on the CPU). */
+    /* Full-GPU path: draw the whole gear train with ONE compiled instanced-mesh
+     * dispatch (VS transform + lighting on the QPU).  glClear above already drove
+     * pgl_g3d_begin_frame, so this frame's first dispatch clears the persistent
+     * colour+Z.  If it declines, latch the GPU off, re-clear and fall through to
+     * the CPU loop so the frame is not left half GPU / half CPU (every later
+     * frame stays on the CPU). */
     if (g3d_active) {
-        int ok = 1;
-        for (i = 0; i < n_gears; i++) {
-            if (!g3d_draw_gear(i, transform)) { ok = 0; break; }
-        }
-        if (ok)
-            return;   /* whole gear train rendered on the QPU */
+        if (g3d_draw_all(transform))
+            return;   /* whole gear train rendered on the QPU in one dispatch */
         g3d_active = 0;
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);

@@ -104,6 +104,8 @@ typedef struct {
 	uint32_t nverts;
 	float*   pos;   /* float3 per vertex */
 	float*   nrm;   /* float3 per vertex */
+	float*   idx;   /* float1 per vertex (instance index); NULL unless instanced */
+	int      instanced;
 	int            glayout;
 	int            gpos_shm;
 	float*         gpos;
@@ -114,6 +116,18 @@ typedef struct {
 } pgl_g3d_mesh_slot_t;
 #define PGL_G3D_MAX_MESH 8
 static pgl_g3d_mesh_slot_t _mesh[PGL_G3D_MAX_MESH];
+
+/* WS4 instanced-mesh per-frame matrix buffer (gears): one 36-float record per
+   instance (MVP mat4 + normal mat4 + material rgb + pad) staged by
+   pgl_g3d_set_instances into a GPU-resident segment and marshalled as ctex
+   unit 0 by an instanced pgl_g3d_draw_mesh_compiled (binding 3 of the
+   instanced xform kernel).  Grown on demand; _inst_floats is the count last
+   staged, _inst_cap the allocated float capacity. */
+static int      _inst_shm;
+static float*   _inst;
+static ewokos_addr_t _inst_phy;
+static uint32_t _inst_floats;
+static uint32_t _inst_cap;
 
 /* Phase D texture table (see PGL_G3D_MAX_TEX): each slot owns a contig-shm
    RGBA8 image addressable by physical base.  A slot is "loaded" iff
@@ -731,6 +745,62 @@ pgl_g3d_mesh pgl_g3d_upload_mesh(const float* interleaved, uint32_t nverts,
 	m->nverts = nverts;
 	/* the GPU-resident staging builds lazily on the first whole-mesh draw
 	   (mesh_gpu_stage); a reused slot was scrubbed by pgl_g3d_free_mesh. */
+	m->idx = NULL;
+	m->instanced = 0;
+	m->glayout = 0;
+	m->gpos_shm = m->gnrm_shm = 0;
+	m->gpos = m->gnrm = NULL;
+	m->gpos_phy = m->gnrm_phy = 0;
+	m->used = 1;
+	return (pgl_g3d_mesh)slot;
+}
+
+/* Instanced variant of pgl_g3d_upload_mesh: additionally reads a per-vertex
+   instance index from element 6 (stride_floats >= 7) into a float1 array the
+   layout-3 GPU staging interleaves as the position stream's 4th component
+   (pos.xyz + idx, vec4 stride 16).  See the public header for the contract. */
+pgl_g3d_mesh pgl_g3d_upload_mesh_instanced(const float* interleaved,
+                                           uint32_t nverts,
+                                           uint32_t stride_floats)
+{
+	pgl_g3d_mesh_slot_t* m;
+	int slot = -1, i;
+	uint32_t v;
+
+	if (!_enabled || interleaved == NULL || nverts == 0)
+		return PGL_G3D_MESH_INVALID;
+	/* layout contract: position float3 at 0, normal float3 at 3, instance
+	   index at element 6 (any extra trailing floats per vertex are ignored). */
+	if (stride_floats < 7u)
+		return PGL_G3D_MESH_INVALID;
+
+	for (i = 0; i < PGL_G3D_MAX_MESH; i++)
+		if (!_mesh[i].used) { slot = i; break; }
+	if (slot < 0)
+		return PGL_G3D_MESH_INVALID;   /* table full: caller keeps its CPU path */
+	m = &_mesh[slot];
+
+	m->pos = (float*)malloc((size_t)nverts * 3u * sizeof(float));
+	m->nrm = (float*)malloc((size_t)nverts * 3u * sizeof(float));
+	m->idx = (float*)malloc((size_t)nverts * sizeof(float));
+	if (!m->pos || !m->nrm || !m->idx) {
+		free(m->pos); free(m->nrm); free(m->idx);
+		m->pos = NULL; m->nrm = NULL; m->idx = NULL;
+		return PGL_G3D_MESH_INVALID;   /* OOM does NOT latch the GPU off */
+	}
+	/* de-interleave once into separate SoA arrays */
+	for (v = 0; v < nverts; v++) {
+		const float* src = interleaved + (size_t)v * stride_floats;
+		m->pos[v*3u + 0u] = src[0];
+		m->pos[v*3u + 1u] = src[1];
+		m->pos[v*3u + 2u] = src[2];
+		m->nrm[v*3u + 0u] = src[3];
+		m->nrm[v*3u + 1u] = src[4];
+		m->nrm[v*3u + 2u] = src[5];
+		m->idx[v]         = src[6];
+	}
+	m->nverts = nverts;
+	m->instanced = 1;
 	m->glayout = 0;
 	m->gpos_shm = m->gnrm_shm = 0;
 	m->gpos = m->gnrm = NULL;
@@ -789,6 +859,38 @@ static int mesh_gpu_stage(pgl_g3d_mesh_slot_t* s, int layout)
 		return 1;
 	}
 
+	if (layout == 3) {
+		/* Instanced gouraud: gpos is a vec4 stream (pos.xyz + instance index,
+		   16-byte stride) matching the instanced xform kernel's binding 1; gnrm
+		   is the float3 normal stream (binding 2).  The per-instance matrices ride
+		   a separate buffer (ctex unit 0), not this staging. */
+		if (s->idx == NULL)
+			return 0;
+		if (g2d_shm_alloc_phy(s->nverts * 16u, &shm, &px, &phy) != 0 ||
+		    shm <= 0 || px == NULL)
+			return 0;
+		s->gpos_shm = shm;
+		s->gpos = (float*)px;
+		s->gpos_phy = phy;
+		if (g2d_shm_alloc_phy(s->nverts * 12u, &shm, &px, &phy) != 0 ||
+		    shm <= 0 || px == NULL) {
+			mesh_gpu_free(s);
+			return 0;
+		}
+		s->gnrm_shm = shm;
+		s->gnrm = (float*)px;
+		s->gnrm_phy = phy;
+		for (v = 0; v < s->nverts; v++) {
+			s->gpos[v*4u + 0u] = s->pos[v*3u + 0u];
+			s->gpos[v*4u + 1u] = s->pos[v*3u + 1u];
+			s->gpos[v*4u + 2u] = s->pos[v*3u + 2u];
+			s->gpos[v*4u + 3u] = s->idx[v];
+		}
+		memcpy(s->gnrm, s->nrm, (size_t)s->nverts * 12u);
+		s->glayout = 3;
+		return 1;
+	}
+
 	if (g2d_shm_alloc_phy(s->nverts * 12u, &shm, &px, &phy) != 0 ||
 	    shm <= 0 || px == NULL)
 		return 0;
@@ -819,10 +921,52 @@ void pgl_g3d_free_mesh(pgl_g3d_mesh m)
 	mesh_gpu_free(s);
 	free(s->pos);
 	free(s->nrm);
+	free(s->idx);
 	s->pos = NULL;
 	s->nrm = NULL;
+	s->idx = NULL;
+	s->instanced = 0;
 	s->nverts = 0;
 	s->used = 0;
+}
+
+/* Stage the per-frame instance-matrix buffer an instanced mesh draw reads
+   (binding 3 of geom_xform_inst_cs_glsl): nfloats consecutive floats, one
+   36-float record per instance (MVP mat4 + normal mat4 + material rgb + pad).
+   The buffer lives in a GPU-resident contig-shm segment grown on demand and
+   marshalled as ctex unit 0 by the next instanced draw_mesh_compiled. */
+int pgl_g3d_set_instances(const float* data, uint32_t nfloats)
+{
+	uint32_t* px = NULL;
+	ewokos_addr_t phy = 0;
+	int shm = 0;
+
+	if (!_enabled || data == NULL || nfloats == 0)
+		return 0;
+	if (nfloats > _inst_cap) {
+		/* grow to a 64-float granularity so a per-frame count jitter does not
+		   reallocate; a failure frees the old buffer and declines (never latches
+		   the GPU off - the caller's CPU path stays live). */
+		uint32_t cap = (nfloats + 63u) & ~63u;
+		if (_inst != NULL) {
+			g2d_shm_free(_inst);
+			_inst = NULL;
+			_inst_shm = 0;
+			_inst_phy = 0;
+			_inst_cap = 0;
+			_inst_floats = 0;
+		}
+		if (g2d_shm_alloc_phy(cap * 4u, &shm, &px, &phy) != 0 ||
+		    shm <= 0 || px == NULL)
+			return 0;
+		_inst_shm = shm;
+		_inst = (float*)px;
+		_inst_phy = phy;
+		_inst_cap = cap;
+	}
+	memcpy(_inst, data, (size_t)nfloats * 4u);
+	_inst_floats = nfloats;
+	return 1;
 }
 
 int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
@@ -838,6 +982,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	int dh, res;
 	int geom;
 	int geom_tex;
+	int geom_inst;
 	int mgpu = 0;
 
 	if (!_enabled)
@@ -880,6 +1025,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 
 	geom = pgl_g3d_shader_is_geom(prog);
 	geom_tex = geom && pgl_g3d_shader_geom_tex(prog);
+	geom_inst = geom && pgl_g3d_shader_geom_inst(prog);
 	/* A whole-mesh geom draw (the teapot/gears shape: first == 0 and count ==
 	   nverts) stages the mesh ONCE into the slot's dedicated GPU-resident
 	   segments and reuses it frame after frame, skipping this per-draw CPU
@@ -887,10 +1033,25 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	   re-bases the range to vertex 0, which a base-addressed whole-mesh
 	   segment cannot do. */
 	if (geom && first == 0 && count == m->nverts)
-		mgpu = mesh_gpu_stage(m, geom_tex ? 2 : 1);
+		mgpu = mesh_gpu_stage(m, geom_inst ? 3 : (geom_tex ? 2 : 1));
 	if (mgpu) {
 		/* nothing to re-stage: gpos/gnrm already hold the whole mesh in the
 		   kernel's layout. */
+	} else if (geom_inst) {
+		/* Instanced variant: pos is a vec4 stream (pos.xyz + instance index,
+		   stride 4) and nrm a float3 stream; the per-instance matrices ride the
+		   separate _inst buffer attached as ctex unit 0 below. */
+		for (v = 0; v < count; v++) {
+			const float* sp = m->pos + (size_t)(first + v) * 3u;
+			const float* sn = m->nrm + (size_t)(first + v) * 3u;
+			_pos[v*4u + 0u] = sp[0];
+			_pos[v*4u + 1u] = sp[1];
+			_pos[v*4u + 2u] = sp[2];
+			_pos[v*4u + 3u] = m->idx ? m->idx[first + v] : 0.0f;
+			_nrm[v*3u + 0u] = sn[0];
+			_nrm[v*3u + 1u] = sn[1];
+			_nrm[v*3u + 2u] = sn[2];
+		}
 	} else if (geom_tex) {
 		/* Textured variant: V3D compute has only 4 SSBO bindings, so pos and
 		   uv SHARE the pos staging as one interleaved stream, stride 6 floats
@@ -931,6 +1092,13 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		if (geom_tex) {
 			pos = g2d_canvas(m->gpos_shm, count * 24u, count, 6, 1);
 			col = g2d_canvas(0, 0, 0, 0, 0);
+		} else if (geom_inst) {
+			/* pos vec4 (stride 16): modelled w=count h=4 (count*16 bytes);
+			   nrm float3 (stride 12) as the col canvas (col_iova != 0 is the
+			   back end's 2-attribute signal). */
+			pos = g2d_canvas(m->gpos_shm, count * 16u, count, 4, 1);
+			col = g2d_canvas(m->gnrm_shm, count * 12u, count, 3, 1);
+			col.phy = m->gnrm_phy;
 		} else {
 			pos = g2d_canvas(m->gpos_shm, count * 12u, count, 3, 1);
 			col = g2d_canvas(m->gnrm_shm, count * 12u, count, 3, 1);
@@ -943,6 +1111,12 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		 * size>=w*h*4 attach check still encodes count*24 bytes). */
 		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 6, 1);
 		col = g2d_canvas(0, 0, 0, 0, 0);
+		pos.phy = _pos_phy;
+	} else if (geom_inst) {
+		/* pos vec4 stride-4 (count*16 bytes, modelled w=count h=4) + nrm float3. */
+		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 4, 1);
+		col = g2d_canvas(_nrm_shm, PGL_G3D_NRM_BYTES, count, 3, 1);
+		col.phy = _nrm_phy;
 		pos.phy = _pos_phy;
 	} else {
 		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 3, 1);
@@ -971,6 +1145,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	     layout is the shadertoy-route 0xAARRGGBB, so R and B swap. */
 	geom = pgl_g3d_shader_is_geom(prog);
 	geom_tex = geom && pgl_g3d_shader_geom_tex(prog);
+	geom_inst = geom && pgl_g3d_shader_geom_inst(prog);
 	unif_n = _unif_count;
 	if (geom) {
 		uint32_t one[1], wh[2], span;
@@ -991,6 +1166,14 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			one[0] = (uint32_t)_tex[s].h;
 			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 			                             "uTexH", one, 1u);
+		} else if (geom_inst) {
+			/* Instanced variant: the per-instance matrix buffer must have been
+			   staged this frame (pgl_g3d_set_instances); without it binding 3
+			   would be unbound and the daemon declines, so fall back to the CPU
+			   path here instead.  The matrices ride ctex unit 0 (marshalled
+			   below); the app packs only uLightEye/uShade as named uniforms. */
+			if (_inst == NULL || _inst_floats == 0)
+				return 0;
 		}
 		/* uViewportWH is declared by BOTH the xform and the raster kernel, so
 		   patch_uniform writes it into each region.  The rest are unique to one
@@ -1073,6 +1256,20 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		req.ctex_stride[0] = t->stride;
 		req.ctex_tiling[0] = (uint8_t)t->tiling;
 		req.ctex_ub_pad[0] = (uint8_t)t->ub_pad;
+	} else if (geom_inst) {
+		/* INSTANCED route: ctex unit 0 carries the per-frame instance-matrix
+		   buffer (binding 3 of the xform kernel), modelled as a 1-row canvas of
+		   _inst_floats dwords so the generic ctex plumbing resolves its physical
+		   base and the daemon hands it to the kernel as a raw SSBO.  No texture
+		   state record is built for it (the kernel indexes it linearly, no TMU). */
+		uint32_t bytes = _inst_floats * 4u;
+		req.ctex[0] = g2d_canvas(_inst_shm, bytes, _inst_floats, 1u, 1);
+		req.ctex[0].phy  = _inst_phy;
+		req.ctex_w[0]      = _inst_floats;
+		req.ctex_h[0]      = 1u;
+		req.ctex_stride[0] = bytes;
+		req.ctex_tiling[0] = 0u;
+		req.ctex_ub_pad[0] = 0u;
 	} else {
 		int u;
 		for (u = 0; u < PGL_G3D_MAX_TEX_UNITS; u++) {
@@ -1242,6 +1439,11 @@ static void free_all(void)
 	if (_uv)  { g2d_shm_free((uint32_t*)_uv);  _uv = NULL; }
 	if (_nrm) { g2d_shm_free((uint32_t*)_nrm); _nrm = NULL; }
 	if (_unif) { g2d_shm_free(_unif); _unif = NULL; }
+	if (_inst) { g2d_shm_free(_inst); _inst = NULL; }
+	_inst_shm = 0;
+	_inst_phy = 0;
+	_inst_floats = 0;
+	_inst_cap = 0;
 	for (i = 0; i < PGL_G3D_MAX_TEX; i++) {
 		if (_tex[i].pixels) {
 			g2d_shm_free(_tex[i].pixels);
@@ -1255,6 +1457,8 @@ static void free_all(void)
 		mesh_gpu_free(&_mesh[i]);
 		if (_mesh[i].pos) { free(_mesh[i].pos); _mesh[i].pos = NULL; }
 		if (_mesh[i].nrm) { free(_mesh[i].nrm); _mesh[i].nrm = NULL; }
+		if (_mesh[i].idx) { free(_mesh[i].idx); _mesh[i].idx = NULL; }
+		_mesh[i].instanced = 0;
 		_mesh[i].nverts = 0;
 		_mesh[i].used = 0;
 	}

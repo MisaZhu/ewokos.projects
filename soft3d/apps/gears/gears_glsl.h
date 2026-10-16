@@ -29,9 +29,21 @@
 #define GEARS_GLSL_H
 
 /* Per-vertex diffuse lighting; outputs the lit RGBA colour as a single smooth
- * vec4 varying and the clip-space position. */
+ * vec4 varying and the clip-space position.
+ *
+ * The PGL_G3D_INSTANCED marker below is read by pgl_g3d's compute-attach logic
+ * (strstr on the VS source) to select the INSTANCED geometry xform kernel
+ * (geom_xform_inst_cs_glsl) instead of the plain per-draw one.  That kernel
+ * ignores uMVP/uNormalMat/uMaterial entirely: it reads a per-vertex instance
+ * index from pos.w and pulls each gear's MVP / normal matrices and material
+ * colour out of a 4th SSBO the app refills every frame, so all six gears are
+ * transformed and lit in ONE dispatch.  uMVP is still declared (and the source
+ * still computes the identical lighting) because the attach gate keys on
+ * "uMVP" and the CPU vertex_shader fallback path in gears.c mirrors this VS
+ * exactly; the marker only steers which GPU kernel is bound. */
 static const char* gears_vs_glsl =
     "#version 310 es\n"
+    "// PGL_G3D_INSTANCED\n"
     "precision highp float;\n"
     "layout(location = 0) in vec3 aPosition;\n"
     "layout(location = 1) in vec3 aNormal;\n"

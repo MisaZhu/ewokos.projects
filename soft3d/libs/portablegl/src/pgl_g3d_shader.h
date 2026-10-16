@@ -72,6 +72,15 @@ int pgl_g3d_shader_is_geom(pgl_g3d_prog p);
  * (patched from the bound slot by pgl_g3d_draw_mesh_compiled). */
 int pgl_g3d_shader_geom_tex(pgl_g3d_prog p);
 
+/* Non-zero when p's geom kernel is the INSTANCED variant
+ * (geom_xform_inst_cs_glsl, attached when the app VS carries the
+ * PGL_G3D_INSTANCED marker): pass 1 reads a per-vertex instance index from
+ * the position stream's 4th float (pos staged as vec4, stride 16 bytes) and
+ * selects the whole per-instance transform from a 4th SSBO (binding 3) that
+ * pgl_g3d_draw_mesh_compiled marshals as ctex unit 0 from the buffer staged by
+ * pgl_g3d_set_instances.  Pass 2 is the plain gouraud raster kernel. */
+int pgl_g3d_shader_geom_inst(pgl_g3d_prog p);
+
 /* The geom kernel's lighting model for p: 1 = eye-space positional light,
  * two-sided, Blinn-Phong specular 48 (teapot's VS); 0 = fixed directional
  * (5,5,10) one-sided diffuse (gears' VS).  Selected at compile time by

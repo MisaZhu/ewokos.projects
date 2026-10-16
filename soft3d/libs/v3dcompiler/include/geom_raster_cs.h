@@ -312,6 +312,89 @@ static const char geom_xform_tex_cs_glsl[] =
 "    vout[v*8+7] = 0.0;\n"
 "}\n";
 
+/* ---- Pass 1: INSTANCED gouraud vertex transform (multi-model single draw) --
+ * gears variant: ONE dispatch transforms+lights a whole gear train whose
+ * per-vertex model transform differs.  A per-vertex INSTANCE INDEX rides in
+ * the position stream's 4th float (binding 1 is a vec4 stream: pos.xyz + idx),
+ * and binding 3 is a per-instance matrix SSBO the client refills every frame:
+ *   gearMat[g*36 + 0..15]  = model-view-projection (column-major mat4)
+ *   gearMat[g*36 + 16..31] = normal matrix        (column-major mat4)
+ *   gearMat[g*36 + 32..34] = material rgb,  [35] = pad
+ * The index selects the whole per-gear transform at RUNTIME, which a default-
+ * block uniform array cannot do here: a dynamically-indexed uniform lowers to
+ * QUNIFORM_UBO_ADDR (nir_to_vir.c ntq_emit_load_uniform), which the daemon's
+ * expand_uniforms declines.  An SSBO read by a computed offset is the SAME
+ * mechanism the plain xform kernel already uses for vpos[v*3+c] every
+ * invocation, so it is proven on this silicon.  Bindings: 0 vout(float[],stride8)
+ * 1 vpos(float[],stride4: pos.xyz,idx) 2 vnrm(float[],stride3) 3 gearMat(float[],
+ * stride36).  Lighting is the gears directional model (uLightEye.w == 0):
+ * one-sided pure material*diffuse along normalize(uLightEye.xyz), matching the
+ * app VS exactly; uShade = (ambient, diffuse scale, specular weight, -).  The
+ * vout record layout is IDENTICAL to the gouraud xform kernel, so pass 2
+ * (geom_raster_cs_glsl) is reused unchanged. */
+static const char geom_xform_inst_cs_glsl[] =
+"#version 310 es\n"
+"precision highp float;\n"
+"precision highp int;\n"
+"\n"
+"layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n"
+"\n"
+"layout(std430, binding = 0) buffer V3dCsVout { float vout[]; }\n;"
+"layout(std430, binding = 1) buffer V3dCsPos  { float vpos[]; }\n;"
+"layout(std430, binding = 2) buffer V3dCsNrm  { float vnrm[]; }\n;"
+"layout(std430, binding = 3) buffer V3dCsGear { float gear[]; }\n;"
+"\n"
+"uniform vec4 uLightEye;\n"
+"uniform vec4 uShade;\n"
+"uniform vec2 uViewportWH;\n"
+"uniform int  uVertCount;\n"
+"\n"
+"mat4 gearMat4(int base)\n"
+"{\n"
+"    return mat4(vec4(gear[base+0],  gear[base+1],  gear[base+2],  gear[base+3]),\n"
+"                vec4(gear[base+4],  gear[base+5],  gear[base+6],  gear[base+7]),\n"
+"                vec4(gear[base+8],  gear[base+9],  gear[base+10], gear[base+11]),\n"
+"                vec4(gear[base+12], gear[base+13], gear[base+14], gear[base+15]));\n"
+"}\n"
+"\n"
+"void main()\n"
+"{\n"
+"    int v = int(gl_WorkGroupID.x) * 64 +\n"
+"            int(gl_LocalInvocationID.y) * 8 + int(gl_LocalInvocationID.x);\n"
+"    if (v >= uVertCount)\n"
+"        return;\n"
+"\n"
+"    vec3 p = vec3(vpos[v*4+0], vpos[v*4+1], vpos[v*4+2]);\n"
+"    int  g = int(vpos[v*4+3]);\n"
+"    vec3 n = vec3(vnrm[v*3+0], vnrm[v*3+1], vnrm[v*3+2]);\n"
+"\n"
+"    int  gb   = g * 36;\n"
+"    mat4 mvp  = gearMat4(gb);\n"
+"    mat4 nmat = gearMat4(gb + 16);\n"
+"    vec3 mat  = vec3(gear[gb+32], gear[gb+33], gear[gb+34]);\n"
+"\n"
+"    vec3 ne = normalize((nmat * vec4(n, 0.0)).xyz);\n"
+"    vec3 L  = normalize(uLightEye.xyz);\n"
+"    float diff = max(dot(ne, L), 0.0);\n"
+"    vec3 col = clamp(mat * (uShade.x + uShade.y * diff), 0.0, 1.0);\n"
+"\n"
+"    vec4 c = mvp * vec4(p, 1.0);\n"
+"    vec2 W = uViewportWH;\n"
+"    float iw = (c.w > 0.0) ? (1.0 / c.w) : 0.0;   /* clip sentinel */\n"
+"    vec2 s = vec2((c.x * iw * 0.5 + 0.5) * W.x, (0.5 - c.y * iw * 0.5) * W.y);\n"
+"    float z = c.z * iw * 0.5 + 0.5;\n"
+"    if (c.w <= 0.0) col = vec3(0.0);\n"
+"\n"
+"    vout[v*8+0] = s.x;\n"
+"    vout[v*8+1] = s.y;\n"
+"    vout[v*8+2] = z;\n"
+"    vout[v*8+3] = iw;\n"
+"    vout[v*8+4] = col.r;\n"
+"    vout[v*8+5] = col.g;\n"
+"    vout[v*8+6] = col.b;\n"
+"    vout[v*8+7] = 0.0;\n"
+"}\n";
+
 /* ---- Pass 2: TEXTURED rasterizer (one workgroup per triangle) ------------
  * Same dispatch model and rasterization as the legacy per-triangle gouraud
  * shape (8x8 workgroup, cs_geom_tpw = 0); the differences are:

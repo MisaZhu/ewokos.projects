@@ -72,6 +72,7 @@ typedef struct {
 	int      is_geom;
 	int      geom_model;
 	int      geom_tex;
+	int      geom_inst;
 	int      geom_tpw;
 	struct v3d_compiled_program prog;
 	/* Two-pass geometry rasterizer: the VERTEX-TRANSFORM kernel (pass 1) is
@@ -113,6 +114,7 @@ static void entry_clear(prog_entry_t* e)
 	e->is_geom = 0;
 	e->geom_model = 0;
 		e->geom_tex = 0;
+	e->geom_inst = 0;
 	e->used = 0;
 }
 
@@ -184,6 +186,19 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 		if (strstr(vert_glsl, "uMVP") != NULL) {
 			struct v3d_compiled_program gres, xres;
 			int tex = strstr(frag_glsl, "sampler") != NULL;
+			/* The INSTANCED variant (gears) is selected by a marker in the
+			   app VS: it swaps pass 1 for geom_xform_inst_cs_glsl, which reads
+			   a per-vertex instance index from pos.w and the per-gear matrices
+			   from a 4th SSBO.  Mutually exclusive with the textured variant
+			   (an instanced mesh carries no sampler).  Pass 2 is the plain
+			   gouraud raster kernel (V5, cs_geom_tpw = 256) since the vout
+			   record layout is unchanged. */
+			int inst = !tex && strstr(vert_glsl, "PGL_G3D_INSTANCED") != NULL;
+			const char* raster_src = tex ? geom_raster_tex_cs_glsl
+			                             : geom_raster_cs_glsl;
+			const char* xform_src  = inst ? geom_xform_inst_cs_glsl
+			                             : (tex ? geom_xform_tex_cs_glsl
+			                                    : geom_xform_cs_glsl);
 			memset(&gres, 0, sizeof(gres));
 			memset(&xres, 0, sizeof(xres));
 			/* BOTH kernels must compile: the raster pass reads the vout
@@ -191,10 +206,8 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			   them cannot run.  On any failure neither stage is attached
 			   (prog.stage[COMPUTE] stays empty -> has_compute == 0) and the
 			   mesh draws on the CPU rasterizer. */
-			if (v3d_compile_compute_raw(tex ? geom_raster_tex_cs_glsl
-			                                : geom_raster_cs_glsl, &gres) &&
-			    v3d_compile_compute_raw(tex ? geom_xform_tex_cs_glsl
-			                                : geom_xform_cs_glsl, &xres)) {
+			if (v3d_compile_compute_raw(raster_src, &gres) &&
+			    v3d_compile_compute_raw(xform_src, &xres)) {
 				/* raster kernel (pass 2) -> prog.stage[COMPUTE] */
 				_progs[slot].prog.stage[V3D_STAGE_COMPUTE] =
 					gres.stage[V3D_STAGE_COMPUTE];   /* move ownership */
@@ -207,6 +220,7 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 				       sizeof(xres.stage[V3D_STAGE_COMPUTE]));
 				_progs[slot].is_geom = 1;
 				_progs[slot].geom_tex = tex;
+				_progs[slot].geom_inst = inst;
 				/* the tex kernel is the legacy one-workgroup-per-triangle shape
 				   (0); the gouraud kernel is one-lane-per-triangle and covers 256
 				   triangles per 16x16 workgroup, so the daemon dispatches the
@@ -292,6 +306,14 @@ int pgl_g3d_shader_geom_tex(pgl_g3d_prog p)
 	if (!pgl_g3d_program_valid(p))
 		return 0;
 	return _progs[p].geom_tex &&
+	       _progs[p].prog.stage[V3D_STAGE_COMPUTE].qpu_word_count != 0;
+}
+
+int pgl_g3d_shader_geom_inst(pgl_g3d_prog p)
+{
+	if (!pgl_g3d_program_valid(p))
+		return 0;
+	return _progs[p].geom_inst &&
 	       _progs[p].prog.stage[V3D_STAGE_COMPUTE].qpu_word_count != 0;
 }
 
@@ -519,7 +541,7 @@ static int program_upload(const prog_entry_t* e)
 	   daemon switches its dispatch shape (per-triangle grid + SSBO layout)
 	   on this byte: 1 = gouraud (fb/pos/nrm/depth), 2 = textured
 	   (fb/interleaved pos+uv/depth/tex). */
-	hdr.cs_is_geom       = e->is_geom ? (e->geom_tex ? 2 : 1) : 0;
+	hdr.cs_is_geom       = e->is_geom ? (e->geom_tex ? 2 : (e->geom_inst ? 3 : 1)) : 0;
 	/* raster-pass workgroup geometry (rides the VERSION-3 reserved byte):
 	   0 = one workgroup per triangle; 64/256 = the V4/V5 one-lane-per-triangle
 	   kernels, so the daemon dispatches ceil(ntris/tpw) workgroups instead. */
