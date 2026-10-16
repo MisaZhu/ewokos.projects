@@ -70,6 +70,13 @@ typedef struct {
 	int      geom_model;
 	int      geom_tex;
 	struct v3d_compiled_program prog;
+	/* Two-pass geometry rasterizer: the VERTEX-TRANSFORM kernel (pass 1) is
+	   stored here as its own compiled program (its COMPUTE stage), separate
+	   from prog.stage[COMPUTE] which holds the RASTER kernel (pass 2).  Both
+	   are attached together or neither is (is_geom stays 0), so a geom draw
+	   always has both stages.  uniform_blob_dwords of this stage's COMPUTE
+	   slot is the split point of the concatenated per-draw blob. */
+	struct v3d_compiled_program xform_prog;
 } prog_entry_t;
 
 static prog_entry_t _progs[PGL_G3D_MAX_PROGS];
@@ -93,6 +100,8 @@ static void entry_clear(prog_entry_t* e)
 	if (e->frag) { free(e->frag); e->frag = NULL; }
 	v3d_compiled_program_free(&e->prog);   /* frees each stage[].qpu */
 	memset(&e->prog, 0, sizeof(e->prog));
+	v3d_compiled_program_free(&e->xform_prog);
+	memset(&e->xform_prog, 0, sizeof(e->xform_prog));
 	e->hash = 0;
 	e->daemon_handle = -1;
 	e->uploaded = 0;
@@ -169,21 +178,36 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 		   A compute compile failure is NOT an error - the program keeps its
 		   VS/FS pair and its draws fall back to the CPU rasterizer. */
 		if (strstr(vert_glsl, "uMVP") != NULL) {
-			struct v3d_compiled_program gres;
+			struct v3d_compiled_program gres, xres;
 			int tex = strstr(frag_glsl, "sampler") != NULL;
 			memset(&gres, 0, sizeof(gres));
+			memset(&xres, 0, sizeof(xres));
+			/* BOTH kernels must compile: the raster pass reads the vout
+			   records the xform pass writes, so a program with only one of
+			   them cannot run.  On any failure neither stage is attached
+			   (prog.stage[COMPUTE] stays empty -> has_compute == 0) and the
+			   mesh draws on the CPU rasterizer. */
 			if (v3d_compile_compute_raw(tex ? geom_raster_tex_cs_glsl
-			                                : geom_raster_cs_glsl, &gres)) {
+			                                : geom_raster_cs_glsl, &gres) &&
+			    v3d_compile_compute_raw(tex ? geom_xform_tex_cs_glsl
+			                                : geom_xform_cs_glsl, &xres)) {
+				/* raster kernel (pass 2) -> prog.stage[COMPUTE] */
 				_progs[slot].prog.stage[V3D_STAGE_COMPUTE] =
 					gres.stage[V3D_STAGE_COMPUTE];   /* move ownership */
 				memset(&gres.stage[V3D_STAGE_COMPUTE], 0,
 				       sizeof(gres.stage[V3D_STAGE_COMPUTE]));
+				/* xform kernel (pass 1) -> xform_prog.stage[COMPUTE] */
+				_progs[slot].xform_prog.stage[V3D_STAGE_COMPUTE] =
+					xres.stage[V3D_STAGE_COMPUTE];   /* move ownership */
+				memset(&xres.stage[V3D_STAGE_COMPUTE], 0,
+				       sizeof(xres.stage[V3D_STAGE_COMPUTE]));
 				_progs[slot].is_geom = 1;
 				_progs[slot].geom_tex = tex;
 				_progs[slot].geom_model =
 					strstr(vert_glsl, "uLightEye") != NULL ? 1 : 0;
 			}
 			v3d_compiled_program_free(&gres);
+			v3d_compiled_program_free(&xres);
 		} else {
 			struct v3d_compiled_program cres;
 			memset(&cres, 0, sizeof(cres));
@@ -281,6 +305,33 @@ int pgl_g3d_shader_uniform_dword(pgl_g3d_prog p, const char* name,
 	   must follow the compute layout rather than the FS's. */
 	cs = &_progs[p].prog.stage[V3D_STAGE_COMPUTE];
 	if (cs->qpu_word_count != 0) {
+		/* Two-pass geom: the per-draw blob is the CONCATENATION
+		   [xform region | raster region].  Search the xform (pass 1) kernel
+		   first (region base 0), then the raster (pass 2) kernel offset by the
+		   xform region's span.  A name declared by BOTH (uViewportWH) resolves
+		   to the XFORM offset here; pgl_g3d_shader_patch_uniform is what writes
+		   every region, so the draw path uses that for derived uniforms. */
+		if (_progs[p].is_geom) {
+			const struct v3d_compiled_stage* xs =
+				&_progs[p].xform_prog.stage[V3D_STAGE_COMPUTE];
+			for (i = 0; i < xs->num_uniform_bindings; i++) {
+				const struct v3d_uniform_binding* ub = &xs->uniform_bindings[i];
+				if (strcmp(ub->name, name) == 0) {
+					if (num_components)
+						*num_components = ub->num_components;
+					return (int)ub->dword_offset;
+				}
+			}
+			for (i = 0; i < cs->num_uniform_bindings; i++) {
+				const struct v3d_uniform_binding* ub = &cs->uniform_bindings[i];
+				if (strcmp(ub->name, name) == 0) {
+					if (num_components)
+						*num_components = ub->num_components;
+					return (int)(xs->uniform_blob_dwords + ub->dword_offset);
+				}
+			}
+			return -1;   /* a geom program never consults the FS/VS layouts */
+		}
 		for (i = 0; i < cs->num_uniform_bindings; i++) {
 			const struct v3d_uniform_binding* ub = &cs->uniform_bindings[i];
 			if (strcmp(ub->name, name) == 0) {
@@ -327,6 +378,66 @@ int pgl_g3d_shader_uniform_dword(pgl_g3d_prog p, const char* name,
 	return -1;   /* no such default-block uniform in this program */
 }
 
+uint32_t pgl_g3d_shader_geom_blob_dwords(pgl_g3d_prog p)
+{
+	const struct v3d_compiled_stage* xs;
+	const struct v3d_compiled_stage* cs;
+
+	if (!pgl_g3d_program_valid(p) || !_progs[p].is_geom)
+		return 0;
+	xs = &_progs[p].xform_prog.stage[V3D_STAGE_COMPUTE];
+	cs = &_progs[p].prog.stage[V3D_STAGE_COMPUTE];
+	return xs->uniform_blob_dwords + cs->uniform_blob_dwords;
+}
+
+/* Write nc dwords into one region of the concatenated blob at region_base +
+   the binding's dword offset, if `name` is declared there and the write fits.
+   Returns one past the highest dword written, or 0 when not written. */
+static uint32_t patch_region(const struct v3d_compiled_stage* st, uint32_t region_base,
+                             const char* name, uint32_t* blob, uint32_t blobcap,
+                             const uint32_t* val, uint32_t nc)
+{
+	uint32_t i;
+
+	for (i = 0; i < st->num_uniform_bindings; i++) {
+		const struct v3d_uniform_binding* ub = &st->uniform_bindings[i];
+		uint32_t off, k, span;
+		if (strcmp(ub->name, name) != 0)
+			continue;
+		/* write the smaller of the caller's and the binding's width so a
+		   vec4 slot fed 3 components (or vice versa) never overruns */
+		span = ub->num_components < nc ? ub->num_components : nc;
+		off = region_base + ub->dword_offset;
+		if (off + span > blobcap)
+			return 0;
+		for (k = 0; k < span; k++)
+			blob[off + k] = val[k];
+		return off + span;
+	}
+	return 0;
+}
+
+uint32_t pgl_g3d_shader_patch_uniform(pgl_g3d_prog p, uint32_t* blob,
+                                      uint32_t blobcap, const char* name,
+                                      const uint32_t* val, uint32_t nc)
+{
+	const struct v3d_compiled_stage* xs;
+	const struct v3d_compiled_stage* cs;
+	uint32_t hi = 0, e;
+
+	if (!name || !val || nc == 0 || !blob ||
+	    !pgl_g3d_program_valid(p) || !_progs[p].is_geom)
+		return 0;
+	xs = &_progs[p].xform_prog.stage[V3D_STAGE_COMPUTE];
+	cs = &_progs[p].prog.stage[V3D_STAGE_COMPUTE];
+
+	e = patch_region(xs, 0u, name, blob, blobcap, val, nc);
+	if (e > hi) hi = e;
+	e = patch_region(cs, xs->uniform_blob_dwords, name, blob, blobcap, val, nc);
+	if (e > hi) hi = e;
+	return hi;
+}
+
 /* Serialize one compiled program into a fresh contig-shm canvas laid out as a
    g2d_pgl_program_blob_t header immediately followed by its variable payload
    (see the struct comment in g2dclient.h for the exact section order), upload
@@ -341,6 +452,7 @@ static int program_upload(const prog_entry_t* e)
 	const struct v3d_compiled_stage* fs = &cp->stage[V3D_STAGE_FRAGMENT];
 	const struct v3d_compiled_stage* cs = &cp->stage[V3D_STAGE_COORD];
 	const struct v3d_compiled_stage* cu = &cp->stage[V3D_STAGE_COMPUTE];
+	const struct v3d_compiled_stage* xu = &e->xform_prog.stage[V3D_STAGE_COMPUTE];
 	g2d_pgl_program_blob_t hdr;
 	g2d_pgl_program_req_t req;
 	uint32_t payload_bytes, total, off;
@@ -399,11 +511,25 @@ static int program_upload(const prog_entry_t* e)
 	   on this byte: 1 = gouraud (fb/pos/nrm/depth), 2 = textured
 	   (fb/interleaved pos+uv/depth/tex). */
 	hdr.cs_is_geom       = e->is_geom ? (e->geom_tex ? 2 : 1) : 0;
+	/* VERSION 4 second compute stage (cs2): the VERTEX-TRANSFORM pass of the
+	   two-pass geometry rasterizer (zero when absent - a single-pass or
+	   non-geom program).  cs2_uniform_blob_dwords is the xform region's span,
+	   i.e. the split point of the concatenated per-draw uniform blob. */
+	hdr.cs2_qpu_words     = xu->qpu_word_count;
+	hdr.cs2_num_uniforms  = xu->num_uniforms;
+	hdr.cs2_local_size[0] = xu->local_size[0];
+	hdr.cs2_local_size[1] = xu->local_size[1];
+	hdr.cs2_local_size[2] = xu->local_size[2];
+	hdr.cs2_shared_size   = xu->shared_size;
+	hdr.cs2_threads       = xu->threads;
+	hdr.cs2_single_seg    = xu->single_seg ? 1 : 0;
+	hdr.cs2_uniform_blob_dwords = xu->uniform_blob_dwords;
 
 	payload_bytes = (hdr.vs_qpu_words + hdr.fs_qpu_words + hdr.coord_qpu_words +
 	                 hdr.vs_num_uniforms * 2u + hdr.fs_num_uniforms * 2u +
 	                 hdr.coord_num_uniforms * 2u +
-	                 hdr.cs_qpu_words + hdr.cs_num_uniforms * 2u) * 4u;
+	                 hdr.cs_qpu_words + hdr.cs_num_uniforms * 2u +
+	                 hdr.cs2_qpu_words + hdr.cs2_num_uniforms * 2u) * 4u;
 	hdr.payload_bytes = payload_bytes;
 	total = (uint32_t)sizeof(hdr) + payload_bytes;
 
@@ -454,6 +580,18 @@ static int program_upload(const prog_entry_t* e)
 		off += hdr.cs_num_uniforms * 4u;
 		memcpy(base + off, cu->uniform_data, hdr.cs_num_uniforms * 4u);
 		off += hdr.cs_num_uniforms * 4u;
+	}
+	/* cs2 (xform) stage payload: QPU then uniform contents+data, appended
+	   after the cs sections (the wire order bsp_g3d_program walks). */
+	if (hdr.cs2_qpu_words && xu->qpu) {
+		memcpy(base + off, xu->qpu, hdr.cs2_qpu_words * 4u);
+		off += hdr.cs2_qpu_words * 4u;
+	}
+	if (hdr.cs2_num_uniforms && xu->uniform_contents && xu->uniform_data) {
+		memcpy(base + off, xu->uniform_contents, hdr.cs2_num_uniforms * 4u);
+		off += hdr.cs2_num_uniforms * 4u;
+		memcpy(base + off, xu->uniform_data, hdr.cs2_num_uniforms * 4u);
+		off += hdr.cs2_num_uniforms * 4u;
 	}
 
 	g2d_pgl_program_req_init(&req, g2d_canvas(shm, total, total / 4u, 1u, 1));

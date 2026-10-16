@@ -710,13 +710,13 @@ static void draw_teapot(void)
     uniforms.light_pos_eye = make_v3(le.x, le.y, le.z);
 
 #ifdef PGL_G3D
-    /* Full-GPU path: pack the matrices by name and issue the 32 per-patch
-     * compiled-mesh draws (VS runs the transform + lighting on the QPU).
+    /* Full-GPU path: pack the matrices by name and issue the whole mesh as ONE
+     * compiled-mesh draw (VS runs the transform + lighting on the QPU).
      * glClear above already drove pgl_g3d_begin_frame, so this frame's first
      * dispatch clears the persistent colour+Z and the rest LOAD/accumulate.
      * GL_LESS depth + Z-write, cull disabled (two-sided lighting). */
     if (g3d_active) {
-        int p, ok = 1;
+        int ok = 1;
         static int dbg_frame = 0;
 
         g3d_unif_count = 0;
@@ -739,19 +739,37 @@ static void draw_teapot(void)
         }
         pgl_g3d_set_uniforms(g3d_unif, g3d_unif_count);
 
-        if (dbg_frame == 0) { printf("TPDBG: frame0 GPU draw, %d patches...\n", NPATCH); fflush(stdout); }
-        for (p = 0; p < NPATCH; p++) {
-            if (dbg_frame == 0) { printf("TPDBG: frame0 patch %d first=%d count=%d ->\n", p, teapot.patch_first[p], teapot.patch_count[p]); fflush(stdout); }
-            if (!pgl_g3d_draw_mesh_compiled(g3d_prog, g3d_mesh,
-                                            (uint32_t)teapot.patch_first[p],
-                                            (uint32_t)teapot.patch_count[p],
-                                            PGL_G3D_DEPTH_LESS, 1u,
-                                            PGL_G3D_CULL_NONE)) {
-                ok = 0;
-                if (dbg_frame == 0) { printf("TPDBG: frame0 patch %d DECLINED\n", p); fflush(stdout); }
-                break;
+        if (dbg_frame == 0) { printf("TPDBG: frame0 GPU draw, %d verts...\n", teapot.nvertices); fflush(stdout); }
+        /* Whole-mesh dispatch: the teapot is ONE rigid mesh under a single
+         * transform, so draw all of it in as few GPU dispatches as the staging
+         * cap allows (exactly one at the current 19200 vertices, well under
+         * PGL_G3D_MAX_VERTS).  The previous per-patch loop issued 32 separate
+         * dispatches per frame, and every dispatch pays a large fixed cost that
+         * is independent of its ~200 triangles: a whole-surface L2 clean+
+         * invalidate of the colour+depth targets (~2.4 MB), a CSD_DONE IRQ wait,
+         * five canvas attach/detach and a blocking IPC round-trip.  That 32x
+         * fixed overhead is what made the GPU path slower than the CPU
+         * rasterizer; batching into one dispatch removes ~97% of it.  Depth
+         * stays coherent because the persistent Z surface carries atomicMin
+         * across any chunks. */
+        {
+            uint32_t done = 0;
+            while (done < (uint32_t)teapot.nvertices) {
+                uint32_t chunk = (uint32_t)teapot.nvertices - done;
+                if (chunk > PGL_G3D_MAX_VERTS)
+                    chunk = PGL_G3D_MAX_VERTS;
+                if (dbg_frame == 0) { printf("TPDBG: frame0 chunk @%u n=%u ->\n", done, chunk); fflush(stdout); }
+                if (!pgl_g3d_draw_mesh_compiled(g3d_prog, g3d_mesh,
+                                                done, chunk,
+                                                PGL_G3D_DEPTH_LESS, 1u,
+                                                PGL_G3D_CULL_NONE)) {
+                    ok = 0;
+                    if (dbg_frame == 0) { printf("TPDBG: frame0 chunk @%u DECLINED\n", done); fflush(stdout); }
+                    break;
+                }
+                if (dbg_frame == 0) { printf("TPDBG: frame0 chunk @%u ok\n", done); fflush(stdout); }
+                done += chunk;
             }
-            if (dbg_frame == 0) { printf("TPDBG: frame0 patch %d ok\n", p); fflush(stdout); }
         }
         if (dbg_frame == 0) { printf("TPDBG: frame0 done ok=%d\n", ok); fflush(stdout); dbg_frame = 1; }
         if (ok)

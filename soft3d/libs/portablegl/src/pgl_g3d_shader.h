@@ -78,5 +78,24 @@ int pgl_g3d_shader_geom_tex(pgl_g3d_prog p);
  * whether the app's VS source declares uLightEye. */
 int pgl_g3d_shader_geom_model(pgl_g3d_prog p);
 
+/* Total dword span of the CONCATENATED per-draw uniform blob of a two-pass
+ * geom program: [xform region | raster region].  The xform (pass 1) kernel's
+ * uniforms occupy dwords [0, N) and the raster (pass 2) kernel's occupy
+ * [N, N+M); the returned value is N+M.  0 when p is not a two-pass geom
+ * program.  pgl_g3d_draw_mesh_compiled sizes the staged blob to exactly this
+ * so the daemon can split it with the program's cs2_uniform_blob_dwords. */
+uint32_t pgl_g3d_shader_geom_blob_dwords(pgl_g3d_prog p);
+
+/* Write nc dwords from val into EVERY region of the concatenated per-draw blob
+ * that declares `name`.  A derived uniform such as uViewportWH is declared by
+ * BOTH the xform and the raster kernel (each at its own region-relative dword
+ * offset), so it must be patched twice; a name unique to one region is patched
+ * once.  blobcap bounds the write.  Returns one past the highest global dword
+ * written (so the caller can grow its count), or 0 when `name` is unknown to
+ * both stages. */
+uint32_t pgl_g3d_shader_patch_uniform(pgl_g3d_prog p, uint32_t* blob,
+                                      uint32_t blobcap, const char* name,
+                                      const uint32_t* val, uint32_t nc);
+
 #endif /* PGL_G3D */
 #endif /* PGL_G3D_SHADER_H */

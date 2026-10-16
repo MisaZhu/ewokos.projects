@@ -28,8 +28,8 @@
 #include "pgl_g3d_shader.h"   /* private bridge: pgl_g3d_shader_upload/_daemon_handle */
 #include <v3dcompiler.h>      /* v3d_tex_layout_2d / v3d_tex_store_2d (tiled uploads) */
 
-/* must match G2D_PGL_MAX_VERTS */
-#define PGL_G3D_MAX_VERTS 4096u
+/* PGL_G3D_MAX_VERTS (the one-dispatch vertex cap and staging size) is defined
+   in the public pgl_g3d.h so apps can split an over-cap mesh into sub-ranges. */
 /* Fixed-function GPU batching (SOLID/GOURAUD/TEX_MOD built-ins through the
    daemon's hand-written QPU shaders).  0: every such primitive stays on the CPU
    rasterizer and only mesa-compiled programs (teapot, shadertoy) reach the
@@ -851,7 +851,8 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	geom_tex = geom && pgl_g3d_shader_geom_tex(prog);
 	unif_n = _unif_count;
 	if (geom) {
-		int off;
+		uint32_t one[1], wh[2], span;
+		float fw = (float)_w, fh = (float)_h;
 		if (geom_tex) {
 			/* Textured variant: attr1 carries (u,v,0) per vertex and the
 			   texture rides ctex unit 0 as a LINEAR (raster) uint32 image
@@ -862,39 +863,43 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			if (s < 0 || s >= PGL_G3D_MAX_TEX || _tex[s].pixels == NULL ||
 			    _tex[s].tiling != V3D_TEX_TILING_RASTER)
 				return 0;
-			off = pgl_g3d_shader_uniform_dword(prog, "uTexW", NULL);
-			if (off >= 0 && (uint32_t)off + 1u <= PGL_G3D_MAX_UNIF) {
-				_unif[off] = (uint32_t)_tex[s].w;
-				if ((uint32_t)off + 1u > unif_n) unif_n = (uint32_t)off + 1u;
-			}
-			off = pgl_g3d_shader_uniform_dword(prog, "uTexH", NULL);
-			if (off >= 0 && (uint32_t)off + 1u <= PGL_G3D_MAX_UNIF) {
-				_unif[off] = (uint32_t)_tex[s].h;
-				if ((uint32_t)off + 1u > unif_n) unif_n = (uint32_t)off + 1u;
-			}
+			one[0] = (uint32_t)_tex[s].w;
+			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+			                             "uTexW", one, 1u);
+			one[0] = (uint32_t)_tex[s].h;
+			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+			                             "uTexH", one, 1u);
 		}
-		off = pgl_g3d_shader_uniform_dword(prog, "uViewportWH", NULL);
-		if (off >= 0 && (uint32_t)off + 2u <= PGL_G3D_MAX_UNIF) {
-			float fw = (float)_w, fh = (float)_h;
-			memcpy(&_unif[off], &fw, 4);
-			memcpy(&_unif[off + 1], &fh, 4);
-			if ((uint32_t)off + 2u > unif_n) unif_n = (uint32_t)off + 2u;
-		}
-		off = pgl_g3d_shader_uniform_dword(prog, "uFbStride", NULL);
-		if (off >= 0 && (uint32_t)off + 1u <= PGL_G3D_MAX_UNIF) {
-			_unif[off] = (uint32_t)_w;
-			if ((uint32_t)off + 1u > unif_n) unif_n = (uint32_t)off + 1u;
-		}
-		off = pgl_g3d_shader_uniform_dword(prog, "uTriFirst", NULL);
-		if (off >= 0 && (uint32_t)off + 1u <= PGL_G3D_MAX_UNIF) {
-			_unif[off] = 0u;
-			if ((uint32_t)off + 1u > unif_n) unif_n = (uint32_t)off + 1u;
-		}
-		off = pgl_g3d_shader_uniform_dword(prog, "uTriCount", NULL);
-		if (off >= 0 && (uint32_t)off + 1u <= PGL_G3D_MAX_UNIF) {
-			_unif[off] = count / 3u;
-			if ((uint32_t)off + 1u > unif_n) unif_n = (uint32_t)off + 1u;
-		}
+		/* uViewportWH is declared by BOTH the xform and the raster kernel, so
+		   patch_uniform writes it into each region.  The rest are unique to one
+		   region: uVertCount feeds the xform (pass 1) vertex loop bound; the
+		   uFbStride/uTriFirst/uTriCount feed the raster (pass 2) kernel.  The
+		   staging re-bases every sub-range to vertex 0, so uTriFirst is 0 and
+		   uVertCount/uTriCount cover exactly this draw's sub-range. */
+		memcpy(&wh[0], &fw, 4);
+		memcpy(&wh[1], &fh, 4);
+		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+		                             "uViewportWH", wh, 2u);
+		one[0] = (uint32_t)_w;
+		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+		                             "uFbStride", one, 1u);
+		one[0] = 0u;
+		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+		                             "uTriFirst", one, 1u);
+		one[0] = count / 3u;
+		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+		                             "uTriCount", one, 1u);
+		one[0] = count;
+		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+		                             "uVertCount", one, 1u);
+		/* The daemon splits the blob at the program's cs2_uniform_blob_dwords,
+		   so it must receive the FULL concatenated span [xform | raster] even
+		   where the app staged fewer words.  Size it exactly. */
+		span = pgl_g3d_shader_geom_blob_dwords(prog);
+		if (span > PGL_G3D_MAX_UNIF)
+			return 0;   /* cannot happen with the shipped kernels */
+		if (span > unif_n)
+			unif_n = span;
 
 		if (_first_frame && _fb != NULL) {
 			uint32_t c = _clear_rgba;
