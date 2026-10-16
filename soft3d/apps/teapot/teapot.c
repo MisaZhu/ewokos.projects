@@ -613,17 +613,12 @@ static void g3d_init(void)
     g3d_active = 0;
     errlog[0] = '\0';
 
-    printf("TPDBG: g3d_init enter, compiling VS+FS...\n"); fflush(stdout);
     g3d_prog = pgl_g3d_program_compile(teapot_vs_glsl, teapot_fs_glsl,
                                        errlog, sizeof(errlog));
-    printf("TPDBG: compile returned prog=%d valid=%d\n", g3d_prog,
-           pgl_g3d_program_valid(g3d_prog)); fflush(stdout);
     if (!pgl_g3d_program_valid(g3d_prog)) {
-        printf("TPDBG: compile FAILED err=%s\n", errlog); fflush(stdout);
         slog("teapot: GPU shader compile failed: %s\n", errlog);
         return;
     }
-    printf("TPDBG: resolving uniforms...\n"); fflush(stdout);
 
     /* Resolve every VS uniform by name; a mat4 reports 16 components, a vec3
      * reports 3, a vec4 (geom kernel's widened material/light slots) reports 4.
@@ -642,21 +637,18 @@ static void g3d_init(void)
     g3d_off_light = pgl_g3d_shader_uniform_dword(g3d_prog, "uLightEye", &g3d_comps_light);
     if (g3d_off_light < 0 || (g3d_comps_light != 3 && g3d_comps_light != 4)) { slog("teapot: uLightEye unresolved\n"); return; }
     g3d_off_shade = pgl_g3d_shader_uniform_dword(g3d_prog, "uShade", &comps);
-    printf("TPDBG: uniforms OK, uploading mesh nverts=%d...\n", teapot.nvertices); fflush(stdout);
 
     if (teapot.vertices == NULL || teapot.nvertices <= 0)
         return;
 
     /* Stage the static interleaved pos+normal mesh once (stride 6 floats). */
     g3d_mesh = pgl_g3d_upload_mesh(teapot.vertices, (uint32_t)teapot.nvertices, 6u);
-    printf("TPDBG: upload returned mesh=%d\n", g3d_mesh); fflush(stdout);
     if (g3d_mesh == PGL_G3D_MESH_INVALID) {
         slog("teapot: GPU mesh upload declined\n");
         return;
     }
 
     g3d_active = 1;
-    printf("TPDBG: GPU compiled-mesh path ACTIVE prog=%d mesh=%d\n", g3d_prog, g3d_mesh); fflush(stdout);
     slog("teapot: GPU compiled-mesh path active (prog=%d mesh=%d)\n",
          g3d_prog, g3d_mesh);
 }
@@ -717,7 +709,6 @@ static void draw_teapot(void)
      * GL_LESS depth + Z-write, cull disabled (two-sided lighting). */
     if (g3d_active) {
         int ok = 1;
-        static int dbg_frame = 0;
 
         g3d_unif_count = 0;
         g3d_set_mat4(g3d_off_mvp, uniforms.mvp_mat);
@@ -739,7 +730,6 @@ static void draw_teapot(void)
         }
         pgl_g3d_set_uniforms(g3d_unif, g3d_unif_count);
 
-        if (dbg_frame == 0) { printf("TPDBG: frame0 GPU draw, %d verts...\n", teapot.nvertices); fflush(stdout); }
         /* Whole-mesh dispatch: the teapot is ONE rigid mesh under a single
          * transform, so draw all of it in as few GPU dispatches as the staging
          * cap allows (exactly one at the current 19200 vertices, well under
@@ -758,20 +748,16 @@ static void draw_teapot(void)
                 uint32_t chunk = (uint32_t)teapot.nvertices - done;
                 if (chunk > PGL_G3D_MAX_VERTS)
                     chunk = PGL_G3D_MAX_VERTS;
-                if (dbg_frame == 0) { printf("TPDBG: frame0 chunk @%u n=%u ->\n", done, chunk); fflush(stdout); }
                 if (!pgl_g3d_draw_mesh_compiled(g3d_prog, g3d_mesh,
                                                 done, chunk,
                                                 PGL_G3D_DEPTH_LESS, 1u,
                                                 PGL_G3D_CULL_NONE)) {
                     ok = 0;
-                    if (dbg_frame == 0) { printf("TPDBG: frame0 chunk @%u DECLINED\n", done); fflush(stdout); }
                     break;
                 }
-                if (dbg_frame == 0) { printf("TPDBG: frame0 chunk @%u ok\n", done); fflush(stdout); }
                 done += chunk;
             }
         }
-        if (dbg_frame == 0) { printf("TPDBG: frame0 done ok=%d\n", ok); fflush(stdout); dbg_frame = 1; }
         if (ok)
             return;   /* whole teapot rendered on the QPU */
 
@@ -918,22 +904,6 @@ static void on_repaint(xwin_t* xwin, graph_t* g)
      * otherwise the first frames blit a stale, freed buffer and the window
      * stays blank until a resize. */
     backbuf = (pix_t*)GetBackBuffer();
-
-#ifdef PGL_G3D
-    {
-        static int _dbg_frame = 0;
-        if ((_dbg_frame % 15) == 0) {
-            printf("TPDIAG f%d: win=%dx%d wsr=%dx%d g=%dx%d backbuf=%p live=%p gpu=%d\n",
-                _dbg_frame, win_width, win_height,
-                xwin && xwin->xinfo ? xwin->xinfo->wsr.w : -1,
-                xwin && xwin->xinfo ? xwin->xinfo->wsr.h : -1,
-                g ? g->w : -1, g ? g->h : -1,
-                (void*)backbuf, (void*)GetBackBuffer(), g3d_active);
-            fflush(stdout);
-        }
-        _dbg_frame++;
-    }
-#endif
 
     graph_t bg;
     graph_init(&bg, backbuf, win_width, win_height);

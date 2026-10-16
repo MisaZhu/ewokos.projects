@@ -249,13 +249,14 @@ static int dump_compute(void)
    return fail;
 }
 
-/* Geometry-rasterizer route: compile the fixed-gouraud per-triangle kernel
+/* Geometry-rasterizer route: compile the fixed-gouraud pass-2 raster kernel
  * (geom_raster_cs.h) VERBATIM through v3d_compile_compute_raw() and verify the
- * things the device draw_compute_geom() depends on: local_size 8x8x1, no shared
- * memory, exactly four SSBO_OFFSET slots, and -- critically -- that each
- * SSBO_OFFSET slot's data is the declared BINDING (fb=0, pos=1, nrm=2, depth=3),
- * not the linker's permuted block index.  The kernel accesses pos,nrm,depth,fb
- * in that order, so the in-order slot data must read 1,2,3,0 after the remap. */
+ * things the device draw_compute_geom() depends on: local_size 16x16x1 (one
+ * lane per triangle, 256 triangles per workgroup), no shared memory, and that
+ * each SSBO_OFFSET slot's data is the declared BINDING (fb=0, vout=1, depth=2),
+ * not the linker's permuted block index.  The two-pass split moved the vertex
+ * transform into its own kernel, so pass 2 reads pre-transformed `vout` records
+ * and touches exactly three SSBOs. */
 static int dump_geom(void)
 {
    int fail = 0;
@@ -274,12 +275,12 @@ static int dump_geom(void)
           (int)cs->single_seg, cs->local_size[0], cs->local_size[1],
           cs->local_size[2], cs->shared_size);
    if (cs->qpu_instr_count == 0) { printf("  !! no QPU\n"); fail++; }
-   if (cs->local_size[0] != 8 || cs->local_size[1] != 8 ||
-       cs->local_size[2] != 1) { printf("  !! local_size != 8x8x1\n"); fail++; }
+   if (cs->local_size[0] != 16 || cs->local_size[1] != 16 ||
+       cs->local_size[2] != 1) { printf("  !! local_size != 16x16x1\n"); fail++; }
    if (cs->shared_size != 0) { printf("  !! shared_size != 0\n"); fail++; }
 
    unsigned n_ssbo = 0;
-   bool seen[4] = { false, false, false, false };
+   bool seen[3] = { false, false, false };
    for (unsigned u = 0; u < cs->num_uniforms; u++) {
       unsigned c = cs->uniform_contents[u];
       unsigned d = cs->uniform_data[u];
@@ -287,16 +288,16 @@ static int dump_geom(void)
              u, quniform_name(c), d, d);
       if (c == 19 /* SSBO_OFFSET */) {
          n_ssbo++;
-         if (d < 4)
+         if (d < 3)
             seen[d] = true;
          else { printf("  !! SSBO_OFFSET binding %u out of range\n", d); fail++; }
       }
    }
    /* Each SSBO access (load AND store) emits its own SSBO_OFFSET slot, so there
-    * are more than 4 slots; the invariant is that every slot's data is a valid
-    * binding in [0,4) and all four bindings are covered (the bijective remap). */
-   if (n_ssbo < 4) { printf("  !! expected >=4 SSBO_OFFSET slots, got %u\n", n_ssbo); fail++; }
-   for (int b = 0; b < 4; b++)
+    * are more than 3 slots; the invariant is that every slot's data is a valid
+    * binding in [0,3) and all three bindings are covered (the bijective remap). */
+   if (n_ssbo < 3) { printf("  !! expected >=3 SSBO_OFFSET slots, got %u\n", n_ssbo); fail++; }
+   for (int b = 0; b < 3; b++)
       if (!seen[b]) { printf("  !! binding %d missing from SSBO_OFFSET remap\n", b); fail++; }
 
    printf("  CS uniform bindings (num=%u, blob_dwords=%u):\n",
@@ -308,29 +309,6 @@ static int dump_geom(void)
    }
    v3d_compiled_program_free(&res);
    printf("=== geom checks %s ===\n", fail ? "FAILED" : "PASSED");
-
-   /* Perf-bisect variants: compile all five and print the CS stats line
-    * (threads is the occupancy signal V3 is aimed at). */
-   static const char *const vsrc[5] = {
-      geom_raster_cs_glsl_v1, geom_raster_cs_glsl_v2, geom_raster_cs_glsl_v3,
-      geom_raster_cs_glsl_v4, geom_raster_cs_glsl_v5
-   };
-   for (int v = 0; v < 5; v++) {
-      struct v3d_compiled_program vres;
-      bool vok = v3d_compile_compute_raw(vsrc[v], &vres);
-      if (!vok) {
-         printf("  V%d compile FAIL: %s\n", v + 1, vres.log);
-         fail++;
-         continue;
-      }
-      const struct v3d_compiled_stage *vc = &vres.stage[V3D_STAGE_COMPUTE];
-      printf("  V%d CS qpu_instr=%u num_uniforms=%u threads=%u single_seg=%d "
-             "local_size=%ux%ux%u shared=%u\n", v + 1,
-             vc->qpu_instr_count, vc->num_uniforms, vc->threads,
-             (int)vc->single_seg, vc->local_size[0], vc->local_size[1],
-             vc->local_size[2], vc->shared_size);
-      v3d_compiled_program_free(&vres);
-   }
    return fail;
 }
 

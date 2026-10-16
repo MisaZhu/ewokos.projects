@@ -170,7 +170,7 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 
 		/* Compute-route attach.  Two mutually exclusive shapes:
 		   - a MESH program (its VS transforms by uMVP) gets the fixed geometry
-		     rasterizer kernel (one workgroup per triangle) - the binner cannot
+		     rasterizer kernel (one lane per triangle) - the binner cannot
 		     rasterise real primitives on this silicon, so this is the only
 		     correct GPU route for mesh draws.  The kernel variant is selected by
 		     the app FS: no sampler -> the gouraud kernel (SSBO 0=fb 1=pos 2=nrm
@@ -184,34 +184,6 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 		if (strstr(vert_glsl, "uMVP") != NULL) {
 			struct v3d_compiled_program gres, xres;
 			int tex = strstr(frag_glsl, "sampler") != NULL;
-			/* Raster-kernel variant gate (see geom_raster_cs.h V1..V4).  Default is
-			   V4 (one lane per triangle): the on-device bisect proved the raster
-			   pass cost is the per-workgroup fixed dispatch overhead (~3us x 6400
-			   workgroups), so the production kernel must cover the mesh with
-			   ntris/64 workgroups.  /tmp/rastvar ('0'..'3') selects a diagnostic
-			   variant; absent/unparseable -> V4.  NOTE the daemon must dispatch
-			   the matching workgroup count (cs_geom_tpw in the program blob). */
-			static int _rast_variant = -1;
-			const char* rsrc;
-			if (_rast_variant < 0) {
-				FILE* vf = fopen("/tmp/rastvar", "r");
-				_rast_variant = 5;
-				if (vf != NULL) {
-					int vc = fgetc(vf);
-					if (vc >= '0' && vc <= '4')
-						_rast_variant = vc - '0';
-					fclose(vf);
-				}
-				fprintf(stderr, "PGLG3D: raster variant V%d\n", _rast_variant);
-			}
-			switch (_rast_variant) {
-			case 0: rsrc = geom_raster_cs_glsl; break;
-			case 1: rsrc = geom_raster_cs_glsl_v1; break;
-			case 2: rsrc = geom_raster_cs_glsl_v2; break;
-			case 3: rsrc = geom_raster_cs_glsl_v3; break;
-			case 4: rsrc = geom_raster_cs_glsl_v4; break;
-			default: rsrc = geom_raster_cs_glsl_v5; break;
-			}
 			memset(&gres, 0, sizeof(gres));
 			memset(&xres, 0, sizeof(xres));
 			/* BOTH kernels must compile: the raster pass reads the vout
@@ -220,7 +192,7 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			   (prog.stage[COMPUTE] stays empty -> has_compute == 0) and the
 			   mesh draws on the CPU rasterizer. */
 			if (v3d_compile_compute_raw(tex ? geom_raster_tex_cs_glsl
-			                                : rsrc, &gres) &&
+			                                : geom_raster_cs_glsl, &gres) &&
 			    v3d_compile_compute_raw(tex ? geom_xform_tex_cs_glsl
 			                                : geom_xform_cs_glsl, &xres)) {
 				/* raster kernel (pass 2) -> prog.stage[COMPUTE] */
@@ -236,10 +208,10 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 				_progs[slot].is_geom = 1;
 				_progs[slot].geom_tex = tex;
 				/* the tex kernel is the legacy one-workgroup-per-triangle shape
-				   (0); the gouraud V4/V5 kernels cover 64/256 triangles per
-				   workgroup and the daemon must dispatch the matching grid. */
-				_progs[slot].geom_tpw = tex ? 0 :
-					(_rast_variant == 5 ? 256 : (_rast_variant == 4 ? 64 : 0));
+				   (0); the gouraud kernel is one-lane-per-triangle and covers 256
+				   triangles per 16x16 workgroup, so the daemon dispatches the
+				   matching ceil(ntris/256) grid from cs_geom_tpw. */
+				_progs[slot].geom_tpw = tex ? 0 : 256;
 				_progs[slot].geom_model =
 					strstr(vert_glsl, "uLightEye") != NULL ? 1 : 0;
 			}
