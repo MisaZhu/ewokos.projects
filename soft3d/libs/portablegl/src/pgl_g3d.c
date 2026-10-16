@@ -58,6 +58,10 @@ static int      _probed;     /* init() has run (success or not) */
 static int      _enabled;    /* GPU path engaged and not latched off */
 
 static int      _w, _h;
+/* physical fb/z capacity in pixels (== _w*_h at the last alloc_target).
+   Resize reuses the contig-slab runs whenever the new viewport fits this
+   capacity, so a shrink performs zero slab alloc/free operations. */
+static uint32_t _fb_cap;
 static int      _fb_shm;
 static uint32_t* _fb;        /* render-target pixels (RGBA8) */
 static ewokos_addr_t _fb_phy;
@@ -1434,6 +1438,7 @@ static void free_all(void)
 
 	if (_fb)  { g2d_shm_free(_fb);  _fb = NULL; }
 	if (_z)   { g2d_shm_free(_z);   _z = NULL; }
+	_fb_cap = 0;
 	if (_pos) { g2d_shm_free((uint32_t*)_pos); _pos = NULL; }
 	if (_col) { g2d_shm_free(_col); _col = NULL; }
 	if (_uv)  { g2d_shm_free((uint32_t*)_uv);  _uv = NULL; }
@@ -1504,33 +1509,52 @@ static int alloc_target(int w, int h)
 	_z_phy = zphy;
 	_w = w;
 	_h = h;
+	_fb_cap = (uint32_t)w * (uint32_t)h;
 	return 1;
 }
 
 int pgl_g3d_resize(int w, int h)
 {
-	uint32_t* old = _fb;
-	uint32_t* oldz = _z;
-
 	if (!_enabled)
+		return 0;
+	if (w <= 0 || h <= 0)
 		return 0;
 	if (w == _w && h == _h)
 		return 1;
 
 	pgl_g3d_flush();
 
-	_fb = NULL;   /* alloc_target repopulates; keep staging */
-	_z = NULL;
+	/* Grow-only physical targets. The kernel contig-slab sub-allocator is
+	   first-fit with a hard entry cap (SHM_POOL_MAX) and splits on every
+	   alloc, merging only physically-adjacent free runs. The previous
+	   alloc-new-before-free-old order forced the slab to hold both the old
+	   and new fb/z at once, so the still-held old run could not satisfy the
+	   (often smaller) new request; each resize fragmented the slab further
+	   and after 2-3 resizes a contig alloc failed and the GPU latched off
+	   even though the slab had ample total free memory. Reusing the existing
+	   runs whenever the new viewport fits the allocated capacity makes a
+	   shrink (or any in-capacity resize) perform ZERO slab operations - it
+	   only retargets the viewport. The daemon is handed the logical _w/_h as
+	   the viewport and _w*4 as the row stride every draw, and writes only
+	   _w*_h pixels tightly packed, so a larger physical buffer is safe. */
+	if ((uint32_t)w * (uint32_t)h <= _fb_cap) {
+		_w = w;
+		_h = h;
+		_first_frame = 1;   /* a resized target starts a fresh frame */
+		return 1;
+	}
+
+	/* Growth beyond capacity: free the old runs FIRST so the larger freed
+	   run can satisfy the new request via split, keeping peak slab use at
+	   two segments instead of four. On failure the GPU latches off (the
+	   caller in pglResizeFramebuffer shuts down and falls back to CPU). */
+	if (_fb) { g2d_shm_free(_fb); _fb = NULL; }
+	if (_z)  { g2d_shm_free(_z);  _z = NULL; }
+	_fb_cap = 0;
 	if (!alloc_target(w, h)) {
-		_fb = old;
-		_z = oldz;
 		_enabled = 0;
 		return 0;
 	}
-	if (old)
-		g2d_shm_free(old);
-	if (oldz)
-		g2d_shm_free(oldz);
 	_first_frame = 1;   /* a resized target starts a fresh frame */
 	return 1;
 }
