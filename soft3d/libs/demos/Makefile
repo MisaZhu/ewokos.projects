@@ -18,8 +18,12 @@ ifeq ($(PGL_G3D),yes)
 CXXFLAGS += -DPGL_G3D
 endif
 
-# glcommon library + merged libGLESv2 (carries portablegl + the mesa compiler)
+# glcommon library + EGL + merged libGLESv2 (carries portablegl + the mesa
+# compiler).  Order matters for static linking: libglcommon and libEGL both
+# resolve their gl*/egl* calls against libGLESv2, so it comes last (the same
+# glcommon -> EGL -> GLESv2 order apps/gears uses).
 GLCOMMON_LIB = $(BUILD_DIR)/lib/libglcommon.a \
+	$(BUILD_DIR)/lib/libEGL.a \
 	$(BUILD_DIR)/lib/libGLESv2.a
 LD_LIB_DEPS = \
 	$(GLCOMMON_LIB) \

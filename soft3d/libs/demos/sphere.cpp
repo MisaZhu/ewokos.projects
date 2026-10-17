@@ -1,8 +1,31 @@
-
-#define SDL_MAIN_HANDLED
-#include <SDL.h>
-
-#include "glcommon/gltools.h"
+/*
+ * Sphereworld Color -- EGL + GLES2 (software rasterizer behind libGLESv2).
+ *
+ * Ported off SDL2 + portablegl.  The window/context now come from libEGL
+ * (native window == xwin_t*), present is a plain eglSwapBuffers, and the two
+ * lighting models are real GLSL ES 1.00 programs compiled by libGLESv2's CPU
+ * GLSL interpreter:
+ *
+ *   - gouraud (default): per-vertex diffuse lighting written EXACTLY like the
+ *     gears demo (uMVP / uNormalMat / uMaterial / uLightEye / uShade feeding a
+ *     passthrough vColor fragment shader).  That shape is what the raspi5 V3D
+ *     bridge recognises and offloads to the fixed lit-gouraud QPU kernel, so the
+ *     CPU interpreter and the GPU produce identical pixels - GPU acceleration is
+ *     preserved transparently.  The 50 scattered spheres are baked into ONE
+ *     vertex buffer (their instance offsets are static) and drawn per instance
+ *     with a shared MVP/material, which the bridge coalesces into a handful of
+ *     GPU dispatches instead of 50.
+ *
+ *   - phong (toggle 'l'): per-pixel ADS lighting.  An arbitrary fragment shader
+ *     never ran on the GPU under portablegl either (only the fixed-function FS
+ *     did), so this stays on the CPU interpreter exactly as before; its normal
+ *     matrix uniform is deliberately named uNMat (not uNormalMat) so the bridge
+ *     does not mistake it for the gouraud kernel.
+ *
+ * Geometry, materials and the rotating sphere/torus animation are unchanged.
+ */
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,52 +33,86 @@
 #include <math.h>
 #include <vector>
 
-#include <ewoksys/klog.h>
-
-#define sinf pgl_fast_sin
-#define cosf pgl_fast_cos
-#define sqrtf pgl_fast_sqrt
-#define tanf pgl_fast_tan
-#define acosf pgl_fast_acos
-#define asinf pgl_fast_asin
-#define atanf pgl_fast_atan
-#define atanf2 pgl_fast_atan2
-
-#define WIDTH 640
-#define HEIGHT 480
-
-#define PIX_FORMAT SDL_PIXELFORMAT_ARGB8888
+#include <unistd.h>
+#include <ewoksys/proc.h>
+#include <ewoksys/keydef.h>
+#include <ewoksys/kernel_tic.h>
+#include <x/x.h>
+#include <x/xwin.h>
+#include <graph/graph.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// Forward declarations for math functions
-void mat4_multiply(float* result, const float* a, const float* b);
-void mat4_perspective(float* m, float fovy, float aspect, float near, float far);
-void mat4_identity(float* m);
-void mat4_translation(float* m, float x, float y, float z);
-void mat4_rotation(float* m, float angle, float x, float y, float z);
-void mat4_scale(float* m, float x, float y, float z);
-void mat3_from_mat4(float* m3, const float* m4);
+#define DEG_TO_RAD(x)   ((x) * 0.017453292519943296)
 
-// Use vec3 and vec4 from portablegl
-// They are already defined in portablegl.h
+#define WIDTH 640
+#define HEIGHT 480
 
+#define FLOOR_SIZE 40
+#define NUM_SPHERES 50
+
+static int win_width = WIDTH;
+static int win_height = HEIGHT;
+
+static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
+static EGLSurface egl_surf = EGL_NO_SURFACE;
+static EGLContext egl_ctx = EGL_NO_CONTEXT;
+
+/* ---- column-major mat4 helpers ---- */
+static void mat4_multiply(float* result, const float* a, const float* b) {
+    float temp[16];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            temp[j*4+i] = 0;
+            for (int k = 0; k < 4; k++)
+                temp[j*4+i] += a[k*4+i] * b[j*4+k];
+        }
+    memcpy(result, temp, sizeof(temp));
+}
+
+static void mat4_perspective(float* m, float fovy, float aspect, float nearv, float farv) {
+    float f = 1.0f / tanf(fovy / 2.0f);
+    for (int i = 0; i < 16; i++) m[i] = 0;
+    m[0] = f / aspect;
+    m[5] = f;
+    m[10] = (farv + nearv) / (nearv - farv);
+    m[11] = -1.0f;
+    m[14] = (2.0f * farv * nearv) / (nearv - farv);
+}
+
+static void mat4_identity(float* m) {
+    for (int i = 0; i < 16; i++) m[i] = 0;
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+static void mat4_translation(float* m, float x, float y, float z) {
+    mat4_identity(m);
+    m[12] = x; m[13] = y; m[14] = z;
+}
+
+static void mat4_rotation(float* m, float angle, float x, float y, float z) {
+    float c = cosf(angle), s = sinf(angle), t = 1.0f - c;
+    float len = sqrtf(x*x + y*y + z*z);
+    if (len > 0.0001f) { x /= len; y /= len; z /= len; }
+    m[0] = t*x*x + c;     m[1] = t*x*y + s*z;   m[2] = t*x*z - s*y;   m[3] = 0;
+    m[4] = t*x*y - s*z;   m[5] = t*y*y + c;     m[6] = t*y*z + s*x;   m[7] = 0;
+    m[8] = t*x*z + s*y;   m[9] = t*y*z - s*x;   m[10] = t*z*z + c;    m[11] = 0;
+    m[12] = 0;            m[13] = 0;            m[14] = 0;            m[15] = 1;
+}
+
+/* ---- camera ---- */
 struct Camera {
     float pos[3];
-    float rot[3];
+    float rot[3];   /* degrees */
 
-    Camera() {
-        pos[0] = 0; pos[1] = 0.3f; pos[2] = 2.5f;
-        rot[0] = 0; rot[1] = 0; rot[2] = 0;
-    }
+    Camera() { pos[0] = 0; pos[1] = 0.3f; pos[2] = 2.5f; rot[0] = rot[1] = rot[2] = 0; }
 
     void get_matrix(float* mat) {
         float rx = rot[0] * M_PI / 180.0f;
         float ry = rot[1] * M_PI / 180.0f;
         float rz = rot[2] * M_PI / 180.0f;
-
         float cx = cosf(rx), sx = sinf(rx);
         float cy = cosf(ry), sy = sinf(ry);
         float cz = cosf(rz), sz = sinf(rz);
@@ -67,10 +124,8 @@ struct Camera {
         rot_mat[12] = 0; rot_mat[13] = 0; rot_mat[14] = 0; rot_mat[15] = 1;
 
         float trans_mat[16];
-        trans_mat[0] = 1; trans_mat[1] = 0; trans_mat[2] = 0; trans_mat[3] = 0;
-        trans_mat[4] = 0; trans_mat[5] = 1; trans_mat[6] = 0; trans_mat[7] = 0;
-        trans_mat[8] = 0; trans_mat[9] = 0; trans_mat[10] = 1; trans_mat[11] = 0;
-        trans_mat[12] = -pos[0]; trans_mat[13] = -pos[1]; trans_mat[14] = -pos[2]; trans_mat[15] = 1;
+        mat4_identity(trans_mat);
+        trans_mat[12] = -pos[0]; trans_mat[13] = -pos[1]; trans_mat[14] = -pos[2];
 
         mat4_multiply(mat, rot_mat, trans_mat);
     }
@@ -80,184 +135,35 @@ struct Camera {
         pos[0] += cosf(rad) * dist;
         pos[2] -= sinf(rad) * dist;
     }
-
-    void move_up(float dist) {
-        pos[1] += dist;
-    }
-
+    void move_up(float dist) { pos[1] += dist; }
     void move_forward(float dist) {
         float rad = rot[1] * M_PI / 180.0f;
         pos[0] -= sinf(rad) * dist;
         pos[2] -= cosf(rad) * dist;
     }
-
-    void rotate_local_x(float deg) {
-        rot[0] += deg;
-    }
-
-    void rotate_local_y(float deg) {
-        rot[1] += deg;
-    }
-
-    void rotate_local_z(float deg) {
-        rot[2] += deg;
-    }
+    void rotate_local_x(float deg) { rot[0] += deg; }
+    void rotate_local_y(float deg) { rot[1] += deg; }
 };
 
-void mat4_multiply(float* result, const float* a, const float* b) {
-    float temp[16];
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            temp[j*4+i] = 0;
-            for (int k = 0; k < 4; k++) {
-                temp[j*4+i] += a[k*4+i] * b[j*4+k];
-            }
-        }
-    }
-    memcpy(result, temp, sizeof(temp));
+/* ---- geometry ---- */
+struct V3 { float x, y, z; };
+static inline V3 mkv3(float x, float y, float z) { V3 v = {x, y, z}; return v; }
+static inline V3 v3_add(V3 a, V3 b) { return mkv3(a.x+b.x, a.y+b.y, a.z+b.z); }
+static inline V3 v3_scale(V3 v, float s) { return mkv3(v.x*s, v.y*s, v.z*s); }
+static inline V3 v3_cross(V3 a, V3 b) {
+    return mkv3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);
+}
+static inline V3 v3_norm(V3 v) {
+    float l = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+    if (l > 0.0001f) { v.x /= l; v.y /= l; v.z /= l; }
+    return v;
+}
+static float randf_range(float lo, float hi) {
+    return lo + (float)rand() / RAND_MAX * (hi - lo);
 }
 
-void mat4_perspective(float* m, float fovy, float aspect, float near, float far) {
-    float f = 1.0f / tanf(fovy / 2.0f);
-    for (int i = 0; i < 16; i++) m[i] = 0;
-    m[0] = f / aspect;
-    m[5] = f;
-    m[10] = (far + near) / (near - far);
-    m[11] = -1.0f;
-    m[14] = (2.0f * far * near) / (near - far);
-}
-
-void mat4_identity(float* m) {
-    for (int i = 0; i < 16; i++) m[i] = 0;
-    m[0] = m[5] = m[10] = m[15] = 1.0f;
-}
-
-void mat4_translation(float* m, float x, float y, float z) {
-    mat4_identity(m);
-    m[12] = x; m[13] = y; m[14] = z;
-}
-
-void mat4_rotation(float* m, float angle, float x, float y, float z) {
-    float c = cosf(angle);
-    float s = sinf(angle);
-    float t = 1.0f - c;
-
-    float len = sqrtf(x*x + y*y + z*z);
-    if (len > 0.0001f) {
-        x /= len; y /= len; z /= len;
-    }
-
-    m[0] = t*x*x + c;     m[1] = t*x*y + s*z;   m[2] = t*x*z - s*y;   m[3] = 0;
-    m[4] = t*x*y - s*z;   m[5] = t*y*y + c;     m[6] = t*y*z + s*x;   m[7] = 0;
-    m[8] = t*x*z + s*y;   m[9] = t*y*z - s*x;   m[10] = t*z*z + c;    m[11] = 0;
-    m[12] = 0;            m[13] = 0;            m[14] = 0;            m[15] = 1;
-}
-
-void mat4_scale(float* m, float x, float y, float z) {
-    mat4_identity(m);
-    m[0] = x; m[5] = y; m[10] = z;
-}
-
-void mat3_from_mat4(float* m3, const float* m4) {
-    m3[0] = m4[0]; m3[1] = m4[1]; m3[2] = m4[2];
-    m3[3] = m4[4]; m3[4] = m4[5]; m3[5] = m4[6];
-    m3[6] = m4[8]; m3[7] = m4[9]; m3[8] = m4[10];
-}
-
-vec3 vec3_add(vec3 a, vec3 b) {
-    return make_v3(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-
-vec3 vec3_scale(vec3 v, float s) {
-    return make_v3(v.x * s, v.y * s, v.z * s);
-}
-
-float vec3_dot(vec3 a, vec3 b) {
-    return a.x*b.x + a.y*b.y + a.z*b.z;
-}
-
-vec3 vec3_cross(vec3 a, vec3 b) {
-    return make_v3(
-        a.y*b.z - a.z*b.y,
-        a.z*b.x - a.x*b.z,
-        a.x*b.y - a.y*b.x
-    );
-}
-
-void vec3_normalize(vec3& v) {
-    float len = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
-    if (len > 0.0001f) {
-        v.x /= len; v.y /= len; v.z /= len;
-    }
-}
-
-vec3 vec3_reflect(vec3 i, vec3 n) {
-    float d = 2.0f * vec3_dot(i, n);
-    return make_v3(i.x - d*n.x, i.y - d*n.y, i.z - d*n.z);
-}
-
-vec3 vec3_neg(vec3 v) {
-    return make_v3(-v.x, -v.y, -v.z);
-}
-
-float randf_range(float min, float max) {
-    return min + (float)rand() / RAND_MAX * (max - min);
-}
-
-void make_torus(std::vector<vec3>& verts, std::vector<int>& tris, std::vector<vec2>& texcoords,
-                float major_radius, float minor_radius, int major_segments, int minor_segments) {
-    // Create vertex grid
-    // Torus is closed in both i (major circle) and j (minor circle) directions
-    // Both directions need texture coordinate wrapping
-    
-    // Vertex array size: (major_segments) * (minor_segments)
-    // Each vertex has unique 3D position and texture coordinates
-    for (int i = 0; i < major_segments; i++) {
-        float theta = 2.0f * M_PI * i / major_segments;
-        float cos_theta = cosf(theta);
-        float sin_theta = sinf(theta);
-
-        for (int j = 0; j < minor_segments; j++) {
-            float phi = 2.0f * M_PI * j / minor_segments;
-            float cos_phi = cosf(phi);
-            float sin_phi = sinf(phi);
-
-            float x = (major_radius + minor_radius * cos_phi) * cos_theta;
-            float y = minor_radius * sin_phi;
-            float z = (major_radius + minor_radius * cos_phi) * sin_theta;
-
-            verts.push_back(make_v3(x, y, z));
-            // Texture coordinates range [0,1), properly wrapped at edges
-            texcoords.push_back({(float)i / major_segments, (float)j / minor_segments});
-        }
-    }
-
-    // Generate triangle indices with proper wrapping in both directions
-    for (int i = 0; i < major_segments; i++) {
-        int next_i = (i + 1) % major_segments;
-        for (int j = 0; j < minor_segments; j++) {
-            int next_j = (j + 1) % minor_segments;
-            
-            int curr = i * minor_segments + j;
-            int right = i * minor_segments + next_j;
-            int down = next_i * minor_segments + j;
-            int diag = next_i * minor_segments + next_j;
-
-            // First triangle
-            tris.push_back(curr);
-            tris.push_back(down);
-            tris.push_back(right);
-            
-            // Second triangle
-            tris.push_back(right);
-            tris.push_back(down);
-            tris.push_back(diag);
-        }
-    }
-}
-
-void make_sphere(std::vector<vec3>& verts, std::vector<int>& tris, std::vector<vec2>& texcoords,
-                 float radius, int segments, int rings) {
+static void make_sphere(std::vector<V3>& verts, std::vector<int>& tris,
+                        float radius, int segments, int rings) {
     for (int ring = 0; ring <= rings; ring++) {
         float phi = M_PI * ring / rings;
         for (int seg = 0; seg <= segments; seg++) {
@@ -265,536 +171,526 @@ void make_sphere(std::vector<vec3>& verts, std::vector<int>& tris, std::vector<v
             float x = sinf(phi) * cosf(theta);
             float y = cosf(phi);
             float z = sinf(phi) * sinf(theta);
-            verts.push_back(make_v3(x * radius, y * radius, z * radius));
-            texcoords.push_back({(float)seg / segments, (float)ring / rings});
+            verts.push_back(mkv3(x*radius, y*radius, z*radius));
         }
     }
-
-    for (int ring = 0; ring < rings; ring++) {
+    for (int ring = 0; ring < rings; ring++)
         for (int seg = 0; seg < segments; seg++) {
             int curr = ring * (segments + 1) + seg;
             int next = curr + segments + 1;
             tris.push_back(curr); tris.push_back(next); tris.push_back(curr + 1);
             tris.push_back(curr + 1); tris.push_back(next); tris.push_back(next + 1);
         }
+}
+
+static void make_torus(std::vector<V3>& verts, std::vector<int>& tris,
+                       float major_radius, float minor_radius,
+                       int major_segments, int minor_segments) {
+    for (int i = 0; i < major_segments; i++) {
+        float theta = 2.0f * M_PI * i / major_segments;
+        float ct = cosf(theta), st = sinf(theta);
+        for (int j = 0; j < minor_segments; j++) {
+            float phi = 2.0f * M_PI * j / minor_segments;
+            float cp = cosf(phi), sp = sinf(phi);
+            float x = (major_radius + minor_radius * cp) * ct;
+            float y = minor_radius * sp;
+            float z = (major_radius + minor_radius * cp) * st;
+            verts.push_back(mkv3(x, y, z));
+        }
+    }
+    for (int i = 0; i < major_segments; i++) {
+        int ni = (i + 1) % major_segments;
+        for (int j = 0; j < minor_segments; j++) {
+            int nj = (j + 1) % minor_segments;
+            int curr = i * minor_segments + j;
+            int right = i * minor_segments + nj;
+            int down = ni * minor_segments + j;
+            int diag = ni * minor_segments + nj;
+            tris.push_back(curr); tris.push_back(down); tris.push_back(right);
+            tris.push_back(right); tris.push_back(down); tris.push_back(diag);
+        }
     }
 }
 
-void compute_normals(const std::vector<vec3>& verts, const std::vector<int>& tris,
-                     std::vector<vec3>& normals, float smooth_angle) {
-    normals.resize(verts.size());
-    for (size_t i = 0; i < normals.size(); i++) normals[i] = make_v3(0, 0, 0);
-
+static void compute_normals(const std::vector<V3>& verts, const std::vector<int>& tris,
+                            std::vector<V3>& normals) {
+    normals.assign(verts.size(), mkv3(0, 0, 0));
     std::vector<int> counts(verts.size(), 0);
-
     for (size_t i = 0; i < tris.size(); i += 3) {
         int i0 = tris[i], i1 = tris[i+1], i2 = tris[i+2];
-        vec3 v0 = verts[i0], v1 = verts[i1], v2 = verts[i2];
-
-        vec3 edge1 = make_v3(v1.x - v0.x, v1.y - v0.y, v1.z - v0.z);
-        vec3 edge2 = make_v3(v2.x - v0.x, v2.y - v0.y, v2.z - v0.z);
-        vec3 n = vec3_cross(edge1, edge2);
-        vec3_normalize(n);
-
-        normals[i0] = vec3_add(normals[i0], n);
-        normals[i1] = vec3_add(normals[i1], n);
-        normals[i2] = vec3_add(normals[i2], n);
+        V3 v0 = verts[i0], v1 = verts[i1], v2 = verts[i2];
+        V3 n = v3_norm(v3_cross(mkv3(v1.x-v0.x, v1.y-v0.y, v1.z-v0.z),
+                                mkv3(v2.x-v0.x, v2.y-v0.y, v2.z-v0.z)));
+        normals[i0] = v3_add(normals[i0], n);
+        normals[i1] = v3_add(normals[i1], n);
+        normals[i2] = v3_add(normals[i2], n);
         counts[i0]++; counts[i1]++; counts[i2]++;
     }
+    for (size_t i = 0; i < normals.size(); i++)
+        if (counts[i] > 0) normals[i] = v3_norm(v3_scale(normals[i], 1.0f / counts[i]));
+}
 
-    for (size_t i = 0; i < normals.size(); i++) {
-        if (counts[i] > 0) {
-            normals[i] = vec3_scale(normals[i], 1.0f / counts[i]);
-            vec3_normalize(normals[i]);
-        }
+/* expand an indexed mesh to an interleaved pos3+normal3 triangle list */
+static void expand_interleaved(const std::vector<V3>& verts, const std::vector<int>& tris,
+                               const std::vector<V3>& normals, std::vector<float>& out) {
+    for (size_t i = 0; i < tris.size(); i++) {
+        int idx = tris[i];
+        out.push_back(verts[idx].x); out.push_back(verts[idx].y); out.push_back(verts[idx].z);
+        out.push_back(normals[idx].x); out.push_back(normals[idx].y); out.push_back(normals[idx].z);
     }
 }
 
-struct My_Uniforms {
-    float mvp_mat[16];
-    float normal_mat[9];
-    vec4 color;
-    vec3 light_dir;
-    vec3 Ka, Kd, Ks;
-    float shininess;
-};
+/* ---- GLSL ES 1.00 programs ---- */
+/* gouraud: byte-for-byte the gears demo shape so the raspi5 V3D lit-gouraud
+ * kernel and the CPU interpreter agree exactly. */
+static const char* gouraud_vs =
+    "attribute vec3 aPosition;\n"
+    "attribute vec3 aNormal;\n"
+    "uniform mat4 uMVP;\n"
+    "uniform mat4 uNormalMat;\n"
+    "uniform vec3 uMaterial;\n"
+    "uniform vec4 uLightEye;\n"
+    "uniform vec4 uShade;\n"
+    "varying vec4 vColor;\n"
+    "void main() {\n"
+    "    vec3 ne = normalize((uNormalMat * vec4(aNormal, 0.0)).xyz);\n"
+    "    vec3 L = normalize(uLightEye.xyz);\n"
+    "    float diff = max(dot(ne, L), 0.0);\n"
+    "    float spec = 0.0;\n"
+    "    vec3 col = clamp(uMaterial * (uShade.x + uShade.y * diff) +\n"
+    "                   vec3(uShade.z * spec), 0.0, 1.0);\n"
+    "    vColor = vec4(col, 1.0);\n"
+    "    gl_Position = uMVP * vec4(aPosition, 1.0);\n"
+    "}\n";
 
-SDL_Window* window;
-SDL_Renderer* ren;
-SDL_Texture* tex;
-glContext the_Context;
-pix_t* bbufpix;
+static const char* gouraud_fs =
+    "precision mediump float;\n"
+    "varying vec4 vColor;\n"
+    "void main() {\n"
+    "    gl_FragColor = vColor;\n"
+    "}\n";
 
-int width, height;
-float proj_mat[16];
+/* phong: per-pixel ADS, CPU-only (uNMat keeps it off the gouraud GPU kernel). */
+static const char* phong_vs =
+    "attribute vec3 aPosition;\n"
+    "attribute vec3 aNormal;\n"
+    "uniform mat4 uMVP;\n"
+    "uniform mat4 uNMat;\n"
+    "varying vec3 vNormal;\n"
+    "void main() {\n"
+    "    vNormal = normalize((uNMat * vec4(aNormal, 0.0)).xyz);\n"
+    "    gl_Position = uMVP * vec4(aPosition, 1.0);\n"
+    "}\n";
 
-enum {
-    ATTR_VERTEX = 0,
-    ATTR_NORMAL = 1,
-    ATTR_TEXCOORD = 2,
-    ATTR_INSTANCE = 3
-};
+static const char* phong_fs =
+    "precision mediump float;\n"
+    "varying vec3 vNormal;\n"
+    "uniform vec3 uLightDir;\n"
+    "uniform vec3 uKa;\n"
+    "uniform vec3 uKd;\n"
+    "uniform vec3 uKs;\n"
+    "uniform float uShininess;\n"
+    "void main() {\n"
+    "    vec3 N = normalize(vNormal);\n"
+    "    vec3 L = normalize(uLightDir);\n"
+    "    vec3 col = uKa;\n"
+    "    float diff = max(dot(N, L), 0.0);\n"
+    "    col += uKd * diff;\n"
+    "    if (diff > 0.0) {\n"
+    "        vec3 r = reflect(-L, N);\n"
+    "        float spec = max(dot(r, vec3(0.0, 0.0, 1.0)), 0.0);\n"
+    "        col += uKs * pow(spec, uShininess);\n"
+    "    }\n"
+    "    gl_FragColor = vec4(col, 1.0);\n"
+    "}\n";
 
-struct vert_attribs {
-    float pos[3];
-    float normal[3];
-};
+/* solid: floor grid lines (pos-only). */
+static const char* solid_vs =
+    "attribute vec3 aPosition;\n"
+    "uniform mat4 uMVP;\n"
+    "uniform vec4 uColor;\n"
+    "varying vec4 vColor;\n"
+    "void main() {\n"
+    "    vColor = uColor;\n"
+    "    gl_Position = uMVP * vec4(aPosition, 1.0);\n"
+    "}\n";
 
-#define NUM_SHADERS 2
+static const char* solid_fs =
+    "precision mediump float;\n"
+    "varying vec4 vColor;\n"
+    "void main() {\n"
+    "    gl_FragColor = vColor;\n"
+    "}\n";
 
-int polygon_mode;
-GLuint shaders[NUM_SHADERS];
-int cur_shader;
-My_Uniforms the_uniforms;
-pgl_ff_solid_uniform line_uniforms;   /* solid-colour floor grid (basic_shader) */
+static GLuint gouraud_prog = 0, phong_prog = 0, solid_prog = 0;
+static int cur_shader = 0;   /* 0 = gouraud (GPU), 1 = phong (CPU) */
 
-void gouraud_ads_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
-void gouraud_ads_fp(float* fs_input, Shader_Builtins* builtins, void* uniforms);
-void phong_ads_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms);
-void phong_ads_fp(float* fs_input, Shader_Builtins* builtins, void* uniforms);
+/* gouraud uniform locations */
+static GLint g_mvp = -1, g_normal = -1, g_material = -1, g_light = -1, g_shade = -1;
+/* phong uniform locations */
+static GLint p_mvp = -1, p_nmat = -1, p_light = -1, p_ka = -1, p_kd = -1, p_ks = -1, p_shin = -1;
+/* solid uniform locations */
+static GLint s_mvp = -1, s_color = -1;
 
-void setup_context() {
-    if (SDL_Init(SDL_INIT_VIDEO)) {
-        printf("SDL_Init error: %s\n", SDL_GetError());
-        exit(0);
+static GLuint baked_vbo = 0, sphere_vbo = 0, torus_vbo = 0, line_vbo = 0;
+static int sphere_count = 0, torus_count = 0, line_count = 0;
+
+static Camera camera;
+static float proj_mat[16];
+static float light_direction[3];
+
+/* materials */
+static const float sphere_diffuse[3] = { 0.0f, 0.0f, 0.7f };
+static const float sphere_ambient[3] = { 0.0f, 0.0f, 0.2f };
+static const float sphere_specular[3] = { 1.0f, 1.0f, 1.0f };
+static const float torus_diffuse[3]  = { 1.0f, 0.0f, 0.0f };
+static const float torus_ambient[3]  = { 0.0f, 0.0f, 0.0f };
+static const float torus_specular[3] = { 0.0f, 0.0f, 0.0f };
+static const float floor_color[4]    = { 0.0f, 1.0f, 0.0f, 1.0f };
+static const float SHININESS = 128.0f;
+
+static GLuint compile_shader(GLenum type, const char* src) {
+    GLuint sh = glCreateShader(type);
+    GLint ok = 0;
+    if (sh == 0) return 0;
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+        printf("sphere: shader compile failed: %s\n", log);
+        glDeleteShader(sh);
+        return 0;
     }
-
-    width = WIDTH;
-    height = HEIGHT;
-
-    window = SDL_CreateWindow("Sphereworld Color", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-    if (!window) exit(0);
-
-    ren = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    tex = SDL_CreateTexture(ren, PIX_FORMAT, SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
-
-    if (!init_glContext(&the_Context, &bbufpix, WIDTH, HEIGHT)) {
-        puts("Failed to initialize glContext");
-        exit(0);
-    }
+    return sh;
 }
 
-void cleanup() {
-    free_glContext(&the_Context);
-    SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
+static GLuint link_prog(const char* vs_src, const char* fs_src, int bind_normal) {
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
+    GLuint prog = glCreateProgram();
+    GLint ok = 0;
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glBindAttribLocation(prog, 0, "aPosition");
+    if (bind_normal) glBindAttribLocation(prog, 1, "aNormal");
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetProgramInfoLog(prog, sizeof(log), NULL, log);
+        printf("sphere: program link failed: %s\n", log);
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    return prog;
 }
 
-int handle_events(Camera& camera, unsigned int last_time, unsigned int cur_time);
+static GLuint upload_vbo(const std::vector<float>& data) {
+    GLuint vbo = 0;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float), &data[0], GL_STATIC_DRAW);
+    return vbo;
+}
 
-#define FLOOR_SIZE 40
-#define NUM_SPHERES 50
+static void bind_mesh(GLuint vbo) {
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), 0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+}
 
-int main(int argc, char** argv) {
-    (void)argc; (void)argv;
-    setup_context();
+static void init_gl(void) {
+    gouraud_prog = link_prog(gouraud_vs, gouraud_fs, 1);
+    phong_prog   = link_prog(phong_vs, phong_fs, 1);
+    solid_prog   = link_prog(solid_vs, solid_fs, 0);
 
-    polygon_mode = 2;
-    mat4_perspective(proj_mat, DEG_TO_RAD(35.0f), WIDTH/(float)HEIGHT, 0.3f, 100.0f);
+    g_mvp      = glGetUniformLocation(gouraud_prog, "uMVP");
+    g_normal   = glGetUniformLocation(gouraud_prog, "uNormalMat");
+    g_material = glGetUniformLocation(gouraud_prog, "uMaterial");
+    g_light    = glGetUniformLocation(gouraud_prog, "uLightEye");
+    g_shade    = glGetUniformLocation(gouraud_prog, "uShade");
 
-    std::vector<vec3> line_verts;
-    for (int i = 0, j = -FLOOR_SIZE/2; i < 11; ++i, j += FLOOR_SIZE/10) {
-        line_verts.push_back(make_v3(j, -1, -FLOOR_SIZE/2));
-        line_verts.push_back(make_v3(j, -1, FLOOR_SIZE/2));
-        line_verts.push_back(make_v3(-FLOOR_SIZE/2, -1, j));
-        line_verts.push_back(make_v3(FLOOR_SIZE/2, -1, j));
-    }
+    p_mvp   = glGetUniformLocation(phong_prog, "uMVP");
+    p_nmat  = glGetUniformLocation(phong_prog, "uNMat");
+    p_light = glGetUniformLocation(phong_prog, "uLightDir");
+    p_ka    = glGetUniformLocation(phong_prog, "uKa");
+    p_kd    = glGetUniformLocation(phong_prog, "uKd");
+    p_ks    = glGetUniformLocation(phong_prog, "uKs");
+    p_shin  = glGetUniformLocation(phong_prog, "uShininess");
 
-    GLuint line_vao, line_buf;
-    glGenVertexArrays(1, &line_vao);
-    glBindVertexArray(line_vao);
-
-    glGenBuffers(1, &line_buf);
-    glBindBuffer(GL_ARRAY_BUFFER, line_buf);
-    glBufferData(GL_ARRAY_BUFFER, line_verts.size()*3*sizeof(float), &line_verts[0], GL_STATIC_DRAW);
-    glEnableVertexAttribArray(ATTR_VERTEX);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
-
-    std::vector<vec3> torus_verts, torus_normals;
-    std::vector<int> torus_tris;
-    std::vector<vec2> torus_texcoords;
-
-    std::vector<vec3> sphere_verts, sphere_normals;
-    std::vector<int> sphere_tris;
-    std::vector<vec2> sphere_texcoords;
-
-    make_torus(torus_verts, torus_tris, torus_texcoords, 0.3f, 0.1f, 40, 20);
-    make_sphere(sphere_verts, sphere_tris, sphere_texcoords, 0.1f, 26, 13);
-
-    // Rotate torus 90 degrees around X
-    for (size_t i = 0; i < torus_verts.size(); ++i) {
-        float y = torus_verts[i].y;
-        float z = torus_verts[i].z;
-        torus_verts[i].y = y * 0 - z * 1;
-        torus_verts[i].z = y * 1 + z * 0;
-    }
-
-    compute_normals(torus_verts, torus_tris, torus_normals, DEG_TO_RAD(30));
-    compute_normals(sphere_verts, sphere_tris, sphere_normals, DEG_TO_RAD(30));
-
-    std::vector<vert_attribs> vert_data;
-
-    for (size_t i = 0; i < torus_tris.size(); i += 3) {
-        int v0 = torus_tris[i], v1 = torus_tris[i+1], v2 = torus_tris[i+2];
-        vert_attribs va0 = {{torus_verts[v0].x, torus_verts[v0].y, torus_verts[v0].z},
-                           {torus_normals[v0].x, torus_normals[v0].y, torus_normals[v0].z}};
-        vert_attribs va1 = {{torus_verts[v1].x, torus_verts[v1].y, torus_verts[v1].z},
-                           {torus_normals[v1].x, torus_normals[v1].y, torus_normals[v1].z}};
-        vert_attribs va2 = {{torus_verts[v2].x, torus_verts[v2].y, torus_verts[v2].z},
-                           {torus_normals[v2].x, torus_normals[v2].y, torus_normals[v2].z}};
-        vert_data.push_back(va0);
-        vert_data.push_back(va1);
-        vert_data.push_back(va2);
-    }
-
-    size_t sphere_offset = vert_data.size();
-
-    for (size_t i = 0; i < sphere_tris.size(); i += 3) {
-        int v0 = sphere_tris[i], v1 = sphere_tris[i+1], v2 = sphere_tris[i+2];
-        vert_attribs va0 = {{sphere_verts[v0].x, sphere_verts[v0].y, sphere_verts[v0].z},
-                           {sphere_normals[v0].x, sphere_normals[v0].y, sphere_normals[v0].z}};
-        vert_attribs va1 = {{sphere_verts[v1].x, sphere_verts[v1].y, sphere_verts[v1].z},
-                           {sphere_normals[v1].x, sphere_normals[v1].y, sphere_normals[v1].z}};
-        vert_attribs va2 = {{sphere_verts[v2].x, sphere_verts[v2].y, sphere_verts[v2].z},
-                           {sphere_normals[v2].x, sphere_normals[v2].y, sphere_normals[v2].z}};
-        vert_data.push_back(va0);
-        vert_data.push_back(va1);
-        vert_data.push_back(va2);
-    }
-
-    std::vector<float> instance_pos;
-    for (int i = 0; i < NUM_SPHERES + 1; ++i) {
-        float rx = randf_range(-FLOOR_SIZE/2.0f, FLOOR_SIZE/2.0f);
-        float rz = randf_range(-FLOOR_SIZE/2.0f, FLOOR_SIZE/2.0f);
-        if (i) {
-            instance_pos.push_back(rx); instance_pos.push_back(0.4f); instance_pos.push_back(rz);
-        } else {
-            instance_pos.push_back(0); instance_pos.push_back(0); instance_pos.push_back(0);
-        }
-    }
-
-    GLuint vao, buffer;
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
-
-    glGenBuffers(1, &buffer);
-    glBindBuffer(GL_ARRAY_BUFFER, buffer);
-    glBufferData(GL_ARRAY_BUFFER, vert_data.size() * sizeof(vert_attribs), &vert_data[0], GL_STATIC_DRAW);
-
-    glEnableVertexAttribArray(ATTR_VERTEX);
-    glVertexAttribPointer(ATTR_VERTEX, 3, GL_FLOAT, GL_FALSE, sizeof(vert_attribs), 0);
-    glEnableVertexAttribArray(ATTR_NORMAL);
-    glVertexAttribPointer(ATTR_NORMAL, 3, GL_FLOAT, GL_FALSE, sizeof(vert_attribs), (void*)(3*sizeof(float)));
-
-    GLuint inst_buf;
-    glGenBuffers(1, &inst_buf);
-    glBindBuffer(GL_ARRAY_BUFFER, inst_buf);
-    glBufferData(GL_ARRAY_BUFFER, instance_pos.size() * sizeof(float), &instance_pos[0], GL_STATIC_DRAW);
-    glEnableVertexAttribArray(ATTR_INSTANCE);
-    glVertexAttribPointer(ATTR_INSTANCE, 3, GL_FLOAT, GL_FALSE, 0, 0);
-    glVertexAttribDivisor(ATTR_INSTANCE, 1);
-
-    GLenum interpolation[5] = { PGL_SMOOTH3 };
-
-    /* The floor grid is a plain solid-colour GL_LINES pass: use the built-in
-     * pgl_ff_solid_vs / pgl_ff_solid pair so the raspi5 V3D back end can offload
-     * it.  It needs a pgl_ff_solid_uniform (mvp_matrix + color); the_uniforms is
-     * not layout-compatible (normal_mat sits between them), so it gets its own. */
-    GLuint basic_shader = pglCreateProgram(pgl_ff_solid_vs, pgl_ff_solid, 0, NULL, GL_FALSE);
-    glUseProgram(basic_shader);
-    pglSetUniform(&line_uniforms);
-
-    shaders[0] = pglCreateProgram(gouraud_ads_vp, pgl_ff_gouraud, 4, interpolation, GL_FALSE);
-    glUseProgram(shaders[0]);
-    pglSetUniform(&the_uniforms);
-
-    shaders[1] = pglCreateProgram(phong_ads_vp, phong_ads_fp, 3, interpolation, GL_FALSE);
-    glUseProgram(shaders[1]);
-    pglSetUniform(&the_uniforms);
-
-    cur_shader = 0;
-
-    Camera camera;
-    camera.pos[0] = 0; camera.pos[1] = 0.3f; camera.pos[2] = 2.5f;
-
-    vec4 floor_color = make_v4(0, 1, 0, 1);
-    vec3 torus_ambient = make_v3(0.0f, 0, 0);
-    vec3 torus_diffuse = make_v3(1.0f, 0, 0);
-    vec3 torus_specular = make_v3(0, 0, 0);
-    vec3 sphere_ambient = make_v3(0, 0, 0.2f);
-    vec3 sphere_diffuse = make_v3(0, 0, 0.7f);
-    vec3 sphere_specular = make_v3(1, 1, 1);
-
-    the_uniforms.color = floor_color;
-    line_uniforms.color = floor_color;
-    the_uniforms.shininess = 128.0f;
-    vec3 light_direction = make_v3(0, 10, 5);
-    vec3_normalize(light_direction);
-
-    glUseProgram(basic_shader);
+    s_mvp   = glGetUniformLocation(solid_prog, "uMVP");
+    s_color = glGetUniformLocation(solid_prog, "uColor");
 
     glEnable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
-    SDL_SetRelativeMouseMode(SDL_TRUE);
+    light_direction[0] = 0.0f; light_direction[1] = 10.0f; light_direction[2] = 5.0f;
+    float ll = sqrtf(light_direction[0]*light_direction[0] +
+                     light_direction[1]*light_direction[1] +
+                     light_direction[2]*light_direction[2]);
+    light_direction[0] /= ll; light_direction[1] /= ll; light_direction[2] /= ll;
 
-    unsigned int old_time = 0, counter = 0, last_time = SDL_GetTicks();
-    float total_time = 0;
+    /* ---- floor grid (pos-only GL_LINES) ---- */
+    std::vector<float> line_verts;
+    for (int i = 0, j = -FLOOR_SIZE/2; i < 11; ++i, j += FLOOR_SIZE/10) {
+        line_verts.push_back((float)j); line_verts.push_back(-1.0f); line_verts.push_back((float)-FLOOR_SIZE/2);
+        line_verts.push_back((float)j); line_verts.push_back(-1.0f); line_verts.push_back((float)FLOOR_SIZE/2);
+        line_verts.push_back((float)-FLOOR_SIZE/2); line_verts.push_back(-1.0f); line_verts.push_back((float)j);
+        line_verts.push_back((float)FLOOR_SIZE/2); line_verts.push_back(-1.0f); line_verts.push_back((float)j);
+    }
+    line_count = (int)(line_verts.size() / 3);
+    line_vbo = upload_vbo(line_verts);
 
-    while (1) {
-        unsigned int new_time = SDL_GetTicks();
-        if (handle_events(camera, last_time, new_time)) break;
+    /* ---- sphere mesh ---- */
+    std::vector<V3> sph_v, sph_n;
+    std::vector<int> sph_t;
+    make_sphere(sph_v, sph_t, 0.1f, 26, 13);
+    compute_normals(sph_v, sph_t, sph_n);
+    std::vector<float> sphere_il;
+    expand_interleaved(sph_v, sph_t, sph_n, sphere_il);
+    sphere_count = (int)sph_t.size();
+    sphere_vbo = upload_vbo(sphere_il);
 
-        last_time = new_time;
-        total_time = new_time / 1000.0f;
-        if (new_time - old_time > 3000) {
-            printf("%f FPS\n", counter * 1000.f / (new_time - old_time));
-            old_time = new_time;
-            counter = 0;
+    /* ---- torus mesh (rotated 90 deg around X, as the original) ---- */
+    std::vector<V3> tor_v, tor_n;
+    std::vector<int> tor_t;
+    make_torus(tor_v, tor_t, 0.3f, 0.1f, 40, 20);
+    for (size_t i = 0; i < tor_v.size(); ++i) {
+        float y = tor_v[i].y, z = tor_v[i].z;
+        tor_v[i].y = -z;
+        tor_v[i].z = y;
+    }
+    compute_normals(tor_v, tor_t, tor_n);
+    std::vector<float> torus_il;
+    expand_interleaved(tor_v, tor_t, tor_n, torus_il);
+    torus_count = (int)tor_t.size();
+    torus_vbo = upload_vbo(torus_il);
+
+    /* ---- bake the 50 static sphere instances into ONE buffer ---- */
+    std::vector<float> baked;
+    for (int i = 0; i < NUM_SPHERES; ++i) {
+        float ox, oy, oz;
+        if (i == 0) { ox = 0.0f; oy = 0.0f; oz = 0.0f; }
+        else {
+            ox = randf_range(-FLOOR_SIZE/2.0f, FLOOR_SIZE/2.0f);
+            oy = 0.4f;
+            oz = randf_range(-FLOOR_SIZE/2.0f, FLOOR_SIZE/2.0f);
         }
-
-        bbufpix = (pix_t*)GetBackBuffer();
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-        for (int i = 0; i < width * height; ++i) {
-            bbufpix[i] = 0xFF000000;
+        for (size_t k = 0; k < sphere_il.size(); k += 6) {
+            baked.push_back(sphere_il[k]   + ox);
+            baked.push_back(sphere_il[k+1] + oy);
+            baked.push_back(sphere_il[k+2] + oz);
+            baked.push_back(sphere_il[k+3]);
+            baked.push_back(sphere_il[k+4]);
+            baked.push_back(sphere_il[k+5]);
         }
+    }
+    baked_vbo = upload_vbo(baked);
+}
 
-        float view_mat[16];
-        camera.get_matrix(view_mat);
+/* Set the lighting/material uniforms of the active program for one mesh draw. */
+static void set_shading(const float* mvp, const float* nmat,
+                        const float* kd, const float* ka, const float* ks) {
+    if (cur_shader == 0) {
+        glUniformMatrix4fv(g_mvp, 1, GL_FALSE, mvp);
+        glUniformMatrix4fv(g_normal, 1, GL_FALSE, nmat);
+        glUniform3f(g_material, kd[0], kd[1], kd[2]);
+        glUniform4f(g_light, light_direction[0], light_direction[1], light_direction[2], 0.0f);
+        /* ambient factor approximates the original per-object Ka against uMaterial */
+        float amb = (kd[0] > 0.0001f) ? (ka[0] / kd[0]) :
+                    (kd[1] > 0.0001f) ? (ka[1] / kd[1]) :
+                    (kd[2] > 0.0001f) ? (ka[2] / kd[2]) : 0.0f;
+        glUniform4f(g_shade, amb, 1.0f, 0.0f, 0.0f);
+    } else {
+        glUniformMatrix4fv(p_mvp, 1, GL_FALSE, mvp);
+        glUniformMatrix4fv(p_nmat, 1, GL_FALSE, nmat);
+        glUniform3f(p_light, light_direction[0], light_direction[1], light_direction[2]);
+        glUniform3f(p_ka, ka[0], ka[1], ka[2]);
+        glUniform3f(p_kd, kd[0], kd[1], kd[2]);
+        glUniform3f(p_ks, ks[0], ks[1], ks[2]);
+        glUniform1f(p_shin, SHININESS);
+    }
+}
 
-        float mvp_mat[16];
-        mat4_multiply(mvp_mat, proj_mat, view_mat);
+static void draw_mesh(GLuint vbo, int first, int count,
+                      const float* mvp, const float* nmat,
+                      const float* kd, const float* ka, const float* ks) {
+    glUseProgram(cur_shader == 0 ? gouraud_prog : phong_prog);
+    set_shading(mvp, nmat, kd, ka, ks);
+    bind_mesh(vbo);
+    glDrawArrays(GL_TRIANGLES, first, count);
+    glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(0);
+}
 
-        glUseProgram(basic_shader);
-        memcpy(line_uniforms.mvp_matrix, mvp_mat, sizeof(mvp_mat));
-        glBindVertexArray(line_vao);
-        glDrawArrays(GL_LINES, 0, line_verts.size());
+static float total_time = 0.0f;
 
-        glBindVertexArray(vao);
-        glUseProgram(shaders[cur_shader]);
-
-        the_uniforms.light_dir = light_direction;
-        mat3_from_mat4(the_uniforms.normal_mat, view_mat);
-        the_uniforms.Ka = sphere_ambient;
-        the_uniforms.Kd = sphere_diffuse;
-        the_uniforms.Ks = sphere_specular;
-
-        glDrawArraysInstanced(GL_TRIANGLES, sphere_offset, sphere_tris.size(), NUM_SPHERES);
-
-        // Rotating sphere
-        float rot_mat[16], trans_mat[16], temp_mat[16];
-        mat4_rotation(rot_mat, -total_time * DEG_TO_RAD(60.0f), 0, 1, 0);
-        mat4_translation(trans_mat, 0.8f, 0.4f, 0.0f);
-        mat4_multiply(temp_mat, rot_mat, trans_mat);
-        mat4_multiply(temp_mat, view_mat, temp_mat);
-        mat4_multiply(the_uniforms.mvp_mat, proj_mat, temp_mat);
-        mat3_from_mat4(the_uniforms.normal_mat, temp_mat);
-
-        glDrawArrays(GL_TRIANGLES, sphere_offset, sphere_tris.size());
-
-        // Rotating torus
-        mat4_rotation(rot_mat, total_time * DEG_TO_RAD(60.0f), 0, 1, 0);
-        mat4_translation(trans_mat, 0.0f, 0.3f, -1.2f);
-        mat4_multiply(temp_mat, rot_mat, trans_mat);
-        mat4_multiply(temp_mat, view_mat, temp_mat);
-        mat4_multiply(the_uniforms.mvp_mat, proj_mat, temp_mat);
-        mat3_from_mat4(the_uniforms.normal_mat, temp_mat);
-
-        the_uniforms.Ka = torus_ambient;
-        the_uniforms.Kd = torus_diffuse;
-        the_uniforms.Ks = torus_specular;
-
-        glDrawArrays(GL_TRIANGLES, 0, torus_tris.size());
-
-        SDL_UpdateTexture(tex, NULL, bbufpix, width * sizeof(pix_t));
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-        SDL_RenderFillRect(ren, NULL);
-        SDL_RenderCopy(ren, tex, NULL, NULL);
-        SDL_RenderPresent(ren);
-
-        ++counter;
+static void render_frame(void) {
+    EGLint w = 0, h = 0;
+    eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
+    if (w > 0 && h > 0 && (w != win_width || h != win_height)) {
+        win_width = w; win_height = h;
+        glViewport(0, 0, w, h);
+        mat4_perspective(proj_mat, DEG_TO_RAD(35.0f), (float)w / (float)h, 0.3f, 100.0f);
     }
 
-    cleanup();
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    float view_mat[16];
+    camera.get_matrix(view_mat);
+    float view_mvp[16];
+    mat4_multiply(view_mvp, proj_mat, view_mat);
+
+    /* floor grid */
+    glUseProgram(solid_prog);
+    glUniformMatrix4fv(s_mvp, 1, GL_FALSE, view_mvp);
+    glUniform4f(s_color, floor_color[0], floor_color[1], floor_color[2], floor_color[3]);
+    glBindBuffer(GL_ARRAY_BUFFER, line_vbo);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glDrawArrays(GL_LINES, 0, line_count);
+    glDisableVertexAttribArray(0);
+
+    /* scattered spheres: one shared MVP/material so the GPU bridge coalesces
+     * the per-instance draws; each instance is sphere_count vertices. */
+    glBindBuffer(GL_ARRAY_BUFFER, baked_vbo);
+    glUseProgram(cur_shader == 0 ? gouraud_prog : phong_prog);
+    set_shading(view_mvp, view_mat, sphere_diffuse, sphere_ambient, sphere_specular);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), 0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    for (int i = 0; i < NUM_SPHERES; ++i)
+        glDrawArrays(GL_TRIANGLES, i * sphere_count, sphere_count);
+    glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(0);
+
+    /* rotating sphere at (0.8, 0.4, 0) */
+    float rot_mat[16], trans_mat[16], temp_mat[16], mv[16], mvp[16];
+    mat4_rotation(rot_mat, -total_time * DEG_TO_RAD(60.0f), 0, 1, 0);
+    mat4_translation(trans_mat, 0.8f, 0.4f, 0.0f);
+    mat4_multiply(temp_mat, rot_mat, trans_mat);
+    mat4_multiply(mv, view_mat, temp_mat);
+    mat4_multiply(mvp, proj_mat, mv);
+    draw_mesh(sphere_vbo, 0, sphere_count, mvp, mv,
+              sphere_diffuse, sphere_ambient, sphere_specular);
+
+    /* rotating torus at (0, 0.3, -1.2) */
+    mat4_rotation(rot_mat, total_time * DEG_TO_RAD(60.0f), 0, 1, 0);
+    mat4_translation(trans_mat, 0.0f, 0.3f, -1.2f);
+    mat4_multiply(temp_mat, rot_mat, trans_mat);
+    mat4_multiply(mv, view_mat, temp_mat);
+    mat4_multiply(mvp, proj_mat, mv);
+    draw_mesh(torus_vbo, 0, torus_count, mvp, mv,
+              torus_diffuse, torus_ambient, torus_specular);
+
+    eglSwapBuffers(egl_dpy, egl_surf);
+}
+
+static int fps = 0, frame_count = 0;
+static uint32_t last_tic = 0, last_frame_tic = 0;
+
+static void loop(void* p) {
+    (void)p;
+    uint32_t now;
+    kernel_tic32(NULL, NULL, &now);
+    if (last_frame_tic == 0) last_frame_tic = now;
+    float dt = (now - last_frame_tic) / 1000000.0f;
+    last_frame_tic = now;
+    if (dt > 0.1f) dt = 0.1f;
+    total_time += dt;
+
+    render_frame();
+
+    if (last_tic == 0 || (now - last_tic) >= 1000000) {
+        last_tic = now; fps = frame_count; frame_count = 0;
+        printf("%d FPS\n", fps); fflush(stdout);
+    }
+    frame_count++;
+    usleep(1000);
+}
+
+static void on_event(xwin_t* xwin, xevent_t* ev) {
+    if (ev->type == XEVT_IM && ev->state == XIM_STATE_PRESS) {
+        int key = ev->value.im.value;
+        switch (key) {
+        case KEY_ESC:   xwin_close(xwin); break;
+        case KEY_LEFT:  camera.rotate_local_y(-5.0f); break;
+        case KEY_RIGHT: camera.rotate_local_y(5.0f); break;
+        case KEY_UP:    camera.rotate_local_x(-5.0f); break;
+        case KEY_DOWN:  camera.rotate_local_x(5.0f); break;
+        case 'a': camera.move_right(0.2f); break;
+        case 'd': camera.move_right(-0.2f); break;
+        case 'w': camera.move_forward(0.2f); break;
+        case 's': camera.move_forward(-0.2f); break;
+        case 'l': cur_shader = (cur_shader + 1) % 2; break;
+        }
+    }
+}
+
+static int init_egl(xwin_t* xwin) {
+    EGLint major, minor, ncfg = 0;
+    EGLint cfg_attr[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 16,
+        EGL_NONE
+    };
+    EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLConfig cfg = NULL;
+
+    egl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (egl_dpy == EGL_NO_DISPLAY) return 0;
+    if (!eglInitialize(egl_dpy, &major, &minor)) return 0;
+    if (!eglChooseConfig(egl_dpy, cfg_attr, &cfg, 1, &ncfg) || ncfg < 1) return 0;
+    egl_ctx = eglCreateContext(egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (egl_ctx == EGL_NO_CONTEXT) return 0;
+    egl_surf = eglCreateWindowSurface(egl_dpy, cfg, (EGLNativeWindowType)xwin, NULL);
+    if (egl_surf == EGL_NO_SURFACE) return 0;
+    if (!eglMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx)) return 0;
+    return 1;
+}
+
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
+
+    x_t x;
+    x_init(&x, NULL);
+    x.on_loop = loop;
+
+    xwin_t* xwin = xwin_open(&x, -1, 32, 32, WIDTH, HEIGHT, "Sphereworld Color", XWIN_STYLE_NORMAL);
+    if (!xwin) {
+        printf("Failed to open window\n");
+        return 1;
+    }
+    xwin_set_alpha(xwin, false);
+    xwin->on_event = on_event;
+
+    if (!init_egl(xwin)) {
+        printf("Failed to initialize EGL\n");
+        return 1;
+    }
+
+    srand(12345);
+    win_width = WIDTH; win_height = HEIGHT;
+    glViewport(0, 0, WIDTH, HEIGHT);
+    mat4_perspective(proj_mat, DEG_TO_RAD(35.0f), WIDTH / (float)HEIGHT, 0.3f, 100.0f);
+    init_gl();
+
+    xwin_set_visible(xwin, true);
+    x_run(&x, xwin);
+
+    xwin_destroy(xwin);
+    eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (egl_surf != EGL_NO_SURFACE) eglDestroySurface(egl_dpy, egl_surf);
+    if (egl_ctx != EGL_NO_CONTEXT) eglDestroyContext(egl_dpy, egl_ctx);
+    eglTerminate(egl_dpy);
     return 0;
-}
-
-int handle_events(Camera& camera, unsigned int last_time, unsigned int cur_time) {
-    SDL_Event event;
-    int sc;
-
-    while (SDL_PollEvent(&event)) {
-        switch (event.type) {
-        case SDL_KEYDOWN:
-            sc = event.key.keysym.sym;
-            if (sc == SDLK_ESCAPE) return 1;
-            else if (sc == SDLK_p) {
-                polygon_mode = (polygon_mode + 1) % 3;
-                if (polygon_mode == 0) glPolygonMode(GL_FRONT_AND_BACK, GL_POINT);
-                else if (polygon_mode == 1) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-                else glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-            } else if (sc == SDLK_l) {
-                cur_shader = (cur_shader + 1) % NUM_SHADERS;
-            }
-            break;
-
-        case SDL_WINDOWEVENT:
-            if (event.window.event == SDL_WINDOWEVENT_RESIZED) {
-                width = event.window.data1;
-                height = event.window.data2;
-                ResizeFramebuffer(width, height);
-                bbufpix = (pix_t*)GetBackBuffer();
-                glViewport(0, 0, width, height);
-                SDL_DestroyTexture(tex);
-                tex = SDL_CreateTexture(ren, PIX_FORMAT, SDL_TEXTUREACCESS_STREAMING, width, height);
-                mat4_perspective(proj_mat, DEG_TO_RAD(35.0f), width/(float)height, 0.3f, 100.0f);
-            }
-            break;
-
-        case SDL_MOUSEMOTION: {
-            float degx = event.motion.xrel / 20.0f;
-            float degy = event.motion.yrel / 20.0f;
-            camera.rotate_local_y(-DEG_TO_RAD(degx));
-            camera.rotate_local_x(DEG_TO_RAD(degy));
-            break;
-        }
-
-        case SDL_QUIT:
-            return 1;
-        }
-    }
-
-    const Uint8 *state = SDL_GetKeyboardState(NULL);
-    float time = (cur_time - last_time) / 1000.0f;
-    float move_speed = 5.0f;
-
-    if (state[SDL_SCANCODE_A]) camera.move_right(time * move_speed);
-    if (state[SDL_SCANCODE_D]) camera.move_right(time * -move_speed);
-    if (state[SDL_SCANCODE_LSHIFT]) camera.move_up(time * move_speed);
-    if (state[SDL_SCANCODE_SPACE]) camera.move_up(time * -move_speed);
-    if (state[SDL_SCANCODE_W]) camera.move_forward(time * move_speed);
-    if (state[SDL_SCANCODE_S]) camera.move_forward(time * -move_speed);
-    if (state[SDL_SCANCODE_Q]) camera.rotate_local_z(-DEG_TO_RAD(60 * time));
-    if (state[SDL_SCANCODE_E]) camera.rotate_local_z(DEG_TO_RAD(60 * time));
-
-    return 0;
-}
-
-/* basic_transform_vp / uniform_color_fp were replaced by the built-in
- * pgl_ff_solid_vs / pgl_ff_solid (see basic_shader setup in main). */
-
-void gouraud_ads_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms) {
-    My_Uniforms* u = (My_Uniforms*)uniforms;
-
-    float nx = vertex_attribs[ATTR_NORMAL].x;
-    float ny = vertex_attribs[ATTR_NORMAL].y;
-    float nz = vertex_attribs[ATTR_NORMAL].z;
-
-    float eye_nx = u->normal_mat[0]*nx + u->normal_mat[3]*ny + u->normal_mat[6]*nz;
-    float eye_ny = u->normal_mat[1]*nx + u->normal_mat[4]*ny + u->normal_mat[7]*nz;
-    float eye_nz = u->normal_mat[2]*nx + u->normal_mat[5]*ny + u->normal_mat[8]*nz;
-
-    float len = sqrtf(eye_nx*eye_nx + eye_ny*eye_ny + eye_nz*eye_nz);
-    if (len > 0.0001f) { eye_nx /= len; eye_ny /= len; eye_nz /= len; }
-
-    vec3 light_dir = u->light_dir;
-    vec3_normalize(light_dir);
-    vec3 eye_dir = make_v3(0, 0, 1);
-
-    vec3 out_light = u->Ka;
-
-    float diff = maxf(0.0f, eye_nx*light_dir.x + eye_ny*light_dir.y + eye_nz*light_dir.z);
-    out_light.x += u->Kd.x * diff;
-    out_light.y += u->Kd.y * diff;
-    out_light.z += u->Kd.z * diff;
-
-    if (diff > 0) {
-        vec3 r = vec3_reflect(vec3_neg(light_dir), make_v3(eye_nx, eye_ny, eye_nz));
-        float spec = maxf(0.0f, r.x*eye_dir.x + r.y*eye_dir.y + r.z*eye_dir.z);
-        float fSpec = powf(spec, u->shininess);
-        out_light.x += u->Ks.x * fSpec;
-        out_light.y += u->Ks.y * fSpec;
-        out_light.z += u->Ks.z * fSpec;
-    }
-
-    vs_output[0] = out_light.x;
-    vs_output[1] = out_light.y;
-    vs_output[2] = out_light.z;
-    vs_output[3] = 1.0f;   /* alpha: the program pairs this VS with the built-in
-                            * pgl_ff_gouraud FS, which reads a vec4 RGBA varying
-                            * (lets the raspi5 V3D back end offload gouraud +
-                            * depth/cull to the GPU; identical on the CPU). */
-
-    vec4 v = vertex_attribs[ATTR_VERTEX];
-    vec4 inst = vertex_attribs[ATTR_INSTANCE];
-    builtins->gl_Position.x = u->mvp_mat[0]*(v.x+inst.x) + u->mvp_mat[4]*(v.y+inst.y) + u->mvp_mat[8]*(v.z+inst.z) + u->mvp_mat[12];
-    builtins->gl_Position.y = u->mvp_mat[1]*(v.x+inst.x) + u->mvp_mat[5]*(v.y+inst.y) + u->mvp_mat[9]*(v.z+inst.z) + u->mvp_mat[13];
-    builtins->gl_Position.z = u->mvp_mat[2]*(v.x+inst.x) + u->mvp_mat[6]*(v.y+inst.y) + u->mvp_mat[10]*(v.z+inst.z) + u->mvp_mat[14];
-    builtins->gl_Position.w = u->mvp_mat[3]*(v.x+inst.x) + u->mvp_mat[7]*(v.y+inst.y) + u->mvp_mat[11]*(v.z+inst.z) + u->mvp_mat[15];
-}
-
-void gouraud_ads_fp(float* fs_input, Shader_Builtins* builtins, void* uniforms) {
-    (void)uniforms;
-    builtins->gl_FragColor.x = fs_input[0];
-    builtins->gl_FragColor.y = fs_input[1];
-    builtins->gl_FragColor.z = fs_input[2];
-    builtins->gl_FragColor.w = 1.0f;
-}
-
-void phong_ads_vp(float* vs_output, vec4* vertex_attribs, Shader_Builtins* builtins, void* uniforms) {
-    My_Uniforms* u = (My_Uniforms*)uniforms;
-
-    float nx = vertex_attribs[ATTR_NORMAL].x;
-    float ny = vertex_attribs[ATTR_NORMAL].y;
-    float nz = vertex_attribs[ATTR_NORMAL].z;
-
-    float eye_nx = u->normal_mat[0]*nx + u->normal_mat[3]*ny + u->normal_mat[6]*nz;
-    float eye_ny = u->normal_mat[1]*nx + u->normal_mat[4]*ny + u->normal_mat[7]*nz;
-    float eye_nz = u->normal_mat[2]*nx + u->normal_mat[5]*ny + u->normal_mat[8]*nz;
-
-    vs_output[0] = eye_nx;
-    vs_output[1] = eye_ny;
-    vs_output[2] = eye_nz;
-
-    vec4 v = vertex_attribs[ATTR_VERTEX];
-    vec4 inst = vertex_attribs[ATTR_INSTANCE];
-    builtins->gl_Position.x = u->mvp_mat[0]*(v.x+inst.x) + u->mvp_mat[4]*(v.y+inst.y) + u->mvp_mat[8]*(v.z+inst.z) + u->mvp_mat[12];
-    builtins->gl_Position.y = u->mvp_mat[1]*(v.x+inst.x) + u->mvp_mat[5]*(v.y+inst.y) + u->mvp_mat[9]*(v.z+inst.z) + u->mvp_mat[13];
-    builtins->gl_Position.z = u->mvp_mat[2]*(v.x+inst.x) + u->mvp_mat[6]*(v.y+inst.y) + u->mvp_mat[10]*(v.z+inst.z) + u->mvp_mat[14];
-    builtins->gl_Position.w = u->mvp_mat[3]*(v.x+inst.x) + u->mvp_mat[7]*(v.y+inst.y) + u->mvp_mat[11]*(v.z+inst.z) + u->mvp_mat[15];
-}
-
-void phong_ads_fp(float* fs_input, Shader_Builtins* builtins, void* uniforms) {
-    My_Uniforms* u = (My_Uniforms*)uniforms;
-
-    vec3 eye_normal = make_v3(fs_input[0], fs_input[1], fs_input[2]);
-    vec3_normalize(eye_normal);
-
-    vec3 light_dir = u->light_dir;
-    vec3_normalize(light_dir);
-    vec3 eye_dir = make_v3(0, 0, 1);
-
-    vec3 out_light = u->Ka;
-
-    float lambertian = maxf(0.0f, vec3_dot(light_dir, eye_normal));
-    if (lambertian > 0) {
-        out_light.x += u->Kd.x * lambertian;
-        out_light.y += u->Kd.y * lambertian;
-        out_light.z += u->Kd.z * lambertian;
-
-        vec3 r = vec3_reflect(vec3_neg(light_dir), eye_normal);
-        float spec = maxf(0.0f, vec3_dot(r, eye_dir));
-        float shine = powf(spec, u->shininess);
-        out_light.x += u->Ks.x * shine;
-        out_light.y += u->Ks.y * shine;
-        out_light.z += u->Ks.z * shine;
-    }
-
-    builtins->gl_FragColor.x = out_light.x;
-    builtins->gl_FragColor.y = out_light.y;
-    builtins->gl_FragColor.z = out_light.z;
-    builtins->gl_FragColor.w = 1.0f;
 }

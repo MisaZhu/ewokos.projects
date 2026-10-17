@@ -6,14 +6,17 @@
 # compiler.  gles orders the sub-builds itself (v3dcompiler -> portablegl ->
 # merge), so neither appears here.
 #
-# glcommon/demos/imgui are temporarily DISABLED: they still call portablegl's
-# old gl* entry points, which were renamed to pgl_* to free the gl* namespace
-# for the new libGLESv2/libEGL front end (libs/gles). They are re-enabled here
-# as each is migrated to the standard GLES2+EGL API.
-DIRS = gles glcommon
-# clean still sweeps the disabled dirs so their stale objects never linger.
+# glcommon and demos are enabled: glcommon is fully migrated to GLES2, and
+# demos builds only the ported demos (balls.c, grass.cpp) -- its Makefile lists
+# the still-unported shadertoy/sphere/cubemap as a migration backlog.
+#
+# imgui is migrated to GLES2+EGL: its single renderer backend
+# (backends/imgui_impl_gles2.cpp) draws ImGui's VBO/element-stream through the
+# standard libGLESv2 GLSL ES 1.00 front end -- no portablegl, no VAOs, no
+# glPolygonMode.  It builds after gles so <GLES2/gl2.h> is installed.
+DIRS = gles glcommon demos imgui
+# clean still sweeps every dir so stale objects never linger.
 # gles clean cascades into portablegl + v3dcompiler.
-CLEAN_DIRS = $(DIRS) demos imgui
 
 .PHONY: all clean
 
@@ -23,6 +26,6 @@ all:
 	done
 
 clean: 
-	@for dir in $(CLEAN_DIRS); do \
+	@for dir in $(DIRS); do \
 		if [ -d $$dir ]; then $(MAKE) -C $$dir clean; fi; \
 	done

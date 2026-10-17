@@ -825,6 +825,15 @@ static glsl_val call_user(env *E, const glsl_expr *e)
         extern int glsl_exec_block(env *E, const glsl_stmt *s);
         glsl_exec_block(E, F->body);
     }
+    /* The callee's `return` leaves E->ctrl == CTRL_RETURN.  That token is local
+     * to the callee and MUST be consumed here: if it leaks into the caller, the
+     * caller's glsl_exec_block / ST_FOR sees CTRL_RETURN and terminates the
+     * caller's body (or breaks its loop) right after the call statement, so any
+     * user function that calls another user function in a non-final statement
+     * silently loses the rest of its body.  Only `discard` propagates out of a
+     * call (it must reach the top to drop the fragment); break/continue are
+     * always consumed by a loop inside the callee and never escape a function. */
+    if (E->ctrl != CTRL_DISCARD) E->ctrl = CTRL_NONE;
     /* write back out/inout params */
     for (i = 0; i < F->nparams && i < e->nargs; ++i) {
         if (F->param_inout[i] == 0) continue;

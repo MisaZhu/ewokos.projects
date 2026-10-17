@@ -5,15 +5,20 @@ TASK_OBJS = $(ARCH)/imgui_demo.o $(ARCH)/imgui_main.o
 
 EXTRA_LIBS_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 
-CFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include/glcommon -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__
-CXXFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include/glcommon -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__ -fno-threadsafe-statics
+# <EGL/egl.h> + <GLES2/gl2.h> and the imgui headers are installed into the
+# shared build include dir by libs/gles and libs/imgui.  -I.../include resolves
+# <EGL/...>, <GLES2/...> and "imgui/..."; -I.../include/imgui lets the backend
+# headers find their sibling "imgui.h".
+CFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__
+CXXFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__ -fno-threadsafe-statics
 LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib
 
-# imgui uses portablegl's pgl_* API directly; portablegl is now merged into
-# libGLESv2.a, so link that (it carries the engine and, on PGL_G3D targets, the
-# on-device mesa GLSL->QPU compiler).  No app-side -lportablegl / -lv3dcompiler.
-IMGUI_LIBS = $(EXTRA_LIBS_DIR)/lib/libglcommon.a \
-	$(EXTRA_LIBS_DIR)/lib/libimgui.a \
+# imgui now renders through the standard GLES2/EGL front end (libs/gles); it no
+# longer touches portablegl.  libGLESv2.a carries the engine and, on PGL_G3D
+# targets, the on-device mesa GLSL->QPU compiler, so the app links only
+# libimgui + libEGL + libGLESv2 (that order: imgui -> gl*, EGL -> engine).
+IMGUI_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui.a \
+	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
 
 TASK = imgui_demo

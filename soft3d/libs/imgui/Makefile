@@ -12,8 +12,7 @@ LIB_IMGUI_OBJS = \
 	$(ARCH)/imgui_draw.o \
 	$(ARCH)/imgui_tables.o \
 	$(ARCH)/imgui_widgets.o \
-	$(ARCH)/backends/imgui_impl_pgl_geometry.o \
-	$(ARCH)/backends/imgui_impl_portablegl.o
+	$(ARCH)/backends/imgui_impl_gles2.o
 
 IMGUI = $(BUILD_DIR)/lib/libimgui.a
 

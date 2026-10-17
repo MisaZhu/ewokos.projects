@@ -274,6 +274,7 @@ static const epair format_map[] = {
 static const epair type_map[] = {
     { GLES2_GL_UNSIGNED_BYTE,  GL_UNSIGNED_BYTE  },
     { GLES2_GL_UNSIGNED_SHORT, GL_UNSIGNED_SHORT },
+    { GLES2_GL_UNSIGNED_INT,   GL_UNSIGNED_INT   },
     { GLES2_GL_FLOAT,          GL_FLOAT          },
 };
 
@@ -552,8 +553,12 @@ void gles_engine_delete_textures(GEint n, const GEuint *t)  { pgl_DeleteTextures
 void gles_engine_bind_texture(GEenum target, GEuint texture)
 {
     pgl_BindTexture(EMAP(tex_target_map, target), texture);
-    /* track the 2D binding per active unit for the interpreter's sampler */
-    if (target == GLES2_GL_TEXTURE_2D && g_active_unit >= 0 && g_active_unit < 32)
+    /* Track the binding per active unit for the interpreter's sampler.  A cube
+     * map shares the slot: bridge_tex_sample resolves it by texture name and
+     * samples it as a cube when the GLSL builtin is textureCube (dim == 3), so
+     * cube binds must be mirrored here too or textureCube reads a stale name. */
+    if ((target == GLES2_GL_TEXTURE_2D || target == GLES2_GL_TEXTURE_CUBE_MAP) &&
+        g_active_unit >= 0 && g_active_unit < 32)
         g_tex_unit[g_active_unit] = texture;
 }
 
@@ -710,6 +715,22 @@ typedef struct {
     int            texblit;
     int            g_sampler_off; /* ublock cell offset of the sampler2D uniform */
     int            g_uv_slot;     /* varying slot supplying the vec2 texcoord    */
+    int            g_color_slot;  /* varying slot modulating the sample, -1 = none */
+    /* Native lit-gouraud fast-path (see match_lit_gouraud): when `lit_gouraud`
+     * is set the VS runs on ff_lit_gouraud_vert instead of the interpreter,
+     * evaluating the diffuse-only ADS formula shared verbatim by sphere.cpp and
+     * apps/gears (uNormalMat/uLightEye/uShade/uMaterial) in native C.  The FS is
+     * the same `gl_FragColor = vColor` passthrough, so it reuses ff_gouraud_frag.
+     * This is the vertex-bound mesh path on virt (no V3D GPU); on raspi5 the
+     * same shader is GPU-eligible (uNormalMat) and never reaches here. */
+    int            lit_gouraud;
+    int            lg_pos_loc;    /* vec3 aPosition attribute location */
+    int            lg_nrm_loc;    /* vec3 aNormal attribute location   */
+    int            lg_mvp_off;    /* ublock float offset of mat4 uMVP       */
+    int            lg_nmat_off;   /* ublock float offset of mat4 uNormalMat */
+    int            lg_mat_off;    /* ublock float offset of vec3 uMaterial  */
+    int            lg_light_off;  /* ublock float offset of vec4 uLightEye  */
+    int            lg_shade_off;  /* ublock float offset of vec4 uShade     */
 } interp_entry;
 
 static interp_entry  g_reg[GLES_MAX_INTERP];
@@ -851,6 +872,13 @@ static void ff_texblit_frag(float *fs_input, Shader_Builtins *builtins, void *un
     if (!e) return;
     c = texture2D(gles_engine_texture_for_unit(e->ublock[e->g_sampler_off].i),
                   fs_input[e->g_uv_slot * 4 + 0], fs_input[e->g_uv_slot * 4 + 1]);
+    /* Colour-modulated blit (imgui): gl_FragColor = vColor * texture2D(...).
+     * Multiply by the interpolated modulating varying exactly as the
+     * interpreter's EX_MUL would, so pixels stay bit-identical. */
+    if (e->g_color_slot >= 0) {
+        const float *m = &fs_input[e->g_color_slot * 4];
+        c.x *= m[0]; c.y *= m[1]; c.z *= m[2]; c.w *= m[3];
+    }
     builtins->gl_FragColor = c;
 }
 
@@ -915,21 +943,26 @@ static int match_gouraud(const glsl_program *gp, int *pos_loc, int *color_loc,
 
 /* Recognise a fragment shader that is exactly
  *      gl_FragColor = texture2D(<sampler2D uniform>, <vec2+ varying>);
- * (single statement, no discard/fragdepth, no arithmetic or swizzle on the
- * sample).  This is the fullscreen-blit shape the CPU-composited demos draw
- * every frame; sampling it natively instead of through the interpreter removes
- * the per-pixel tree-walk.  The vertex shader is deliberately NOT constrained:
- * ff_texblit_frag reads the same interpolated varying the interpreter would, so
- * any VS feeding varying g_uv_slot stays pixel-identical.  Returns 1 and reports
- * the sampler's ublock offset + the texcoord varying slot. */
-static int match_texblit(const glsl_program *gp, int *sampler_off, int *uv_slot)
+ * or the colour-modulated form used by Dear ImGui
+ *      gl_FragColor = <vec4 varying> * texture2D(<sampler2D uniform>, <vec2+ varying>);
+ * (single statement, no discard/fragdepth, no other arithmetic or swizzle on the
+ * sample).  This is the fullscreen-blit / UI-atlas shape the CPU-composited
+ * demos and imgui draw every frame; sampling it natively instead of through the
+ * interpreter removes the per-pixel tree-walk.  The vertex shader is deliberately
+ * NOT constrained: ff_texblit_frag reads the same interpolated varyings the
+ * interpreter would, so any VS feeding them stays pixel-identical.  Returns 1 and
+ * reports the sampler's ublock offset + the texcoord varying slot + (or -1 for)
+ * the modulating colour varying slot. */
+static int match_texblit(const glsl_program *gp, int *sampler_off, int *uv_slot,
+                         int *color_slot)
 {
     const glsl_stage *fs;
     const glsl_func *ffn;
     const glsl_stmt *s;
-    const glsl_expr *e, *call, *a0, *a1;
-    int uslot, vslot;
+    const glsl_expr *e, *rhs, *call, *mod, *a0, *a1;
+    int uslot, vslot, mslot;
 
+    *color_slot = -1;
     if (!gp || !gp->linked || !gp->fs) return 0;
     fs = gp->fs;
     if (fs->uses_discard || fs->uses_fragdepth) return 0;
@@ -937,7 +970,7 @@ static int match_texblit(const glsl_program *gp, int *sampler_off, int *uv_slot)
     ffn = &fs->funcs[fs->main_idx];
     if (!ffn->body) return 0;
 
-    /* FS: a single `gl_FragColor = texture2D(...);` */
+    /* FS: a single `gl_FragColor = [mod *] texture2D(...);` */
     s = ffn->body->children;
     if (!s || s->next || s->kind != ST_EXPR || !s->expr) return 0;
     e = s->expr;
@@ -945,7 +978,23 @@ static int match_texblit(const glsl_program *gp, int *sampler_off, int *uv_slot)
     if (e->a->kind != EX_VAR || e->a->var_scope != VARSCOPE_BUILTIN ||
         e->a->var_slot != BI_GL_FRAGCOLOR) return 0;
 
-    call = e->b;
+    rhs = e->b;
+    mod = NULL;
+    if (rhs->kind == EX_MUL && rhs->a && rhs->b) {
+        /* colour-modulated: one operand the sample, the other a vec4 varying */
+        const glsl_expr *cand = NULL;
+        if (rhs->a->kind == EX_CALL) { call = rhs->a; cand = rhs->b; }
+        else if (rhs->b->kind == EX_CALL) { call = rhs->b; cand = rhs->a; }
+        else return 0;
+        if (cand->kind != EX_VAR || cand->var_scope != VARSCOPE_VARYING)
+            return 0;
+        mslot = cand->var_slot;
+        if (mslot < 0 || mslot >= gp->nvaryings) return 0;
+        if (gp->varyings[mslot].ncomp < 4) return 0;
+        mod = cand;
+    } else {
+        call = rhs;
+    }
     if (call->kind != EX_CALL || call->is_user_fn || call->op_builtin != BF_TEXTURE2D)
         return 0;
     if (call->nargs != 2 || !call->args) return 0;
@@ -967,6 +1016,170 @@ static int match_texblit(const glsl_program *gp, int *sampler_off, int *uv_slot)
 
     *sampler_off = gp->uniforms[uslot].offset;
     *uv_slot = vslot;
+    if (mod) *color_slot = mslot;
+    return 1;
+}
+
+/* Native lit-gouraud vertex shader (see match_lit_gouraud).  Evaluates the
+ * diffuse-only ADS formula shared verbatim by sphere.cpp and apps/gears:
+ *      ne   = normalize((uNormalMat * vec4(aNormal, 0)).xyz)
+ *      L    = normalize(uLightEye.xyz)
+ *      diff = max(dot(ne, L), 0)
+ *      col  = clamp(uMaterial * (uShade.x + uShade.y*diff), 0, 1)   // spec==0
+ *      vColor      = vec4(col, 1)
+ *      gl_Position = uMVP * vec4(aPosition, 1)
+ * Every step mirrors the interpreter's builtin math (glsl_exec.c) bit-for-bit:
+ * column-major mat*vec accumulated col 0..3 (the w column drops out for the
+ * normal since vec4(aNormal,0).w==0, and adds 0.0 exactly for the position),
+ * normalize divides by sqrtf of the left-to-right summed squares (0 when the
+ * length is 0), and max/clamp use the same comparisons.  The specular term is
+ * dropped because both callers hard-code `spec = 0.0`, so vec3(uShade.z*spec)
+ * has zero magnitude and can only flip a -0.0 sign that quantises to pixel 0. */
+static void ff_lit_gouraud_vert(float *vs_output, vec4 *vertex_attribs,
+                                Shader_Builtins *builtins, void *uniforms)
+{
+    interp_entry *e = g_active;
+    const glsl_cell *u, *nm, *mvp, *mat, *le, *sh;
+    const float *pos, *nrm;
+    vec4 *vo = (vec4 *)vs_output;
+    float ex, ey, ez, lx, ly, lz, len, diff, k, cr, cg, cb;
+    int cc;
+    (void)uniforms;
+    if (!e) return;
+    u   = e->ublock;
+    pos = &vertex_attribs[e->lg_pos_loc].x;
+    nrm = &vertex_attribs[e->lg_nrm_loc].x;
+
+    /* ne = normalize((uNormalMat * vec4(aNormal, 0)).xyz); row cc = sum_col
+     * nm[col*4 + cc] * nrm[col], the w column (col 3) multiplying 0. */
+    nm = u + e->lg_nmat_off;
+    ex = nm[0 * 4 + 0].f * nrm[0] + nm[1 * 4 + 0].f * nrm[1] + nm[2 * 4 + 0].f * nrm[2];
+    ey = nm[0 * 4 + 1].f * nrm[0] + nm[1 * 4 + 1].f * nrm[1] + nm[2 * 4 + 1].f * nrm[2];
+    ez = nm[0 * 4 + 2].f * nrm[0] + nm[1 * 4 + 2].f * nrm[1] + nm[2 * 4 + 2].f * nrm[2];
+    len = sqrtf(ex * ex + ey * ey + ez * ez);
+    if (len > 0.0f) { ex /= len; ey /= len; ez /= len; }
+    else { ex = ey = ez = 0.0f; }
+
+    /* L = normalize(uLightEye.xyz) */
+    le = u + e->lg_light_off;
+    lx = le[0].f; ly = le[1].f; lz = le[2].f;
+    len = sqrtf(lx * lx + ly * ly + lz * lz);
+    if (len > 0.0f) { lx /= len; ly /= len; lz /= len; }
+    else { lx = ly = lz = 0.0f; }
+
+    /* diff = max(dot(ne, L), 0) -- ternary mirrors the interpreter's max */
+    diff = ex * lx + ey * ly + ez * lz;
+    diff = diff > 0.0f ? diff : 0.0f;
+
+    /* col = clamp(uMaterial * (uShade.x + uShade.y*diff), 0, 1) */
+    mat = u + e->lg_mat_off;
+    sh  = u + e->lg_shade_off;
+    k = sh[0].f + sh[1].f * diff;
+    cr = mat[0].f * k; cg = mat[1].f * k; cb = mat[2].f * k;
+    if (cr < 0.0f) cr = 0.0f; else if (cr > 1.0f) cr = 1.0f;
+    if (cg < 0.0f) cg = 0.0f; else if (cg > 1.0f) cg = 1.0f;
+    if (cb < 0.0f) cb = 0.0f; else if (cb > 1.0f) cb = 1.0f;
+    vo[0].x = cr; vo[0].y = cg; vo[0].z = cb; vo[0].w = 1.0f;
+
+    /* gl_Position = uMVP * vec4(aPosition, 1.0); column 3 multiplies w == 1. */
+    mvp = u + e->lg_mvp_off;
+    for (cc = 0; cc < 4; ++cc) {
+        float s = mvp[0 * 4 + cc].f * pos[0] + mvp[1 * 4 + cc].f * pos[1]
+                + mvp[2 * 4 + cc].f * pos[2] + mvp[3 * 4 + cc].f;
+        if (cc == 0) builtins->gl_Position.x = s;
+        else if (cc == 1) builtins->gl_Position.y = s;
+        else if (cc == 2) builtins->gl_Position.z = s;
+        else builtins->gl_Position.w = s;
+    }
+}
+
+/* Recognise the diffuse-only lit-gouraud program drawn by sphere.cpp and
+ * apps/gears: a single smooth vec4 varying, a `gl_FragColor = vColor`
+ * passthrough FS, the vec3 aPosition/aNormal attributes and the five uniforms
+ * uMVP/uNormalMat (mat4), uMaterial (vec3), uLightEye/uShade (vec4), whose VS
+ * writes both gl_Position and the varying.  The lighting formula itself is NOT
+ * re-derived from the AST: this exact set of names is the same name-based
+ * contract the raspi5 GPU router already uses to select its lit V3D kernel, and
+ * both callers spell the identical spec==0 body, so ff_lit_gouraud_vert can
+ * evaluate it natively.  Anything that does not match keeps the interpreter, so
+ * this fast-path can only skip the tree-walk - never change pixels.  Attribute
+ * locations are read by iterating attribs[] by name (glsl_attrib_index returns
+ * the .loc, not the array index, and we also need .size). */
+static int match_lit_gouraud(const glsl_program *gp, int *pos_loc, int *nrm_loc,
+                             int *mvp_off, int *nmat_off, int *mat_off,
+                             int *light_off, int *shade_off)
+{
+    const glsl_stage *vs, *fs;
+    const glsl_func *vfn, *ffn;
+    const glsl_stmt *s;
+    const glsl_expr *e;
+    int iu_mvp, iu_nmat, iu_mat, iu_light, iu_shade;
+    int ip = -1, in = -1, j, have_pos = 0, have_col = 0;
+
+    if (!gp || !gp->linked || !gp->vs || !gp->fs) return 0;
+    if (gp->nvaryings != 1) return 0;
+    if (gp->varyings[0].ncomp != 4 || gp->varyings[0].interp != 0) return 0;
+    vs = gp->vs; fs = gp->fs;
+    if (fs->uses_discard || fs->uses_fragdepth) return 0;
+    if (vs->main_idx < 0 || fs->main_idx < 0) return 0;
+    vfn = &vs->funcs[vs->main_idx];
+    ffn = &fs->funcs[fs->main_idx];
+    if (!vfn->body || !ffn->body) return 0;
+
+    /* FS: a single `gl_FragColor = <varying0>;` (identical to match_gouraud) */
+    s = ffn->body->children;
+    if (!s || s->next || s->kind != ST_EXPR || !s->expr) return 0;
+    e = s->expr;
+    if (e->kind != EX_ASSIGN || !e->a || !e->b) return 0;
+    if (e->a->kind != EX_VAR || e->a->var_scope != VARSCOPE_BUILTIN ||
+        e->a->var_slot != BI_GL_FRAGCOLOR) return 0;
+    if (e->b->kind != EX_VAR || e->b->var_scope != VARSCOPE_VARYING ||
+        e->b->var_slot != 0) return 0;
+
+    /* the five uniforms, by name, with the exact types the formula needs */
+    iu_mvp   = glsl_uniform_index(gp, "uMVP");
+    iu_nmat  = glsl_uniform_index(gp, "uNormalMat");
+    iu_mat   = glsl_uniform_index(gp, "uMaterial");
+    iu_light = glsl_uniform_index(gp, "uLightEye");
+    iu_shade = glsl_uniform_index(gp, "uShade");
+    if (iu_mvp < 0 || iu_nmat < 0 || iu_mat < 0 || iu_light < 0 || iu_shade < 0)
+        return 0;
+    if (gp->uniforms[iu_mvp].type   != T_MAT4 || gp->uniforms[iu_mvp].ncomp   != 16) return 0;
+    if (gp->uniforms[iu_nmat].type  != T_MAT4 || gp->uniforms[iu_nmat].ncomp  != 16) return 0;
+    if (gp->uniforms[iu_mat].type   != T_VEC3 || gp->uniforms[iu_mat].ncomp   != 3)  return 0;
+    if (gp->uniforms[iu_light].type != T_VEC4 || gp->uniforms[iu_light].ncomp != 4)  return 0;
+    if (gp->uniforms[iu_shade].type != T_VEC4 || gp->uniforms[iu_shade].ncomp != 4)  return 0;
+
+    /* aPosition / aNormal, by name, both vec3 at distinct locations */
+    for (j = 0; j < gp->nattribs; ++j) {
+        if (!strcmp(gp->attribs[j].name, "aPosition")) ip = j;
+        else if (!strcmp(gp->attribs[j].name, "aNormal")) in = j;
+    }
+    if (ip < 0 || in < 0 || ip == in) return 0;
+    if (gp->attribs[ip].size != 3 || gp->attribs[in].size != 3) return 0;
+    if (gp->attribs[ip].loc == gp->attribs[in].loc) return 0;
+
+    /* VS main must write both gl_Position and the single varying (slot 0); the
+     * local declarations and the lighting arithmetic are intentionally not
+     * inspected (see the comment above on the name-based contract). */
+    for (s = vfn->body->children; s; s = s->next) {
+        if (s->kind != ST_EXPR || !s->expr || s->expr->kind != EX_ASSIGN) continue;
+        e = s->expr;
+        if (!e->a || e->a->kind != EX_VAR) continue;
+        if (e->a->var_scope == VARSCOPE_BUILTIN && e->a->var_slot == BI_GL_POSITION)
+            have_pos = 1;
+        else if (e->a->var_scope == VARSCOPE_VARYING && e->a->var_slot == 0)
+            have_col = 1;
+    }
+    if (!have_pos || !have_col) return 0;
+
+    *pos_loc   = gp->attribs[ip].loc;
+    *nrm_loc   = gp->attribs[in].loc;
+    *mvp_off   = gp->uniforms[iu_mvp].offset;
+    *nmat_off  = gp->uniforms[iu_nmat].offset;
+    *mat_off   = gp->uniforms[iu_mat].offset;
+    *light_off = gp->uniforms[iu_light].offset;
+    *shade_off = gp->uniforms[iu_shade].offset;
     return 1;
 }
 
@@ -978,7 +1191,9 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     GLuint id;
     int i, n;
     int gouraud, pos_loc = 0, color_loc = 0, mvp_off = 0;
-    int texblit, sampler_off = 0, uv_slot = 0;
+    int texblit, sampler_off = 0, uv_slot = 0, color_slot = -1;
+    int litgou, lg_pos = 0, lg_nrm = 0, lg_mvp = 0, lg_nmat = 0;
+    int lg_mat = 0, lg_light = 0, lg_shade = 0;
     GLboolean depth_or_discard;
     (void)ublock_cells;
     if (!gp || !gp->linked) return 0;
@@ -991,9 +1206,13 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     depth_or_discard = (gp->fs && (gp->fs->uses_discard || gp->fs->uses_fragdepth))
                        ? GL_TRUE : GL_FALSE;
     gouraud = match_gouraud(gp, &pos_loc, &color_loc, &mvp_off);
-    texblit = gouraud ? 0 : match_texblit(gp, &sampler_off, &uv_slot);
-    id = pglCreateProgram(gouraud ? ff_gouraud_vert : interp_vert,
-                          gouraud ? ff_gouraud_frag
+    litgou = gouraud ? 0 : match_lit_gouraud(gp, &lg_pos, &lg_nrm, &lg_mvp,
+                                             &lg_nmat, &lg_mat, &lg_light, &lg_shade);
+    texblit = (gouraud || litgou) ? 0
+            : match_texblit(gp, &sampler_off, &uv_slot, &color_slot);
+    id = pglCreateProgram(gouraud ? ff_gouraud_vert
+                                  : (litgou ? ff_lit_gouraud_vert : interp_vert),
+                          (gouraud || litgou) ? ff_gouraud_frag
                                   : (texblit ? ff_texblit_frag : interp_frag),
                           (GLsizei)n, interp, depth_or_discard);
     if (!id) return 0;
@@ -1005,6 +1224,15 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     e->texblit = texblit;
     e->g_sampler_off = texblit ? sampler_off : 0;
     e->g_uv_slot = texblit ? uv_slot : 0;
+    e->g_color_slot = texblit ? color_slot : -1;
+    e->lit_gouraud  = litgou;
+    e->lg_pos_loc   = litgou ? lg_pos   : 0;
+    e->lg_nrm_loc   = litgou ? lg_nrm   : 0;
+    e->lg_mvp_off   = litgou ? lg_mvp   : 0;
+    e->lg_nmat_off  = litgou ? lg_nmat  : 0;
+    e->lg_mat_off   = litgou ? lg_mat   : 0;
+    e->lg_light_off = litgou ? lg_light : 0;
+    e->lg_shade_off = litgou ? lg_shade : 0;
     return id;
 }
 
@@ -1174,6 +1402,8 @@ typedef struct {
     pgl_g3d_prog  prog;
     int           eligible;      /* compiled to a geometry kernel         */
     int           textured;      /* attr1 is uv; needs a raster texture   */
+    int           fullscreen;    /* passthrough VS + gl_FragCoord FS: routed
+                                    by gpu_try_fullscreen, not the mesh path */
     int           cpu_latched;   /* a dispatch declined: stay on the CPU  */
     int           unif_resolved;
     int           in_use;
@@ -1450,6 +1680,147 @@ static void gpu_coalesce_flush(void)
     g_coalesce_active = 0; g_coalesce_n = 0;
 }
 
+/* ------------------------------------------------------------------ *
+ * Fullscreen compiled-shader route (shadertoy).
+ *
+ * A program whose VS is a passthrough (no uMVP, so not one of the fixed
+ * geometry kernels) and whose FS derives colour from gl_FragCoord is a
+ * fullscreen effect: the compiled FS computes every pixel procedurally from
+ * uniforms (iGlobalTime / iResolution) and optional iChannelN samplers, so no
+ * per-vertex attribute is staged.  This mirrors portablegl's pgl_gpu_frame:
+ * dispatch a fixed NDC quad as two pos-only triangles through
+ * pgl_g3d_batch_tri_compiled, with the per-draw uniform blob packed BY NAME
+ * (mesa dead-strips unused uniforms, shifting dword offsets per effect) and
+ * each sampler bound to a TILED texture slot (the compiled TMU samples UIF
+ * images, never the raster rows the fixed TEX_MOD kernel reads).  Anything that
+ * cannot back the draw - no GPU, a sampler whose texture is not NEAREST/REPEAT,
+ * a declined upload - latches the program to the CPU interpreter, which renders
+ * the identical fullscreen quad, so the app never learns which path ran. */
+
+/* name -> TILED slot for a compiled-shader sampler.  Separate from the raster
+ * table above: a back-end slot holds either a raster (TEX_MOD) or a tiled
+ * (compiled TMU) image, never both.  Stages the glTexture's internal packed
+ * words once and caches by name+size, mirroring portablegl's pgl_gpu_ctex_slot
+ * (which gates on GL_REPEAT, the raspi5 compiled-sampler record's wrap).
+ * Returns -1 when the texture cannot back a compiled sampler, leaving its unit
+ * unbound so the draw declines to the CPU. */
+static GLuint  g_gpu_ctexname[PGL_G3D_MAX_TEX];
+static int     g_gpu_ctexused[PGL_G3D_MAX_TEX];
+static int     g_gpu_ctexw[PGL_G3D_MAX_TEX];
+static int     g_gpu_ctexh[PGL_G3D_MAX_TEX];
+
+static int gpu_ctex_slot(GLuint name)
+{
+    const glTexture *t;
+    int i, slot = -1;
+    if (name == 0 || (int)name >= g_ctx.textures.size) return -1;
+    t = &g_ctx.textures.a[name];
+    if (t->deleted || !t->data || t->w <= 0 || t->h <= 0) return -1;
+    /* the raspi5 compiled-sampler record is GL_NEAREST + GL_REPEAT */
+    if (t->wrap_s != GL_REPEAT || t->wrap_t != GL_REPEAT) return -1;
+    for (i = 0; i < PGL_G3D_MAX_TEX; ++i)
+        if (g_gpu_ctexused[i] && g_gpu_ctexname[i] == name &&
+            g_gpu_ctexw[i] == (int)t->w && g_gpu_ctexh[i] == (int)t->h)
+            return i;   /* already staged tiled */
+    for (i = 0; i < PGL_G3D_MAX_TEX; ++i)
+        if (!g_gpu_ctexused[i]) { slot = i; break; }
+    if (slot < 0) return -1;   /* slot table full: this texture stays CPU-only */
+    if (!pgl_g3d_upload_texture_tiled(slot, (int)t->w, (int)t->h, t->data))
+        return -1;   /* transient upload failure: decline, do not latch the GPU */
+    g_gpu_ctexused[slot] = 1;
+    g_gpu_ctexname[slot] = name;
+    g_gpu_ctexw[slot] = (int)t->w;
+    g_gpu_ctexh[slot] = (int)t->h;
+    return slot;
+}
+
+static int gpu_try_fullscreen(gpu_entry *e, GLenum mode, GLint first, GLsizei count)
+{
+    /* NDC full-screen quad (z=0) as two pos-only triangles, wound so NDC y=+1
+     * lands on the target's row 0 to match portablegl's y-down CPU convention
+     * (identical corners to pgl_gpu_frame).  The compiled FS derives
+     * gl_FragCoord from the rasterised window position, so the app's own vertex
+     * data is never read. */
+    static const float qa[3] = { -1.0f, -1.0f, 0.0f };
+    static const float qb[3] = {  1.0f, -1.0f, 0.0f };
+    static const float qc[3] = {  1.0f,  1.0f, 0.0f };
+    static const float qd[3] = { -1.0f,  1.0f, 0.0f };
+    const glsl_program *gp;
+    uint32_t blob[PGL_G3D_MAX_UNIF];
+    uint32_t nunif = 0;
+    int i;
+
+    (void)first;
+    if (mode != GL_TRIANGLES || count < 3) return 0;
+
+    /* A scissored frame stays on the CPU: the compiled quad passes no ext
+     * scissor, so declining here keeps pixels identical to the interpreter and
+     * gives apps a CPU-pin lever (shadertoy "cpu" check mode uses a full-window
+     * scissor to A/B the GPU route against the interpreter on one binary). */
+    if (g_ctx.scissor_test) return 0;
+
+    /* drain any open geometry batch first so painter's order holds (a fullscreen
+     * app issues none, but a mixed frame must not reorder). */
+    gpu_coalesce_flush();
+    if (!g_gpu_ready) return 0;
+    gp = g_active->gp;
+
+    /* Pack every default-block uniform the compiled FS reads, BY NAME: resolve
+     * each app uniform to its GPU dword offset and copy its value as raw float
+     * bits.  This generalises the mesh path's fixed six-uniform packing so an
+     * arbitrary procedural effect (iGlobalTime/iResolution and any others) is
+     * staged without a hardcoded layout. */
+    memset(blob, 0, sizeof(blob));
+    for (i = 0; i < gp->nuniforms; ++i) {
+        const glsl_uniform *u = &gp->uniforms[i];
+        uint32_t comps = 0;
+        int d, k, n;
+        if (u->is_sampler) continue;   /* samplers ride the texture path */
+        d = pgl_g3d_shader_uniform_dword(e->prog, u->name, &comps);
+        if (d < 0 || comps == 0) continue;
+        n = ((int)comps < u->ncomp) ? (int)comps : u->ncomp;
+        for (k = 0; k < n && d + k < (int)PGL_G3D_MAX_UNIF; ++k) {
+            float fv = g_active->ublock[u->offset + k].f;
+            memcpy(&blob[d + k], &fv, 4);
+        }
+        if ((uint32_t)(d + n) > nunif) nunif = (uint32_t)(d + n);
+    }
+
+    pgl_g3d_set_shader_program(e->prog);
+    pgl_g3d_set_uniforms(nunif ? blob : NULL, nunif);
+
+    /* Bind each sampler to a TILED slot.  The app binds iChannelU to GLES2
+     * texture unit U (shadertoy convention), so the sampler's unit value is also
+     * the compiled FS's TMU slot index; an unstageable texture leaves its unit
+     * unbound, which declines the draw back to the CPU rather than sampling a
+     * wrong image. */
+    for (i = 0; i < gp->nuniforms; ++i) {
+        const glsl_uniform *u = &gp->uniforms[i];
+        int unit, slot;
+        if (!u->is_sampler) continue;
+        unit = g_active->ublock[u->offset].i;
+        slot = gpu_ctex_slot(gles_engine_texture_for_unit(unit));
+        pgl_g3d_bind_tex_unit(unit, slot);
+    }
+
+    /* First triangle: a declined upload (or a GPU latched off mid-call) returns
+     * 0 with nothing dispatched, so latch this program to the CPU and let the
+     * caller redraw the whole frame on the interpreter. */
+    if (!pgl_g3d_batch_tri_compiled(qa, qb, qc,
+                                    PGL_G3D_DEPTH_NONE, 0u, PGL_G3D_CULL_NONE, NULL)) {
+        e->cpu_latched = 1;
+        return 0;
+    }
+    pgl_g3d_batch_tri_compiled(qa, qc, qd,
+                               PGL_G3D_DEPTH_NONE, 0u, PGL_G3D_CULL_NONE, NULL);
+    pgl_g3d_flush();
+    if (pgl_g3d_program_declined(e->prog) || !pgl_g3d_enabled()) {
+        e->cpu_latched = 1;
+        return 0;
+    }
+    return 1;
+}
+
 static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
 {
     gpu_entry *e;
@@ -1464,7 +1835,11 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
     if (!g_gpu_ready) return 0;
     if (!g_active || !g_active->gp || !g_active->ublock) return 0;
     e = gpu_find_entry(g_active->pgl_id);
-    if (!e || !e->eligible || e->cpu_latched) return 0;
+    if (!e || e->cpu_latched) return 0;
+    /* a fullscreen compiled program is routed by its own quad dispatch, never
+     * the fixed geometry kernels (it exposes no uMVP, so it is not eligible). */
+    if (e->fullscreen) return gpu_try_fullscreen(e, mode, first, count);
+    if (!e->eligible) return 0;
 
     /* the fixed kernels rasterise triangles only */
     if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP && mode != GL_TRIANGLE_FAN)
@@ -1569,12 +1944,26 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
     pgl_g3d_prog prog;
     char err[256];
     uint32_t nc;
-    int i;
+    int i, is_fullscreen;
     if (!pgl_id || !vs_src || !fs_src) return 0;
     err[0] = '\0';
     prog = pgl_g3d_program_compile(vs_src, fs_src, err, (int)sizeof(err));
     if (prog == PGL_G3D_PROG_INVALID)
         return 0;   /* not GPU-viable: the CPU interpreter keeps this program */
+    /* A samplerCube fragment shader can never drive the 2D textured geometry
+     * kernel (it samples a cube map by direction, not a raster 2D slot by uv),
+     * and cube faces are never mirrored into a GPU raster slot, so decline the
+     * program up front.  It stays on the CPU interpreter - where textureCube is
+     * fully supported - and, crucially, is NOT marked eligible: otherwise
+     * g_gpu_has_eligible would flip the framebuffer to the slow NOCACHE path for
+     * a program that can never dispatch.  Cubemaps were CPU-only under
+     * portablegl too (arbitrary C shaders never matched the fixed-function GPU
+     * gate), so this preserves behaviour and keeps the raspi5 GPU path clean for
+     * the demos that do use it. */
+    if (strstr(fs_src, "samplerCube")) {
+        pgl_g3d_program_free(prog);
+        return 0;
+    }
     /* Three GPU mesh shapes are staged, all sharing the stride-6 pos+attr1
      * upload and the gouraud/tex raster pass:
      *   - FS declares a sampler   -> textured kernel (attr1 = uv);
@@ -1596,8 +1985,15 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
          * mis-staged. */
         int gouraud_color = (ie != NULL && ie->gouraud &&
                              ie->g_pos_loc == 0 && ie->g_color_loc == 1);
+        /* A fullscreen effect (shadertoy): a passthrough VS with no uMVP (so it
+         * is not one of the fixed geometry kernels) whose FS computes colour
+         * from gl_FragCoord.  gpu_try_fullscreen drives it through the compiled
+         * full-screen-quad path (pgl_g3d_batch_tri_compiled), so it must survive
+         * the fixed-kernel decline below even when its FS samples no texture. */
+        is_fullscreen = (strstr(vs_src, "uMVP") == NULL &&
+                         strstr(fs_src, "gl_FragCoord") != NULL);
         if (!strstr(fs_src, "sampler") && !strstr(vs_src, "uNormalMat") &&
-            !gouraud_color) {
+            !gouraud_color && !is_fullscreen) {
             pgl_g3d_program_free(prog);
             return 0;
         }
@@ -1606,18 +2002,21 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
     if (!e) { pgl_g3d_program_free(prog); return 0; }
     e->prog = prog;
     e->textured = (strstr(fs_src, "sampler") != NULL);
+    e->fullscreen = is_fullscreen;
     e->eligible = 0;
     for (i = 0; i < GPU_NUNIF; ++i) {
         nc = 0;
         e->koff[i] = pgl_g3d_shader_uniform_dword(prog, g_gpu_uname[i], &nc);
         e->knc[i] = (int)nc;
     }
-    /* the fixed geometry xform kernel attached exactly when it exposes uMVP */
-    e->eligible = (e->koff[0] >= 0);
+    /* the fixed geometry xform kernel attached exactly when it exposes uMVP; a
+     * fullscreen program has none, so it stays ineligible for the mesh path and
+     * is routed by gpu_try_fullscreen instead. */
+    e->eligible = (e->koff[0] >= 0) && !is_fullscreen;
     e->unif_resolved = 0;
-    if (e->eligible)
+    if (e->eligible || e->fullscreen)
         g_gpu_has_eligible = 1;   /* GPU is now worth bringing up (NOCACHE fb) */
-    return (GEuint)(e->eligible ? 1 : 0);
+    return (GEuint)((e->eligible || e->fullscreen) ? 1 : 0);
 }
 
 void gles_engine_gpu_delete(GEuint pgl_id)
@@ -1647,8 +2046,11 @@ int gles_engine_gpu_active(void)
     if (!g_gpu_ready) return 0;
     if (!g_active || !g_active->gp) return 0;
     e = gpu_find_entry(g_active->pgl_id);
-    if (!e || !e->eligible || e->cpu_latched) return 0;
-    return 1;
+    if (!e || e->cpu_latched) return 0;
+    /* eligible = compiled geometry kernel (mesh route); fullscreen = compiled
+     * fullscreen-quad kernel (shadertoy route).  Either means the bound program
+     * is drawing on the V3D GPU rather than the CPU interpreter. */
+    return (e->eligible || e->fullscreen);
 }
 
 #else  /* !PGL_G3D: inert so the GPU-agnostic GLES2/EGL TUs link unchanged */

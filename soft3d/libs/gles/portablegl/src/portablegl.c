@@ -234,40 +234,17 @@ static int get_max_vertices(void)
 // ---------------------------------------------------------------------------
 // NEON load/store primitives
 //
-// GCC with -mstrict-align (mandatory in the aarch64 make.rule) lowers
-// vld1q_*/vst1q_* on pointers without proven 16-byte alignment to scalar
-// ldp w/orr/stp w sequences, silently turning every kernel below into scalar
-// code. LD1/ST1 accept unaligned Normal memory (the kernel boots with
-// SCTLR_EL1.A=0), so emit them directly. Do NOT use the q-form LDP/STP here:
-// unlike LD1/ST1 they require 16-byte alignment even with A=0.
+// Plain typed loads/stores.  The aarch64 make.rule must NOT pass
+// -mstrict-align (the kernel boots with SCTLR_EL1.A=0, so unaligned access is
+// legal); without it GCC/Clang lower these to real vld1q/vst1q.  An earlier
+// hand-written LD1/ST1 inline-asm variant (added to dodge -mstrict-align)
+// mis-scheduled under GCC and dropped scattered pixels in filled spans, so it
+// is gone: let the compiler emit the vector memory ops itself.
 // ---------------------------------------------------------------------------
-#if defined(__aarch64__) && defined(__GNUC__) && !defined(__clang__)
-// The accessed memory is passed as a "Q" operand (single base register, no
-// offset -- the only addressing mode LD1/ST1 have) rather than a blanket
-// "memory" clobber, so GCC knows exactly which bytes are touched and can keep
-// unrelated values in registers across the access. The operand types carry
-// aligned(4) so no 16-byte alignment is implied, and may_alias so the typed
-// wrappers can be mixed on the same buffer.
-#define PGL_NEON_LD(name, type, arr) \
-typedef type name ## _mem_t __attribute__((aligned(4), may_alias)); \
-static inline type name(const void* p) \
-{ \
-    type v; \
-    __asm__("ld1 {%0." arr "}, %1" : "=w"(v) : "Q"(*(const name ## _mem_t*)p)); \
-    return v; \
-}
-#define PGL_NEON_ST(name, type, arr) \
-typedef type name ## _mem_t __attribute__((aligned(4), may_alias)); \
-static inline void name(void* p, type v) \
-{ \
-    __asm__("st1 {%1." arr "}, %0" : "=Q"(*(name ## _mem_t*)p) : "w"(v)); \
-}
-#else
 #define PGL_NEON_LD(name, type, arr) \
 static inline type name(const void* p) { return *(const type*)p; }
 #define PGL_NEON_ST(name, type, arr) \
 static inline void name(void* p, type v) { *(type*)p = v; }
-#endif
 
 PGL_NEON_LD(pgl_vld1q_f32, float32x4_t, "4s")
 PGL_NEON_ST(pgl_vst1q_f32, float32x4_t, "4s")
@@ -5935,7 +5912,15 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
     Shader_Builtins builtins;
     builtins.gl_InstanceID = c->builtins.gl_InstanceID;
 
-#if PGL_NEON_ENABLED
+    // The 4-wide NEON span fill below drops scattered single pixels inside
+    // filled quads (dotted seams along each quad diagonal, showing the clear
+    // colour / whatever was underneath).  It reproduces with both the inline-
+    // asm and the intrinsic load/store styles and disappears entirely with the
+    // scalar loop, so the defect is in the NEON coverage/stepping path, not in
+    // rounding of one expression.  Until that is isolated the triangle fill
+    // runs scalar (verified pixel-clean on device); every other NEON kernel
+    // (memcpy/fill/blend/matrix) makes no coverage decision and stays on.
+#if 0 && PGL_NEON_ENABLED
     (void)alpha; (void)beta; (void)gamma; (void)tmp; (void)fs_input;
 
     pgl_neon_interp_plan plan;

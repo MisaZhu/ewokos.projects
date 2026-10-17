@@ -313,7 +313,7 @@ static void draw_sphere(Sphere* s)
     if (llen > 0.0001f) { lx/=llen; ly/=llen; lz/=llen; }
 
     glUniformMatrix4fv(loc_mvp, 1, GL_FALSE, model_view_projection);
-    glUniformMatrix3fv(loc_normal, 1, normal3);
+    glUniformMatrix3fv(loc_normal, 1, GL_FALSE, normal3);
     glUniform3f(loc_light, lx, ly, lz);
     glUniform3f(loc_material, s->color[0], s->color[1], s->color[2]);
 
