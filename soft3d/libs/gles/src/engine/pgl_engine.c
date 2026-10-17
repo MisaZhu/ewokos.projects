@@ -44,6 +44,10 @@ static GLsizei   g_h = 0;
 static GLuint g_tex_unit[32];
 static int    g_active_unit = 0;
 
+/* Direct 1:1 fullscreen textured-blit fast-path (defined below).  Returns 1
+ * when it fully handled the draw, 0 to fall through to the interpreter. */
+static int cpu_try_direct_blit(GLenum mode, GLint first, GLsizei count);
+
 #ifdef PGL_G3D
 /* Transparent V3D GPU bridge hooks (defined at the bottom of this TU, the only
  * GPU-aware code in the library).  Each is inert unless the active program
@@ -655,6 +659,14 @@ void gles_engine_draw_arrays(GEenum mode, GEint first, GEint count)
      * first so the CPU draw below lands after it (painter's order). */
     gles_engine_gpu_flush();
 #endif
+    /* Fullscreen 1:1 textured-quad blit (Fireworks/matrix): repack the bound
+     * texture straight into the back buffer, bypassing portablegl's rasteriser
+     * and per-pixel texture2D (~155x faster, byte-identical).  Declines - and
+     * falls through to the interpreter - for anything that is not provably that
+     * canonical blit.  Runs on virt (CPU) and raspi5 alike (these apps are never
+     * GPU-eligible, so the CPU draws them there too). */
+    if (cpu_try_direct_blit(EMAP(prim_map, mode), first, count))
+        return;
     pgl_DrawArrays(EMAP(prim_map, mode), first, count);
 }
 
@@ -994,6 +1006,128 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     e->g_sampler_off = texblit ? sampler_off : 0;
     e->g_uv_slot = texblit ? uv_slot : 0;
     return id;
+}
+
+/* ------------------------------------------------------------------ *
+ * Direct 1:1 fullscreen textured-blit fast-path
+ *
+ * Fireworks and matrix composite the whole frame on the CPU into a
+ * 0xAARRGGBB buffer, upload it as a GL_RGBA texture, then draw a canonical
+ * fullscreen quad (two triangles tiling NDC [-1,1]^2 with uv (0,0)..(1,1))
+ * whose FS is `gl_FragColor = texture2D(uTex0, vUV)`.  Even on the native
+ * ff_texblit_frag the rasteriser still walks the quad and runs texture2D's
+ * floorf/wrap/Color_to_v4 float round-trip for every covered pixel - measured
+ * ~6-15 ms/frame for a full-HD blit on the host vs ~0.04-0.1 ms for a direct
+ * repack (~155x).  When the draw is provably that canonical blit we repack the
+ * bound texture's packed-RGBA words straight into the back buffer with
+ * RGBA_TO_PIXEL - byte-for-byte what the rasteriser writes (texture2D returns
+ * Color_to_v4(texel) and the fragment stage stores VEC4_TO_COLOR of that, an
+ * identity round-trip), verified on the host against real portablegl.  Anything
+ * that does not match falls through to pgl_DrawArrays unchanged, so this is a
+ * pure fast-path.
+ *
+ * The canonical quad's v = (1-y)/2 flip exactly cancels portablegl's top-left
+ * back-buffer origin, so texel(x,y) lands on back-buffer pixel (x,y): a plain
+ * linear repack, no row flip.  Compiled for both virt (CPU) and raspi5
+ * (PGL_G3D), where these never-GPU-eligible apps also render on the CPU. */
+
+/* read ncomp floats of one GL_FLOAT attrib for buffer vertex vi (VBO-backed; a
+ * client-array attrib fails the buf check and the blit is declined). */
+static int blit_read_attrib(const glVertex_Attrib *v, GLsizei vi, float *out, int ncomp)
+{
+    const glBuffer *b;
+    GLsizeiptr off;
+    if (!v->enabled || v->type != GL_FLOAT || v->size < ncomp) return 0;
+    if (v->buf >= (GLuint)g_ctx.buffers.size) return 0;
+    b = &g_ctx.buffers.a[v->buf];
+    if (!b->data) return 0;
+    off = v->offset + (GLsizeiptr)v->stride * (GLsizeiptr)vi;
+    if (off < 0 || off + (GLsizeiptr)ncomp * 4 > (GLsizeiptr)b->size) return 0;
+    memcpy(out, b->data + off, (size_t)ncomp * sizeof(float));
+    return 1;
+}
+
+static int cpu_try_direct_blit(GLenum mode, GLint first, GLsizei count)
+{
+    interp_entry *e = g_active;
+    const glVertex_Attrib *va;
+    const glTexture *t;
+    const Color *src;
+    pix_t *fb;
+    GLuint tex;
+    GLsizei bw, bh;
+    int unit, tri[2], miss[2], b, k, vi;
+    long n, px;
+
+    if (!e || !e->texblit || !e->ublock) return 0;
+
+    /* state: an opaque, unspecialised full-frame overwrite */
+    if (g_ctx.blend || g_ctx.depth_test || g_ctx.scissor_test ||
+        g_ctx.cull_face || g_ctx.logic_ops || g_ctx.fragdepth_or_discard)
+        return 0;
+#ifndef PGL_NO_STENCIL
+    if (g_ctx.stencil_test) return 0;
+#endif
+    if (g_ctx.color_mask != (pix_t)~(pix_t)0) return 0;
+
+    /* geometry: exactly the canonical 6-vertex fullscreen quad */
+    if (mode != GL_TRIANGLES || count != 6 || first != 0) return 0;
+    va = g_ctx.vertex_arrays.a[g_ctx.cur_vertex_array].vertex_attribs;
+
+    /* bound texture the FS samples (the sampler cell holds the texture unit) */
+    unit = e->ublock[e->g_sampler_off].i;
+    tex = gles_engine_texture_for_unit(unit);
+    if (tex == 0 || (int)tex >= g_ctx.textures.size) return 0;
+    t = &g_ctx.textures.a[tex];
+    /* the same validity conditions portablegl's own pgl_gpu_tex_get enforces */
+    if (t->deleted || t->type != GL_TEXTURE_2D - (GL_TEXTURE_UNBOUND + 1)) return 0;
+    if (!t->data || t->w <= 0 || t->h <= 0) return 0;
+    if (t->format != GL_RGBA) return 0;
+    if (t->mag_filter != GL_NEAREST || t->min_filter != GL_NEAREST) return 0;
+
+    /* viewport must cover the whole back buffer and the texture map 1:1 onto it */
+    fb = (pix_t *)pglGetBackBuffer();
+    bw = g_ctx.back_buffer.w; bh = g_ctx.back_buffer.h;
+    if (!fb || bw <= 0 || bh <= 0) return 0;
+    if (g_ctx.xmin != 0 || g_ctx.ymin != 0 ||
+        g_ctx.width != bw || g_ctx.height != bh) return 0;
+    if (t->w != bw || t->h != bh) return 0;
+
+    /* every vertex must be an NDC corner with u=(x+1)/2, v=(1-y)/2; collect the
+     * corner bits of each triangle to confirm the two together tile the square. */
+    tri[0] = tri[1] = 0;
+    for (vi = 0; vi < 6; ++vi) {
+        float p[2], q[2];
+        int cx, cy, bit;
+        if (!blit_read_attrib(&va[0], (GLsizei)vi, p, 2)) return 0;
+        if (!blit_read_attrib(&va[1], (GLsizei)vi, q, 2)) return 0;
+        if ((p[0] != -1.0f && p[0] != 1.0f) || (p[1] != -1.0f && p[1] != 1.0f))
+            return 0;
+        if (q[0] != (p[0] + 1.0f) * 0.5f || q[1] != (1.0f - p[1]) * 0.5f)
+            return 0;
+        cx = (p[0] > 0.0f);            /* 0 = left, 1 = right */
+        cy = (p[1] > 0.0f);            /* 0 = bottom, 1 = top */
+        bit = (cy << 1) | cx;          /* BL=0 BR=1 TL=2 TR=3 */
+        tri[vi / 3] |= (1 << bit);
+    }
+    /* each triangle uses 3 distinct corners and the two missing corners are
+     * opposite (shared diagonal) => the pair tiles the full square, no overlap
+     * and no gap. */
+    for (k = 0; k < 2; ++k) {
+        int cnt = 0;
+        for (b = 0; b < 4; ++b) if (tri[k] & (1 << b)) ++cnt;
+        if (cnt != 3) return 0;
+        miss[k] = -1;
+        for (b = 0; b < 4; ++b) if (!(tri[k] & (1 << b))) miss[k] = b;
+    }
+    if ((miss[0] ^ miss[1]) != 3) return 0;
+
+    /* 1:1 repack the texture's packed-RGBA into the back buffer. */
+    src = (const Color *)t->data;
+    n = (long)bw * bh;
+    for (px = 0; px < n; ++px)
+        fb[px] = RGBA_TO_PIXEL(src[px].r, src[px].g, src[px].b, src[px].a);
+    return 1;
 }
 
 /* ================================================================== *
