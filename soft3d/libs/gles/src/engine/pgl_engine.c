@@ -691,6 +691,13 @@ typedef struct {
     int            g_pos_loc;    /* vec4 position attribute location */
     int            g_color_loc;  /* vec4 colour attribute location   */
     int            g_mvp_off;    /* ublock float offset of the mat4 MVP */
+    /* Native textured-blit fast-path (see match_texblit): when `texblit` is set
+     * the FS runs on ff_texblit_frag instead of the interpreter, sampling the
+     * g_sampler_off sampler at the g_uv_slot varying's (s,t).  The VS stays
+     * interpreted - a fullscreen blit issues only a handful of vertices. */
+    int            texblit;
+    int            g_sampler_off; /* ublock cell offset of the sampler2D uniform */
+    int            g_uv_slot;     /* varying slot supplying the vec2 texcoord    */
 } interp_entry;
 
 static interp_entry  g_reg[GLES_MAX_INTERP];
@@ -816,6 +823,25 @@ static void ff_gouraud_frag(float *fs_input, Shader_Builtins *builtins, void *un
     builtins->gl_FragColor = ((vec4 *)fs_input)[0];
 }
 
+/* Native textured-blit fragment (see match_texblit).  Reproduces interp_frag's
+ * `gl_FragColor = texture2D(<sampler>, <varying>)` exactly - the same unit->name
+ * resolution as bridge_tex_sample (the sampler uniform cell holds the texture
+ * unit as an int, since T_SAMPLER2D is int-family) and the same portablegl
+ * texture2D fetch - but without the per-pixel tree-walk.  A fullscreen blit
+ * issues one of these per covered pixel, so skipping the interpreter is what
+ * keeps the CPU-composited demos (Fireworks, matrix) at speed after they moved
+ * off SDL_RenderCopy onto a GLES2 fullscreen textured quad. */
+static void ff_texblit_frag(float *fs_input, Shader_Builtins *builtins, void *uniforms)
+{
+    interp_entry *e = g_active;
+    vec4 c;
+    (void)uniforms;
+    if (!e) return;
+    c = texture2D(gles_engine_texture_for_unit(e->ublock[e->g_sampler_off].i),
+                  fs_input[e->g_uv_slot * 4 + 0], fs_input[e->g_uv_slot * 4 + 1]);
+    builtins->gl_FragColor = c;
+}
+
 static int match_gouraud(const glsl_program *gp, int *pos_loc, int *color_loc,
                          int *mvp_off)
 {
@@ -875,6 +901,63 @@ static int match_gouraud(const glsl_program *gp, int *pos_loc, int *color_loc,
     return 1;
 }
 
+/* Recognise a fragment shader that is exactly
+ *      gl_FragColor = texture2D(<sampler2D uniform>, <vec2+ varying>);
+ * (single statement, no discard/fragdepth, no arithmetic or swizzle on the
+ * sample).  This is the fullscreen-blit shape the CPU-composited demos draw
+ * every frame; sampling it natively instead of through the interpreter removes
+ * the per-pixel tree-walk.  The vertex shader is deliberately NOT constrained:
+ * ff_texblit_frag reads the same interpolated varying the interpreter would, so
+ * any VS feeding varying g_uv_slot stays pixel-identical.  Returns 1 and reports
+ * the sampler's ublock offset + the texcoord varying slot. */
+static int match_texblit(const glsl_program *gp, int *sampler_off, int *uv_slot)
+{
+    const glsl_stage *fs;
+    const glsl_func *ffn;
+    const glsl_stmt *s;
+    const glsl_expr *e, *call, *a0, *a1;
+    int uslot, vslot;
+
+    if (!gp || !gp->linked || !gp->fs) return 0;
+    fs = gp->fs;
+    if (fs->uses_discard || fs->uses_fragdepth) return 0;
+    if (fs->main_idx < 0) return 0;
+    ffn = &fs->funcs[fs->main_idx];
+    if (!ffn->body) return 0;
+
+    /* FS: a single `gl_FragColor = texture2D(...);` */
+    s = ffn->body->children;
+    if (!s || s->next || s->kind != ST_EXPR || !s->expr) return 0;
+    e = s->expr;
+    if (e->kind != EX_ASSIGN || !e->a || !e->b) return 0;
+    if (e->a->kind != EX_VAR || e->a->var_scope != VARSCOPE_BUILTIN ||
+        e->a->var_slot != BI_GL_FRAGCOLOR) return 0;
+
+    call = e->b;
+    if (call->kind != EX_CALL || call->is_user_fn || call->op_builtin != BF_TEXTURE2D)
+        return 0;
+    if (call->nargs != 2 || !call->args) return 0;
+    a0 = call->args[0]; a1 = call->args[1];
+    if (!a0 || !a1) return 0;
+
+    /* arg0: the sampler2D uniform (its cell holds the texture unit as an int) */
+    if (a0->kind != EX_VAR || a0->var_scope != VARSCOPE_UNIFORM) return 0;
+    uslot = a0->var_slot;
+    if (uslot < 0 || uslot >= gp->nuniforms) return 0;
+    if (!gp->uniforms[uslot].is_sampler || gp->uniforms[uslot].type != T_SAMPLER2D)
+        return 0;
+
+    /* arg1: a vec2 (or wider) varying supplying (s,t) */
+    if (a1->kind != EX_VAR || a1->var_scope != VARSCOPE_VARYING) return 0;
+    vslot = a1->var_slot;
+    if (vslot < 0 || vslot >= gp->nvaryings) return 0;
+    if (gp->varyings[vslot].ncomp < 2) return 0;
+
+    *sampler_off = gp->uniforms[uslot].offset;
+    *uv_slot = vslot;
+    return 1;
+}
+
 GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
                                               void *ublock, GEint ublock_cells)
 {
@@ -883,6 +966,7 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     GLuint id;
     int i, n;
     int gouraud, pos_loc = 0, color_loc = 0, mvp_off = 0;
+    int texblit, sampler_off = 0, uv_slot = 0;
     GLboolean depth_or_discard;
     (void)ublock_cells;
     if (!gp || !gp->linked) return 0;
@@ -895,8 +979,10 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     depth_or_discard = (gp->fs && (gp->fs->uses_discard || gp->fs->uses_fragdepth))
                        ? GL_TRUE : GL_FALSE;
     gouraud = match_gouraud(gp, &pos_loc, &color_loc, &mvp_off);
+    texblit = gouraud ? 0 : match_texblit(gp, &sampler_off, &uv_slot);
     id = pglCreateProgram(gouraud ? ff_gouraud_vert : interp_vert,
-                          gouraud ? ff_gouraud_frag : interp_frag,
+                          gouraud ? ff_gouraud_frag
+                                  : (texblit ? ff_texblit_frag : interp_frag),
                           (GLsizei)n, interp, depth_or_discard);
     if (!id) return 0;
     e->pgl_id = id; e->gp = gp; e->ublock = (glsl_cell *)ublock; e->in_use = 1;
@@ -904,6 +990,9 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     e->g_pos_loc = gouraud ? pos_loc : 0;
     e->g_color_loc = gouraud ? color_loc : 1;
     e->g_mvp_off = gouraud ? mvp_off : 0;
+    e->texblit = texblit;
+    e->g_sampler_off = texblit ? sampler_off : 0;
+    e->g_uv_slot = texblit ? uv_slot : 0;
     return id;
 }
 
@@ -960,6 +1049,16 @@ typedef struct {
 
 static gpu_entry g_gpu[GLES_MAX_INTERP];
 static int       g_gpu_ready = 0;
+/* Set once a program links to a GPU-eligible geometry kernel.  gpu_bringup()
+ * only adopts the pgl_g3d render target as portablegl's back buffer after this
+ * is set: that target is contig NOCACHE (uncached) shm so the GPU can DMA it,
+ * and a pure-CPU app (no uMVP -> never eligible, e.g. the fullscreen-quad
+ * texblit of Fireworks/matrix) would otherwise rasterise every pixel into
+ * uncached memory - DRAM-bound with no write-combining, ~an order of magnitude
+ * slower than the cached malloc back buffer it uses off raspi5.  Deferring the
+ * adoption keeps GPU apps byte-identical (they set this before their first
+ * draw) while CPU apps never touch NOCACHE. */
+static int       g_gpu_has_eligible = 0;
 
 /* texture-name -> raster-slot map for the textured kernel (PGL_G3D_MAX_TEX) */
 static GLuint  g_gpu_texname[PGL_G3D_MAX_TEX];
@@ -1017,6 +1116,10 @@ static gpu_entry *gpu_alloc_entry(GLuint id)
 static void gpu_bringup(void)
 {
     if (g_gpu_ready || !g_inited) return;
+    /* No GPU-eligible program yet: keep portablegl's cached malloc back buffer.
+     * Adopting the NOCACHE pgl_g3d target now would make a pure-CPU app render
+     * every pixel uncached (see g_gpu_has_eligible). */
+    if (!g_gpu_has_eligible) return;
     if (pglGpuBegin(g_w, g_h))
         g_gpu_ready = 1;
 }
@@ -1378,6 +1481,8 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
     /* the fixed geometry xform kernel attached exactly when it exposes uMVP */
     e->eligible = (e->koff[0] >= 0);
     e->unif_resolved = 0;
+    if (e->eligible)
+        g_gpu_has_eligible = 1;   /* GPU is now worth bringing up (NOCACHE fb) */
     return (GEuint)(e->eligible ? 1 : 0);
 }
 

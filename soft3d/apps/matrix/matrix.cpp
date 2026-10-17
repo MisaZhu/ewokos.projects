@@ -701,8 +701,6 @@ int load_font() {
 }
 
 static uint32_t last_frame_ms = 0;
-static int frame_count = 0;
-static uint32_t fps_time = 0;
 
 static uint32_t now_ms(void) {
     uint32_t low;
@@ -726,14 +724,6 @@ static void render_frame(void) {
     float dt = (current_time - last_frame_ms) / 1000.0f;
     if (dt > 0.1f) dt = 0.1f;  // Clamp large frame gaps to avoid visible jumps after stalls
     last_frame_ms = current_time;
-
-    frame_count++;
-    if (fps_time == 0) fps_time = current_time;
-    if (current_time - fps_time > 3000) {
-        klog("%d FPS (%dx%d)\n", frame_count * 1000 / (current_time - fps_time), width, height);
-        frame_count = 0;
-        fps_time = current_time;
-    }
 
     long total_pixels = (long)width * height;
     for (long i = 0; i < total_pixels; ++i) {
