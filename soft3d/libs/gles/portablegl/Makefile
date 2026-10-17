@@ -1,4 +1,4 @@
-PROJS_ROOT_DIR=../../..
+PROJS_ROOT_DIR=../../../..
 include $(PROJS_ROOT_DIR)/make.inc
 
 BUILD_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
@@ -24,6 +24,12 @@ PORTABLEGL = $(BUILD_DIR)/lib/libportablegl.a
 $(PORTABLEGL): $(LIB_PORTABLEGL_OBJS)
 	$(AR) rcs $(PORTABLEGL) $(LIB_PORTABLEGL_OBJS)
 	cp -r include/* $(BUILD_DIR)/include
+
+# Explicit object rule (mirrors gles/glcommon): the obj dir is created here so a
+# clean-tree build never depends on make.rule's implicit $(ARCH)/%.o rule firing.
+$(ARCH)/src/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 .PHONY: clean
 

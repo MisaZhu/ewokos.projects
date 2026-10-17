@@ -310,6 +310,15 @@ init_context(struct gl_context *ctx, unsigned glsl_version, bool is_es)
    ctx->Version = 450;
 
    init_v3d_nir_options();
+   /* V3D 4.2 (Pi4) has no saturating float unpack (v3d_device_has_unpack_sat is
+    * false before ver 4.5), so nir_op_fsat -- which the GLSL frontend's
+    * opt_algebraic folds clamp(x,0,1) into -- must be expanded back to
+    * fmin/fmax by the focused nir_opt_algebraic() before ntq_emit_alu() asserts
+    * the capability.  V3D 7.1 (Pi5) reports unpack_sat and leaves lower_fsat
+    * unset, keeping the single-instruction fsat path so raspi5's emitted QPU is
+    * byte-for-byte unchanged.  Set per init_context (i.e. per compile) so it
+    * tracks the live version chosen by v3d_compiler_set_version(). */
+   v3d_nir_options.lower_fsat = !v3d_be_has_unpack_sat();
    ctx->screen->nir_options[MESA_SHADER_VERTEX] = &v3d_nir_options;
    ctx->screen->nir_options[MESA_SHADER_FRAGMENT] = &v3d_nir_options;
    ctx->screen->nir_options[MESA_SHADER_COMPUTE] = &v3d_nir_options;
@@ -846,6 +855,17 @@ v3d_compile_set_cs_local_size(unsigned x, unsigned y)
       return;
    s_cs_local_x = x;
    s_cs_local_y = y;
+}
+
+/* Public version selector: forwards straight to the C backend, which owns the
+ * hand-built device infos (v3dcompiler_backend.c).  The frontend keeps no
+ * state of its own here; it only exists so pgl_g3d can reach the backend
+ * through the single public header (v3dcompiler.h) without including the
+ * internal C bridge.  Call before the first compile. */
+extern "C" void
+v3d_compiler_set_version(int ver)
+{
+   v3d_be_set_version(ver);
 }
 
 static char *

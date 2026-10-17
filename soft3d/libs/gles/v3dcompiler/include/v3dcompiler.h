@@ -231,6 +231,16 @@ bool v3d_compile_compute_raw(const char *cs_src,
  * after the call. */
 void v3d_compile_set_cs_local_size(unsigned x, unsigned y);
 
+/* Select the V3D generation the compiler targets, by live version
+ * (ver == major*10 + minor: 42 = V3D 4.2 / Pi4, 71 = V3D 7.1 / Pi5).  Any
+ * other value leaves the default (71) in place.  Call ONCE at startup, before
+ * the first v3d_compile_*(), on a machine that ships one binary across chip
+ * generations (raspix: it queries the actual V3D version over the g2d
+ * dev-cntl channel and passes it here).  raspi5 targets a single chip (Pi5 /
+ * ver 71) and never calls this, so its emitted QPU is byte-for-byte unchanged.
+ * Affects only compiles issued after the call. */
+void v3d_compiler_set_version(int ver);
+
 /* Release any QPU buffers owned by a successful compile. Safe to call on a
  * failed/zeroed result. */
 void v3d_compiled_program_free(struct v3d_compiled_program *res);

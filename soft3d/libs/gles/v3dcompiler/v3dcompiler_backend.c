@@ -86,6 +86,78 @@ static const struct v3d_device_info v3d71_devinfo = {
    .max_render_targets      = V3D_MAX_RENDER_TARGETS(71),
 };
 
+/* V3D 4.2 device info, mirroring v3d_get_device_info() for ver == 42
+ * (BCM2711 / VideoCore VI, as in the Pi4).  The version-specific fields come
+ * straight from the mesa ver==42 case:
+ *   ver            = major*10 + minor = 4*10 + 2
+ *   has_accumulators = (ver < 71) -> true for 42
+ *   clipper_xy_granularity = 256.0f, cle_readahead = 256  (the ver-42 case)
+ *   max_render_targets / max_framebuffer_size = V3D_MAX_*(42) (4 / 4096)
+ *   vpm_size       = the conservative 32768 baseline.  The V3D 4.2 route the
+ *                    soft3d apps use is COMPUTE-only (CSD), and the compute
+ *                    emit never reads vpm_size: it is touched solely by the
+ *                    VS/binning VCM-cache sector math (vir.c
+ *                    compute_vpm_size_in_sectors / the vpm_output_batches
+ *                    assert), which this hand-built compiler does not reach for
+ *                    the geom raster kernels.  Any non-zero value satisfies
+ *                    that math, so the same baseline as ver 71 is functionally
+ *                    safe here; a future binning path on 4.2 would want the
+ *                    live IDENT1 VPM nibble * 8192.
+ *   rev/compat_rev = 0 (conservative baseline; only gates optional newer-hw
+ *                    paths, never correctness), qpu_count driver-only -> 0.
+ *
+ * Same lifetime rule as v3d71_devinfo: v3d_compiler_init() keeps the POINTER,
+ * so both devinfos are file-static const and outlive every v3d_compile() call. */
+static const struct v3d_device_info v3d42_devinfo = {
+   .ver                     = 42,
+   .rev                     = 0,
+   .compat_rev              = 0,
+   .max_perfcnt             = 0,
+   .vpm_size                = 32768,
+   .qpu_count               = 0,
+   .has_accumulators        = true,
+   .has_reset_counter       = false,
+   .clipper_xy_granularity  = 256.0f,
+   .cle_readahead           = 256,
+   .page_size               = 4096,
+   .max_framebuffer_size    = V3D_MAX_FRAMEBUFFER_SIZE(42),
+   .max_render_targets      = V3D_MAX_RENDER_TARGETS(42),
+};
+
+/* The device info every v3d_compiler_init() below is handed.  raspi5 ships one
+ * binary for one chip (Pi5 / ver 71) and never calls the setter, so the default
+ * stays 71 and its emitted QPU is byte-for-byte unchanged.  raspix ships ONE
+ * binary across Pi3(21)/Pi4(42)/Pi5(71); pgl_g3d queries the live V3D version
+ * over the g2d dev-cntl channel and calls v3d_compiler_set_version() once at
+ * init so the compile target matches the actual silicon.  ver < 41 (Pi3/VC4,
+ * no CSD compute) is declined by pgl_g3d before any compile is issued. */
+static const struct v3d_device_info *v3d_be_devinfo = &v3d71_devinfo;
+
+void
+v3d_be_set_version(int ver)
+{
+   switch (ver) {
+   case 42:
+      v3d_be_devinfo = &v3d42_devinfo;
+      break;
+   case 71:
+      v3d_be_devinfo = &v3d71_devinfo;
+      break;
+   default:
+      /* Unknown / unsupported (e.g. 21): keep the 71 default.  The caller
+       * declines to compile on such a chip, so this is never used for a
+       * real dispatch; leaving the default avoids surprising an unexpected
+       * ver with a mismatched devinfo. */
+      break;
+   }
+}
+
+bool
+v3d_be_has_unpack_sat(void)
+{
+   return v3d_device_has_unpack_sat(v3d_be_devinfo);
+}
+
 /* v3d_compile() invokes c->debug_output unconditionally on some paths (e.g. the
  * shader-db dump at the tail of v3d_compile), so a NULL callback would fault.
  * Provide a no-op sink; the GLSL/link diagnostics the caller sees come from the
@@ -186,7 +258,7 @@ v3d_be_compile_program(nir_shader *vs, nir_shader *fs,
       return false;
    }
 
-   const struct v3d_compiler *compiler = v3d_compiler_init(&v3d71_devinfo, 0);
+   const struct v3d_compiler *compiler = v3d_compiler_init(v3d_be_devinfo, 0);
    if (!compiler) {
       be_log(log, logsz, "v3d backend: v3d_compiler_init failed");
       return false;
@@ -434,7 +506,7 @@ v3d_be_compile_compute(nir_shader *cs,
       return false;
    }
 
-   const struct v3d_compiler *compiler = v3d_compiler_init(&v3d71_devinfo, 0);
+   const struct v3d_compiler *compiler = v3d_compiler_init(v3d_be_devinfo, 0);
    if (!compiler) {
       be_log(log, logsz, "v3d backend: v3d_compiler_init failed");
       return false;

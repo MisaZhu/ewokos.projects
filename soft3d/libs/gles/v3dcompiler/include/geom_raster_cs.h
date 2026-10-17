@@ -155,6 +155,58 @@ static const char geom_xform_cs_glsl[] =
 "    vout[v*8+7] = 0.0;\n"
 "}\n";
 
+/* ---- Pass 1 (colour variant): precomputed-colour vertex transform ---------
+ * Byte-identical screen/z/iw transform to geom_xform_cs_glsl, but attribute 1
+ * is a PRECOMPUTED per-vertex colour (rgb) rather than a normal: the app lights
+ * the mesh on the CPU (teapot's native gouraud fast-path) and this kernel just
+ * copies that colour into the vout record for the SHARED gouraud raster pass.
+ * Selected when the app VS carries uMVP but declares no uNormalMat/uLightEye
+ * (no GPU-side lighting).  Bindings match the lit kernel (0 vout, 1 vpos,
+ * 2 = attr1.xyz) so the daemon's cs_is_geom=1 dispatch, the stride-6 client
+ * upload and pgl_g3d_upload_mesh's pos/attr1 de-interleave are all reused
+ * verbatim - only the compiled xform QPU differs. */
+static const char geom_xform_color_cs_glsl[] =
+"#version 310 es\n"
+"precision highp float;\n"
+"precision highp int;\n"
+"\n"
+"layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n"
+"\n"
+"layout(std430, binding = 0) buffer V3dCsVout { float vout[]; };\n"
+"layout(std430, binding = 1) buffer V3dCsPos  { float vpos[]; };\n"
+"layout(std430, binding = 2) buffer V3dCsCol  { float vcol[]; };\n"
+"\n"
+"uniform mat4 uMVP;\n"
+"uniform vec2 uViewportWH;\n"
+"uniform int  uVertCount;\n"
+"\n"
+"void main()\n"
+"{\n"
+"    int v = int(gl_WorkGroupID.x) * 64 +\n"
+"            int(gl_LocalInvocationID.y) * 8 + int(gl_LocalInvocationID.x);\n"
+"    if (v >= uVertCount)\n"
+"        return;\n"
+"\n"
+"    vec3 p = vec3(vpos[v*3+0], vpos[v*3+1], vpos[v*3+2]);\n"
+"\n"
+"    vec4 c = uMVP * vec4(p, 1.0);\n"
+"    vec2 W = uViewportWH;\n"
+"    float iw = (c.w > 0.0) ? (1.0 / c.w) : 0.0;   /* clip sentinel */\n"
+"    vec2 s = vec2((c.x * iw * 0.5 + 0.5) * W.x, (0.5 - c.y * iw * 0.5) * W.y);\n"
+"    float z = c.z * iw * 0.5 + 0.5;\n"
+"    vec3 col = (c.w > 0.0) ? vec3(vcol[v*3+0], vcol[v*3+1], vcol[v*3+2])\n"
+"                           : vec3(0.0);\n"
+"\n"
+"    vout[v*8+0] = s.x;\n"
+"    vout[v*8+1] = s.y;\n"
+"    vout[v*8+2] = z;\n"
+"    vout[v*8+3] = iw;\n"
+"    vout[v*8+4] = col.r;\n"
+"    vout[v*8+5] = col.g;\n"
+"    vout[v*8+6] = col.b;\n"
+"    vout[v*8+7] = 0.0;\n"
+"}\n";
+
 /* ---- Pass 2: gouraud rasterizer (ONE LANE PER TRIANGLE) ------------------
  * A 16x16 workgroup (256 lanes) covers 256 triangles: lane L of workgroup W
  * owns triangle W*256+L outright, reads its three pre-transformed vout records

@@ -257,58 +257,143 @@ static int dump_compute(void)
  * not the linker's permuted block index.  The two-pass split moved the vertex
  * transform into its own kernel, so pass 2 reads pre-transformed `vout` records
  * and touches exactly three SSBOs. */
-static int dump_geom(void)
+/* One hand-written geom kernel + the shape the device dispatchers depend on. */
+struct geom_kernel {
+   const char *name;
+   const char *src;
+   unsigned    lsx, lsy;      /* declared local_size (z is always 1) */
+   unsigned    n_ssbo;        /* declared SSBO bindings, all must be remapped */
+};
+
+/* All five compute kernels of the two-pass geometry rasterizer (geom_raster_cs.h):
+ *   pass-1 gouraud xform, pass-2 gouraud raster (one lane/triangle, atomicMin),
+ *   pass-1 instanced xform (4 SSBOs incl. the per-gear matrix), pass-1 textured
+ *   xform (2 SSBOs), pass-2 textured raster (4 SSBOs, atomicMin). */
+static const struct geom_kernel geom_kernels[] = {
+   { "xform",        geom_xform_cs_glsl,      8,  8, 3 },
+   { "raster",       geom_raster_cs_glsl,    16, 16, 3 },
+   { "xform_inst",   geom_xform_inst_cs_glsl, 8,  8, 4 },
+   { "xform_tex",    geom_xform_tex_cs_glsl,  8,  8, 2 },
+   { "raster_tex",   geom_raster_tex_cs_glsl, 8,  8, 4 },
+};
+#define N_GEOM_KERNELS ((int)(sizeof(geom_kernels)/sizeof(geom_kernels[0])))
+
+/* Compile ONE geom kernel VERBATIM through v3d_compile_compute_raw() at the
+ * currently-selected V3D version and verify the invariants the device
+ * draw_compute_geom()/CSD dispatcher depend on:
+ *   - the compile SUCCEEDS and emits non-zero QPU (mesa packs every emitted
+ *     instruction through v3d_qpu_instr_pack for the target ver, so a clean
+ *     compile means the 4.2 encoding is structurally valid);
+ *   - local_size matches the declaration (one lane/triangle raster is 16x16,
+ *     the xform passes are 8x8);
+ *   - shared_size == 0 (no workgroup shared memory);
+ *   - every SSBO_OFFSET slot's data is a valid declared BINDING in [0,n_ssbo)
+ *     and all n_ssbo bindings are covered (the bijective block-index -> binding
+ *     remap v3d_compile_compute_raw performs).
+ * *p_instr receives the emitted instruction count for the cross-version table.
+ * Returns the number of failed checks. */
+static int check_geom_kernel(const struct geom_kernel *k, unsigned *p_instr)
 {
    int fail = 0;
-   printf("\n########## GEOM RASTERIZER (compute_raw) ##########\n");
+   *p_instr = 0;
    struct v3d_compiled_program res;
-   bool ok = v3d_compile_compute_raw(geom_raster_cs_glsl, &res);
-   printf("=== geom_raster_cs : %s ===\n", ok ? "OK" : "FAIL");
+   bool ok = v3d_compile_compute_raw(k->src, &res);
    if (!ok) {
-      printf("  log: %s\n", res.log);
+      printf("    !! %-11s COMPILE FAILED: %s\n", k->name, res.log);
       return 1;
    }
    const struct v3d_compiled_stage *cs = &res.stage[V3D_STAGE_COMPUTE];
-   printf("  CS qpu_instr=%u num_uniforms=%u threads=%u single_seg=%d "
-          "local_size=%ux%ux%u shared=%u\n",
-          cs->qpu_instr_count, cs->num_uniforms, cs->threads,
-          (int)cs->single_seg, cs->local_size[0], cs->local_size[1],
-          cs->local_size[2], cs->shared_size);
-   if (cs->qpu_instr_count == 0) { printf("  !! no QPU\n"); fail++; }
-   if (cs->local_size[0] != 16 || cs->local_size[1] != 16 ||
-       cs->local_size[2] != 1) { printf("  !! local_size != 16x16x1\n"); fail++; }
-   if (cs->shared_size != 0) { printf("  !! shared_size != 0\n"); fail++; }
+   *p_instr = cs->qpu_instr_count;
+
+   if (cs->qpu_instr_count == 0) {
+      printf("    !! %-11s emitted NO QPU\n", k->name); fail++;
+   }
+   if (cs->local_size[0] != k->lsx || cs->local_size[1] != k->lsy ||
+       cs->local_size[2] != 1) {
+      printf("    !! %-11s local_size=%ux%ux%u, expected %ux%ux1\n",
+             k->name, cs->local_size[0], cs->local_size[1], cs->local_size[2],
+             k->lsx, k->lsy);
+      fail++;
+   }
+   if (cs->shared_size != 0) {
+      printf("    !! %-11s shared_size=%u, expected 0\n", k->name, cs->shared_size);
+      fail++;
+   }
 
    unsigned n_ssbo = 0;
-   bool seen[3] = { false, false, false };
+   bool seen[4] = { false, false, false, false };
    for (unsigned u = 0; u < cs->num_uniforms; u++) {
-      unsigned c = cs->uniform_contents[u];
+      if (cs->uniform_contents[u] != 19 /* SSBO_OFFSET */)
+         continue;
       unsigned d = cs->uniform_data[u];
-      printf("    CS unif[%2u] %-18s data=%-6u (0x%08x)\n",
-             u, quniform_name(c), d, d);
-      if (c == 19 /* SSBO_OFFSET */) {
-         n_ssbo++;
-         if (d < 3)
-            seen[d] = true;
-         else { printf("  !! SSBO_OFFSET binding %u out of range\n", d); fail++; }
+      n_ssbo++;
+      if (d < k->n_ssbo)
+         seen[d] = true;
+      else {
+         printf("    !! %-11s SSBO_OFFSET binding %u out of range [0,%u)\n",
+                k->name, d, k->n_ssbo);
+         fail++;
       }
    }
-   /* Each SSBO access (load AND store) emits its own SSBO_OFFSET slot, so there
-    * are more than 3 slots; the invariant is that every slot's data is a valid
-    * binding in [0,3) and all three bindings are covered (the bijective remap). */
-   if (n_ssbo < 3) { printf("  !! expected >=3 SSBO_OFFSET slots, got %u\n", n_ssbo); fail++; }
-   for (int b = 0; b < 3; b++)
-      if (!seen[b]) { printf("  !! binding %d missing from SSBO_OFFSET remap\n", b); fail++; }
-
-   printf("  CS uniform bindings (num=%u, blob_dwords=%u):\n",
-          cs->num_uniform_bindings, cs->uniform_blob_dwords);
-   for (unsigned b = 0; b < cs->num_uniform_bindings; b++) {
-      const struct v3d_uniform_binding *ub = &cs->uniform_bindings[b];
-      printf("    %-16s dword=%-3u comps=%u\n",
-             ub->name, ub->dword_offset, ub->num_components);
+   if (n_ssbo < k->n_ssbo) {
+      printf("    !! %-11s expected >=%u SSBO_OFFSET slots, got %u\n",
+             k->name, k->n_ssbo, n_ssbo);
+      fail++;
    }
+   for (unsigned b = 0; b < k->n_ssbo; b++)
+      if (!seen[b]) {
+         printf("    !! %-11s binding %u missing from SSBO_OFFSET remap\n",
+                k->name, b);
+         fail++;
+      }
+
+   printf("    %-11s qpu_instr=%-4u num_unif=%-3u threads=%u single_seg=%d "
+          "local=%ux%ux%u shared=%u ssbo_slots=%u : %s\n",
+          k->name, cs->qpu_instr_count, cs->num_uniforms, cs->threads,
+          (int)cs->single_seg, cs->local_size[0], cs->local_size[1],
+          cs->local_size[2], cs->shared_size, n_ssbo, fail ? "FAIL" : "OK");
    v3d_compiled_program_free(&res);
-   printf("=== geom checks %s ===\n", fail ? "FAILED" : "PASSED");
+   return fail;
+}
+
+/* GATE A: prove mesa can retarget EVERY geometry-rasterizer compute kernel to
+ * V3D 4.2 (Pi4), not just the 7.1 default.  Each kernel is compiled verbatim
+ * through the SAME v3d_compile_compute_raw() entry the device uses, once at the
+ * 7.1 reference version and once at 4.2 (selected via v3d_compiler_set_version,
+ * the runtime hook raspix drives from the live g2d version query).  Both passes
+ * must satisfy the dispatch invariants; the instruction counts are tabulated
+ * side by side so a 4.2 codegen regression (empty/absurd output) is visible.
+ *
+ * NOTE on simulation: the external qpu_sim (.tmp/videocore7-exps) runs a single
+ * 16-lane workgroup with synchronous TMU loads/stores and has NO SSBO atomic
+ * RMW path, so it cannot faithfully execute these kernels (the raster passes
+ * resolve depth with atomicMin into the depth SSBO over 256-lane workgroups).
+ * The decisive, tooling-supported question GATE A answers is therefore whether
+ * mesa EMITS valid 4.2 compute for all five kernels; a clean compile means every
+ * instruction packed through v3d_qpu_instr_pack for ver==42. */
+static int dump_geom(void)
+{
+   int fail = 0;
+   printf("\n########## GEOM RASTERIZER (compute_raw) : V3D 7.1 vs 4.2 ##########\n");
+
+   unsigned instr[2][8] = { { 0 } };   /* [ver slot][kernel] */
+   const int vers[2] = { 71, 42 };
+   for (int vi = 0; vi < 2; vi++) {
+      v3d_compiler_set_version(vers[vi]);
+      printf("=== V3D %d ===\n", vers[vi]);
+      for (int k = 0; k < N_GEOM_KERNELS; k++)
+         fail += check_geom_kernel(&geom_kernels[k], &instr[vi][k]);
+   }
+   v3d_compiler_set_version(71);   /* restore the default for any later caller */
+
+   printf("=== instruction counts (7.1 -> 4.2) ===\n");
+   for (int k = 0; k < N_GEOM_KERNELS; k++)
+      printf("    %-11s %5u -> %5u\n", geom_kernels[k].name,
+             instr[0][k], instr[1][k]);
+
+   printf("=== geom checks %s (V3D 4.2 codegen %s) ===\n",
+          fail ? "FAILED" : "PASSED",
+          fail ? "UNVERIFIED" : "OK for all kernels");
    return fail;
 }
 

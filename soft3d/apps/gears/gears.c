@@ -1,16 +1,16 @@
 /*
  * Copyright (C) 1999-2001  Brian Paul   All Rights Reserved.
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
  * to deal in the Software without restriction, including without limitation
  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
  * and/or sell copies of the Software, and to permit persons to whom the
  * Software is furnished to do so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included
  * in all copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
  * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
@@ -20,37 +20,16 @@
  */
 
 /*
- * Ported to GLES2.
- * Kristian Høgsberg <krh@bitplanet.net>
- * May 3, 2010
- * 
- * Improve GLES2 port:
- *   * Refactor gear drawing.
- *   * Use correct normals for surfaces.
- *   * Improve shader.
- *   * Use perspective projection transformation.
- *   * Add FPS count.
- *   * Add comments.
- * Alexandros Frantzis <alexandros.frantzis@linaro.org>
- * Jul 13, 2010
+ * Ported to GLES2.  Kristian Høgsberg, May 3, 2010
+ * Improved GLES2 port.  Alexandros Frantzis, Jul 13, 2010
+ * Ported to SDL2 / OpenGL 3.3 core.  Robert Winkler, April 9, 2016
+ * Ported to PortableGL.  Robert Winkler, September 5, 2016
+ * Ported to EwokOS xwin/graph_t.
  *
- * Ported to SDL2 and OpenGL 3.3 core
- *   * Fix up shaders
- *   * Add a VAO
- *   * Remove all glut/egl code replace with SDL2
- *   * Add polygon_mode toggle for fun
- *   * TODO: refactor/clean up more
- *   * repo at:         https://github.com/rswinkle/opengl_reference
- *   * original source: https://cgit.freedesktop.org/mesa/demos/tree/src/egl/opengles2/es2gears.c
- * Robert Winkler
- * April 9, 2016
- *
- * Ported to PortableGL
- * Robert Winkler
- * September 5, 2016
- *
- * Ported to EwokOS xwin/graph_t
- * Removed SDL dependency
+ * Rewritten onto the standard EGL + GLES2 + GLSL ES 1.00 front end (libs/gles).
+ * The window/context now come from libEGL (native window == xwin_t*), the gear
+ * lighting runs as a real GLSL ES 1.00 vertex shader compiled by libGLESv2's
+ * CPU GLSL interpreter, and present is a plain eglSwapBuffers.
  */
 
 #include <stdio.h>
@@ -66,18 +45,11 @@
 #include <x/x.h>
 #include <x/xwin.h>
 #include <graph/graph.h>
-#include <font/font.h>
 
-#include "glcommon/gltools.h"
-
-#define sinf pgl_fast_sin
-#define cosf pgl_fast_cos
-#define sqrtf pgl_fast_sqrt
-#define tanf pgl_fast_tan
-#define acosf pgl_fast_acos
-#define asinf pgl_fast_asin
-#define atanf pgl_fast_atan
-#define atanf2 pgl_fast_atan2
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+#include <glcommon/hud.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -86,9 +58,9 @@
 static int win_width = 640;
 static int win_height = 480;
 
-static glContext the_context;
-static pix_t* backbuf = NULL;
-static font_t* font = NULL;
+static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
+static EGLSurface egl_surf = EGL_NO_SURFACE;
+static EGLContext egl_ctx = EGL_NO_CONTEXT;
 
 #define STRIPS_PER_TOOTH 7
 #define VERTICES_PER_TOOTH 34
@@ -128,73 +100,44 @@ static struct gear_instance gears[MAX_GEARS];
 static int n_gears = 0;
 static GLfloat angle = 0.0f;
 
-// Camera orbit parameters
+/* Camera orbit parameters */
 static float camera_angle = 0.0f;
 static GLfloat projection_matrix[16];
 
-typedef struct {
-    mat4 mvp_mat;
-    mat4 normal_mat;
-    vec3 material_color;
-} My_Uniforms;
+static GLuint program = 0;
+static GLint loc_mvp = -1, loc_normal = -1, loc_material = -1;
+static GLint loc_light = -1, loc_shade = -1;
 
-static My_Uniforms uniforms;
-static GLuint program;
+/* GLSL ES 1.00 shaders: per-vertex diffuse lighting (Gouraud) paired with a
+ * passthrough fragment shader.  mat4 uniforms are uploaded column-major
+ * (transpose = GL_FALSE), so "uMVP * vec4(p,1)" reproduces the classic
+ * mult_m4_v4(mvp, p) exactly. */
+static const char *gears_vs =
+    "attribute vec3 aPosition;\n"
+    "attribute vec3 aNormal;\n"
+    "uniform mat4 uMVP;\n"
+    "uniform mat4 uNormalMat;\n"
+    "uniform vec3 uMaterial;\n"
+    "uniform vec4 uLightEye;\n"
+    "uniform vec4 uShade;\n"
+    "varying vec4 vColor;\n"
+    "void main() {\n"
+    "    vec3 ne = normalize((uNormalMat * vec4(aNormal, 0.0)).xyz);\n"
+    "    vec3 L = normalize(uLightEye.xyz);\n"
+    "    float diff = max(dot(ne, L), 0.0);\n"
+    "    float spec = 0.0;\n"
+    "    vec3 col = clamp(uMaterial * (uShade.x + uShade.y * diff) +\n"
+    "                   vec3(uShade.z * spec), 0.0, 1.0);\n"
+    "    vColor = vec4(col, 1.0);\n"
+    "    gl_Position = uMVP * vec4(aPosition, 1.0);\n"
+    "}\n";
 
-#ifdef PGL_G3D
-#include <portablegl/pgl_g3d.h>
-#include "gears_glsl.h"
-
-/* Full-GPU path (mirrors teapot.c): the gears' vertex stage (MVP transform +
- * diffuse lighting) is compiled to VideoCore VII QPU and runs on the V3D GPU,
- * with the gouraud-passthrough FS shading the fragments.  g3d_active latches on
- * only after the program compiles, the INSTANCED geom kernel attaches, its two
- * lighting uniforms resolve by name, and the merged mesh uploads; any decline
- * leaves it 0 and the CPU vertex_shader + pgl_ff_gouraud path below renders the
- * identical design.  All six gears' triangle strips are expanded once to a
- * GL_TRIANGLES list and MERGED into ONE instanced mesh (each vertex carries its
- * gear index at element 6), so the whole train is transformed, lit and
- * rasterised in a single dispatch; the per-gear MVP/normal/material matrices
- * ride a 4th SSBO refilled every frame (pgl_g3d_set_instances). */
-static int          g3d_active = 0;
-static pgl_g3d_prog g3d_prog   = PGL_G3D_PROG_INVALID;
-static pgl_g3d_mesh g3d_mesh   = PGL_G3D_MESH_INVALID;
-static uint32_t     g3d_mesh_count = 0;
-
-/* Per-gear matrix record staged into the instanced kernel's 4th SSBO every
- * frame: MVP mat4 (16) + normal mat4 (16) + material rgb (3) + pad (1) = 36
- * floats, matching geom_xform_inst_cs_glsl's gearMat4(g*36) read layout. */
-#define G3D_GEARMAT_FLOATS 36
-static float g3d_gearmat[MAX_GEARS * G3D_GEARMAT_FLOATS];
-
-/* Geom-kernel lighting uniforms, resolved by name at init (never assumed: mesa
- * dead-strips/renumbers per program).  The instanced kernel derives every
- * per-gear matrix from the SSBO, so uMVP/uNormalMat/uMaterial are gone and only
- * these two remain: uLightEye (.w==0 selects its directional-light model) and
- * uShade (ambient/diffuse/specular weights).  -1 = unresolved. */
-static int g3d_off_light = -1, g3d_off_shade = -1;
-
-/* The per-draw uniform blob staged for the daemon's QUNIFORM interpreter. */
-static uint32_t g3d_unif[PGL_G3D_MAX_UNIF];
-static uint32_t g3d_unif_count = 0;
-
-/* EwokOS demo binaries are linked with ld directly and the C runtime _start
- * never calls __libc_init_array, so the C++ static constructors gathered in
- * .init_array are never run.  The on-device mesa GLSL->QPU compiler
- * (v3d_compile_glsl, pulled in through libv3dcompiler.a) depends on two of them
- * (the glsl type system and the built-in function table); without them the
- * first compile dereferences unconstructed globals and faults.  Run them here,
- * before any shader is compiled (same guard shadertoy.cpp uses). */
-extern void (*__init_array_start[])(void);
-extern void (*__init_array_end[])(void);
-static void gears_run_static_ctors(void)
-{
-    void (**p)(void);
-    for (p = __init_array_start; p < __init_array_end; ++p)
-        if (*p != 0)
-            (*p)();
-}
-#endif /* PGL_G3D */
+static const char *gears_fs =
+    "precision mediump float;\n"
+    "varying vec4 vColor;\n"
+    "void main() {\n"
+    "    gl_FragColor = vColor;\n"
+    "}\n";
 
 static void multiply(GLfloat *m, const GLfloat *n)
 {
@@ -220,7 +163,7 @@ static void rotate(GLfloat *m, GLfloat angle, GLfloat x, GLfloat y, GLfloat z)
     GLfloat s = sinf(angle * M_PI / 180.0f);
     GLfloat r[16] = {
         x * x * (1 - c) + c,     y * x * (1 - c) + z * s, x * z * (1 - c) - y * s, 0,
-        x * y * (1 - c) - z * s, y * y * (1 - c) + c,     y * z * (1 - c) + x * s, 0, 
+        x * y * (1 - c) - z * s, y * y * (1 - c) + c,     y * z * (1 - c) + x * s, 0,
         x * z * (1 - c) + y * s, y * z * (1 - c) - x * s, z * z * (1 - c) + c,     0,
         0, 0, 0, 1
     };
@@ -269,24 +212,24 @@ static void perspective(GLfloat *m, GLfloat fovy, GLfloat aspect, GLfloat z_near
 {
     GLfloat tmp[16];
     identity(tmp);
-    
+
     GLfloat radians = fovy / 2.0f * M_PI / 180.0f;
     GLfloat sine = sinf(radians);
     GLfloat cosine = cosf(radians);
     GLfloat delta_z = z_far - z_near;
-    
+
     if (delta_z == 0 || sine == 0 || aspect == 0)
         return;
-    
+
     GLfloat cotangent = cosine / sine;
-    
+
     tmp[0] = cotangent / aspect;
     tmp[5] = cotangent;
     tmp[10] = -(z_far + z_near) / delta_z;
     tmp[11] = -1.0f;
     tmp[14] = -2.0f * z_near * z_far / delta_z;
     tmp[15] = 0.0f;
-    
+
     memcpy(m, tmp, sizeof(tmp));
 }
 
@@ -426,257 +369,18 @@ static struct gear *create_gear(GLfloat inner_radius, GLfloat outer_radius, GLfl
     return gear;
 }
 
-/* PortableGL vertex shader.
- *
- * gears lights per vertex (Gouraud shading), so the lit colour is written to
- * vs_output[0..3] as a vec4 RGBA and the program pairs this VS with the
- * built-in pgl_ff_gouraud fragment shader.  That makes the fragment stage
- * semantically identical to the previous hand-written fragment_shader (which
- * just emitted the interpolated colour) while letting the raspi5 V3D back end
- * offload rasterization + interpolation + depth/cull to the GPU; on every other
- * platform it runs unchanged on the CPU rasterizer. */
-void vertex_shader(float* vs_output, vec4* v_attrs, Shader_Builtins* builtins, void* uniforms)
-{
-    vec4* vs_out = (vec4*)vs_output;
-    My_Uniforms* u = uniforms;
-
-    vec4 v4 = mult_m4_v4(u->normal_mat, v_attrs[1]);
-    vec3 v3 = { v4.x, v4.y, v4.z };
-    vec3 N = norm_v3(v3);
-
-    const vec3 light_pos = { 5.0f, 5.0f, 10.0f };
-    vec3 L = norm_v3(light_pos);
-
-    float tmp = dot_v3s(N, L);
-    float diff_intensity = MAX(tmp, 0.0f);
-
-    vec3 c = scale_v3(u->material_color, diff_intensity);
-    vs_out[0] = make_v4(c.x, c.y, c.z, 1.0f);
-
-    builtins->gl_Position = mult_m4_v4(u->mvp_mat, v_attrs[0]);
-}
-
-#ifdef PGL_G3D
-/* ------------------------------------------------------------------ *
- * Full-GPU path: pack the per-draw uniform blob and issue one compiled-mesh
- * draw per gear.  The matrices are uploaded in portablegl's column-major flat
- * order (gears_glsl.h documents why this is bit-identical to the C
- * mult_m4_v4 path).
- * ------------------------------------------------------------------ */
-static void g3d_set_f(int off, float v)
-{
-    uint32_t bits;
-    if (off < 0 || (uint32_t)off >= PGL_G3D_MAX_UNIF)
-        return;
-    memcpy(&bits, &v, sizeof(bits));
-    g3d_unif[off] = bits;
-    if ((uint32_t)off + 1u > g3d_unif_count)
-        g3d_unif_count = (uint32_t)off + 1u;
-}
-
-/* Write one mat4 into the per-gear SSBO staging array at `off` in portablegl's
- * column-major flat order (bit-identical to the C mult_m4_v4 path; see
- * gears_glsl.h).  The instanced kernel reads it back with gearMat4(off). */
-static void g3d_gm_mat4(int off, const GLfloat* m)
-{
-    int i;
-    for (i = 0; i < 16; i++)
-        g3d_gearmat[off + i] = m[i];
-}
-
-/* Merge all six gears into ONE instanced GL_TRIANGLES mesh.  Each gear's
- * GL_TRIANGLE_STRIP list is expanded to triangles (the compiled-mesh draw path
- * issues triangles only) with the same winding the CPU path uses - for the i-th
- * triangle of a strip emit (v[i], v[i+1], v[i+2]) when i is even and
- * (v[i+1], v[i], v[i+2]) when odd, so front-facing and back-face culling match
- * the strips exactly.  Every emitted vertex is pos float3 + normal float3 + its
- * gear index at element 6 (stride 7), which is pgl_g3d_upload_mesh_instanced's
- * contract; the index selects that gear's matrices from the per-frame SSBO, so
- * a single pgl_g3d_draw_mesh_compiled transforms+lights+rasterises the whole
- * train in one dispatch. */
-static void g3d_build_merged_mesh(void)
-{
-    float* out;
-    uint32_t nverts, o = 0;
-    int total_tri = 0, gi, s;
-
-    for (gi = 0; gi < n_gears; gi++) {
-        struct gear* g = gears[gi].g;
-        if (g == NULL || g->strips == NULL || g->vertices == NULL)
-            continue;
-        for (s = 0; s < g->nstrips; s++)
-            if (g->strips[s].count >= 3)
-                total_tri += g->strips[s].count - 2;
-    }
-    nverts = (uint32_t)total_tri * 3u;
-    if (nverts == 0)
-        return;
-
-    out = (float*)malloc((size_t)nverts * 7u * sizeof(float));
-    if (out == NULL)
-        return;
-
-    for (gi = 0; gi < n_gears; gi++) {
-        struct gear* g = gears[gi].g;
-        if (g == NULL || g->strips == NULL || g->vertices == NULL)
-            continue;
-        for (s = 0; s < g->nstrips; s++) {
-            int first = g->strips[s].first, c = g->strips[s].count, i;
-            for (i = 0; i + 2 < c; i++) {
-                int idx[3], k;
-                if ((i & 1) == 0) { idx[0] = first + i;     idx[1] = first + i + 1; idx[2] = first + i + 2; }
-                else              { idx[0] = first + i + 1; idx[1] = first + i;     idx[2] = first + i + 2; }
-                for (k = 0; k < 3; k++) {
-                    const GLfloat* src = g->vertices[idx[k]];
-                    float* dv = out + (size_t)(o++) * 7u;
-                    dv[0] = src[0]; dv[1] = src[1]; dv[2] = src[2];
-                    dv[3] = src[3]; dv[4] = src[4]; dv[5] = src[5];
-                    dv[6] = (float)gi;   /* per-vertex instance (gear) index */
-                }
-            }
-        }
-    }
-
-    g3d_mesh = pgl_g3d_upload_mesh_instanced(out, nverts, 7u);
-    g3d_mesh_count = nverts;
-    free(out);
-}
-
-/* Compile the gears VS+FS to QPU, confirm the INSTANCED geom kernel attached,
- * resolve its two lighting uniforms by name, and stage the merged instanced
- * mesh.  On any decline g3d_active stays 0 and the CPU path renders.  Called
- * once after init_gears() (and after pglGpuBegin()). */
-static void g3d_init(void)
-{
-    char errlog[512];
-    uint32_t comps = 0;
-
-    g3d_active = 0;
-    errlog[0] = '\0';
-
-    g3d_prog = pgl_g3d_program_compile(gears_vs_glsl, gears_fs_glsl,
-                                       errlog, sizeof(errlog));
-    if (!pgl_g3d_program_valid(g3d_prog)) {
-        slog("gears: GPU shader compile failed: %s\n", errlog);
-        return;
-    }
-
-    /* The merged mesh is staged with a per-vertex instance index (layout 3) and
-     * the per-gear matrices ride the 4th SSBO, which ONLY the instanced xform
-     * kernel reads.  If that kernel did not attach (marker missing, or a
-     * plain/textured geom kernel bound instead) the mesh layout would not match
-     * the kernel, so decline to the CPU path rather than draw garbage. */
-    if (!pgl_g3d_shader_geom_inst(g3d_prog)) {
-        slog("gears: instanced geom kernel not attached\n");
-        return;
-    }
-
-    /* The instanced kernel derives every per-gear matrix from the SSBO, so only
-     * its two lighting uniforms live in the named blob; both must resolve. */
-    g3d_off_light = pgl_g3d_shader_uniform_dword(g3d_prog, "uLightEye", &comps);
-    g3d_off_shade = pgl_g3d_shader_uniform_dword(g3d_prog, "uShade", &comps);
-    (void)comps;
-    if (g3d_off_light < 0 || g3d_off_shade < 0) {
-        slog("gears: instanced light uniforms unresolved\n");
-        return;
-    }
-
-    g3d_build_merged_mesh();
-    if (g3d_mesh == PGL_G3D_MESH_INVALID || g3d_mesh_count == 0) {
-        slog("gears: GPU merged-mesh upload declined\n");
-        return;
-    }
-
-    g3d_active = 1;
-    slog("gears: GPU instanced-mesh path active (prog=%d, %u verts, %d gears)\n",
-         g3d_prog, g3d_mesh_count, n_gears);
-}
-
-/* Draw the whole gear train in ONE QPU dispatch: recompute each gear's
- * model/MVP/normal matrices exactly as draw_gear() does, pack them into that
- * gear's 36-float SSBO record, stage the two lighting uniforms, then issue the
- * merged instanced mesh (GL_LESS depth + Z-write, back-face cull to match the
- * CPU path's glEnable(GL_CULL_FACE)).  Returns 1 on success, 0 on any decline. */
-static int g3d_draw_all(const GLfloat* transform)
-{
-    int gi;
-
-    if (g3d_mesh == PGL_G3D_MESH_INVALID || g3d_mesh_count == 0)
-        return 0;
-
-    /* Refill every gear's matrix SSBO record for this frame's angles. */
-    for (gi = 0; gi < n_gears; gi++) {
-        struct gear_instance* inst = &gears[gi];
-        GLfloat model_view[16], normal_matrix[16], mvp[16];
-        int base = gi * G3D_GEARMAT_FLOATS;
-
-        if (inst->g == NULL) {
-            /* empty slot: zero its record (no vertex references this index). */
-            memset(&g3d_gearmat[base], 0, G3D_GEARMAT_FLOATS * sizeof(float));
-            continue;
-        }
-
-        memcpy(model_view, transform, sizeof(model_view));
-        translate(model_view, inst->x, inst->y, 0);
-        rotate(model_view, inst->speed * angle + inst->phase, 0, 0, 1);
-
-        memcpy(mvp, projection_matrix, sizeof(mvp));
-        multiply(mvp, model_view);
-
-        memcpy(normal_matrix, model_view, sizeof(normal_matrix));
-        invert(normal_matrix);
-        transpose(normal_matrix);
-
-        g3d_gm_mat4(base, mvp);              /* [+0..15]  MVP */
-        g3d_gm_mat4(base + 16, normal_matrix); /* [+16..31] normal matrix */
-        g3d_gearmat[base + 32] = inst->color[0];
-        g3d_gearmat[base + 33] = inst->color[1];
-        g3d_gearmat[base + 34] = inst->color[2];
-        g3d_gearmat[base + 35] = 0.0f;        /* pad */
-    }
-    if (!pgl_g3d_set_instances(g3d_gearmat,
-                               (uint32_t)n_gears * G3D_GEARMAT_FLOATS))
-        return 0;
-
-    /* The instanced kernel needs only the two lighting uniforms as named blob
-     * entries; every per-gear matrix/material is derived from the SSBO above. */
-    g3d_unif_count = 0;
-    /* directional model (.w == 0): the VS's fixed world direction (5,5,10),
-     * which the kernel normalizes. */
-    g3d_set_f(g3d_off_light + 0, 5.0f);
-    g3d_set_f(g3d_off_light + 1, 5.0f);
-    g3d_set_f(g3d_off_light + 2, 10.0f);
-    g3d_set_f(g3d_off_light + 3, 0.0f);
-    /* gouraud weights, mirroring the VS exactly: no ambient, pure
-     * material*diffuse, no specular. */
-    g3d_set_f(g3d_off_shade + 0, 0.0f);
-    g3d_set_f(g3d_off_shade + 1, 1.0f);
-    g3d_set_f(g3d_off_shade + 2, 0.0f);
-    g3d_set_f(g3d_off_shade + 3, 0.0f);
-    pgl_g3d_set_uniforms(g3d_unif, g3d_unif_count);
-
-    return pgl_g3d_draw_mesh_compiled(g3d_prog, g3d_mesh, 0u, g3d_mesh_count,
-                                      PGL_G3D_DEPTH_LESS, 1u,
-                                      PGL_G3D_CULL_BACK_CCW);
-}
-#endif /* PGL_G3D */
-
 static void draw_gear(struct gear *gear, GLfloat *transform,
                       GLfloat x, GLfloat y, GLfloat angle_rot, const GLfloat color[4])
 {
     GLfloat model_view[16];
     GLfloat normal_matrix[16];
     GLfloat mvp[16];
+    int n;
 
-    if (gear == NULL || gear->strips == NULL || gear->vertices == NULL) {
-        klog("draw_gear: NULL check failed: gear=%p, strips=%p, vertices=%p\n", gear, gear ? gear->strips : NULL, gear ? gear->vertices : NULL);
+    if (gear == NULL || gear->strips == NULL || gear->vertices == NULL)
         return;
-    }
-
-    if (gear->vbo == 0) {
-        klog("draw_gear: invalid vbo\n");
+    if (gear->vbo == 0)
         return;
-    }
 
     memcpy(model_view, transform, sizeof(model_view));
     translate(model_view, x, y, 0);
@@ -689,11 +393,9 @@ static void draw_gear(struct gear *gear, GLfloat *transform,
     invert(normal_matrix);
     transpose(normal_matrix);
 
-    memcpy(&uniforms.mvp_mat, mvp, sizeof(mat4));
-    memcpy(&uniforms.normal_mat, normal_matrix, sizeof(mat4));
-    uniforms.material_color.x = color[0];
-    uniforms.material_color.y = color[1];
-    uniforms.material_color.z = color[2];
+    glUniformMatrix4fv(loc_mvp, 1, GL_FALSE, mvp);
+    glUniformMatrix4fv(loc_normal, 1, GL_FALSE, normal_matrix);
+    glUniform3f(loc_material, color[0], color[1], color[2]);
 
     glBindBuffer(GL_ARRAY_BUFFER, gear->vbo);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), 0);
@@ -702,12 +404,8 @@ static void draw_gear(struct gear *gear, GLfloat *transform,
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
 
-    int n;
-    int total_verts = 0;
-    for (n = 0; n < gear->nstrips; n++) {
+    for (n = 0; n < gear->nstrips; n++)
         glDrawArrays(GL_TRIANGLE_STRIP, gear->strips[n].first, gear->strips[n].count);
-        total_verts += gear->strips[n].count;
-    }
 
     glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(0);
@@ -718,28 +416,24 @@ static void look_at(GLfloat *m, GLfloat eye_x, GLfloat eye_y, GLfloat eye_z,
                     GLfloat up_x, GLfloat up_y, GLfloat up_z)
 {
     GLfloat f[3], s[3], u[3];
-    GLfloat f_len, s_len, u_len;
-    
-    // Forward vector (from eye to center)
+    GLfloat f_len, s_len;
+
     f[0] = center_x - eye_x;
     f[1] = center_y - eye_y;
     f[2] = center_z - eye_z;
     f_len = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
     f[0] /= f_len; f[1] /= f_len; f[2] /= f_len;
-    
-    // Side vector (cross product of forward and up)
+
     s[0] = f[1]*up_z - f[2]*up_y;
     s[1] = f[2]*up_x - f[0]*up_z;
     s[2] = f[0]*up_y - f[1]*up_x;
     s_len = sqrtf(s[0]*s[0] + s[1]*s[1] + s[2]*s[2]);
     s[0] /= s_len; s[1] /= s_len; s[2] /= s_len;
-    
-    // Recompute up vector (cross product of side and forward)
+
     u[0] = s[1]*f[2] - s[2]*f[1];
     u[1] = s[2]*f[0] - s[0]*f[2];
     u[2] = s[0]*f[1] - s[1]*f[0];
-    
-    // Build look-at matrix
+
     GLfloat look_at_mat[16] = {
         s[0], u[0], -f[0], 0,
         s[1], u[1], -f[1], 0,
@@ -749,7 +443,7 @@ static void look_at(GLfloat *m, GLfloat eye_x, GLfloat eye_y, GLfloat eye_z,
         f[0]*eye_x + f[1]*eye_y + f[2]*eye_z,
         1
     };
-    
+
     memcpy(m, look_at_mat, sizeof(look_at_mat));
 }
 
@@ -761,59 +455,30 @@ static void draw_gears(void)
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // Camera orbits the gear cluster, close enough that it nearly fills the frame.
-    // The cluster's outermost tooth reaches ~9.6 units from the origin; with a 60 deg
-    // vertical FOV a distance of 16.5 gives a half-height of ~9.5, so the gears span
-    // almost the whole window.  cam_y is kept low for a near face-on view (a higher
-    // camera would tilt the circles into ellipses and waste vertical space).
+    /* Camera orbits the gear cluster, close enough that it nearly fills the frame. */
     float cam_x = sinf(camera_angle * M_PI / 180.0f) * 16.5f;
-    float cam_y = 4.0f;  // Slightly above the gears
+    float cam_y = 4.0f;
     float cam_z = cosf(camera_angle * M_PI / 180.0f) * 16.5f;
 
-    // Build look-at matrix to always face the center (0, 0, 0)
     look_at(transform, cam_x, cam_y, cam_z, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f);
-
-#ifdef PGL_G3D
-    /* Full-GPU path: draw the whole gear train with ONE compiled instanced-mesh
-     * dispatch (VS transform + lighting on the QPU).  glClear above already drove
-     * pgl_g3d_begin_frame, so this frame's first dispatch clears the persistent
-     * colour+Z.  If it declines, latch the GPU off, re-clear and fall through to
-     * the CPU loop so the frame is not left half GPU / half CPU (every later
-     * frame stays on the CPU). */
-    if (g3d_active) {
-        if (g3d_draw_all(transform))
-            return;   /* whole gear train rendered on the QPU in one dispatch */
-        g3d_active = 0;
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    }
-#endif /* PGL_G3D */
 
     for (i = 0; i < n_gears; i++)
         draw_gear(gears[i].g, transform, gears[i].x, gears[i].y,
                   gears[i].speed * angle + gears[i].phase, gears[i].color);
 }
 
-/* Add a gear meshing with the driver sun gear.  The planet is placed with its
- * centre at exactly R_sun + R_planet along phi_deg, spun at -N_sun/N_planet
- * times the sun's angle (external gears counter-rotate), and given the phase
- *
- *   phi = phi_deg*(1 + N_sun/N_planet) + 180 - 5*180/(2*N_planet)
- *
- * that drops each tooth into the mating gap.  This reproduces the original
- * hand-tuned offsets exactly (gear2: phi=0 -> 135 deg == -9 deg mod one tooth
- * pitch of 36 deg; gear3 -> 407.7 deg == -25 deg), so the whole train meshes. */
+/* Add a gear meshing with the driver sun gear (see original for the phase math). */
 static void add_planet_gear(GLint teeth, GLfloat phi_deg, GLfloat width,
                             const GLfloat color[4])
 {
-    static const GLint sun_teeth = 20;   // must match the sun created in init_gears()
+    static const GLint sun_teeth = 20;
     GLfloat dist, rad, phi, inner, outer;
 
     if (n_gears >= MAX_GEARS)
         return;
 
-    dist = R_PER_TOOTH * (sun_teeth + teeth);   // centre distance = R_sun + R_planet
-    outer = R_PER_TOOTH * teeth;                // pitch radius = outer_radius
+    dist = R_PER_TOOTH * (sun_teeth + teeth);
+    outer = R_PER_TOOTH * teeth;
     inner = outer * 0.25f;
 
     phi = phi_deg * (1.0f + (GLfloat)sun_teeth / (GLfloat)teeth)
@@ -843,10 +508,28 @@ static void add_sun_gear(GLint teeth, GLfloat width, const GLfloat color[4])
     gears[n_gears].x = 0.0f;
     gears[n_gears].y = 0.0f;
     memcpy(gears[n_gears].color, color, sizeof(gears[n_gears].color));
-    gears[n_gears].speed = 1.0f;   // driver: rotation = angle
+    gears[n_gears].speed = 1.0f;
     gears[n_gears].phase = 0.0f;
     if (gears[n_gears].g != NULL)
         n_gears++;
+}
+
+static GLuint compile_shader(GLenum type, const char *src)
+{
+    GLuint sh = glCreateShader(type);
+    GLint ok = 0;
+    if (sh == 0) return 0;
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+        klog("gears: shader compile failed: %s\n", log);
+        glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
 }
 
 static void init_gears(void)
@@ -858,28 +541,49 @@ static void init_gears(void)
     static const GLfloat magenta[4] = { 0.9f, 0.2f, 0.8f, 1.0f };
     static const GLfloat cyan[4]    = { 0.1f, 0.8f, 0.9f, 1.0f };
 
+    GLuint vs, fs;
+    GLint ok = 0;
+
     glEnable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
 
-    GLenum smooth[4] = { PGL_SMOOTH4 };
-
-    /* Create the shader program: gears' own per-vertex-lighting VS paired with
-     * the built-in pgl_ff_gouraud FS (4 smooth RGBA varyings). */
-    program = CreateProgram(vertex_shader, pgl_ff_gouraud, 4, smooth, GL_FALSE);
-    if (program == 0) {
-        klog("init_gears: failed to create program\n");
+    vs = compile_shader(GL_VERTEX_SHADER, gears_vs);
+    fs = compile_shader(GL_FRAGMENT_SHADER, gears_fs);
+    program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glBindAttribLocation(program, 0, "aPosition");
+    glBindAttribLocation(program, 1, "aNormal");
+    glLinkProgram(program);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetProgramInfoLog(program, sizeof(log), NULL, log);
+        klog("gears: program link failed: %s\n", log);
         return;
     }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
     glUseProgram(program);
 
-    /* Set uniform pointer */
-    SetUniform(&uniforms);
+    loc_mvp      = glGetUniformLocation(program, "uMVP");
+    loc_normal   = glGetUniformLocation(program, "uNormalMat");
+    loc_material = glGetUniformLocation(program, "uMaterial");
+    loc_light    = glGetUniformLocation(program, "uLightEye");
+    loc_shade    = glGetUniformLocation(program, "uShade");
+
+    /* Lighting parameters matching the V3D gouraud kernel's directional branch
+     * (uLightEye.w == 0 selects it): a directional light along (5,5,10) and
+     * pure diffuse shading (ambient 0, diffuse 1, specular 0).  Constant for
+     * every gear, so set once here.  uLightEye/uShade are declared vec4 so the
+     * model-selecting .w is packed explicitly; the CPU interpreter and the GPU
+     * kernel read these same values and produce identical pixels. */
+    glUniform4f(loc_light, 5.0f, 5.0f, 10.0f, 0.0f);
+    glUniform4f(loc_shade, 0.0f, 1.0f, 0.0f, 0.0f);
 
     perspective(projection_matrix, 60.0f, (GLfloat)win_width / (GLfloat)win_height, 1.0f, 1024.0f);
     glViewport(0, 0, win_width, win_height);
 
-    /* One red sun gear at the origin drives five differently-coloured planets
-     * spread around it; each meshes with the sun and none overlap its neighbour. */
     add_sun_gear(20, 1.2f, red);
     add_planet_gear(10,   0.0f, 0.9f, green);
     add_planet_gear(14,  72.0f, 1.1f, blue);
@@ -887,34 +591,19 @@ static void init_gears(void)
     add_planet_gear(12, 216.0f, 1.0f, magenta);
     add_planet_gear(10, 288.0f, 0.9f, cyan);
 
-    if (n_gears != 6) {
+    if (n_gears != 6)
         printf("Failed to create gears (%d/6)\n", n_gears);
-    }
 
-#ifdef PGL_G3D
-    /* Compile the VS+FS to QPU and stage every gear's expanded mesh now that
-     * the geometry exists and (if pglGpuBegin succeeded) the GPU target is up.
-     * Any decline leaves g3d_active = 0 and the CPU path renders identically. */
-    g3d_init();
-#endif
+    hud_init();
 }
 
 static void reshape(int width, int height)
 {
     if (width <= 0 || height <= 0)
         return;
-        
     win_width = width;
     win_height = height;
-    
-    /* Resize the PortableGL framebuffer first */
-    ResizeFramebuffer(width, height);
-    backbuf = (pix_t*)GetBackBuffer();
-    
-    /* Update viewport */
     glViewport(0, 0, width, height);
-    
-    /* Update projection matrix with new aspect ratio */
     perspective(projection_matrix, 60.0f, (GLfloat)width / (GLfloat)height, 1.0f, 1024.0f);
 }
 
@@ -927,8 +616,6 @@ static void update_fps(void)
 {
     uint32_t low;
     kernel_tic32(NULL, NULL, &low);
-    
-    /* Update FPS statistics once per second */
     if (last_tic == 0 || (low - last_tic) >= 1000000) {
         last_tic = low;
         fps = count;
@@ -937,58 +624,40 @@ static void update_fps(void)
     count++;
 }
 
-static void on_repaint(xwin_t* xwin, graph_t* g)
+static void render_frame(void)
 {
-    (void)xwin;
-
-    // Calculate time-based animation for smooth rotation regardless of frame rate
+    EGLint w = 0, h = 0;
     uint32_t current_tic;
+    float dt;
+
+    eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
+    if (w > 0 && h > 0 && (w != win_width || h != win_height))
+        reshape(w, h);
+
     kernel_tic32(NULL, NULL, &current_tic);
-    
-    if (last_frame_tic == 0) {
+    if (last_frame_tic == 0)
         last_frame_tic = current_tic;
-    }
-    
-    // Calculate delta time in seconds (kernel_tic is in microseconds)
-    float dt = (current_tic - last_frame_tic) / 1000000.0f;
+    dt = (current_tic - last_frame_tic) / 1000000.0f;
     last_frame_tic = current_tic;
-    
-    // Limit dt to avoid large jumps
     if (dt > 0.1f) dt = 0.1f;
-    
-    // Rotate at 240 degrees per second for smooth animation (4x speed)
+
     angle += 240.0f * dt;
-    if (angle >= 360.0f)
-        angle -= 360.0f;
-    
-    // Update camera orbit angle (30 degrees per second, 2x speed)
+    if (angle >= 360.0f) angle -= 360.0f;
     camera_angle += 30.0f * dt;
-    if (camera_angle >= 360.0f)
-        camera_angle -= 360.0f;
+    if (camera_angle >= 360.0f) camera_angle -= 360.0f;
 
     draw_gears();
-
-    /* The GPU path adopts pgl_g3d_pixels() as the back buffer on its first
-     * draw (pglGpuBegin frees the CPU buffer init_glContext handed us), so
-     * re-read the live pointer every frame instead of only in reshape -
-     * otherwise the first frames blit a stale, freed buffer and the window
-     * stays blank until a resize. */
-    backbuf = (pix_t*)GetBackBuffer();
-
-    graph_t bg;
-    graph_init(&bg, backbuf, win_width, win_height);
-    graph_blt(&bg, 0, 0, win_width, win_height, g, 0, 0, win_width, win_height);
-    update_fps();
-
-    if (font != NULL) {
-        char txt[48];
-#ifdef PGL_G3D
-        snprintf(txt, sizeof(txt), "FPS:%d gpu:%d %dx%d", fps, g3d_active, win_width, win_height);
-#else
-        snprintf(txt, sizeof(txt), "FPS: %d", fps);
-#endif
-        graph_draw_text_font(g, 8, 8, txt, font, 16, 0xff00ff00);
+    {
+        /* Query GPU status while the scene program is still bound, then draw
+         * the FPS/GPU readout into the back buffer before presenting. */
+        char hud[64];
+        int gpu = glGpuActiveEWOK();
+        snprintf(hud, sizeof(hud), "FPS:%d %s", fps, gpu ? "GPU" : "CPU");
+        hud_draw(program, win_width, win_height, 8, 8, hud);
     }
+    eglSwapBuffers(egl_dpy, egl_surf);
+    update_fps();
 }
 
 static void on_event(xwin_t* xwin, xevent_t* ev)
@@ -1001,86 +670,76 @@ static void on_event(xwin_t* xwin, xevent_t* ev)
     }
 }
 
-static void on_resize(xwin_t* xwin)
-{
-    if(xwin == NULL || xwin->xinfo == NULL)
-        return;
-    reshape(xwin->xinfo->wsr.w, xwin->xinfo->wsr.h);
-}
-
-static bool _repaint = false;
-
 static void loop(void* p)
 {
-    xwin_t* xwin = (xwin_t*)p;
-    xwin_repaint(xwin);
+    (void)p;
+    render_frame();
     usleep(1000);
+}
+
+static int init_egl(xwin_t* xwin)
+{
+    EGLint major, minor, ncfg = 0;
+    EGLint cfg_attr[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 16,
+        EGL_NONE
+    };
+    EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLConfig cfg = NULL;
+
+    egl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (egl_dpy == EGL_NO_DISPLAY) return 0;
+    if (!eglInitialize(egl_dpy, &major, &minor)) return 0;
+    if (!eglChooseConfig(egl_dpy, cfg_attr, &cfg, 1, &ncfg) || ncfg < 1) return 0;
+
+    egl_ctx = eglCreateContext(egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (egl_ctx == EGL_NO_CONTEXT) return 0;
+
+    egl_surf = eglCreateWindowSurface(egl_dpy, cfg, (EGLNativeWindowType)xwin, NULL);
+    if (egl_surf == EGL_NO_SURFACE) return 0;
+
+    if (!eglMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx)) return 0;
+    return 1;
 }
 
 int main(int argc, char* argv[])
 {
+    x_t x;
+    xwin_t* xwin;
+
     (void)argc;
     (void)argv;
+    (void)view_rot;
 
-#ifdef PGL_G3D
-    /* Run the C++ static constructors the on-device mesa compiler needs before
-     * the first v3d_compile_glsl() (see gears_run_static_ctors). */
-    gears_run_static_ctors();
-#endif
-
-    x_t x;
     x_init(&x, NULL);
-    
     x.on_loop = loop;
-    xwin_t* xwin = xwin_open(&x, -1, 32, 32, win_width, win_height, "Gears", XWIN_STYLE_NORMAL);
+
+    xwin = xwin_open(&x, -1, 32, 32, win_width, win_height, "Gears", XWIN_STYLE_NORMAL);
     if (!xwin) {
         printf("Failed to open window\n");
         return 1;
     }
-    
-    xwin->on_repaint = on_repaint;
     xwin->on_event = on_event;
-    xwin->on_resize = on_resize;
 
-    pgl_set_max_vertices(PGL_TINY_MAX_VERTICES);
-
-    /* Initialize PortableGL context */
-    if (!init_glContext(&the_context, &backbuf, win_width, win_height)) {
-        printf("Failed to initialize glContext\n");
+    /* libEGL owns on_repaint/on_resize once the window surface is created. */
+    if (!init_egl(xwin)) {
+        printf("Failed to initialize EGL\n");
         return 1;
     }
 
-#ifdef PGL_G3D
-    /* Bring up the V3D GPU target and adopt pgl_g3d_pixels() as the back
-     * buffer, so the compiled-mesh draws and the CPU fallback share one surface
-     * and the present blit stays zero-copy.  On success refresh backbuf; on
-     * failure the CPU back buffer from init_glContext stands (g3d_init then
-     * declines and the CPU path renders). */
-    if (pglGpuBegin(win_width, win_height))
-        backbuf = (pix_t*)pglGetBackBuffer();
-#endif
-
-    /* Create and bind VAO (required in core profile) */
-    GLuint vao;
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
-
-    /* Initialize gears */
     init_gears();
 
-    /* Load system font for the on-screen FPS readout */
-    font = font_new(DEFAULT_SYSTEM_FONT, true);
-
-    /* Make window visible after all initialization is done */
     xwin_set_visible(xwin, true);
-    
     x_run(&x, xwin);
-    
-    /* Cleanup */
+
     xwin_destroy(xwin);
-    if (font != NULL)
-        font_free(font);
-    free_glContext(&the_context);
-    
+    eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroySurface(egl_dpy, egl_surf);
+    eglDestroyContext(egl_dpy, egl_ctx);
+    eglTerminate(egl_dpy);
+
     return 0;
 }

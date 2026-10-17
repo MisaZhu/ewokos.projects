@@ -8,21 +8,19 @@ CFLAGS += -I.. -I../external -I $(BUILD_DIR)/include/SDL2 -D__ewokos__
 CXXFLAGS += -I.. -I../external -I $(BUILD_DIR)/include/SDL2 -I../glcommon/include -I../glcommon/include/glcommon -D__ewokos__ -fno-threadsafe-statics
 
 # Common LDFLAGS
-LDFLAGS += -lSDL2_image -lSDL2_mixer -lSDL2_gfx -lSDL2_ttf -lSDL2 -lfreetype -lpng -lvorbis -logg -lz -lm -lopenlibm -lportablegl $(EWOK_LIB_X) $(EWOK_LIB_GRAPH) $(EWOK_LIBC) -lcxx
+LDFLAGS += -lSDL2_image -lSDL2_mixer -lSDL2_gfx -lSDL2_ttf -lSDL2 -lfreetype -lpng -lvorbis -logg -lz -lm -lopenlibm $(EWOK_LIB_X) $(EWOK_LIB_GRAPH) $(EWOK_LIBC) -lcxx
 
 # raspi5 (PGL_G3D=yes): shadertoy.cpp compiles its GLSL ES ports to VideoCore
-# VII QPU via pgl_g3d_program_compile, which pulls pgl_g3d_shader.o out of
-# libportablegl.a and with it libv3dcompiler.a (the on-device mesa compiler).
-# Group the compiler with libc/libm/cxx so its ~160 undefined refs resolve
-# regardless of archive order. No-op on targets without the 3D capability.
+# VII QPU via pgl_g3d_program_compile.  portablegl and the on-device mesa
+# compiler are merged into libGLESv2.a, so the app only needs -DPGL_G3D to see
+# the pgl_g3d_* decls; no app-side -lv3dcompiler group is required.
 ifeq ($(PGL_G3D),yes)
 CXXFLAGS += -DPGL_G3D
-LDFLAGS += --start-group -lv3dcompiler $(EWOK_LIBC) -lcxx -lopenlibm -lm --end-group
 endif
 
-# glcommon library
+# glcommon library + merged libGLESv2 (carries portablegl + the mesa compiler)
 GLCOMMON_LIB = $(BUILD_DIR)/lib/libglcommon.a \
-	$(BUILD_DIR)/lib/libportablegl.a
+	$(BUILD_DIR)/lib/libGLESv2.a
 LD_LIB_DEPS = \
 	$(GLCOMMON_LIB) \
 	$(BUILD_DIR)/lib/libSDL2.a \
@@ -63,12 +61,12 @@ dirs:
 # Compile C files
 $(ARCH)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I../glcommon/include -I../glcommon/include/glcommon -I../portablegl/include -I../portablegl/include/portablegl -c $< -o $@
+	$(CC) $(CFLAGS) -I../glcommon/include -I../glcommon/include/glcommon -I../gles/portablegl/include -I../gles/portablegl/include/portablegl -c $< -o $@
 
 # Compile C++ files (include glcommon for rsw_math and gltools)
 $(ARCH)/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -I../portablegl/include -I../portablegl/include/portablegl -I../glcommon/include -I../glcommon/include/glcommon -I $(BUILD_DIR)/include -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I../gles/portablegl/include -I../gles/portablegl/include/portablegl -I../glcommon/include -I../glcommon/include/glcommon -I $(BUILD_DIR)/include -c $< -o $@
 
 # Link C programs
 $(ROOTFS_BIN)/%: $(ARCH)/%.o $(LD_LIB_DEPS) \

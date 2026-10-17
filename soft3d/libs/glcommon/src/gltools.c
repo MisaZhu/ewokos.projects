@@ -352,11 +352,9 @@ void load_texture2D_from_mem(GLubyte* image, int w, int h, GLenum min_filter, GL
         glTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA, w, h, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, image);
     } else {
-        // TODO map image for regular OpenGL
-#ifdef USING_PORTABLEGL
-        pglTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA, w, h, 0,
-                      GL_RGBA, GL_UNSIGNED_BYTE, image);
-#endif
+        /* GLES2 has no buffer-mapping upload; always copy the client pixels. */
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA, w, h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, image);
     }
 
     if (min_filter == GL_LINEAR_MIPMAP_LINEAR ||
@@ -437,14 +435,11 @@ GLboolean load_texture_cubemap_from_mem(GLubyte* image, int w, int h, GLenum min
             }
         }
     } else {
-        // TODO map image for regular OpenGL
-#ifdef USING_PORTABLEGL
-        pglTexImage2D(GL_TEXTURE_CUBE_MAP, 0, GL_COMPRESSED_RGBA, w, h, 0,
-                      GL_RGBA, GL_UNSIGNED_BYTE, image);
-#else
-        fprintf(stderr, "Mapping cubemap data only supported with PortableGL\n");
-        return GL_FALSE;
-#endif
+        /* GLES2 has no buffer-mapping upload; copy each face explicitly. */
+        for (int i=0; i<6; i++) {
+            glTexImage2D(cube[i], 0, GL_COMPRESSED_RGBA, w, h, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, &image[i*plane]);
+        }
     }
 
     return GL_TRUE;
@@ -454,14 +449,6 @@ GLboolean load_texture_cubemap(const char* filename[], GLenum min_filter, GLenum
 {
     GLubyte* images[6] = {0};
     int w, h, n;
-
-#ifndef USING_PORTABLEGL
-    //assert(!mapdata);
-    if (mapdata) {
-        fprintf(stderr, "Mapping cubemap data only supported with PortableGL\n");
-        return GL_FALSE;
-    }
-#endif
 
     int prev_w, prev_h;
     for (int i=0; i<6; ++i) {

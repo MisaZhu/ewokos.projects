@@ -1,4 +1,4 @@
-PROJS_ROOT_DIR=../../..
+PROJS_ROOT_DIR=../../../..
 include $(PROJS_ROOT_DIR)/make.inc
 
 BUILD_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
@@ -106,7 +106,11 @@ COMPILER_C = $(S)/compiler/builtin_types.c $(S)/compiler/glsl_types.c \
 # NIR: every pass. nir_opt_algebraic.c (~49 MB generated) is deliberately not
 # vendored; its 6 entry points are no-op stubbed in v3dcompiler_stubs.c
 # (correctness is unaffected - algebraic rewriting is an optimisation only).
-NIR_C = $(wildcard $(S)/compiler/nir/*.c)
+# nir_stub.c is Microsoft's empty no-op nir_print_shader() - an ALTERNATIVE to
+# the real printer in nir_print.c. Both match the wildcard and both define
+# nir_print_shader strongly, so the stub is dropped and nir_print.c wins (it also
+# supplies nir_print_shader_annotated, which the stub lacks).
+NIR_C = $(filter-out $(S)/compiler/nir/nir_stub.c, $(wildcard $(S)/compiler/nir/*.c))
 
 # GLSL frontend (C++): exclude the standalone CLI driver (main.cpp/standalone.cpp
 # have main()) and the shader disk-cache / serialize pair (host-only). Keeps

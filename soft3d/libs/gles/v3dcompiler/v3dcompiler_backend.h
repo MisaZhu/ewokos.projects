@@ -132,6 +132,24 @@ void v3d_be_result_free(struct v3d_be_result *res);
  * needs the value to remap SSBO_OFFSET uniform slots after a compute compile. */
 uint32_t v3d_be_quniform_ssbo_offset(void);
 
+/* Select the device info the backend compiles against, by live V3D version
+ * (ver == major*10 + minor: 42 = V3D 4.2 / Pi4, 71 = V3D 7.1 / Pi5).  Any
+ * other value leaves the default (71) in place.  Must be called BEFORE the
+ * first v3d_be_compile_*() on a machine that ships one binary across chip
+ * generations (raspix); raspi5 never calls it and keeps the 71 default.  The
+ * selected devinfo pointer is retained for the process lifetime. */
+void v3d_be_set_version(int ver);
+
+/* Whether the currently-selected device can emit a saturating float unpack
+ * (V3D71_QPU_UNPACK_SAT), i.e. v3d_device_has_unpack_sat() for the devinfo
+ * chosen by the last v3d_be_set_version().  V3D 4.2 (Pi4, ver < 45) CANNOT, so
+ * the frontend sets nir_shader_compiler_options.lower_fsat accordingly and the
+ * focused nir_opt_algebraic() (v3dcompiler_algebraic.c) expands nir_op_fsat into
+ * fmin/fmax before it reaches ntq_emit_alu(), which asserts the capability.  V3D
+ * 7.1 (Pi5) reports true and keeps the single-instruction unpack_sat path, so
+ * raspi5's emitted QPU is unchanged. */
+bool v3d_be_has_unpack_sat(void);
+
 #ifdef __cplusplus
 }
 #endif

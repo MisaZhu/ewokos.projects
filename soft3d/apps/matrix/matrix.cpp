@@ -1,16 +1,24 @@
-#define SDL_MAIN_HANDLED
-#include <SDL2/SDL.h>
-
-#include "glcommon/gltools.h"
 #include "glcommon/gltext.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 #include <vector>
 
+#include <unistd.h>
+#include <ewoksys/proc.h>
+#include <ewoksys/keydef.h>
+#include <ewoksys/kernel_tic.h>
+#include <ewoksys/timer.h>
 #include <ewoksys/klog.h>
+#include <x/x.h>
+#include <x/xwin.h>
+#include <graph/graph.h>
+
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
 
 #define WIDTH 640
 #define HEIGHT 480
@@ -19,7 +27,9 @@
 #define MAX_WIDTH 3840
 #define MAX_HEIGHT 2160
 
-#define PIX_FORMAT SDL_PIXELFORMAT_ARGB8888
+/* The composited framebuffer is plain 0xAARRGGBB words; pix_t keeps the rest of
+ * the (unchanged) CPU drawing code readable. */
+typedef uint32_t pix_t;
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -448,58 +458,177 @@ struct Column {
     }
 };
 
-SDL_Window* window = nullptr;
-SDL_Renderer* ren = nullptr;
-SDL_Texture* tex = nullptr;
-glContext the_Context = {};
+static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
+static EGLSurface egl_surf = EGL_NO_SURFACE;
+static EGLContext egl_ctx = EGL_NO_CONTEXT;
+
+static GLuint program = 0, quad_vbo = 0, texture = 0;
+static GLint loc_tex = -1;
+
 pix_t* bbufpix = nullptr;
+static uint8_t* rgba_buf = nullptr;
 
 int width = 0, height = 0;
 int buf_width = 0, buf_height = 0;
 
 std::vector<Column> columns;
 
-void setup_context() {
-    if (SDL_Init(SDL_INIT_VIDEO)) {
-        klog("SDL_Init error: %s\n", SDL_GetError());
-        exit(0);
+static const char* quad_vs =
+    "attribute vec2 aPos;\n"
+    "attribute vec2 aUV;\n"
+    "varying vec2 vUV;\n"
+    "void main() {\n"
+    "    vUV = aUV;\n"
+    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+    "}\n";
+
+static const char* quad_fs =
+    "precision mediump float;\n"
+    "varying vec2 vUV;\n"
+    "uniform sampler2D uTex0;\n"
+    "void main() {\n"
+    "    gl_FragColor = texture2D(uTex0, vUV);\n"
+    "}\n";
+
+static GLuint compile_shader(GLenum type, const char* src)
+{
+    GLuint sh = glCreateShader(type);
+    GLint ok = 0;
+    if (sh == 0) return 0;
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+        klog("matrix: shader compile failed: %s\n", log);
+        glDeleteShader(sh);
+        return 0;
     }
+    return sh;
+}
 
-    window = SDL_CreateWindow("Matrix Rain", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN);
-    if (!window) exit(0);
+/* Fullscreen quad in clip space; texture row 0 maps to the top of the window,
+ * matching the top-down screen coordinates the rain and glyphs are drawn in. */
+static const GLfloat quad_verts[] = {
+    -1.0f,  1.0f, 0.0f, 0.0f,
+    -1.0f, -1.0f, 0.0f, 1.0f,
+     1.0f,  1.0f, 1.0f, 0.0f,
+    -1.0f, -1.0f, 0.0f, 1.0f,
+     1.0f, -1.0f, 1.0f, 1.0f,
+     1.0f,  1.0f, 1.0f, 0.0f,
+};
 
-    SDL_GetWindowSize(window, &width, &height);
-    if (width <= 0 || height <= 0) {
-        width = WIDTH;
-        height = HEIGHT;
+static void init_gl()
+{
+    GLuint vs, fs;
+    GLint ok = 0;
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+
+    vs = compile_shader(GL_VERTEX_SHADER, quad_vs);
+    fs = compile_shader(GL_FRAGMENT_SHADER, quad_fs);
+    program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glBindAttribLocation(program, 0, "aPos");
+    glBindAttribLocation(program, 1, "aUV");
+    glLinkProgram(program);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetProgramInfoLog(program, sizeof(log), NULL, log);
+        klog("matrix: program link failed: %s\n", log);
+        return;
     }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    glUseProgram(program);
 
-    ren = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    if (!ren) exit(0);
+    loc_tex = glGetUniformLocation(program, "uTex0");
 
-    tex = SDL_CreateTexture(ren, PIX_FORMAT, SDL_TEXTUREACCESS_STREAMING, width, height);
-    if (!tex) exit(0);
+    glGenBuffers(1, &quad_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_STATIC_DRAW);
 
-    pgl_set_max_vertices(PGL_SMALL_MAX_VERTICES);
-    if (!init_glContext(&the_Context, &bbufpix, width, height)) {
-        puts("Failed to initialize glContext");
-        exit(0);
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glUniform1i(loc_tex, 0);
+}
+
+/* (Re)allocate the CPU compositing buffers + texture storage for a new size and
+ * rebuild the rain columns to match. */
+static int ensure_buffer(int w, int h)
+{
+    if (w <= 0 || h <= 0) return 0;
+    if (bbufpix != NULL && w == buf_width && h == buf_height) return 1;
+
+    free(bbufpix);
+    free(rgba_buf);
+    bbufpix = (pix_t*)malloc((size_t)w * h * sizeof(pix_t));
+    rgba_buf = (uint8_t*)malloc((size_t)w * h * 4);
+    if (bbufpix == NULL || rgba_buf == NULL) {
+        free(bbufpix); free(rgba_buf);
+        bbufpix = NULL; rgba_buf = NULL;
+        return 0;
     }
+    width = w; height = h;
+    buf_width = w; buf_height = h;
 
-    buf_width = width;
-    buf_height = height;
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, NULL);
+    glViewport(0, 0, w, h);
+
+    int num_cols = w / FONT_SIZE;
+    if (num_cols <= 0) num_cols = 1;
+    if (num_cols > 10000) num_cols = 10000;
+    columns.resize(num_cols);
+    for (size_t k = 0; k < columns.size(); k++)
+        columns[k].reset();
+    return 1;
+}
+
+static int init_egl(xwin_t* xwin)
+{
+    EGLint major, minor, ncfg = 0;
+    EGLint cfg_attr[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 16,
+        EGL_NONE
+    };
+    EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLConfig cfg = NULL;
+
+    egl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (egl_dpy == EGL_NO_DISPLAY) return 0;
+    if (!eglInitialize(egl_dpy, &major, &minor)) return 0;
+    if (!eglChooseConfig(egl_dpy, cfg_attr, &cfg, 1, &ncfg) || ncfg < 1) return 0;
+
+    egl_ctx = eglCreateContext(egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (egl_ctx == EGL_NO_CONTEXT) return 0;
+
+    egl_surf = eglCreateWindowSurface(egl_dpy, cfg, (EGLNativeWindowType)xwin, NULL);
+    if (egl_surf == EGL_NO_SURFACE) return 0;
+
+    if (!eglMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx)) return 0;
+    return 1;
 }
 
 void cleanup() {
     if (font_buffer) free(font_buffer);
-    free_glContext(&the_Context);
-    if (tex) SDL_DestroyTexture(tex);
-    if (ren) SDL_DestroyRenderer(ren);
-    if (window) SDL_DestroyWindow(window);
-    SDL_Quit();
+    free(bbufpix);
+    free(rgba_buf);
+    bbufpix = NULL;
+    rgba_buf = NULL;
 }
-
-int handle_events();
 
 static int load_font_from_path(const char* path) {
     FILE* f = fopen(path, "rb");
@@ -571,162 +700,190 @@ int load_font() {
     return 0;
 }
 
-int main(int argc, char** argv) {
-    (void)argc; (void)argv;
-    srand((unsigned int)time(NULL));
+static uint32_t last_frame_ms = 0;
+static int frame_count = 0;
+static uint32_t fps_time = 0;
 
-    setup_context();
+static uint32_t now_ms(void) {
+    uint32_t low;
+    kernel_tic32(NULL, NULL, &low);
+    return low / 1000;   /* kernel tic is in microseconds */
+}
 
-    load_font();
-    init_glyph_cache();
+/* Composite one animation frame into bbufpix, upload it and present it as a
+ * fullscreen textured quad. */
+static void render_frame(void) {
+    EGLint w = 0, h = 0;
 
-    int num_columns = width / FONT_SIZE;
-    if (num_columns <= 0) num_columns = 1;
-    columns.resize(num_columns);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
+    if (w <= 0 || h <= 0) { w = WIDTH; h = HEIGHT; }
+    if (!ensure_buffer(w, h))
+        return;
 
-    for (size_t i = 0; i < columns.size(); i++) {
-        columns[i].y = (float)(rand() % (height + height)) - height;
+    unsigned int current_time = now_ms();
+    if (last_frame_ms == 0) last_frame_ms = current_time;
+    float dt = (current_time - last_frame_ms) / 1000.0f;
+    if (dt > 0.1f) dt = 0.1f;  // Clamp large frame gaps to avoid visible jumps after stalls
+    last_frame_ms = current_time;
+
+    frame_count++;
+    if (fps_time == 0) fps_time = current_time;
+    if (current_time - fps_time > 3000) {
+        klog("%d FPS (%dx%d)\n", frame_count * 1000 / (current_time - fps_time), width, height);
+        frame_count = 0;
+        fps_time = current_time;
     }
 
-    unsigned int last_time = SDL_GetTicks();
-    int frame_count = 0;
-    unsigned int fps_time = 0;
+    long total_pixels = (long)width * height;
+    for (long i = 0; i < total_pixels; ++i) {
+        bbufpix[i] = 0xFF000000;
+    }
 
-    while (1) {
-        unsigned int current_time = SDL_GetTicks();
-        float dt = (current_time - last_time) / 1000.0f;
-        if (dt > 0.1f) dt = 0.1f;  // Clamp large frame gaps to avoid visible jumps after stalls
-        last_time = current_time;
+    // Update once per rendered frame with the real frame time so the
+    // animation stays in step with what is actually displayed.
+    for (size_t ci = 0; ci < columns.size(); ci++) {
+        columns[ci].update(dt);
+    }
 
-        if (handle_events()) {
-            break;
-        }
-        frame_count++;
-        if (current_time - fps_time > 3000) {
-            klog("%d FPS (%dx%d)\n", frame_count * 1000 / (current_time - fps_time), width, height);
-            frame_count = 0;
-            fps_time = current_time;
-        }
-
-        long total_pixels = (long)width * height;
-        for (long i = 0; i < total_pixels; ++i) {
-            bbufpix[i] = 0xFF000000;
-        }
-
-        // Update once per rendered frame with the real frame time so the
-        // animation stays in step with what is actually displayed.
+    if (is_font_loaded) {
         for (size_t ci = 0; ci < columns.size(); ci++) {
-            columns[ci].update(dt);
-        }
 
-        if (is_font_loaded) {
-            for (size_t ci = 0; ci < columns.size(); ci++) {
+            Column& col = columns[ci];
+            int col_x = (int)(ci * FONT_SIZE);
+            if (col_x >= width) continue;
 
-                Column& col = columns[ci];
-                int col_x = (int)(ci * FONT_SIZE);
-                if (col_x >= width) continue;
+            for (int j = 0; j < col.length; j++) {
+                int char_y = (int)(col.y - j * FONT_SIZE);
+                if (char_y < -FONT_SIZE || char_y >= height + FONT_SIZE) continue;
 
-                for (int j = 0; j < col.length; j++) {
-                    int char_y = (int)(col.y - j * FONT_SIZE);
-                    if (char_y < -FONT_SIZE || char_y >= height + FONT_SIZE) continue;
+                char c = col.chars[j];
 
-                    char c = col.chars[j];
+                float brightness = 1.0f - (float)j / col.length;
+                uint32_t color;
+                if (j == 0) {
+                    color = 0xFFFFFFFF;
+                } else {
+                    unsigned char g_val = (unsigned char)(brightness * 255);
+                    unsigned char r_val = (unsigned char)(brightness * 50);
+                    color = 0xFF000000 | ((uint32_t)r_val << 16) | ((uint32_t)g_val << 8);
+                }
 
-                    float brightness = 1.0f - (float)j / col.length;
-                    uint32_t color;
-                    if (j == 0) {
-                        color = 0xFFFFFFFF;
-                    } else {
-                        unsigned char g_val = (unsigned char)(brightness * 255);
-                        unsigned char r_val = (unsigned char)(brightness * 50);
-                        color = 0xFF000000 | ((uint32_t)r_val << 16) | ((uint32_t)g_val << 8);
-                    }
+                GlyphCacheEntry* glyph = get_glyph_cache(c);
+                if (glyph->w <= 0 || glyph->h <= 0) {
+                    draw_fallback_block(col_x, char_y, FONT_SIZE, FONT_SIZE, color);
+                    continue;
+                }
 
-                    GlyphCacheEntry* glyph = get_glyph_cache(c);
-                    if (glyph->w <= 0 || glyph->h <= 0) {
-                        draw_fallback_block(col_x, char_y, FONT_SIZE, FONT_SIZE, color);
-                        continue;
-                    }
+                int baseline_y = char_y + (int)(font_ascent * font_scale) + glyph->y0;
 
-                    int baseline_y = char_y + (int)(font_ascent * font_scale) + glyph->y0;
+                for (int row = 0; row < glyph->h; row++) {
+                    int py = baseline_y + row;
+                    if (py < 0 || py >= height) continue;
 
-                    for (int row = 0; row < glyph->h; row++) {
-                        int py = baseline_y + row;
-                        if (py < 0 || py >= height) continue;
+                    for (int col_idx = 0; col_idx < glyph->w; col_idx++) {
+                        int px = col_x + glyph->x0 + col_idx;
+                        if (px < 0 || px >= width) continue;
 
-                        for (int col_idx = 0; col_idx < glyph->w; col_idx++) {
-                            int px = col_x + glyph->x0 + col_idx;
-                            if (px < 0 || px >= width) continue;
-
-                            unsigned char alpha = glyph->bitmap[row * glyph->w + col_idx];
-                            if (alpha > 0) {
-                                long idx = ((long)py * width) + px;
-                                bbufpix[idx] = color;
-                            }
+                        unsigned char alpha = glyph->bitmap[row * glyph->w + col_idx];
+                        if (alpha > 0) {
+                            long idx = ((long)py * width) + px;
+                            bbufpix[idx] = color;
                         }
                     }
                 }
             }
         }
-
-        render_time_overlay();
-
-        SDL_UpdateTexture(tex, NULL, bbufpix, width * sizeof(pix_t));
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-        SDL_RenderFillRect(ren, NULL);
-        SDL_RenderCopy(ren, tex, NULL, NULL);
-        SDL_RenderPresent(ren);
-        SDL_Delay(3);
     }
 
-    cleanup();
-    return 0;
+    render_time_overlay();
+
+    // Convert 0xAARRGGBB words to tightly-packed RGBA8 for the texture upload.
+    for (long i = 0; i < total_pixels; ++i) {
+        uint32_t px = bbufpix[i];
+        rgba_buf[i * 4 + 0] = (px >> 16) & 0xFF;   /* r */
+        rgba_buf[i * 4 + 1] = (px >> 8)  & 0xFF;   /* g */
+        rgba_buf[i * 4 + 2] = px & 0xFF;           /* b */
+        rgba_buf[i * 4 + 3] = (px >> 24) & 0xFF;   /* a */
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                    GL_RGBA, GL_UNSIGNED_BYTE, rgba_buf);
+
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), 0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+                          (void*)(2 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(0);
+
+    eglSwapBuffers(egl_dpy, egl_surf);
 }
 
-int handle_events() {
-    SDL_Event event;
+static void on_event(xwin_t* xwin, xevent_t* ev) {
+    if (ev->type == XEVT_IM && ev->state == XIM_STATE_PRESS && ev->value.im.value == KEY_ESC)
+        xwin_close(xwin);
+}
 
-    while (SDL_PollEvent(&event)) {
-        switch (event.type) {
-        case SDL_KEYDOWN:
-            if (event.key.keysym.sym == SDLK_ESCAPE) {
-                return 1;
-            }
-            break;
+static void loop(void* p) {
+    (void)p;
+    render_frame();
+    usleep(3000);
+}
 
-        case SDL_MOUSEBUTTONDOWN:
-            return 1;
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
+    srand((unsigned int)time(NULL));
 
-        case SDL_WINDOWEVENT:
-            if (event.window.event == SDL_WINDOWEVENT_CLOSE) {
-                return 1;
-            }
-            if (event.window.event == SDL_WINDOWEVENT_RESIZED) {
-                width = event.window.data1;
-                height = event.window.data2;
+    x_t x;
+    x_init(&x, NULL);
+    x.on_loop = loop;
 
-                ResizeFramebuffer(width, height);
-                bbufpix = (pix_t*)GetBackBuffer();
-                glViewport(0, 0, width, height);
-                SDL_DestroyTexture(tex);
-                tex = SDL_CreateTexture(ren, PIX_FORMAT, SDL_TEXTUREACCESS_STREAMING, width, height);
-            
-                int num_cols = width / FONT_SIZE;
-                if (num_cols <= 0) num_cols = 1;
-                if (num_cols > 10000) {
-                    break;
-                }
-                columns.resize(num_cols);
-                for (size_t k = 0; k < columns.size(); k++) {
-                    columns[k].reset();
-                }
-            }
-            break;
+    xwin_t* xwin = xwin_open(&x, -1, 32, 32, WIDTH, HEIGHT, "Matrix Rain", XWIN_STYLE_NORMAL);
+    if (!xwin) {
+        printf("Failed to open window\n");
+        return 1;
+    }
+    xwin->on_event = on_event;
 
-        case SDL_QUIT:
-            return 1;
-        }
+    /* libEGL owns on_repaint/on_resize once the window surface is created. */
+    if (!init_egl(xwin)) {
+        printf("Failed to initialize EGL\n");
+        return 1;
     }
 
+    init_gl();
+    load_font();
+    init_glyph_cache();
+
+    /* Seed the rain once the real surface size is known. */
+    {
+        EGLint w = WIDTH, h = HEIGHT;
+        eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
+        eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
+        if (w <= 0 || h <= 0) { w = WIDTH; h = HEIGHT; }
+        ensure_buffer(w, h);
+        for (size_t i = 0; i < columns.size(); i++)
+            columns[i].y = (float)(rand() % (height + height)) - height;
+    }
+
+    xwin_set_visible(xwin, true);
+    x_run(&x, xwin);
+
+    xwin_destroy(xwin);
+    eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroySurface(egl_dpy, egl_surf);
+    eglDestroyContext(egl_dpy, egl_ctx);
+    eglTerminate(egl_dpy);
+
+    cleanup();
     return 0;
 }

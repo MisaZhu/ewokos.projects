@@ -30,8 +30,23 @@
  *   frem(a,b)        -> fsub(a, fmul(b, ftrunc(fdiv(a,b))))
  *   ffract(a)        -> fsub(a, ffloor(a))
  *   flrp(a,b,c)      -> fadd(a, fmul(c, fsub(b,a)))
+ *   fsat(a)          -> fmin(fmax(a,0),1)          [ONLY when lower_fsat]
+ *   fsat_signed(a)   -> fmin(fmax(a,-1),1)         [ONLY when lower_fsat]
  *   unpack_32_2x16_split_x(a) -> u2u16(a)           [truncate low 16]
  *   unpack_32_2x16_split_y(a) -> u2u16(ushr(a,16))  [extract high 16]
+ *
+ * fsat lowering (V3D 4.2 / Pi4): the GLSL frontend's opt_algebraic folds a
+ * clamp(x,0,1) into ir_unop_saturate, which glsl_to_nir turns into nir_op_fsat.
+ * ntq_emit_alu() implements fsat with the saturating float unpack
+ * (V3D71_QPU_UNPACK_SAT) and ASSERTS v3d_device_has_unpack_sat(), which is
+ * false before V3D 4.5 - so on ver 42 an fsat that survives to the backend
+ * aborts the compile.  Upstream mesa expands fsat back to fmin/fmax in the
+ * generated generic nir_opt_algebraic under options->lower_fsat; this focused
+ * pass is that generated pass's stand-in, so it performs the same expansion,
+ * gated on the SAME lower_fsat option the frontend sets from the live device
+ * (!v3d_be_has_unpack_sat()).  When lower_fsat is unset (V3D 7.1 / Pi5) fsat is
+ * left intact so the backend keeps the single-instruction unpack_sat and
+ * raspi5's emitted QPU is byte-for-byte unchanged.
  *
  * Every target opcode (fmul, fadd, fsub, frcp, frsq, fexp2, flog2, ffloor,
  * ftrunc, fabs) IS handled by ntq_emit_alu(), so a fixpoint of this pass leaves
@@ -74,6 +89,15 @@ lower_v3d_alu(nir_builder *b, nir_alu_instr *instr, UNUSED void *cb_data)
    case nir_op_flrp:
    case nir_op_unpack_32_2x16_split_x:
    case nir_op_unpack_32_2x16_split_y:
+      break;
+   case nir_op_fsat:
+   case nir_op_fsat_signed:
+      /* Expand ONLY when the target cannot emit the saturating unpack (V3D 4.2);
+       * otherwise leave fsat for the backend's unpack_sat so V3D 7.1 output is
+       * unchanged.  options->lower_fsat is set by the frontend from
+       * !v3d_be_has_unpack_sat() for the live-selected device version. */
+      if (!b->shader->options || !b->shader->options->lower_fsat)
+         return false;
       break;
    default:
       return false;
@@ -125,6 +149,22 @@ lower_v3d_alu(nir_builder *b, nir_alu_instr *instr, UNUSED void *cb_data)
       nir_def *bm = nir_ssa_for_alu_src(b, instr, 1);
       nir_def *t  = nir_ssa_for_alu_src(b, instr, 2);
       lowered = nir_fadd(b, a, nir_fmul(b, t, nir_fsub(b, bm, a)));
+      break;
+   }
+   case nir_op_fsat: {
+      /* clamp(a, 0, 1) with bit-size-matched immediates (fsat may be f16/f32). */
+      unsigned bs = instr->def.bit_size;
+      lowered = nir_fmin(b,
+                         nir_fmax(b, a, nir_imm_floatN_t(b, 0.0, bs)),
+                         nir_imm_floatN_t(b, 1.0, bs));
+      break;
+   }
+   case nir_op_fsat_signed: {
+      /* clamp(a, -1, 1). */
+      unsigned bs = instr->def.bit_size;
+      lowered = nir_fmin(b,
+                         nir_fmax(b, a, nir_imm_floatN_t(b, -1.0, bs)),
+                         nir_imm_floatN_t(b, 1.0, bs));
       break;
    }
    case nir_op_unpack_32_2x16_split_x:

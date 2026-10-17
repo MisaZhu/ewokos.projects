@@ -1,21 +1,16 @@
 /*
- * Utah Teapot demo for EwokOS (soft3d / PortableGL)
+ * Utah Teapot demo for EwokOS (soft3d / EGL + GLES2)
  *
  * The classic Newell Utah teapot, defined as 32 bicubic Bezier patches over
  * 306 control points, tessellated at run time into a smooth triangle mesh with
  * analytic per-vertex normals.  The teapot spins about its own axis while the
  * camera orbits it, so the view angle changes continuously.
  *
- * Lighting is a per-vertex Blinn-Phong model (ambient + diffuse + specular)
- * evaluated in eye space against a world-fixed light.  Because the lit colour
- * is written to vs_output[0] as a vec4 RGBA and the program is paired with the
- * built-in pgl_ff_gouraud fragment shader, this app opts into the raspi5
- * VideoCore (V3D) GPU fast path: on a PGL_G3D build the rasterization +
- * interpolation + depth/cull stage runs on the GPU.  On every other platform
- * (and as the GPU fallback) it runs unchanged on the CPU rasterizer.
- *
- * An on-screen FPS readout, refreshed once per second, is drawn with the font
- * library after the framebuffer is blitted to the window.
+ * Lighting is a per-vertex two-sided Blinn-Phong model (ambient + diffuse +
+ * specular) evaluated in eye space against a world-fixed light, expressed as a
+ * GLSL ES 1.00 vertex shader run by libGLESv2's CPU GLSL interpreter, paired
+ * with a passthrough fragment shader.  The window surface, present blit and
+ * resize are all owned by libEGL; the app only drives frames from its run loop.
  *
  * Teapot control-point / patch data is the canonical public-domain Utah teapot
  * dataset (the same numbers used by glutSolidTeapot).
@@ -34,18 +29,11 @@
 #include <x/x.h>
 #include <x/xwin.h>
 #include <graph/graph.h>
-#include <font/font.h>
 
-#include "glcommon/gltools.h"
-
-#define sinf pgl_fast_sin
-#define cosf pgl_fast_cos
-#define sqrtf pgl_fast_sqrt
-#define tanf pgl_fast_tan
-#define acosf pgl_fast_acos
-#define asinf pgl_fast_asin
-#define atanf pgl_fast_atan
-#define atanf2 pgl_fast_atan2
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+#include <glcommon/hud.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -54,9 +42,9 @@
 static int win_width = 640;
 static int win_height = 480;
 
-static glContext the_context;
-static pix_t* backbuf = NULL;
-static font_t* font = NULL;
+static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
+static EGLSurface egl_surf = EGL_NO_SURFACE;
+static EGLContext egl_ctx = EGL_NO_CONTEXT;
 
 /* ------------------------------------------------------------------ *
  * Utah teapot geometry: 306 control points and 32 bicubic patches.
@@ -181,11 +169,13 @@ static const int patches[32][16] = {
 #define TEAPOT_GRID 10          /* tessellation per patch; 10x10 quads each */
 
 struct teapot_mesh {
-    GLfloat* vertices;          /* 6 floats per vertex: x,y,z, nx,ny,nz */
+    GLfloat* vertices;          /* CPU: 6 floats/vertex x,y,z, nx,ny,nz (lit per frame) */
+    GLfloat* colors;            /* CPU: 4 floats/vertex rgba, recomputed each frame     */
     int nvertices;
     int patch_first[NPATCH];    /* start vertex of each patch (GL_TRIANGLES) */
     int patch_count[NPATCH];    /* vertex count of each patch */
-    GLuint vbo;
+    GLuint pos_vbo;             /* GPU: vec4 position (x,y,z,1), static            */
+    GLuint color_vbo;           /* GPU: vec4 colour, re-uploaded each frame         */
 };
 static struct teapot_mesh teapot;
 
@@ -194,47 +184,34 @@ static GLfloat camera_angle = 0.0f; /* camera orbit about the teapot */
 static GLfloat camera_elev = 15.0f; /* camera elevation (degrees) */
 static GLfloat projection_matrix[16];
 
-typedef struct {
-    mat4 mvp_mat;
-    mat4 modelview_mat;
-    mat4 normal_mat;
-    vec3 material_color;
-    vec3 light_pos_eye;
-} My_Uniforms;
+static GLuint program = 0;
+static GLint loc_mvp = -1;
+static GLint attr_pos = 0, attr_color = 1;
 
-static My_Uniforms uniforms;
-static GLuint program;
+/* GLSL ES 1.00 shaders.  The per-vertex two-sided Blinn-Phong lighting is
+ * computed on the CPU (compute_colors) and uploaded as a vec4 colour attribute,
+ * so the vertex shader is a pure passthrough:
+ *      vColor = aColor;  gl_Position = uMVP * aPosition;
+ * libGLESv2 recognises this exact shape and runs it on a native gouraud
+ * fast-path (compiled C) instead of the tree-walking GLSL interpreter, which is
+ * what makes the 19200-vertex teapot fast again.  Both attributes are vec4 and
+ * uMVP is uploaded column-major (transpose = GL_FALSE). */
+static const char *teapot_vs =
+    "attribute vec4 aPosition;\n"
+    "attribute vec4 aColor;\n"
+    "uniform mat4 uMVP;\n"
+    "varying vec4 vColor;\n"
+    "void main() {\n"
+    "    vColor = aColor;\n"
+    "    gl_Position = uMVP * aPosition;\n"
+    "}\n";
 
-#ifdef PGL_G3D
-#include <portablegl/pgl_g3d.h>
-#include "teapot_glsl.h"
-
-/* WS5 full-GPU path: the teapot's vertex stage (MVP transform + Blinn-Phong
- * lighting) is compiled to VideoCore VII QPU and runs on the V3D GPU, with the
- * gouraud-passthrough FS shading the fragments - so the VERTEX stage is
- * hardware-accelerated too, not just rasterization.  g3d_active latches on only
- * after the program compiles, every VS uniform resolves by name, and the static
- * mesh uploads; any decline leaves it 0 and the CPU vertex_shader +
- * pgl_ff_gouraud path below renders the identical design. */
-static int          g3d_active = 0;
-static pgl_g3d_prog g3d_prog   = PGL_G3D_PROG_INVALID;
-static pgl_g3d_mesh g3d_mesh   = PGL_G3D_MESH_INVALID;
-
-/* VS uniform dword offsets within the per-draw blob, resolved by name at init
- * (never assumed: mesa dead-strips/renumbers per program).  -1 = unresolved.
- * When the geometry-rasterizer compute stage is attached, these resolve to the
- * KERNEL's bindings (pgl_g3d_shader_uniform_dword is compute-first), where
- * uMaterial/uLightEye are vec4 (the kernel's .w selects its lighting model);
- * the mat/v3 widths actually resolved are kept so the pack step writes the
- * matching number of dwords. */
-static int g3d_off_mvp = -1, g3d_off_mv = -1, g3d_off_nm = -1;
-static int g3d_off_mat = -1, g3d_off_light = -1, g3d_off_shade = -1;
-static uint32_t g3d_comps_mat = 3, g3d_comps_light = 3;
-
-/* The per-draw uniform blob staged for the daemon's QUNIFORM interpreter. */
-static uint32_t g3d_unif[PGL_G3D_MAX_UNIF];
-static uint32_t g3d_unif_count = 0;
-#endif /* PGL_G3D */
+static const char *teapot_fs =
+    "precision mediump float;\n"
+    "varying vec4 vColor;\n"
+    "void main() {\n"
+    "    gl_FragColor = vColor;\n"
+    "}\n";
 
 /* ------------------------------------------------------------------ *
  * Minimal matrix helpers (row-vector convention, as in gears.c).
@@ -493,165 +470,144 @@ static void build_teapot(void)
 
     teapot.nvertices = (int)(v - teapot.vertices) / 6;
 
-    glGenBuffers(1, &teapot.vbo);
-    if (teapot.vbo == 0) {
-        slog("build_teapot: glGenBuffers failed\n");
+    /* CPU colour buffer, recomputed every frame by compute_colors(). */
+    teapot.colors = (GLfloat*)malloc((size_t)teapot.nvertices * 4 * sizeof(GLfloat));
+    if (teapot.colors == NULL) {
+        slog("build_teapot: out of memory (colours)\n");
         return;
     }
-    glBindBuffer(GL_ARRAY_BUFFER, teapot.vbo);
-    glBufferData(GL_ARRAY_BUFFER, teapot.nvertices * 6 * sizeof(GLfloat),
-                 teapot.vertices, GL_STATIC_DRAW);
-}
 
-/* ------------------------------------------------------------------ *
- * Vertex shader: per-vertex Blinn-Phong lighting in eye space, written
- * as a vec4 RGBA and paired with the built-in pgl_ff_gouraud fragment
- * shader so the raspi5 V3D back end can offload the per-pixel stage.
- * ------------------------------------------------------------------ */
-static float fpow(float b, int e)
-{
-    float r = 1.0f;
-    while (e > 0) {
-        if (e & 1) r *= b;
-        b *= b;
-        e >>= 1;
+    /* Static vec4 position VBO (x,y,z,1) built from the interleaved pos+normal. */
+    {
+        GLfloat *pos4 = (GLfloat*)malloc((size_t)teapot.nvertices * 4 * sizeof(GLfloat));
+        int i;
+        if (pos4 == NULL) {
+            slog("build_teapot: out of memory (positions)\n");
+            return;
+        }
+        for (i = 0; i < teapot.nvertices; ++i) {
+            pos4[i*4+0] = teapot.vertices[i*6+0];
+            pos4[i*4+1] = teapot.vertices[i*6+1];
+            pos4[i*4+2] = teapot.vertices[i*6+2];
+            pos4[i*4+3] = 1.0f;
+        }
+        glGenBuffers(1, &teapot.pos_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, teapot.pos_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)teapot.nvertices * 4 * sizeof(GLfloat),
+                     pos4, GL_STATIC_DRAW);
+        free(pos4);
     }
-    return r;
+
+    /* Dynamic vec4 colour VBO; storage allocated here, filled each frame. */
+    glGenBuffers(1, &teapot.color_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, teapot.color_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)teapot.nvertices * 4 * sizeof(GLfloat),
+                 NULL, GL_STREAM_DRAW);
+
+    if (teapot.pos_vbo == 0 || teapot.color_vbo == 0)
+        slog("build_teapot: glGenBuffers failed\n");
 }
 
-static float clampf01(float x)
+/* Transform a point (w=1) by a column-major mat4, mirroring mult_m4_v4. */
+static void xform_point(const GLfloat *m, GLfloat x, GLfloat y, GLfloat z, GLfloat out[3])
 {
-    if (x < 0.0f) return 0.0f;
-    if (x > 1.0f) return 1.0f;
-    return x;
+    out[0] = m[0]*x + m[4]*y + m[8]*z  + m[12];
+    out[1] = m[1]*x + m[5]*y + m[9]*z  + m[13];
+    out[2] = m[2]*x + m[6]*y + m[10]*z + m[14];
 }
 
-void vertex_shader(float* vs_output, vec4* v_attrs, Shader_Builtins* builtins, void* uniforms_p)
+/* Exponent-48 power by repeated squaring (48 == 32 + 16), matching the former
+ * vertex shader's fpow and avoiding libm powf on the embedded target. */
+static float fpow48(float x)
 {
-    vec4* vs_out = (vec4*)vs_output;
-    My_Uniforms* u = (My_Uniforms*)uniforms_p;
+    float x2 = x * x, x4 = x2 * x2, x8 = x4 * x4, x16 = x8 * x8, x32 = x16 * x16;
+    return x32 * x16;
+}
 
-    /* Eye-space position and normal. */
-    vec4 Pe = mult_m4_v4(u->modelview_mat, v_attrs[0]);
-    vec3 P = make_v3(Pe.x, Pe.y, Pe.z);
+static void norm3(const float *v, float *o)
+{
+    float len = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    if (len < 1e-8f) { o[0] = 0.0f; o[1] = 0.0f; o[2] = 0.0f; return; }
+    o[0] = v[0]/len; o[1] = v[1]/len; o[2] = v[2]/len;
+}
 
-    vec4 Ne = mult_m4_v4(u->normal_mat, v_attrs[1]);
-    vec3 N = norm_v3(make_v3(Ne.x, Ne.y, Ne.z));
+/* Per-vertex two-sided Blinn-Phong in eye space against a positional light,
+ * reproducing the former GLSL vertex shader exactly (uShade = ambient 0.22,
+ * diffuse 0.78, specular 1.0; material 0.85/0.32/0.20).  The result is written
+ * to teapot.colors as vec4 RGBA and uploaded as a colour attribute, so the
+ * vertex shader becomes a trivial passthrough that libGLESv2 runs natively. */
+static void compute_colors(const GLfloat *model_view, const GLfloat *normal_matrix,
+                           const GLfloat *light_eye)
+{
+    const float mat[3] = { 0.85f, 0.32f, 0.20f };
+    const float amb = 0.22f, dif = 0.78f, spc = 1.0f;
+    int i;
+    if (teapot.vertices == NULL || teapot.colors == NULL) return;
+    for (i = 0; i < teapot.nvertices; ++i) {
+        const GLfloat *v = teapot.vertices + (size_t)i * 6;
+        GLfloat ep[3], ne[3], V[3], Ld[3], L[3], H[3], neg[3];
+        float diff, ndoth, ndotv, spec;
+        int c;
 
-    /* View direction (eye at the origin of eye space). */
-    vec3 V = norm_v3(scale_v3(P, -1.0f));
+        xform_point(model_view, v[0], v[1], v[2], ep);          /* eye position */
+        ne[0] = normal_matrix[0]*v[3] + normal_matrix[4]*v[4] + normal_matrix[8]*v[5];
+        ne[1] = normal_matrix[1]*v[3] + normal_matrix[5]*v[4] + normal_matrix[9]*v[5];
+        ne[2] = normal_matrix[2]*v[3] + normal_matrix[6]*v[4] + normal_matrix[10]*v[5];
+        norm3(ne, ne);                                          /* eye normal */
 
-    /* Two-sided lighting: flip the normal if it faces away from the viewer so
-     * the interior/back faces of the tessellated patches still shade correctly
-     * regardless of triangle winding (we render with culling disabled). */
-    if (dot_v3s(N, V) < 0.0f)
-        N = scale_v3(N, -1.0f);
+        neg[0] = -ep[0]; neg[1] = -ep[1]; neg[2] = -ep[2];      /* eye at origin */
+        norm3(neg, V);
 
-    /* Light direction from the vertex to the (eye-space) light position. */
-    vec3 L = norm_v3(sub_v3s(u->light_pos_eye, P));
+        ndotv = ne[0]*V[0] + ne[1]*V[1] + ne[2]*V[2];           /* two-sided flip */
+        if (ndotv < 0.0f) { ne[0] = -ne[0]; ne[1] = -ne[1]; ne[2] = -ne[2]; }
 
-    float diff = dot_v3s(N, L);
-    if (diff < 0.0f) diff = 0.0f;
+        Ld[0] = light_eye[0] - ep[0];                           /* positional light */
+        Ld[1] = light_eye[1] - ep[1];
+        Ld[2] = light_eye[2] - ep[2];
+        norm3(Ld, L);
 
-    vec3 H = norm_v3(add_v3s(L, V));
-    float spec = dot_v3s(N, H);
-    if (spec < 0.0f) spec = 0.0f;
-    spec = fpow(spec, 48);
+        diff = ne[0]*L[0] + ne[1]*L[1] + ne[2]*L[2];
+        if (diff < 0.0f) diff = 0.0f;
 
-    const float ambient = 0.22f;
-    float shade = ambient + 0.78f * diff;
+        H[0] = L[0] + V[0]; H[1] = L[1] + V[1]; H[2] = L[2] + V[2];
+        norm3(H, H);
+        ndoth = ne[0]*H[0] + ne[1]*H[1] + ne[2]*H[2];
+        if (ndoth < 0.0f) ndoth = 0.0f;
+        spec = fpow48(ndoth);
 
-    vec3 base = u->material_color;
-    float r = clampf01(base.x * shade + spec);
-    float g = clampf01(base.y * shade + spec);
-    float b = clampf01(base.z * shade + spec);
-    vs_out[0] = make_v4(r, g, b, 1.0f);
+        for (c = 0; c < 3; ++c) {
+            float col = mat[c] * (amb + dif * diff) + spc * spec;
+            if (col < 0.0f) col = 0.0f;
+            if (col > 1.0f) col = 1.0f;
+            teapot.colors[(size_t)i * 4 + c] = col;
+        }
+        teapot.colors[(size_t)i * 4 + 3] = 1.0f;
+    }
+}
 
-    builtins->gl_Position = mult_m4_v4(u->mvp_mat, v_attrs[0]);
+static GLuint compile_shader(GLenum type, const char *src)
+{
+    GLuint sh = glCreateShader(type);
+    GLint ok = 0;
+    if (sh == 0) return 0;
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+        klog("teapot: shader compile failed: %s\n", log);
+        glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
 }
 
 #ifdef PGL_G3D
-/* ------------------------------------------------------------------ *
- * WS5 full-GPU path: pack the per-draw uniform blob and issue the 32
- * per-patch compiled-mesh draws.  The matrices are uploaded in
- * portablegl's column-major flat order (teapot_glsl.h documents why
- * this is bit-identical to the C mult_m4_v4 path).
- * ------------------------------------------------------------------ */
-static void g3d_set_f(int off, float v)
-{
-    uint32_t bits;
-    if (off < 0 || (uint32_t)off >= PGL_G3D_MAX_UNIF)
-        return;
-    memcpy(&bits, &v, sizeof(bits));
-    g3d_unif[off] = bits;
-    if ((uint32_t)off + 1u > g3d_unif_count)
-        g3d_unif_count = (uint32_t)off + 1u;
-}
-
-static void g3d_set_mat4(int off, const GLfloat* m)
-{
-    int i;
-    for (i = 0; i < 16; i++)
-        g3d_set_f(off + i, m[i]);
-}
-
-static void g3d_set_v3(int off, vec3 v)
-{
-    g3d_set_f(off + 0, v.x);
-    g3d_set_f(off + 1, v.y);
-    g3d_set_f(off + 2, v.z);
-}
-
-/* Compile the teapot VS+FS to QPU, resolve the VS uniforms by name, and stage
- * the static pos+normal mesh.  On any decline g3d_active stays 0 and the CPU
- * path renders.  Called once after build_teapot() (and after pglGpuBegin()). */
-static void g3d_init(void)
-{
-    char errlog[512];
-    uint32_t comps;
-
-    g3d_active = 0;
-    errlog[0] = '\0';
-
-    g3d_prog = pgl_g3d_program_compile(teapot_vs_glsl, teapot_fs_glsl,
-                                       errlog, sizeof(errlog));
-    if (!pgl_g3d_program_valid(g3d_prog)) {
-        slog("teapot: GPU shader compile failed: %s\n", errlog);
-        return;
-    }
-
-    /* Resolve every VS uniform by name; a mat4 reports 16 components, a vec3
-     * reports 3, a vec4 (geom kernel's widened material/light slots) reports 4.
-     * A missing/mis-sized uniform means the blob cannot feed the QPU, so
-     * decline to the CPU path rather than draw with garbage.  uShade exists
-     * only on the geom kernel (ambient/diffuse/specular weights); its absence
-     * just means the binner route, so it never declines. */
-    g3d_off_mvp = pgl_g3d_shader_uniform_dword(g3d_prog, "uMVP", &comps);
-    if (g3d_off_mvp < 0 || comps != 16) { slog("teapot: uMVP unresolved\n"); return; }
-    g3d_off_mv = pgl_g3d_shader_uniform_dword(g3d_prog, "uModelView", &comps);
-    if (g3d_off_mv < 0 || comps != 16) { slog("teapot: uModelView unresolved\n"); return; }
-    g3d_off_nm = pgl_g3d_shader_uniform_dword(g3d_prog, "uNormalMat", &comps);
-    if (g3d_off_nm < 0 || comps != 16) { slog("teapot: uNormalMat unresolved\n"); return; }
-    g3d_off_mat = pgl_g3d_shader_uniform_dword(g3d_prog, "uMaterial", &g3d_comps_mat);
-    if (g3d_off_mat < 0 || (g3d_comps_mat != 3 && g3d_comps_mat != 4)) { slog("teapot: uMaterial unresolved\n"); return; }
-    g3d_off_light = pgl_g3d_shader_uniform_dword(g3d_prog, "uLightEye", &g3d_comps_light);
-    if (g3d_off_light < 0 || (g3d_comps_light != 3 && g3d_comps_light != 4)) { slog("teapot: uLightEye unresolved\n"); return; }
-    g3d_off_shade = pgl_g3d_shader_uniform_dword(g3d_prog, "uShade", &comps);
-
-    if (teapot.vertices == NULL || teapot.nvertices <= 0)
-        return;
-
-    /* Stage the static interleaved pos+normal mesh once (stride 6 floats). */
-    g3d_mesh = pgl_g3d_upload_mesh(teapot.vertices, (uint32_t)teapot.nvertices, 6u);
-    if (g3d_mesh == PGL_G3D_MESH_INVALID) {
-        slog("teapot: GPU mesh upload declined\n");
-        return;
-    }
-
-    g3d_active = 1;
-    slog("teapot: GPU compiled-mesh path active (prog=%d mesh=%d)\n",
-         g3d_prog, g3d_mesh);
-}
+/* The teapot's passthrough vertex shader carries no lighting uniforms, so the
+ * engine's V3D geometry kernel declines it (see gles_engine_gpu_link) and it
+ * renders on the native CPU gouraud fast-path - correct and fast on every
+ * target, with no GPU dependency. */
 #endif /* PGL_G3D */
 
 static void draw_teapot(void)
@@ -688,136 +644,84 @@ static void draw_teapot(void)
     invert(normal_matrix);
     transpose(normal_matrix);
 
-    memcpy(&uniforms.mvp_mat, mvp, sizeof(mat4));
-    memcpy(&uniforms.modelview_mat, model_view, sizeof(mat4));
-    memcpy(&uniforms.normal_mat, normal_matrix, sizeof(mat4));
-    uniforms.material_color.x = 0.85f;
-    uniforms.material_color.y = 0.32f;
-    uniforms.material_color.z = 0.20f;
-
     /* World-fixed light transformed into eye space so highlights sweep across
      * the surface as the teapot spins and the camera orbits. */
-    vec4 lw = make_v4(6.0f, 8.0f, 10.0f, 1.0f);
-    vec4 le = mult_m4_v4(view, lw);
-    uniforms.light_pos_eye = make_v3(le.x, le.y, le.z);
+    GLfloat le[3];
+    xform_point(view, 6.0f, 8.0f, 10.0f, le);
 
-#ifdef PGL_G3D
-    /* Full-GPU path: pack the matrices by name and issue the whole mesh as ONE
-     * compiled-mesh draw (VS runs the transform + lighting on the QPU).
-     * glClear above already drove pgl_g3d_begin_frame, so this frame's first
-     * dispatch clears the persistent colour+Z and the rest LOAD/accumulate.
-     * GL_LESS depth + Z-write, cull disabled (two-sided lighting). */
-    if (g3d_active) {
-        int ok = 1;
-
-        g3d_unif_count = 0;
-        g3d_set_mat4(g3d_off_mvp, uniforms.mvp_mat);
-        g3d_set_mat4(g3d_off_mv,  uniforms.modelview_mat);
-        g3d_set_mat4(g3d_off_nm,  uniforms.normal_mat);
-        g3d_set_v3(g3d_off_mat,   uniforms.material_color);
-        if (g3d_comps_mat == 4)
-            g3d_set_f(g3d_off_mat + 3, 0.0f);   /* geom kernel reads .rgb only */
-        g3d_set_v3(g3d_off_light, uniforms.light_pos_eye);
-        if (g3d_comps_light == 4)
-            g3d_set_f(g3d_off_light + 3, 1.0f); /* .w>0: positional-light model */
-        if (g3d_off_shade >= 0) {
-            /* geom kernel gouraud weights, mirroring the VS exactly:
-             * shade = 0.22 + 0.78*diff, specular weight 1. */
-            g3d_set_f(g3d_off_shade + 0, 0.22f);
-            g3d_set_f(g3d_off_shade + 1, 0.78f);
-            g3d_set_f(g3d_off_shade + 2, 1.0f);
-            g3d_set_f(g3d_off_shade + 3, 0.0f);
-        }
-        pgl_g3d_set_uniforms(g3d_unif, g3d_unif_count);
-
-        /* Whole-mesh dispatch: the teapot is ONE rigid mesh under a single
-         * transform, so draw all of it in as few GPU dispatches as the staging
-         * cap allows (exactly one at the current 19200 vertices, well under
-         * PGL_G3D_MAX_VERTS).  The previous per-patch loop issued 32 separate
-         * dispatches per frame, and every dispatch pays a large fixed cost that
-         * is independent of its ~200 triangles: a whole-surface L2 clean+
-         * invalidate of the colour+depth targets (~2.4 MB), a CSD_DONE IRQ wait,
-         * five canvas attach/detach and a blocking IPC round-trip.  That 32x
-         * fixed overhead is what made the GPU path slower than the CPU
-         * rasterizer; batching into one dispatch removes ~97% of it.  Depth
-         * stays coherent because the persistent Z surface carries atomicMin
-         * across any chunks. */
-        {
-            uint32_t done = 0;
-            while (done < (uint32_t)teapot.nvertices) {
-                uint32_t chunk = (uint32_t)teapot.nvertices - done;
-                if (chunk > PGL_G3D_MAX_VERTS)
-                    chunk = PGL_G3D_MAX_VERTS;
-                if (!pgl_g3d_draw_mesh_compiled(g3d_prog, g3d_mesh,
-                                                done, chunk,
-                                                PGL_G3D_DEPTH_LESS, 1u,
-                                                PGL_G3D_CULL_NONE)) {
-                    ok = 0;
-                    break;
-                }
-                done += chunk;
-            }
-        }
-        if (ok)
-            return;   /* whole teapot rendered on the QPU */
-
-        /* A decline latches the GPU off; re-clear and fall through to the CPU
-         * path so this frame is not left half GPU / half CPU.  Every later
-         * frame stays on the CPU (g3d_active cleared). */
-        g3d_active = 0;
-        glClearColor(0.05f, 0.06f, 0.09f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    }
-#endif /* PGL_G3D */
-
-    if (teapot.vbo == 0 || teapot.vertices == NULL)
+    if (teapot.pos_vbo == 0 || teapot.color_vbo == 0 ||
+        teapot.vertices == NULL || teapot.colors == NULL)
         return;
 
-    glBindBuffer(GL_ARRAY_BUFFER, teapot.vbo);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), 0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat),
-                          (void*)(3 * sizeof(GLfloat)));
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
+    /* Light every vertex on the CPU (Blinn-Phong, formerly the vertex shader)
+     * and refresh the dynamic colour VBO; the trivial passthrough VS then runs
+     * on libGLESv2's native gouraud fast-path instead of the GLSL interpreter. */
+    compute_colors(model_view, normal_matrix, le);
 
-    /* One draw call per patch keeps every dispatch small (GPU friendly) while
-     * sharing a single VBO. */
+    glUniformMatrix4fv(loc_mvp, 1, GL_FALSE, mvp);
+
+    glBindBuffer(GL_ARRAY_BUFFER, teapot.color_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0,
+                    (GLsizeiptr)teapot.nvertices * 4 * sizeof(GLfloat),
+                    teapot.colors);
+
+    glBindBuffer(GL_ARRAY_BUFFER, teapot.pos_vbo);
+    glVertexAttribPointer(attr_pos, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), 0);
+    glEnableVertexAttribArray(attr_pos);
+    glBindBuffer(GL_ARRAY_BUFFER, teapot.color_vbo);
+    glVertexAttribPointer(attr_color, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), 0);
+    glEnableVertexAttribArray(attr_color);
+
+    /* One draw call per patch keeps every dispatch small while sharing VBOs. */
     int p;
     for (p = 0; p < NPATCH; p++)
         glDrawArrays(GL_TRIANGLES, teapot.patch_first[p], teapot.patch_count[p]);
 
-    glDisableVertexAttribArray(1);
-    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(attr_color);
+    glDisableVertexAttribArray(attr_pos);
 }
 
 static void init_teapot(void)
 {
+    GLuint vs, fs;
+    GLint ok = 0;
+
     glEnable(GL_DEPTH_TEST);
     /* Culling left disabled: the tessellated patches are lit two-sided. */
 
-    GLenum smooth[4] = { PGL_SMOOTH4 };
-
-    /* Custom per-vertex-lighting VS paired with the built-in pgl_ff_gouraud FS
-     * (4 smooth RGBA varyings) -> raspi5 V3D GPU fast path; CPU elsewhere. */
-    program = CreateProgram(vertex_shader, pgl_ff_gouraud, 4, smooth, GL_FALSE);
-    if (program == 0) {
-        slog("init_teapot: failed to create program\n");
+    vs = compile_shader(GL_VERTEX_SHADER, teapot_vs);
+    fs = compile_shader(GL_FRAGMENT_SHADER, teapot_fs);
+    program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetProgramInfoLog(program, sizeof(log), NULL, log);
+        klog("teapot: program link failed: %s\n", log);
         return;
     }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
     glUseProgram(program);
-    SetUniform(&uniforms);
+
+    loc_mvp = glGetUniformLocation(program, "uMVP");
+    /* libGLESv2 ignores glBindAttribLocation, so query the linked locations
+     * rather than assuming 0/1 (they come out in declaration order here). */
+    attr_pos   = glGetAttribLocation(program, "aPosition");
+    attr_color = glGetAttribLocation(program, "aColor");
+    if (attr_pos < 0 || attr_color < 0) {
+        klog("teapot: attribute location query failed\n");
+        return;
+    }
 
     perspective(projection_matrix, 45.0f, (GLfloat)win_width / (GLfloat)win_height, 0.5f, 100.0f);
     glViewport(0, 0, win_width, win_height);
 
     build_teapot();
 
-#ifdef PGL_G3D
-    /* Compile the VS+FS to QPU and stage the mesh now that the geometry exists
-     * and (if pglGpuBegin succeeded) the GPU target is up.  Any decline leaves
-     * g3d_active = 0 and the CPU path renders identically. */
-    g3d_init();
-#endif
+    hud_init();
 }
 
 static void reshape(int width, int height)
@@ -828,9 +732,6 @@ static void reshape(int width, int height)
     win_width = width;
     win_height = height;
 
-    ResizeFramebuffer(width, height);
-    backbuf = (pix_t*)GetBackBuffer();
-
     glViewport(0, 0, width, height);
     perspective(projection_matrix, 45.0f, (GLfloat)width / (GLfloat)height, 0.5f, 100.0f);
 }
@@ -839,89 +740,54 @@ static int fps = 0;
 static int count = 0;
 static uint32_t last_tic = 0;
 static uint32_t last_frame_tic = 0;
-static int g_last_px = -1;
 
 static void update_fps(void)
 {
     uint32_t low;
     kernel_tic32(NULL, NULL, &low);
-
     if (last_tic == 0 || (low - last_tic) >= 1000000) {
         last_tic = low;
         fps = count;
         count = 0;
-#ifdef PGL_G3D
-        /* headless-measurable FPS + pixel-diff probe: px counts back-buffer
-         * pixels that differ from the top-left (clear) pixel, so a blank frame
-         * (GPU drew nothing, px~0) is distinguishable from a rendered one
-         * (px large), alongside the gpu path flag, all from stdout alone. */
-        {
-            uint32_t px = 0;
-            if (backbuf != NULL && win_width > 0 && win_height > 0) {
-                pix_t ref = backbuf[0];
-                uint32_t n = (uint32_t)win_width * (uint32_t)win_height;
-                uint32_t i;
-                for (i = 0; i < n; i++)
-                    if (backbuf[i] != ref)
-                        px++;
-            }
-            g_last_px = (int)px;
-            printf("TEAPOT FPS: %d (gpu=%d px=%u %dx%d)\n",
-                   fps, g3d_active, px, win_width, win_height);
-            fflush(stdout);
-        }
-#endif
     }
     count++;
 }
 
-static void on_repaint(xwin_t* xwin, graph_t* g)
+static void render_frame(void)
 {
-    (void)xwin;
-
+    EGLint w = 0, h = 0;
     uint32_t current_tic;
-    kernel_tic32(NULL, NULL, &current_tic);
+    float dt;
 
+    eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
+    if (w > 0 && h > 0 && (w != win_width || h != win_height))
+        reshape(w, h);
+
+    kernel_tic32(NULL, NULL, &current_tic);
     if (last_frame_tic == 0)
         last_frame_tic = current_tic;
-
-    float dt = (current_tic - last_frame_tic) / 1000000.0f;
+    dt = (current_tic - last_frame_tic) / 1000000.0f;
     last_frame_tic = current_tic;
     if (dt > 0.1f) dt = 0.1f;
 
     /* Continuous angle change: teapot spins, camera orbits. */
     spin_angle += 45.0f * dt;
     if (spin_angle >= 360.0f) spin_angle -= 360.0f;
-
     camera_angle += 20.0f * dt;
     if (camera_angle >= 360.0f) camera_angle -= 360.0f;
 
     draw_teapot();
-
-    /* The GPU path adopts pgl_g3d_pixels() as the back buffer on its first
-     * draw (pglGpuBegin frees the CPU buffer init_glContext handed us), so
-     * re-read the live pointer every frame instead of only in reshape -
-     * otherwise the first frames blit a stale, freed buffer and the window
-     * stays blank until a resize. */
-    backbuf = (pix_t*)GetBackBuffer();
-
-    graph_t bg;
-    graph_init(&bg, backbuf, win_width, win_height);
-    graph_blt(&bg, 0, 0, win_width, win_height, g, 0, 0, win_width, win_height);
-    update_fps();
-
-    if (font != NULL) {
-        char txt[64];
-#ifdef PGL_G3D
-        /* on-screen readout carries the gpu path flag + live dims so the
-         * blank-until-resize state is visible without ssh stdout. */
-        snprintf(txt, sizeof(txt), "FPS:%d gpu:%d px:%d %dx%d",
-                 fps, g3d_active, g_last_px, win_width, win_height);
-#else
-        snprintf(txt, sizeof(txt), "Teapot  FPS: %d", fps);
-#endif
-        graph_draw_text_font(g, 8, 8, txt, font, 16, 0xff00ff00);
+    {
+        /* Query GPU status while the scene program is still bound, then draw
+         * the FPS/GPU readout into the back buffer before presenting. */
+        char hud[64];
+        int gpu = glGpuActiveEWOK();
+        snprintf(hud, sizeof(hud), "FPS:%d %s", fps, gpu ? "GPU" : "CPU");
+        hud_draw(program, win_width, win_height, 8, 8, hud);
     }
+    eglSwapBuffers(egl_dpy, egl_surf);
+    update_fps();
 }
 
 static void on_event(xwin_t* xwin, xevent_t* ev)
@@ -934,75 +800,79 @@ static void on_event(xwin_t* xwin, xevent_t* ev)
     }
 }
 
-static void on_resize(xwin_t* xwin)
-{
-    if (xwin == NULL || xwin->xinfo == NULL)
-        return;
-    reshape(xwin->xinfo->wsr.w, xwin->xinfo->wsr.h);
-}
-
 static void loop(void* p)
 {
-    xwin_t* xwin = (xwin_t*)p;
-    xwin_repaint(xwin);
+    (void)p;
+    render_frame();
     usleep(1000);
+}
+
+static int init_egl(xwin_t* xwin)
+{
+    EGLint major, minor, ncfg = 0;
+    EGLint cfg_attr[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 16,
+        EGL_NONE
+    };
+    EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLConfig cfg = NULL;
+
+    egl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (egl_dpy == EGL_NO_DISPLAY) return 0;
+    if (!eglInitialize(egl_dpy, &major, &minor)) return 0;
+    if (!eglChooseConfig(egl_dpy, cfg_attr, &cfg, 1, &ncfg) || ncfg < 1) return 0;
+
+    egl_ctx = eglCreateContext(egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (egl_ctx == EGL_NO_CONTEXT) return 0;
+
+    egl_surf = eglCreateWindowSurface(egl_dpy, cfg, (EGLNativeWindowType)xwin, NULL);
+    if (egl_surf == EGL_NO_SURFACE) return 0;
+
+    if (!eglMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx)) return 0;
+    return 1;
 }
 
 int main(int argc, char* argv[])
 {
+    x_t x;
+    xwin_t* xwin;
+
     (void)argc;
     (void)argv;
 
-    x_t x;
     x_init(&x, NULL);
-
     x.on_loop = loop;
-    xwin_t* xwin = xwin_open(&x, -1, 32, 32, win_width, win_height, "Teapot", XWIN_STYLE_NORMAL);
+
+    xwin = xwin_open(&x, -1, 32, 32, win_width, win_height, "Teapot", XWIN_STYLE_NORMAL);
     if (!xwin) {
         printf("Failed to open window\n");
         return 1;
     }
-
-    xwin->on_repaint = on_repaint;
     xwin->on_event = on_event;
-    xwin->on_resize = on_resize;
 
-    /* Each per-patch draw stays well under 5000 vertices, so TINY is enough. */
-    pgl_set_max_vertices(PGL_TINY_MAX_VERTICES);
-
-    if (!init_glContext(&the_context, &backbuf, win_width, win_height)) {
-        printf("Failed to initialize glContext\n");
+    /* libEGL owns on_repaint/on_resize once the window surface is created. */
+    if (!init_egl(xwin)) {
+        printf("Failed to initialize EGL\n");
         return 1;
     }
 
-#ifdef PGL_G3D
-    /* Bring up the V3D GPU target and adopt pgl_g3d_pixels() as the back
-     * buffer, so the compiled-mesh draws and the CPU fallback share one surface
-     * and the present blit stays zero-copy.  On success refresh backbuf; on
-     * failure the CPU back buffer from init_glContext stands (g3d_init then
-     * declines and the CPU path renders). */
-    if (pglGpuBegin(win_width, win_height))
-        backbuf = (pix_t*)pglGetBackBuffer();
-#endif
-
-    GLuint vao;
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
-
     init_teapot();
 
-    font = font_new(DEFAULT_SYSTEM_FONT, true);
-
     xwin_set_visible(xwin, true);
-
     x_run(&x, xwin);
 
     xwin_destroy(xwin);
-    if (font != NULL)
-        font_free(font);
+    eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroySurface(egl_dpy, egl_surf);
+    eglDestroyContext(egl_dpy, egl_ctx);
+    eglTerminate(egl_dpy);
     if (teapot.vertices != NULL)
         free(teapot.vertices);
-    free_glContext(&the_context);
+    if (teapot.colors != NULL)
+        free(teapot.colors);
 
     return 0;
 }

@@ -1,26 +1,41 @@
-#define SDL_MAIN_HANDLED
-#include <SDL2/SDL.h>
-#include "glcommon/gltools.h"
+/*
+ * Fireworks demo for EwokOS.
+ *
+ * A CPU particle system: rockets launch, explode, and their glowing debris
+ * falls under gravity.  Every particle is composited (alpha-blended radial glow
+ * + dotted velocity trail) into an in-memory ARGB framebuffer exactly as the
+ * original did.
+ *
+ * Presentation was rewritten off SDL2 + a portablegl scratch buffer onto the
+ * standard EGL + GLES2 front end (libs/gles): the composited framebuffer is
+ * uploaded each frame as a texture and drawn as a fullscreen quad by libGLESv2,
+ * and libEGL owns the window surface, present and resize.  The particle physics
+ * and the per-pixel drawing below are unchanged, so the visuals are identical.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
+
+#include <unistd.h>
+#include <ewoksys/proc.h>
+#include <ewoksys/keydef.h>
+#include <ewoksys/kernel_tic.h>
+#include <ewoksys/timer.h>
 #include <ewoksys/klog.h>
+#include <x/x.h>
+#include <x/xwin.h>
+#include <graph/graph.h>
+
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
 
 #define WIDTH 1024
 #define HEIGHT 768
-#define PIX_FORMAT SDL_PIXELFORMAT_ARGB8888
 #define MAX_PARTICLES 5000
-
-#define sinf pgl_fast_sin
-#define cosf pgl_fast_cos
-#define sqrtf pgl_fast_sqrt
-#define tanf pgl_fast_tan
-#define acosf pgl_fast_acos
-#define asinf pgl_fast_asin
-#define atanf pgl_fast_atan
-#define atanf2 pgl_fast_atan2
+#define MAX_FIREWORKS 5
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -46,64 +61,140 @@ typedef struct {
 } Firework;
 
 // Global variables
-SDL_Window* window = NULL;
-SDL_Renderer* ren = NULL;
-SDL_Texture* tex = NULL;
-glContext the_Context;
-pix_t* bbufpix = NULL;
-int screen_width, screen_height;
+static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
+static EGLSurface egl_surf = EGL_NO_SURFACE;
+static EGLContext egl_ctx = EGL_NO_CONTEXT;
+
+static GLuint program = 0, quad_vbo = 0, texture = 0;
+static GLint loc_tex = -1;
+
+static int screen_width = WIDTH, screen_height = HEIGHT;
+
+/* CPU compositing target: 0xAARRGGBB words, converted to RGBA8 for upload. */
+static uint32_t* bbufpix = NULL;
+static uint8_t*  rgba_buf = NULL;
 
 Particle particles[MAX_PARTICLES];
 int num_particles = 0;
 
-#define MAX_FIREWORKS 5
 Firework fireworks[MAX_FIREWORKS];
 int next_firework_time = 0;
 
-// Initialization
-void setup_context() {
-    if (SDL_Init(SDL_INIT_VIDEO)) {
-        klog("SDL_Init error: %s\n", SDL_GetError());
-        exit(0);
+static const char *quad_vs =
+    "attribute vec2 aPos;\n"
+    "attribute vec2 aUV;\n"
+    "varying vec2 vUV;\n"
+    "void main() {\n"
+    "    vUV = aUV;\n"
+    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *quad_fs =
+    "precision mediump float;\n"
+    "varying vec2 vUV;\n"
+    "uniform sampler2D uTex0;\n"
+    "void main() {\n"
+    "    gl_FragColor = texture2D(uTex0, vUV);\n"
+    "}\n";
+
+static GLuint compile_shader(GLenum type, const char *src)
+{
+    GLuint sh = glCreateShader(type);
+    GLint ok = 0;
+    if (sh == 0) return 0;
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+        klog("Fireworks: shader compile failed: %s\n", log);
+        glDeleteShader(sh);
+        return 0;
     }
-
-    // Create window with default size, will adjust to actual screen size later
-    window = SDL_CreateWindow("Fireworks", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                              WIDTH, HEIGHT, SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN);
-    if (!window) exit(0);
-
-    // Get actual window size (screen resolution in fullscreen mode)
-    SDL_GetWindowSize(window, &screen_width, &screen_height);
-    klog("Fireworks: window size %dx%d\n", screen_width, screen_height);
-
-    ren = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    if (!ren) exit(0);
-
-    tex = SDL_CreateTexture(ren, PIX_FORMAT, SDL_TEXTUREACCESS_STREAMING, screen_width, screen_height);
-    if (!tex) exit(0);
-
-    pgl_set_max_vertices(PGL_SMALL_MAX_VERTICES);
-    if (!init_glContext(&the_Context, &bbufpix, screen_width, screen_height)) {
-        puts("Failed to initialize glContext");
-        exit(0);
-    }
+    return sh;
 }
 
-void cleanup() {
-    free_glContext(&the_Context);
-    if (tex) {
-        SDL_DestroyTexture(tex);
-        tex = NULL;
+/* Fullscreen quad (two triangles) in clip space.  Texture row 0 maps to the top
+ * of the window, matching the top-down screen coordinates the particles use. */
+static const GLfloat quad_verts[] = {
+    /* x,    y,    u,   v */
+    -1.0f,  1.0f, 0.0f, 0.0f,
+    -1.0f, -1.0f, 0.0f, 1.0f,
+     1.0f,  1.0f, 1.0f, 0.0f,
+    -1.0f, -1.0f, 0.0f, 1.0f,
+     1.0f, -1.0f, 1.0f, 1.0f,
+     1.0f,  1.0f, 1.0f, 0.0f,
+};
+
+static void init_gl(void)
+{
+    GLuint vs, fs;
+    GLint ok = 0;
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+
+    vs = compile_shader(GL_VERTEX_SHADER, quad_vs);
+    fs = compile_shader(GL_FRAGMENT_SHADER, quad_fs);
+    program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glBindAttribLocation(program, 0, "aPos");
+    glBindAttribLocation(program, 1, "aUV");
+    glLinkProgram(program);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetProgramInfoLog(program, sizeof(log), NULL, log);
+        klog("Fireworks: program link failed: %s\n", log);
+        return;
     }
-    if (ren) {
-        SDL_DestroyRenderer(ren);
-        ren = NULL;
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    glUseProgram(program);
+
+    loc_tex = glGetUniformLocation(program, "uTex0");
+
+    glGenBuffers(1, &quad_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_STATIC_DRAW);
+
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glUniform1i(loc_tex, 0);
+}
+
+/* (Re)allocate the CPU compositing buffers and the texture storage for a new
+ * window size. */
+static int ensure_buffer(int w, int h)
+{
+    if (w <= 0 || h <= 0)
+        return 0;
+    if (bbufpix != NULL && w == screen_width && h == screen_height)
+        return 1;
+
+    free(bbufpix);
+    free(rgba_buf);
+    bbufpix = (uint32_t*)malloc((size_t)w * h * sizeof(uint32_t));
+    rgba_buf = (uint8_t*)malloc((size_t)w * h * 4);
+    if (bbufpix == NULL || rgba_buf == NULL) {
+        free(bbufpix); free(rgba_buf);
+        bbufpix = NULL; rgba_buf = NULL;
+        return 0;
     }
-    if (window) {
-        SDL_DestroyWindow(window);
-        window = NULL;
-    }
-    SDL_Quit();
+    screen_width = w;
+    screen_height = h;
+
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, NULL);
+    glViewport(0, 0, w, h);
+    return 1;
 }
 
 float random_float(float min, float max) {
@@ -139,17 +230,17 @@ void launch_firework() {
         }
     }
     if (slot < 0) return; // No available slots
-    
+
     Firework* fw = &fireworks[slot];
     fw->x = random_float(screen_width * 0.1f, screen_width * 0.9f);
     fw->y = screen_height;
     fw->vx = random_float(-0.5f, 0.5f);
     // Speed adjusted based on target height, higher targets need faster speed
     fw->vy = random_float(-12.0f, -18.0f);
-    
+
     float hue = random_float(0.0f, 1.0f);
     hsv_to_rgb(hue, 1.0f, 1.0f, &fw->r, &fw->g, &fw->b);
-    
+
     fw->active = 1;
 }
 
@@ -157,27 +248,27 @@ void launch_firework() {
 void create_explosion(float x, float y, float r, float g, float b) {
     // Check if particle array is full
     if (num_particles >= MAX_PARTICLES - 500) return;
-    
+
     int streams = 20 + rand() % 12; // 20-32 streams
-    
+
     for (int s = 0; s < streams; s++) {
         float base_angle = (M_PI * 2 * s) / streams;
         // Add natural random angle variation
         float angle_var = random_float(-0.15f, 0.15f);
-        
+
         // Reduce particles per stream
         int particles_per_stream = 12 + rand() % 8;
-        
+
         for (int i = 0; i < particles_per_stream; i++) {
             if (num_particles >= MAX_PARTICLES) break;
-            
+
             Particle* p = &particles[num_particles++];
-            
+
             float angle = base_angle + angle_var + random_float(-0.08f, 0.08f);
             // Slower speed, more compact range
             float base_speed = 1.2f + (float)i * 0.25f;
             float speed = base_speed * random_float(0.9f, 1.1f);
-            
+
             p->x = x + random_float(-2.0f, 2.0f); // Slight randomness in starting position
             p->y = y + random_float(-2.0f, 2.0f);
             p->vx = cos(angle) * speed;
@@ -185,27 +276,27 @@ void create_explosion(float x, float y, float r, float g, float b) {
             p->life = 1.0f;
             p->maxLife = random_float(50.0f, 90.0f);
             p->brightness = 1.0f - (float)i / particles_per_stream * 0.25f;
-            
+
             // Color gradient
             float fade = 1.0f - (float)i / particles_per_stream * 0.35f;
             p->r = r * fade;
             p->g = g * fade;
             p->b = b * fade;
-            
+
             p->active = 1;
         }
     }
-    
+
     // Reduce center particles
     int center_particles = 15;
     for (int i = 0; i < center_particles; i++) {
         if (num_particles >= MAX_PARTICLES) break;
-        
+
         Particle* p = &particles[num_particles++];
-        
+
         float angle = random_float(0, M_PI * 2);
         float speed = random_float(0.3f, 1.5f);
-        
+
         p->x = x;
         p->y = y;
         p->vx = cos(angle) * speed;
@@ -249,16 +340,16 @@ void update_particles() {
             i++;
             continue;
         }
-        
+
         p->x += p->vx;
         p->y += p->vy;
         p->vy += 0.12f; // Enhanced gravity
         p->life -= 1.0f / p->maxLife;
-        
+
         // Air resistance
         p->vx *= 0.985f;
         p->vy *= 0.985f;
-        
+
         if (p->life <= 0) {
             p->active = 0;
             particles[i] = particles[--num_particles];
@@ -278,18 +369,18 @@ void set_pixel(int x, int y, uint32_t color) {
 // Draw pixel with alpha blending
 void blend_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     if (x < 0 || x >= screen_width || y < 0 || y >= screen_height) return;
-    
+
     long idx = (long)y * screen_width + x;
     uint32_t dst = bbufpix[idx];
-    
+
     uint8_t dstR = (dst >> 16) & 0xFF;
     uint8_t dstG = (dst >> 8) & 0xFF;
     uint8_t dstB = dst & 0xFF;
-    
+
     uint8_t outR = (r * a + dstR * (255 - a)) / 255;
     uint8_t outG = (g * a + dstG * (255 - a)) / 255;
     uint8_t outB = (b * a + dstB * (255 - a)) / 255;
-    
+
     bbufpix[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
 }
 
@@ -331,23 +422,23 @@ void draw_dotted_trail(float x0, float y0, float x1, float y1,
     float dx = x1 - x0;
     float dy = y1 - y0;
     float dist = sqrtf(dx * dx + dy * dy);
-    
+
     if (dist < 1.0f) {
         draw_glow_pixel((int)x0, (int)y0, r, g, b, alpha);
         return;
     }
-    
+
     // Dot spacing - one dot every 3-4 pixels, larger grain
     float dot_spacing = 3.5f;
     int num_dots = (int)(dist / dot_spacing);
     if (num_dots < 1) num_dots = 1;
     if (num_dots > 30) num_dots = 30; // cap the max number of dots
-    
+
     for (int i = 0; i <= num_dots; i++) {
         float t = (float)i / num_dots;
         float x = x0 + dx * t;
         float y = y0 + dy * t;
-        
+
         // Head bright, tail dim, but tail is brighter (obvious trail)
         float dot_alpha = alpha * (0.6f + 0.4f * (1.0f - t));
         if (dot_alpha > 0.05f) {
@@ -422,74 +513,149 @@ void draw_fireworks() {
     }
 }
 
-int handle_events() {
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-        switch (event.type) {
-        case SDL_KEYDOWN:
-            if (event.key.keysym.sym == SDLK_ESCAPE) return 1;
-            break;
-        case SDL_MOUSEBUTTONDOWN:
-            return 1;
-        case SDL_WINDOWEVENT:
-            // Handle window close event (when xwin closes)
-            if (event.window.event == SDL_WINDOWEVENT_CLOSE) {
-                return 1;
-            }
-            break;
-        case SDL_QUIT:
-            return 1;
-        }
+/* Composite one animation frame into bbufpix, upload it and present it as a
+ * fullscreen textured quad. */
+static int frame_count = 0;
+
+static void render_frame(void)
+{
+    EGLint w = 0, h = 0;
+
+    eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
+    if (w <= 0 || h <= 0) { w = WIDTH; h = HEIGHT; }
+    if (!ensure_buffer(w, h))
+        return;
+
+    // Random launch timing, no need to wait for previous to finish
+    if (frame_count >= next_firework_time) {
+        launch_firework();
+        // Next launch time: 10-60 frames later (about 0.16-1 second)
+        next_firework_time = frame_count + rand() % 50 + 10;
     }
-    return 0;
+
+    update_fireworks();
+    update_particles();
+
+    // Clear the CPU framebuffer to opaque black, then composite the show.
+    long total_pixels = (long)screen_width * screen_height;
+    for (long i = 0; i < total_pixels; ++i)
+        bbufpix[i] = 0xFF000000;
+
+    draw_fireworks();
+    draw_particles();
+
+    // Convert 0xAARRGGBB words to tightly-packed RGBA8 for the texture upload.
+    for (long i = 0; i < total_pixels; ++i) {
+        uint32_t px = bbufpix[i];
+        rgba_buf[i * 4 + 0] = (px >> 16) & 0xFF;   /* r */
+        rgba_buf[i * 4 + 1] = (px >> 8)  & 0xFF;   /* g */
+        rgba_buf[i * 4 + 2] = px & 0xFF;           /* b */
+        rgba_buf[i * 4 + 3] = (px >> 24) & 0xFF;   /* a */
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, screen_width, screen_height,
+                    GL_RGBA, GL_UNSIGNED_BYTE, rgba_buf);
+
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), 0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+                          (void*)(2 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(0);
+
+    eglSwapBuffers(egl_dpy, egl_surf);
+    frame_count++;
 }
 
-int main(int argc, char** argv) {
+static void on_event(xwin_t* xwin, xevent_t* ev)
+{
+    if (ev->type == XEVT_IM && ev->state == XIM_STATE_PRESS && ev->value.im.value == KEY_ESC)
+        xwin_close(xwin);
+}
+
+static void loop(void* p)
+{
+    (void)p;
+    render_frame();
+    usleep(16000);
+}
+
+static int init_egl(xwin_t* xwin)
+{
+    EGLint major, minor, ncfg = 0;
+    EGLint cfg_attr[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 16,
+        EGL_NONE
+    };
+    EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLConfig cfg = NULL;
+
+    egl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (egl_dpy == EGL_NO_DISPLAY) return 0;
+    if (!eglInitialize(egl_dpy, &major, &minor)) return 0;
+    if (!eglChooseConfig(egl_dpy, cfg_attr, &cfg, 1, &ncfg) || ncfg < 1) return 0;
+
+    egl_ctx = eglCreateContext(egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (egl_ctx == EGL_NO_CONTEXT) return 0;
+
+    egl_surf = eglCreateWindowSurface(egl_dpy, cfg, (EGLNativeWindowType)xwin, NULL);
+    if (egl_surf == EGL_NO_SURFACE) return 0;
+
+    if (!eglMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx)) return 0;
+    return 1;
+}
+
+int main(int argc, char** argv)
+{
+    x_t x;
+    xwin_t* xwin;
+
     (void)argc; (void)argv;
     srand((unsigned int)time(NULL));
-
-    setup_context();
 
     // Random seed initialization for launch timing
     next_firework_time = rand() % 30 + 10;
 
-    int frame_count = 0;
+    x_init(&x, NULL);
+    x.on_loop = loop;
 
-    while (1) {
-        if (handle_events()) break;
+    xwin = xwin_open(&x, -1, 32, 32, WIDTH, HEIGHT, "Fireworks", XWIN_STYLE_NORMAL);
+    if (!xwin) {
+        printf("Failed to open window\n");
+        return 1;
+    }
+    xwin->on_event = on_event;
 
-        // Random launch timing, no need to wait for previous to finish
-        if (frame_count >= next_firework_time) {
-            launch_firework();
-            // Next launch time: 10-60 frames later (about 0.16-1 second)
-            next_firework_time = frame_count + rand() % 50 + 10;
-        }
-
-        update_fireworks();
-        update_particles();
-
-        // Clear screen - pure black background
-        if (bbufpix) {
-            long total_pixels = (long)screen_width * screen_height;
-            for (long i = 0; i < total_pixels; ++i) {
-                bbufpix[i] = 0xFF000000;
-            }
-
-            draw_fireworks();
-            draw_particles();
-
-            SDL_UpdateTexture(tex, NULL, bbufpix, screen_width * sizeof(pix_t));
-        }
-
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-        SDL_RenderClear(ren);
-        SDL_RenderCopy(ren, tex, NULL, NULL);
-        SDL_RenderPresent(ren);
-
-        frame_count++;
-        SDL_Delay(16);
+    /* libEGL owns on_repaint/on_resize once the window surface is created. */
+    if (!init_egl(xwin)) {
+        printf("Failed to initialize EGL\n");
+        return 1;
     }
 
-    cleanup();
+    init_gl();
+
+    xwin_set_visible(xwin, true);
+    x_run(&x, xwin);
+
+    xwin_destroy(xwin);
+    eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroySurface(egl_dpy, egl_surf);
+    eglDestroyContext(egl_dpy, egl_ctx);
+    eglTerminate(egl_dpy);
+
+    free(bbufpix);
+    free(rgba_buf);
     return 0;
 }

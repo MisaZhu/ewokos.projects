@@ -1581,11 +1581,28 @@ int pgl_g3d_init(int w, int h)
 	if (has_g2d() != 0)
 		return 0;
 
+	/* Query the live V3D architecture version so the app-side compiler targets
+	   the actual silicon.  soft3d ships ONE binary across chip generations on
+	   raspix (Pi3 V3D 2.1 / Pi4 4.2 / Pi5 7.1) and the mesa compiler runs here
+	   in the APP process, so the codegen target must be chosen at runtime
+	   rather than baked in.  v3d_compiler_set_version() must run before the
+	   first v3d_compile_*().  A query that fails, or reports ver < 41 (VC4 /
+	   V3D 2.1 on Pi3, which has no CSD compute for the geom rasterizer),
+	   declines the GPU path entirely and portablegl keeps its CPU/NEON
+	   rasterizer.  raspi5 reports 71 and selects the same devinfo the compiler
+	   defaults to, so its emitted QPU is byte-for-byte unchanged. */
+	{
+		uint32_t v3d_ver = 0;
+		if (g2d_get_version(&v3d_ver) != G2D_OK || v3d_ver < 41u)
+			return 0;
+		v3d_compiler_set_version((int)v3d_ver);
+	}
+
 	if (!alloc_target(w, h))
 		return 0;
 
 	/* frame-boundary defaults so the very first dispatch clears even if a
-	   frame is drawn before the first glClear/pgl_g3d_begin_frame */
+	   frame is drawn before the first pgl_Clear/pgl_g3d_begin_frame */
 	_first_frame = 1;
 	_clear_rgba = 0xFF000000u;
 	_clear_z = 1.0f;

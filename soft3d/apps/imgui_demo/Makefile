@@ -9,16 +9,12 @@ CFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include/glcommon -I $(EXTRA_LIBS_DIR)/includ
 CXXFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include/glcommon -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__ -fno-threadsafe-statics
 LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib
 
-# PGL_G3D (raspi5): the portablegl GPU backend pulls in pgl_g3d_shader.o, which
-# references the on-device mesa compiler (v3d_compile_glsl) in libv3dcompiler.a;
-# group it with libc/libm/cxx so its refs resolve (mirrors libs/demos/Makefile).
-ifeq ($(PGL_G3D),yes)
-LDFLAGS += --start-group -lv3dcompiler $(EWOK_LIBC) -lcxx -lopenlibm -lm --end-group
-endif
-
+# imgui uses portablegl's pgl_* API directly; portablegl is now merged into
+# libGLESv2.a, so link that (it carries the engine and, on PGL_G3D targets, the
+# on-device mesa GLSL->QPU compiler).  No app-side -lportablegl / -lv3dcompiler.
 IMGUI_LIBS = $(EXTRA_LIBS_DIR)/lib/libglcommon.a \
 	$(EXTRA_LIBS_DIR)/lib/libimgui.a \
-	$(EXTRA_LIBS_DIR)/lib/libportablegl.a
+	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
 
 TASK = imgui_demo
 TASK_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)/rootfs/apps/$(TASK)

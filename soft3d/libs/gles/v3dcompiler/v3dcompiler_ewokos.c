@@ -117,19 +117,23 @@ open_memstream(char **bufp, size_t *sizep)
  * emitted verbatim, so it matches the C++ reference) and implemented by
  * delegating to libcxx's scalar operators - identical allocation semantics, no
  * array cookie needed because every mesa use pairs new[] with a matching
- * delete[] of a trivially-destructible or explicitly-destructed type. This keeps
- * the archive self-contained: an app links libv3dcompiler.a with no extra C++
- * runtime library. */
+ * delete[] of a trivially-destructible or explicitly-destructed type.
+ *
+ * They are WEAK: libewokstl.a (which every EwokOS C++ app links) also defines
+ * the array operators strongly, and now that libv3dcompiler.a is merged into
+ * libGLESv2.a both land in a single link. Weak lets libewokstl's strong
+ * definition win, while still leaving a self-contained fallback for a link with
+ * no C++ runtime library. */
 extern void *_Znwm(unsigned long);   /* operator new(unsigned long)  - libcxx */
 extern void  _ZdlPv(void *);         /* operator delete(void*)       - libcxx */
 
-void *
+__attribute__((weak)) void *
 _Znam(unsigned long n)               /* operator new[](unsigned long) */
 {
    return _Znwm(n);
 }
 
-void
+__attribute__((weak)) void
 _ZdaPv(void *p)                      /* operator delete[](void*) */
 {
    _ZdlPv(p);

@@ -316,7 +316,7 @@ static inline int pgl_neon_any_u32(uint32x4_t m)
 #endif
 
 // ---------------------------------------------------------------------------
-// Buffer fills / copies (glClear, glBufferData, format conversion)
+// Buffer fills / copies (pgl_Clear, pgl_BufferData, format conversion)
 // ---------------------------------------------------------------------------
 
 // dst[i] = v
@@ -356,7 +356,7 @@ static inline void pgl_neon_fill_u16(uint16_t* dst, uint16_t v, int n)
     }
 }
 
-// dst[i] = (dst[i] & keep) | v   -- glClear with a color/stencil write mask,
+// dst[i] = (dst[i] & keep) | v   -- pgl_Clear with a color/stencil write mask,
 // and the PGL_D24S8 depth clear that must preserve the stencil byte.
 static inline void pgl_neon_fill_masked_u32(uint32_t* dst, uint32_t keep, uint32_t v, int n)
 {
@@ -476,7 +476,7 @@ static inline float32x4_t pgl_neon_pixel_to_v4(uint32_t p)
     return vmulq_n_f32(vcvtq_f32_u32(u), 1.0f / 255.0f);
 }
 
-// glBlendFunc factor for all 4 channels. The separate-alpha factors in
+// pgl_BlendFunc factor for all 4 channels. The separate-alpha factors in
 // blend_pixel() are exactly lane 3 of the same table, so callers reuse this
 // for blend_sA/blend_dA and pick lane 3.
 static inline float32x4_t pgl_neon_blend_factor(GLenum f, float32x4_t src, float32x4_t dst,
@@ -505,7 +505,7 @@ static inline float32x4_t pgl_neon_blend_factor(GLenum f, float32x4_t src, float
     }
 }
 
-// glBlendEquation combine for all 4 channels
+// pgl_BlendEquation combine for all 4 channels
 static inline float32x4_t pgl_neon_blend_eq(GLenum eq, float32x4_t Cs, float32x4_t src,
                                             float32x4_t Cd, float32x4_t dst)
 {
@@ -1836,7 +1836,7 @@ void invert_m4(mat4 mInverse, const mat4& m)
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 //assumes converting from canonical view volume [-1,1]^3
-//works just like glViewport, x and y are lower left corner.  opengl should be 1.
+//works just like pgl_Viewport, x and y are lower left corner.  opengl should be 1.
 void make_viewport_m4(mat4 mat, int x, int y, unsigned int width, unsigned int height, int opengl)
 {
     float w, h, l, t, b, r;
@@ -3598,10 +3598,10 @@ PGLDEF void pgl_ff_tex_modulate(float* fs_input, Shader_Builtins* builtins, void
  * buffer. */
 static int _pgl_gpu_active;   /* back buffer adopted the GPU shm target */
 static int _pgl_gpu_off;      /* latched off; stop probing */
-/* Set for a frame whose glClear was scissored or colour-masked: the GPU folds
+/* Set for a frame whose pgl_Clear was scissored or colour-masked: the GPU folds
  * the frame clear into its first draw dispatch as a FULL-FRAME, unmasked
  * CLEAR_RENDER_TARGETS that would clobber the precise CPU clear, so the whole
- * frame is pinned to the CPU (re-evaluated at the next glClear). */
+ * frame is pinned to the CPU (re-evaluated at the next pgl_Clear). */
 static int _pgl_gpu_frame_cpu;
 
 static int pgl_c255(float f, int max)
@@ -3695,7 +3695,7 @@ static int pgl_gpu_begin(int w, int h)
 
 /* Public bring-up: force the GPU target live and adopt pgl_g3d_pixels() as the
  * back buffer, so an app's compiled-mesh draws (which render into pgl_g3d_pixels())
- * and its CPU glDrawArrays fallback share ONE surface and the present blit stays
+ * and its CPU pgl_DrawArrays fallback share ONE surface and the present blit stays
  * zero-copy.  Returns 1 when the GPU path is live (then pglGetBackBuffer() is the
  * adopted GPU pixels), 0 when it is off / unavailable (CPU back buffer unchanged).
  * Idempotent: a second call just reports pgl_g3d_enabled(). */
@@ -3716,7 +3716,7 @@ static void pgl_gpu_fence(void)
  * a miss evicts round-robin.  Returns the slot index, or -1 when the texture
  * cannot be represented by the GPU TEX_MOD kernel (unbound / not 2D / not
  * tightly-packed RGBA8 / non-NEAREST filter / non-CLAMP_TO_EDGE wrap) so the
- * caller declines the GPU path and rasterizes on the CPU.  glTexSubImage2D
+ * caller declines the GPU path and rasterizes on the CPU.  pgl_TexSubImage2D
  * that mutates data in place without reallocating is NOT detected - the caller
  * must pgl_g3d_free_texture the slot (or resize) to force a re-upload. */
 typedef struct {
@@ -3742,7 +3742,7 @@ static glTexture* pgl_gpu_tex_get(GLuint tex_id)
     if ((int)tex_id >= c->textures.size)
         return NULL;
     t = &c->textures.a[tex_id];
-    /* glBindTexture stores type as target-(GL_TEXTURE_UNBOUND+1) (see the
+    /* pgl_BindTexture stores type as target-(GL_TEXTURE_UNBOUND+1) (see the
      * pglDrawFrame tex check), NOT the raw GL_TEXTURE_2D enum. */
     if (t->deleted || t->type != GL_TEXTURE_2D-(GL_TEXTURE_UNBOUND+1) || t->data == NULL)
         return NULL;
@@ -3853,7 +3853,7 @@ static int pgl_gpu_state(int poly_off, int want_cull, int* fs_id,
     if (!c)
         return 0;
     if (_pgl_gpu_frame_cpu)
-        return 0;   /* this frame's glClear was scissored/colour-masked: the GPU
+        return 0;   /* this frame's pgl_Clear was scissored/colour-masked: the GPU
                      * full-frame first-dispatch clear would clobber it, so the
                      * whole frame stays on the CPU */
 
@@ -5539,7 +5539,7 @@ static void draw_triangle_final(glVertex* v0, glVertex* v1, glVertex* v2, unsign
 
     c->builtins.gl_FrontFacing = front_facing;
 
-    // TODO when/if I get rid of glPolygonMode support for FRONT
+    // TODO when/if I get rid of pgl_PolygonMode support for FRONT
     // and BACK, this becomes a single function pointer, no branch
     if (front_facing) {
         c->draw_triangle_front(v0, v1, v2, provoke);
@@ -6737,7 +6737,7 @@ PGLDEF GLboolean init_glContext(glContext* context, pix_t** back, GLsizei w, GLs
     cvec_glTexture(&c->textures, 0, 1);
     cvec_glVertex(&c->glverts, 0, 10);
 
-    // If not pre-allocating max, need to track size and edit glUseProgram and pglSetInterp
+    // If not pre-allocating max, need to track size and edit pgl_UseProgram and pglSetInterp
     int max_vertices = get_max_vertices();
     c->vs_output.output_buf = (float*)PGL_MALLOC(max_vertices * GL_MAX_VERTEX_OUTPUT_COMPONENTS * sizeof(float));
     PGL_ERR_RET_VAL(!c->vs_output.output_buf, GL_OUT_OF_MEMORY, GL_FALSE);
@@ -6829,7 +6829,7 @@ PGLDEF GLboolean init_glContext(glContext* context, pix_t** back, GLsizei w, GLs
     // just make it default, no transform, just draws things red
     glProgram tmp_prog = { default_vs, default_fs, NULL, 0, {0}, GL_FALSE, GL_FALSE };
     cvec_push_glProgram(&c->programs, tmp_prog);
-    glUseProgram(0);
+    pgl_UseProgram(0);
 
     // setup default vertex_array (vao) at position 0
     // we're like a compatibility profile for this but come on
@@ -6846,7 +6846,7 @@ PGLDEF GLboolean init_glContext(glContext* context, pix_t** back, GLsizei w, GLs
     tmp_buf.deleted = GL_FALSE;
     cvec_push_glBuffer(&c->buffers, tmp_buf);
 
-    // From glBindTexture():
+    // From pgl_BindTexture():
     // "The value zero is reserved to represent the default texture for each texture target."
     // "In effect, the texture targets become aliases for the textures currently bound to them, and the texture name zero refers to the default textures that were bound to them at initialization."
     //
@@ -7049,7 +7049,7 @@ PGLDEF GLboolean pglResizeFramebuffer(GLsizei w, GLsizei h)
 
 
 
-PGLDEF GLubyte* glGetString(GLenum name)
+PGLDEF GLubyte* pgl_GetString(GLenum name)
 {
     static GLubyte vendor[] = "Robert Winkler (robertwinkler.com)";
     static GLubyte renderer[] = "PortableGL 0.101.0";
@@ -7067,14 +7067,14 @@ PGLDEF GLubyte* glGetString(GLenum name)
     }
 }
 
-PGLDEF GLenum glGetError(void)
+PGLDEF GLenum pgl_GetError(void)
 {
     GLenum err = c->error;
     c->error = GL_NO_ERROR;
     return err;
 }
 
-PGLDEF void glGenVertexArrays(GLsizei n, GLuint* arrays)
+PGLDEF void pgl_GenVertexArrays(GLsizei n, GLuint* arrays)
 {
     PGL_ERR(n < 0, GL_INVALID_VALUE);
 
@@ -7097,7 +7097,7 @@ PGLDEF void glGenVertexArrays(GLsizei n, GLuint* arrays)
     }
 }
 
-PGLDEF void glDeleteVertexArrays(GLsizei n, const GLuint* arrays)
+PGLDEF void pgl_DeleteVertexArrays(GLsizei n, const GLuint* arrays)
 {
     PGL_ERR(n < 0, GL_INVALID_VALUE);
     for (int i=0; i<n; ++i) {
@@ -7120,7 +7120,7 @@ PGLDEF void glDeleteVertexArrays(GLsizei n, const GLuint* arrays)
     }
 }
 
-PGLDEF void glGenBuffers(GLsizei n, GLuint* buffers)
+PGLDEF void pgl_GenBuffers(GLsizei n, GLuint* buffers)
 {
     PGL_ERR(n < 0, GL_INVALID_VALUE);
     //fill up empty slots first
@@ -7144,7 +7144,7 @@ PGLDEF void glGenBuffers(GLsizei n, GLuint* buffers)
     }
 }
 
-PGLDEF void glDeleteBuffers(GLsizei n, const GLuint* buffers)
+PGLDEF void pgl_DeleteBuffers(GLsizei n, const GLuint* buffers)
 {
     PGL_ERR(n < 0, GL_INVALID_VALUE);
     GLenum type;
@@ -7153,7 +7153,7 @@ PGLDEF void glDeleteBuffers(GLsizei n, const GLuint* buffers)
             continue;
 
         // NOTE(rswinkle): type is stored as correct index not the raw enum value so no need to
-        // subtract here see glBindBuffer
+        // subtract here see pgl_BindBuffer
         type = c->buffers.a[buffers[i]].type;
         if (buffers[i] == c->bound_buffers[type])
             c->bound_buffers[type] = 0;
@@ -7167,7 +7167,7 @@ PGLDEF void glDeleteBuffers(GLsizei n, const GLuint* buffers)
     }
 }
 
-PGLDEF void glGenTextures(GLsizei n, GLuint* textures)
+PGLDEF void pgl_GenTextures(GLsizei n, GLuint* textures)
 {
     PGL_ERR(n < 0, GL_INVALID_VALUE);
     int j = 0;
@@ -7191,7 +7191,7 @@ PGLDEF void glGenTextures(GLsizei n, GLuint* textures)
     }
 }
 
-PGLDEF void glCreateTextures(GLenum target, GLsizei n, GLuint* textures)
+PGLDEF void pgl_CreateTextures(GLenum target, GLsizei n, GLuint* textures)
 {
     PGL_ERR((target < GL_TEXTURE_1D || target >= GL_NUM_TEXTURE_TYPES), GL_INVALID_ENUM);
     PGL_ERR(n < 0, GL_INVALID_VALUE);
@@ -7214,7 +7214,7 @@ PGLDEF void glCreateTextures(GLenum target, GLsizei n, GLuint* textures)
     }
 }
 
-PGLDEF void glDeleteTextures(GLsizei n, const GLuint* textures)
+PGLDEF void pgl_DeleteTextures(GLsizei n, const GLuint* textures)
 {
     PGL_ERR(n < 0, GL_INVALID_VALUE);
     GLenum type;
@@ -7223,7 +7223,7 @@ PGLDEF void glDeleteTextures(GLsizei n, const GLuint* textures)
             continue;
 
         // NOTE(rswinkle): type is stored as correct index not the raw enum value
-        // so no need to subtract here see glBindTexture
+        // so no need to subtract here see pgl_BindTexture
         type = c->textures.a[textures[i]].type;
         if (textures[i] == c->bound_textures[type])
             c->bound_textures[type] = 0;
@@ -7239,7 +7239,7 @@ PGLDEF void glDeleteTextures(GLsizei n, const GLuint* textures)
     }
 }
 
-PGLDEF void glBindVertexArray(GLuint array)
+PGLDEF void pgl_BindVertexArray(GLuint array)
 {
     PGL_ERR((array >= c->vertex_arrays.size || c->vertex_arrays.a[array].deleted), GL_INVALID_OPERATION);
 
@@ -7247,7 +7247,7 @@ PGLDEF void glBindVertexArray(GLuint array)
     c->bound_buffers[GL_ELEMENT_ARRAY_BUFFER-GL_ARRAY_BUFFER] = c->vertex_arrays.a[array].element_buffer;
 }
 
-PGLDEF void glBindBuffer(GLenum target, GLuint buffer)
+PGLDEF void pgl_BindBuffer(GLenum target, GLuint buffer)
 {
     PGL_ERR(target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER, GL_INVALID_ENUM);
 
@@ -7267,8 +7267,8 @@ PGLDEF void glBindBuffer(GLenum target, GLuint buffer)
     }
 }
 
-// TODO reuse code, call glNamedBufferData() internally, remove duplicated error checks?
-PGLDEF void glBufferData(GLenum target, GLsizeiptr size, const GLvoid* data, GLenum usage)
+// TODO reuse code, call pgl_NamedBufferData() internally, remove duplicated error checks?
+PGLDEF void pgl_BufferData(GLenum target, GLsizeiptr size, const GLvoid* data, GLenum usage)
 {
     //TODO check for usage later
     PGL_UNUSED(usage);
@@ -7294,7 +7294,7 @@ PGLDEF void glBufferData(GLenum target, GLsizeiptr size, const GLvoid* data, GLe
     c->buffers.a[c->bound_buffers[target]].size = size;
 }
 
-PGLDEF void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const GLvoid* data)
+PGLDEF void pgl_BufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const GLvoid* data)
 {
     PGL_ERR(target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER, GL_INVALID_ENUM);
     PGL_ERR((offset < 0 || size < 0), GL_INVALID_VALUE);
@@ -7307,7 +7307,7 @@ PGLDEF void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, con
     PGL_MEMCPY(&c->buffers.a[c->bound_buffers[target]].data[offset], data, size);
 }
 
-PGLDEF void glNamedBufferData(GLuint buffer, GLsizeiptr size, const GLvoid* data, GLenum usage)
+PGLDEF void pgl_NamedBufferData(GLuint buffer, GLsizeiptr size, const GLvoid* data, GLenum usage)
 {
     //check for usage later
     PGL_UNUSED(usage);
@@ -7329,7 +7329,7 @@ PGLDEF void glNamedBufferData(GLuint buffer, GLsizeiptr size, const GLvoid* data
     c->buffers.a[buffer].size = size;
 }
 
-PGLDEF void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const GLvoid* data)
+PGLDEF void pgl_NamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const GLvoid* data)
 {
     PGL_ERR((!buffer || buffer >= c->buffers.size || c->buffers.a[buffer].deleted), GL_INVALID_OPERATION);
     PGL_ERR((offset < 0 || size < 0), GL_INVALID_VALUE);
@@ -7339,7 +7339,7 @@ PGLDEF void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size
 }
 
 // TODO see page 136-7 of spec
-PGLDEF void glBindTexture(GLenum target, GLuint texture)
+PGLDEF void pgl_BindTexture(GLenum target, GLuint texture)
 {
     PGL_ERR((target < GL_TEXTURE_1D || target >= GL_NUM_TEXTURE_TYPES), GL_INVALID_ENUM);
 
@@ -7460,7 +7460,7 @@ static void get_texparami(glTexture* tex, GLenum pname, GLenum type, GLvoid* par
     }
 }
 
-PGLDEF void glTexParameteri(GLenum target, GLenum pname, GLint param)
+PGLDEF void pgl_TexParameteri(GLenum target, GLenum pname, GLint param)
 {
     PGL_ERR((target != GL_TEXTURE_1D && target != GL_TEXTURE_2D && target != GL_TEXTURE_3D && target != GL_TEXTURE_2D_ARRAY && target != GL_TEXTURE_RECTANGLE && target != GL_TEXTURE_CUBE_MAP), GL_INVALID_ENUM);
 
@@ -7476,7 +7476,7 @@ PGLDEF void glTexParameteri(GLenum target, GLenum pname, GLint param)
     set_texparami(tex, pname, param);
 }
 
-PGLDEF void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params)
+PGLDEF void pgl_TexParameterfv(GLenum target, GLenum pname, const GLfloat* params)
 {
 #ifdef PGL_ENABLE_CLAMP_TO_BORDER
     PGL_ERR((target != GL_TEXTURE_1D && target != GL_TEXTURE_2D && target != GL_TEXTURE_3D && target != GL_TEXTURE_2D_ARRAY && target != GL_TEXTURE_RECTANGLE && target != GL_TEXTURE_CUBE_MAP), GL_INVALID_ENUM);
@@ -7493,7 +7493,7 @@ PGLDEF void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params)
     memcpy(&tex->border_color, params, sizeof(GLfloat)*4);
 #endif
 }
-PGLDEF void glTexParameteriv(GLenum target, GLenum pname, const GLint* params)
+PGLDEF void pgl_TexParameteriv(GLenum target, GLenum pname, const GLint* params)
 {
 #ifdef PGL_ENABLE_CLAMP_TO_BORDER
     PGL_ERR((target != GL_TEXTURE_1D && target != GL_TEXTURE_2D && target != GL_TEXTURE_3D && target != GL_TEXTURE_2D_ARRAY && target != GL_TEXTURE_RECTANGLE && target != GL_TEXTURE_CUBE_MAP), GL_INVALID_ENUM);
@@ -7518,13 +7518,13 @@ PGLDEF void glTexParameteriv(GLenum target, GLenum pname, const GLint* params)
 // NOTE: I added the !texture checks to the glTextureParameter*() functions
 // even though it's not in the spec because there's no way to know which
 // default texture (0) target you're referring to
-PGLDEF void glTextureParameteri(GLuint texture, GLenum pname, GLint param)
+PGLDEF void pgl_TextureParameteri(GLuint texture, GLenum pname, GLint param)
 {
     PGL_ERR((!texture || texture >= c->textures.size || c->textures.a[texture].deleted), GL_INVALID_OPERATION);
     set_texparami(&c->textures.a[texture], pname, param);
 }
 
-PGLDEF void glTextureParameterfv(GLuint texture, GLenum pname, const GLfloat* params)
+PGLDEF void pgl_TextureParameterfv(GLuint texture, GLenum pname, const GLfloat* params)
 {
 #ifdef PGL_ENABLE_CLAMP_TO_BORDER
     PGL_ERR((!texture || texture >= c->textures.size || c->textures.a[texture].deleted), GL_INVALID_OPERATION);
@@ -7532,7 +7532,7 @@ PGLDEF void glTextureParameterfv(GLuint texture, GLenum pname, const GLfloat* pa
 #endif
 }
 
-PGLDEF void glTextureParameteriv(GLuint texture, GLenum pname, const GLint* params)
+PGLDEF void pgl_TextureParameteriv(GLuint texture, GLenum pname, const GLint* params)
 {
 #ifdef PGL_ENABLE_CLAMP_TO_BORDER
     PGL_ERR((!texture || texture >= c->textures.size || c->textures.a[texture].deleted), GL_INVALID_OPERATION);
@@ -7545,7 +7545,7 @@ PGLDEF void glTextureParameteriv(GLuint texture, GLenum pname, const GLint* para
 #endif
 }
 
-PGLDEF void glGetTexParameterfv(GLenum target, GLenum pname, GLfloat* params)
+PGLDEF void pgl_GetTexParameterfv(GLenum target, GLenum pname, GLfloat* params)
 {
 #ifdef PGL_ENABLE_CLAMP_TO_BORDER
     PGL_ERR((target != GL_TEXTURE_1D && target != GL_TEXTURE_2D && target != GL_TEXTURE_3D && target != GL_TEXTURE_2D_ARRAY && target != GL_TEXTURE_RECTANGLE && target != GL_TEXTURE_CUBE_MAP), GL_INVALID_ENUM);
@@ -7563,7 +7563,7 @@ PGLDEF void glGetTexParameterfv(GLenum target, GLenum pname, GLfloat* params)
 #endif
 }
 
-PGLDEF void glGetTexParameteriv(GLenum target, GLenum pname, GLint* params)
+PGLDEF void pgl_GetTexParameteriv(GLenum target, GLenum pname, GLint* params)
 {
     PGL_ERR((target != GL_TEXTURE_1D && target != GL_TEXTURE_2D && target != GL_TEXTURE_3D && target != GL_TEXTURE_2D_ARRAY && target != GL_TEXTURE_RECTANGLE && target != GL_TEXTURE_CUBE_MAP), GL_INVALID_ENUM);
 
@@ -7578,7 +7578,7 @@ PGLDEF void glGetTexParameteriv(GLenum target, GLenum pname, GLint* params)
     get_texparami(tex, pname, GL_INT, (GLvoid*)params);
 }
 
-PGLDEF void glGetTexParameterIiv(GLenum target, GLenum pname, GLint* params)
+PGLDEF void pgl_GetTexParameterIiv(GLenum target, GLenum pname, GLint* params)
 {
     PGL_ERR((target != GL_TEXTURE_1D && target != GL_TEXTURE_2D && target != GL_TEXTURE_3D && target != GL_TEXTURE_2D_ARRAY && target != GL_TEXTURE_RECTANGLE && target != GL_TEXTURE_CUBE_MAP), GL_INVALID_ENUM);
 
@@ -7593,7 +7593,7 @@ PGLDEF void glGetTexParameterIiv(GLenum target, GLenum pname, GLint* params)
     get_texparami(tex, pname, GL_INT, (GLvoid*)params);
 }
 
-PGLDEF void glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint* params)
+PGLDEF void pgl_GetTexParameterIuiv(GLenum target, GLenum pname, GLuint* params)
 {
     PGL_ERR((target != GL_TEXTURE_1D && target != GL_TEXTURE_2D && target != GL_TEXTURE_3D && target != GL_TEXTURE_2D_ARRAY && target != GL_TEXTURE_RECTANGLE && target != GL_TEXTURE_CUBE_MAP), GL_INVALID_ENUM);
 
@@ -7608,7 +7608,7 @@ PGLDEF void glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint* params)
     get_texparami(tex, pname, GL_UNSIGNED_INT, (GLvoid*)params);
 }
 
-PGLDEF void glGetTextureParameterfv(GLuint texture, GLenum pname, GLfloat* params)
+PGLDEF void pgl_GetTextureParameterfv(GLuint texture, GLenum pname, GLfloat* params)
 {
 #ifdef PGL_ENABLE_CLAMP_TO_BORDER
     PGL_ERR((!texture || texture >= c->textures.size || c->textures.a[texture].deleted), GL_INVALID_OPERATION);
@@ -7616,26 +7616,26 @@ PGLDEF void glGetTextureParameterfv(GLuint texture, GLenum pname, GLfloat* param
 #endif
 }
 
-PGLDEF void glGetTextureParameteriv(GLuint texture, GLenum pname, GLint* params)
+PGLDEF void pgl_GetTextureParameteriv(GLuint texture, GLenum pname, GLint* params)
 {
     PGL_ERR((!texture || texture >= c->textures.size || c->textures.a[texture].deleted), GL_INVALID_OPERATION);
     get_texparami(&c->textures.a[texture], pname, GL_UNSIGNED_INT, (GLvoid*)params);
 }
 
-PGLDEF void glGetTextureParameterIiv(GLuint texture, GLenum pname, GLint* params)
+PGLDEF void pgl_GetTextureParameterIiv(GLuint texture, GLenum pname, GLint* params)
 {
     PGL_ERR((!texture || texture >= c->textures.size || c->textures.a[texture].deleted), GL_INVALID_OPERATION);
     get_texparami(&c->textures.a[texture], pname, GL_UNSIGNED_INT, (GLvoid*)params);
 }
 
-PGLDEF void glGetTextureParameterIuiv(GLuint texture, GLenum pname, GLuint* params)
+PGLDEF void pgl_GetTextureParameterIuiv(GLuint texture, GLenum pname, GLuint* params)
 {
     PGL_ERR((!texture || texture >= c->textures.size || c->textures.a[texture].deleted), GL_INVALID_OPERATION);
     get_texparami(&c->textures.a[texture], pname, GL_UNSIGNED_INT, (GLvoid*)params);
 }
 
 
-PGLDEF void glPixelStorei(GLenum pname, GLint param)
+PGLDEF void pgl_PixelStorei(GLenum pname, GLint param)
 {
     PGL_ERR((pname != GL_UNPACK_ALIGNMENT && pname != GL_PACK_ALIGNMENT), GL_INVALID_ENUM);
 
@@ -7678,7 +7678,7 @@ PGLDEF void glPixelStorei(GLenum pname, GLint param)
     } \
     } while (0)
 
-PGLDEF void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const GLvoid* data)
+PGLDEF void pgl_TexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const GLvoid* data)
 {
     PGL_UNUSED(level);
     PGL_UNUSED(internalformat);
@@ -7725,7 +7725,7 @@ PGLDEF void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsiz
     tex->user_owned = GL_FALSE;
 }
 
-PGLDEF void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid* data)
+PGLDEF void pgl_TexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid* data)
 {
     PGL_UNUSED(level);
     PGL_UNUSED(internalformat);
@@ -7805,7 +7805,7 @@ PGLDEF void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsiz
             PGL_FREE(tex->data);
 
         // TODO specs say INVALID_VALUE, man/ref pages say INVALID_ENUM?
-        // https://registry.khronos.org/OpenGL-Refpages/gl4/html/glTexImage2D.xhtml
+        // https://registry.khronos.org/OpenGL-Refpages/gl4/html/pgl_TexImage2D.xhtml
         PGL_ERR(width != height, GL_INVALID_VALUE);
 
         // TODO hardcoded 4 as long as we only support RGBA/UBYTES
@@ -7839,7 +7839,7 @@ PGLDEF void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsiz
     } //end CUBE_MAP
 }
 
-PGLDEF void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const GLvoid* data)
+PGLDEF void pgl_TexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const GLvoid* data)
 {
     PGL_UNUSED(level);
     PGL_UNUSED(internalformat);
@@ -7892,7 +7892,7 @@ PGLDEF void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsiz
     tex->user_owned = GL_FALSE;
 }
 
-PGLDEF void glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const GLvoid* data)
+PGLDEF void pgl_TexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const GLvoid* data)
 {
     PGL_UNUSED(level);
 
@@ -7923,7 +7923,7 @@ PGLDEF void glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei w
     convert_format_to_packed_rgba((u8*)&texdata[xoffset], (u8*)data, width, 1, width*components, format);
 }
 
-PGLDEF void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* data)
+PGLDEF void pgl_TexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* data)
 {
     PGL_UNUSED(level);
 
@@ -8001,7 +8001,7 @@ PGLDEF void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yof
     } //end CUBE_MAP
 }
 
-PGLDEF void glTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const GLvoid* data)
+PGLDEF void pgl_TexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const GLvoid* data)
 {
     PGL_UNUSED(level);
 
@@ -8054,7 +8054,7 @@ PGLDEF void glTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yof
     }
 }
 
-PGLDEF void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const GLvoid* pointer)
+PGLDEF void pgl_VertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const GLvoid* pointer)
 {
     // See Section 2.8 pages 37-38 of 3.3 compatiblity spec
     //
@@ -8106,19 +8106,19 @@ PGLDEF void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboole
     v->buf = c->bound_buffers[GL_ARRAY_BUFFER-GL_ARRAY_BUFFER];
 }
 
-PGLDEF void glEnableVertexAttribArray(GLuint index)
+PGLDEF void pgl_EnableVertexAttribArray(GLuint index)
 {
     PGL_ERR(index >= GL_MAX_VERTEX_ATTRIBS, GL_INVALID_VALUE);
     c->vertex_arrays.a[c->cur_vertex_array].vertex_attribs[index].enabled = GL_TRUE;
 }
 
-PGLDEF void glDisableVertexAttribArray(GLuint index)
+PGLDEF void pgl_DisableVertexAttribArray(GLuint index)
 {
     PGL_ERR(index >= GL_MAX_VERTEX_ATTRIBS, GL_INVALID_VALUE);
     c->vertex_arrays.a[c->cur_vertex_array].vertex_attribs[index].enabled = GL_FALSE;
 }
 
-PGLDEF void glEnableVertexArrayAttrib(GLuint vaobj, GLuint index)
+PGLDEF void pgl_EnableVertexArrayAttrib(GLuint vaobj, GLuint index)
 {
     PGL_ERR(index >= GL_MAX_VERTEX_ATTRIBS, GL_INVALID_VALUE);
     PGL_ERR((vaobj >= c->vertex_arrays.size || c->vertex_arrays.a[vaobj].deleted), GL_INVALID_OPERATION);
@@ -8126,14 +8126,14 @@ PGLDEF void glEnableVertexArrayAttrib(GLuint vaobj, GLuint index)
     c->vertex_arrays.a[c->cur_vertex_array].vertex_attribs[index].enabled = GL_TRUE;
 }
 
-PGLDEF void glDisableVertexArrayAttrib(GLuint vaobj, GLuint index)
+PGLDEF void pgl_DisableVertexArrayAttrib(GLuint vaobj, GLuint index)
 {
     PGL_ERR(index >= GL_MAX_VERTEX_ATTRIBS, GL_INVALID_VALUE);
     PGL_ERR((vaobj >= c->vertex_arrays.size || c->vertex_arrays.a[vaobj].deleted), GL_INVALID_OPERATION);
     c->vertex_arrays.a[c->cur_vertex_array].vertex_attribs[index].enabled = GL_FALSE;
 }
 
-PGLDEF void glVertexAttribDivisor(GLuint index, GLuint divisor)
+PGLDEF void pgl_VertexAttribDivisor(GLuint index, GLuint divisor)
 {
     PGL_ERR(index >= GL_MAX_VERTEX_ATTRIBS, GL_INVALID_VALUE);
 
@@ -8143,7 +8143,7 @@ PGLDEF void glVertexAttribDivisor(GLuint index, GLuint divisor)
 
 
 //TODO(rswinkle): Why is first, an index, a GLint and not GLuint or GLsizei?
-PGLDEF void glDrawArrays(GLenum mode, GLint first, GLsizei count)
+PGLDEF void pgl_DrawArrays(GLenum mode, GLint first, GLsizei count)
 {
     PGL_ERR((mode < GL_POINTS || mode > GL_TRIANGLE_FAN), GL_INVALID_ENUM);
     PGL_ERR(count < 0, GL_INVALID_VALUE);
@@ -8154,7 +8154,7 @@ PGLDEF void glDrawArrays(GLenum mode, GLint first, GLsizei count)
     run_pipeline(mode, (GLvoid*)(GLintptr)first, count, 0, 0, GL_FALSE);
 }
 
-PGLDEF void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount)
+PGLDEF void pgl_MultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount)
 {
     PGL_ERR((mode < GL_POINTS || mode > GL_TRIANGLE_FAN), GL_INVALID_ENUM);
     PGL_ERR(drawcount < 0, GL_INVALID_VALUE);
@@ -8165,7 +8165,7 @@ PGLDEF void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* co
     }
 }
 
-PGLDEF void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices)
+PGLDEF void pgl_DrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices)
 {
     PGL_ERR((mode < GL_POINTS || mode > GL_TRIANGLE_FAN), GL_INVALID_ENUM);
     PGL_ERR(count < 0, GL_INVALID_VALUE);
@@ -8180,7 +8180,7 @@ PGLDEF void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid
 }
 
 // TODO fix
-PGLDEF void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices, GLsizei drawcount)
+PGLDEF void pgl_MultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices, GLsizei drawcount)
 {
     PGL_ERR((mode < GL_POINTS || mode > GL_TRIANGLE_FAN), GL_INVALID_ENUM);
     PGL_ERR(drawcount < 0, GL_INVALID_VALUE);
@@ -8194,7 +8194,7 @@ PGLDEF void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, 
     }
 }
 
-PGLDEF void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount)
+PGLDEF void pgl_DrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount)
 {
     PGL_ERR((mode < GL_POINTS || mode > GL_TRIANGLE_FAN), GL_INVALID_ENUM);
     PGL_ERR((count < 0 || instancecount < 0), GL_INVALID_VALUE);
@@ -8207,7 +8207,7 @@ PGLDEF void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsiz
     }
 }
 
-PGLDEF void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei instancecount, GLuint baseinstance)
+PGLDEF void pgl_DrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei instancecount, GLuint baseinstance)
 {
     PGL_ERR((mode < GL_POINTS || mode > GL_TRIANGLE_FAN), GL_INVALID_ENUM);
     PGL_ERR((count < 0 || instancecount < 0), GL_INVALID_VALUE);
@@ -8221,7 +8221,7 @@ PGLDEF void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei 
 }
 
 
-PGLDEF void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices, GLsizei instancecount)
+PGLDEF void pgl_DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices, GLsizei instancecount)
 {
     PGL_ERR((mode < GL_POINTS || mode > GL_TRIANGLE_FAN), GL_INVALID_ENUM);
     PGL_ERR((count < 0 || instancecount < 0), GL_INVALID_VALUE);
@@ -8237,7 +8237,7 @@ PGLDEF void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, con
     }
 }
 
-PGLDEF void glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices, GLsizei instancecount, GLuint baseinstance)
+PGLDEF void pgl_DrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices, GLsizei instancecount, GLuint baseinstance)
 {
     PGL_ERR((mode < GL_POINTS || mode > GL_TRIANGLE_FAN), GL_INVALID_ENUM);
     PGL_ERR((count < 0 || instancecount < 0), GL_INVALID_VALUE);
@@ -8253,13 +8253,13 @@ PGLDEF void glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLen
     }
 }
 
-PGLDEF void glDebugMessageCallback(GLDEBUGPROC callback, void* userParam)
+PGLDEF void pgl_DebugMessageCallback(GLDEBUGPROC callback, void* userParam)
 {
     c->dbg_callback = callback;
     c->dbg_userparam = userParam;
 }
 
-PGLDEF void glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
+PGLDEF void pgl_Viewport(GLint x, GLint y, GLsizei width, GLsizei height)
 {
     PGL_ERR((width < 0 || height < 0), GL_INVALID_VALUE);
 
@@ -8272,7 +8272,7 @@ PGLDEF void glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
     c->height = height;
 }
 
-PGLDEF void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
+PGLDEF void pgl_ClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
 {
     red = clamp_01(red);
     green = clamp_01(green);
@@ -8284,41 +8284,41 @@ PGLDEF void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha
     c->clear_color = RGBA_TO_PIXEL(red*PGL_RMAX, green*PGL_GMAX, blue*PGL_BMAX, alpha*PGL_AMAX);
 }
 
-PGLDEF void glClearDepthf(GLfloat depth)
+PGLDEF void pgl_ClearDepthf(GLfloat depth)
 {
     c->clear_depth = clamp_01(depth);
 }
 
-PGLDEF void glClearDepth(GLdouble depth)
+PGLDEF void pgl_ClearDepth(GLdouble depth)
 {
     c->clear_depth = clamp_01(depth);
 }
 
-PGLDEF void glDepthFunc(GLenum func)
+PGLDEF void pgl_DepthFunc(GLenum func)
 {
     PGL_ERR((func < GL_LESS || func > GL_NEVER), GL_INVALID_ENUM);
 
     c->depth_func = func;
 }
 
-PGLDEF void glDepthRangef(GLfloat nearVal, GLfloat farVal)
+PGLDEF void pgl_DepthRangef(GLfloat nearVal, GLfloat farVal)
 {
     c->depth_range_near = clamp_01(nearVal);
     c->depth_range_far = clamp_01(farVal);
 }
 
-PGLDEF void glDepthRange(GLdouble nearVal, GLdouble farVal)
+PGLDEF void pgl_DepthRange(GLdouble nearVal, GLdouble farVal)
 {
     c->depth_range_near = clamp_01(nearVal);
     c->depth_range_far = clamp_01(farVal);
 }
 
-PGLDEF void glDepthMask(GLboolean flag)
+PGLDEF void pgl_DepthMask(GLboolean flag)
 {
     c->depth_mask = flag;
 }
 
-PGLDEF void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha)
+PGLDEF void pgl_ColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha)
 {
 #ifndef PGL_DISABLE_COLOR_MASK
     // !! ensures 1 or 0
@@ -8336,7 +8336,7 @@ PGLDEF void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolea
 #endif
 }
 
-// glClear row/span kernels. One contiguous run of n pixels each; the
+// pgl_Clear row/span kernels. One contiguous run of n pixels each; the
 // scalar bodies are the original per-pixel macros.
 #ifndef PGL_DISABLE_COLOR_MASK
 static inline void clear_color_span(pix_t* p, pix_t color, pix_t clear_mask, int n)
@@ -8416,15 +8416,15 @@ static inline void clear_stencil_span(stencil_pix_t* p, u8 cs, int n)
 #endif
 #endif
 
-PGLDEF void glClear(GLbitfield mask)
+PGLDEF void pgl_Clear(GLbitfield mask)
 {
-    // TODO: If a buffer is not present, then a glClear directed at that buffer has no effect.
+    // TODO: If a buffer is not present, then a pgl_Clear directed at that buffer has no effect.
     // right now they're all always present
 
     PGL_ERR((mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)), GL_INVALID_VALUE);
 
 #ifdef PGL_G3D
-    /* Phase A2 persistent depth.  glClear marks the frame boundary: it records
+    /* Phase A2 persistent depth.  pgl_Clear marks the frame boundary: it records
      * the clear colour/depth and flags the NEXT GPU draw dispatch as the frame's
      * first, so that dispatch clears the persistent colour+Z surfaces (later
      * dispatches LOAD them, letting a multi-draw frame accumulate instead of
@@ -8433,7 +8433,7 @@ PGLDEF void glClear(GLbitfield mask)
      * primitive that may follow GPU draws in the same frame, and guarantees the
      * shared back_buffer is cleared even for a frame that issues no GPU draw. */
     if (_pgl_gpu_active) {
-        /* A scissored or colour-masked glClear is performed precisely by the CPU
+        /* A scissored or colour-masked pgl_Clear is performed precisely by the CPU
          * below, but the GPU folds the frame clear into its first draw dispatch
          * as a FULL-FRAME, unmasked clear that would clobber it.  Pin such a
          * frame to the CPU (pgl_gpu_state declines while _pgl_gpu_frame_cpu is
@@ -8518,7 +8518,7 @@ PGLDEF void glClear(GLbitfield mask)
 #undef CLEAR_COLOR_SPAN
 }
 
-PGLDEF void glEnable(GLenum cap)
+PGLDEF void pgl_Enable(GLenum cap)
 {
     switch (cap) {
     case GL_CULL_FACE:
@@ -8571,7 +8571,7 @@ PGLDEF void glEnable(GLenum cap)
     }
 }
 
-PGLDEF void glDisable(GLenum cap)
+PGLDEF void pgl_Disable(GLenum cap)
 {
     switch (cap) {
     case GL_CULL_FACE:
@@ -8621,7 +8621,7 @@ PGLDEF void glDisable(GLenum cap)
     }
 }
 
-PGLDEF GLboolean glIsEnabled(GLenum cap)
+PGLDEF GLboolean pgl_IsEnabled(GLenum cap)
 {
     // make up my own enum for this?  rename member as no_early_z?
     //GLboolean fragdepth_or_discard;
@@ -8646,7 +8646,7 @@ PGLDEF GLboolean glIsEnabled(GLenum cap)
     return GL_FALSE;
 }
 
-PGLDEF GLboolean glIsProgram(GLuint program)
+PGLDEF GLboolean pgl_IsProgram(GLuint program)
 {
     if (!program || program >= c->programs.size || c->programs.a[program].deleted) {
         return GL_FALSE;
@@ -8655,7 +8655,7 @@ PGLDEF GLboolean glIsProgram(GLuint program)
     return GL_TRUE;
 }
 
-PGLDEF void glGetBooleanv(GLenum pname, GLboolean* data)
+PGLDEF void pgl_GetBooleanv(GLenum pname, GLboolean* data)
 {
     // not sure it's worth adding every enum, spec says
     // gelGet* will convert/map types if they don't match the function
@@ -8678,7 +8678,7 @@ PGLDEF void glGetBooleanv(GLenum pname, GLboolean* data)
     }
 }
 
-PGLDEF void glGetFloatv(GLenum pname, GLfloat* data)
+PGLDEF void pgl_GetFloatv(GLenum pname, GLfloat* data)
 {
     switch (pname) {
     case GL_POLYGON_OFFSET_FACTOR:         *data = c->poly_factor;         break;
@@ -8711,7 +8711,7 @@ PGLDEF void glGetFloatv(GLenum pname, GLfloat* data)
     }
 }
 
-PGLDEF void glGetIntegerv(GLenum pname, GLint* data)
+PGLDEF void pgl_GetIntegerv(GLenum pname, GLint* data)
 {
     // TODO maybe make all the enum/int member names match the associated ENUM?
     switch (pname) {
@@ -8735,7 +8735,7 @@ PGLDEF void glGetIntegerv(GLenum pname, GLint* data)
 
     case GL_LOGIC_OP_MODE:             data[0] = c->logic_func; break;
 
-    //TODO implement glBlendFuncSeparate and glBlendEquationSeparate
+    //TODO implement pgl_BlendFuncSeparate and pgl_BlendEquationSeparate
     case GL_BLEND_SRC_RGB:             data[0] = c->blend_sRGB; break;
     case GL_BLEND_SRC_ALPHA:           data[0] = c->blend_sA; break;
     case GL_BLEND_DST_RGB:             data[0] = c->blend_dRGB; break;
@@ -8809,19 +8809,19 @@ PGLDEF void glGetIntegerv(GLenum pname, GLint* data)
     }
 }
 
-PGLDEF void glCullFace(GLenum mode)
+PGLDEF void pgl_CullFace(GLenum mode)
 {
     PGL_ERR((mode != GL_FRONT && mode != GL_BACK && mode != GL_FRONT_AND_BACK), GL_INVALID_ENUM);
     c->cull_mode = mode;
 }
 
-PGLDEF void glFrontFace(GLenum mode)
+PGLDEF void pgl_FrontFace(GLenum mode)
 {
     PGL_ERR((mode != GL_CCW && mode != GL_CW), GL_INVALID_ENUM);
     c->front_face = mode;
 }
 
-PGLDEF void glPolygonMode(GLenum face, GLenum mode)
+PGLDEF void pgl_PolygonMode(GLenum face, GLenum mode)
 {
     // TODO only support FRONT_AND_BACK like OpenGL 3/4 and OpenGL ES 2/3 ...
     // or keep support for FRONT and BACK like OpenGL 1 and 2?
@@ -8871,19 +8871,19 @@ PGLDEF void glPolygonMode(GLenum face, GLenum mode)
     }
 }
 
-PGLDEF void glLineWidth(GLfloat width)
+PGLDEF void pgl_LineWidth(GLfloat width)
 {
     PGL_ERR(width <= 0.0f, GL_INVALID_VALUE);
     c->line_width = width;
 }
 
-PGLDEF void glPointSize(GLfloat size)
+PGLDEF void pgl_PointSize(GLfloat size)
 {
     PGL_ERR(size <= 0.0f, GL_INVALID_VALUE);
     c->point_size = size;
 }
 
-PGLDEF void glPointParameteri(GLenum pname, GLint param)
+PGLDEF void pgl_PointParameteri(GLenum pname, GLint param)
 {
     //also GL_POINT_FADE_THRESHOLD_SIZE
     PGL_ERR((pname != GL_POINT_SPRITE_COORD_ORIGIN ||
@@ -8892,7 +8892,7 @@ PGLDEF void glPointParameteri(GLenum pname, GLint param)
     c->point_spr_origin = param;
 }
 
-PGLDEF void glProvokingVertex(GLenum provokeMode)
+PGLDEF void pgl_ProvokingVertex(GLenum provokeMode)
 {
     PGL_ERR((provokeMode != GL_FIRST_VERTEX_CONVENTION && provokeMode != GL_LAST_VERTEX_CONVENTION), GL_INVALID_ENUM);
 
@@ -8903,7 +8903,7 @@ PGLDEF void glProvokingVertex(GLenum provokeMode)
 // Shader functions
 PGLDEF GLuint pglCreateProgram(vert_func vertex_shader, frag_func fragment_shader, GLsizei n, GLenum* interpolation, GLboolean fragdepth_or_discard)
 {
-    // Using glAttachShader error if shader is not a shader object which
+    // Using pgl_AttachShader error if shader is not a shader object which
     // is the closest analog
     PGL_ERR_RET_VAL((!vertex_shader || !fragment_shader), GL_INVALID_OPERATION, 0);
 
@@ -8928,7 +8928,7 @@ PGLDEF GLuint pglCreateProgram(vert_func vertex_shader, frag_func fragment_shade
 // Doesn't really do anything except mark for re-use, you
 // could still use it even if it wasn't current as long as
 // no new program get's assigned to the same spot
-PGLDEF void glDeleteProgram(GLuint program)
+PGLDEF void pgl_DeleteProgram(GLuint program)
 {
     // This check isn't really necessary since "deleting" only marks it
     // and CreateProgram will never overwrite the 0/default shader
@@ -8940,7 +8940,7 @@ PGLDEF void glDeleteProgram(GLuint program)
     c->programs.a[program].deleted = GL_TRUE;
 }
 
-PGLDEF void glUseProgram(GLuint program)
+PGLDEF void pgl_UseProgram(GLuint program)
 {
     // Not a problem if program is marked "deleted" already
     PGL_ERR(program >= c->programs.size, GL_INVALID_VALUE);
@@ -8972,7 +8972,7 @@ PGLDEF void pglSetProgramUniform(GLuint program, void* uniform)
 }
 
 
-PGLDEF void glBlendFunc(GLenum sfactor, GLenum dfactor)
+PGLDEF void pgl_BlendFunc(GLenum sfactor, GLenum dfactor)
 {
     PGL_ERR((sfactor < GL_ZERO || sfactor >= NUM_BLEND_FUNCS || dfactor < GL_ZERO || dfactor >= NUM_BLEND_FUNCS), GL_INVALID_ENUM);
 
@@ -8982,7 +8982,7 @@ PGLDEF void glBlendFunc(GLenum sfactor, GLenum dfactor)
     c->blend_dA = dfactor;
 }
 
-PGLDEF void glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha)
+PGLDEF void pgl_BlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha)
 {
     PGL_ERR((srcRGB < GL_ZERO || srcRGB >= NUM_BLEND_FUNCS ||
              dstRGB < GL_ZERO || dstRGB >= NUM_BLEND_FUNCS ||
@@ -8995,7 +8995,7 @@ PGLDEF void glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, G
     c->blend_dA = dstAlpha;
 }
 
-PGLDEF void glBlendEquation(GLenum mode)
+PGLDEF void pgl_BlendEquation(GLenum mode)
 {
     PGL_ERR((mode < GL_FUNC_ADD || mode >= NUM_BLEND_EQUATIONS), GL_INVALID_ENUM);
 
@@ -9003,7 +9003,7 @@ PGLDEF void glBlendEquation(GLenum mode)
     c->blend_eqA = mode;
 }
 
-PGLDEF void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha)
+PGLDEF void pgl_BlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha)
 {
     PGL_ERR((modeRGB < GL_FUNC_ADD || modeRGB >= NUM_BLEND_EQUATIONS ||
         modeAlpha < GL_FUNC_ADD || modeAlpha >= NUM_BLEND_EQUATIONS), GL_INVALID_ENUM);
@@ -9012,24 +9012,24 @@ PGLDEF void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha)
     c->blend_eqA = modeAlpha;
 }
 
-PGLDEF void glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
+PGLDEF void pgl_BlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
 {
     SET_V4(c->blend_color, clamp_01(red), clamp_01(green), clamp_01(blue), clamp_01(alpha));
 }
 
-PGLDEF void glLogicOp(GLenum opcode)
+PGLDEF void pgl_LogicOp(GLenum opcode)
 {
     PGL_ERR((opcode < GL_CLEAR || opcode > GL_INVERT), GL_INVALID_ENUM);
     c->logic_func = opcode;
 }
 
-PGLDEF void glPolygonOffset(GLfloat factor, GLfloat units)
+PGLDEF void pgl_PolygonOffset(GLfloat factor, GLfloat units)
 {
     c->poly_factor = factor;
     c->poly_units = units;
 }
 
-PGLDEF void glScissor(GLint x, GLint y, GLsizei width, GLsizei height)
+PGLDEF void pgl_Scissor(GLint x, GLint y, GLsizei width, GLsizei height)
 {
     PGL_ERR((width < 0 || height < 0), GL_INVALID_VALUE);
 
@@ -9047,7 +9047,7 @@ PGLDEF void glScissor(GLint x, GLint y, GLsizei width, GLsizei height)
 }
 
 #ifndef PGL_NO_STENCIL
-PGLDEF void glStencilFunc(GLenum func, GLint ref, GLuint mask)
+PGLDEF void pgl_StencilFunc(GLenum func, GLint ref, GLuint mask)
 {
     PGL_ERR((func < GL_LESS || func > GL_NEVER), GL_INVALID_ENUM);
 
@@ -9064,7 +9064,7 @@ PGLDEF void glStencilFunc(GLenum func, GLint ref, GLuint mask)
     c->stencil_valuemask_back = mask;
 }
 
-PGLDEF void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask)
+PGLDEF void pgl_StencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask)
 {
     PGL_ERR((face < GL_FRONT || face > GL_FRONT_AND_BACK), GL_INVALID_ENUM);
     PGL_ERR((func < GL_LESS || func > GL_NEVER), GL_INVALID_ENUM);
@@ -9072,7 +9072,7 @@ PGLDEF void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint ma
     // TODO clamp byte function?
     clampi(ref, 0, 255);
 
-    // Any better way to do this? I don't call glStencilFunc in case
+    // Any better way to do this? I don't call pgl_StencilFunc in case
     // I ever want/need debugging/logging info to show the function call
     if (face == GL_FRONT) {
         c->stencil_func = func;
@@ -9093,7 +9093,7 @@ PGLDEF void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint ma
     }
 }
 
-PGLDEF void glStencilOp(GLenum sfail, GLenum dpfail, GLenum dppass)
+PGLDEF void pgl_StencilOp(GLenum sfail, GLenum dpfail, GLenum dppass)
 {
     PGL_ERR((((sfail < GL_INVERT || sfail > GL_DECR_WRAP) && sfail != GL_ZERO) ||
             ((dpfail < GL_INVERT || dpfail > GL_DECR_WRAP) && dpfail != GL_ZERO) ||
@@ -9108,7 +9108,7 @@ PGLDEF void glStencilOp(GLenum sfail, GLenum dpfail, GLenum dppass)
     c->stencil_dppass_back = dppass;
 }
 
-PGLDEF void glStencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass)
+PGLDEF void pgl_StencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass)
 {
     PGL_ERR((face < GL_FRONT || face > GL_FRONT_AND_BACK), GL_INVALID_ENUM);
 
@@ -9136,18 +9136,18 @@ PGLDEF void glStencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum
     }
 }
 
-PGLDEF void glClearStencil(GLint s)
+PGLDEF void pgl_ClearStencil(GLint s)
 {
     c->clear_stencil = s & PGL_STENCIL_MASK;
 }
 
-PGLDEF void glStencilMask(GLuint mask)
+PGLDEF void pgl_StencilMask(GLuint mask)
 {
     c->stencil_writemask = mask;
     c->stencil_writemask_back = mask;
 }
 
-PGLDEF void glStencilMaskSeparate(GLenum face, GLuint mask)
+PGLDEF void pgl_StencilMaskSeparate(GLenum face, GLuint mask)
 {
     PGL_ERR((face < GL_FRONT || face > GL_FRONT_AND_BACK), GL_INVALID_ENUM);
 
@@ -9164,7 +9164,7 @@ PGLDEF void glStencilMaskSeparate(GLenum face, GLuint mask)
 
 
 // Just wrap my pgl extension getter, unmap does nothing
-PGLDEF void* glMapBuffer(GLenum target, GLenum access)
+PGLDEF void* pgl_MapBuffer(GLenum target, GLenum access)
 {
     PGL_ERR_RET_VAL((target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER), GL_INVALID_ENUM, NULL);
 
@@ -9178,7 +9178,7 @@ PGLDEF void* glMapBuffer(GLenum target, GLenum access)
     return data;
 }
 
-PGLDEF void* glMapNamedBuffer(GLuint buffer, GLenum access)
+PGLDEF void* pgl_MapNamedBuffer(GLuint buffer, GLenum access)
 {
     // TODO pglGetBufferData will verify buffer is valid, hmm
     PGL_ERR_RET_VAL((access != GL_READ_ONLY && access != GL_WRITE_ONLY && access != GL_READ_WRITE), GL_INVALID_ENUM, NULL);
@@ -9194,146 +9194,146 @@ PGLDEF void* glMapNamedBuffer(GLuint buffer, GLenum access)
 // Stubs to let real OpenGL libs compile with minimal modifications/ifdefs
 // add what you need
 
-PGLDEF const GLubyte* glGetStringi(GLenum name, GLuint index) { return NULL; }
+PGLDEF const GLubyte* pgl_GetStringi(GLenum name, GLuint index) { return NULL; }
 
-PGLDEF void glColorMaski(GLuint buf, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {}
+PGLDEF void pgl_ColorMaski(GLuint buf, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {}
 
-PGLDEF void glGenerateMipmap(GLenum target)
+PGLDEF void pgl_GenerateMipmap(GLenum target)
 {
     //TODO not implemented, not sure it's worth it.
     //For example mipmap generation code see
     //https://github.com/thebeast33/cro_lib/blob/master/cro_mipmap.h
 }
 
-PGLDEF void glGetDoublev(GLenum pname, GLdouble* params) { }
-PGLDEF void glGetInteger64v(GLenum pname, GLint64* params) { }
+PGLDEF void pgl_GetDoublev(GLenum pname, GLdouble* params) { }
+PGLDEF void pgl_GetInteger64v(GLenum pname, GLint64* params) { }
 
 // Drawbuffers
-PGLDEF void glDrawBuffers(GLsizei n, const GLenum* bufs) {}
-PGLDEF void glNamedFramebufferDrawBuffers(GLuint framebuffer, GLsizei n, const GLenum* bufs) {}
+PGLDEF void pgl_DrawBuffers(GLsizei n, const GLenum* bufs) {}
+PGLDEF void pgl_NamedFramebufferDrawBuffers(GLuint framebuffer, GLsizei n, const GLenum* bufs) {}
 
 // Framebuffers/Renderbuffers
-PGLDEF void glGenFramebuffers(GLsizei n, GLuint* ids) {}
-PGLDEF void glBindFramebuffer(GLenum target, GLuint framebuffer) {}
-PGLDEF void glDeleteFramebuffers(GLsizei n, GLuint* framebuffers) {}
-PGLDEF void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {}
-PGLDEF void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {}
-PGLDEF void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {}
-PGLDEF void glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint layer) {}
-PGLDEF GLboolean glIsFramebuffer(GLuint framebuffer) { return GL_FALSE; }
+PGLDEF void pgl_GenFramebuffers(GLsizei n, GLuint* ids) {}
+PGLDEF void pgl_BindFramebuffer(GLenum target, GLuint framebuffer) {}
+PGLDEF void pgl_DeleteFramebuffers(GLsizei n, GLuint* framebuffers) {}
+PGLDEF void pgl_FramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {}
+PGLDEF void pgl_FramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {}
+PGLDEF void pgl_FramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {}
+PGLDEF void pgl_FramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint layer) {}
+PGLDEF GLboolean pgl_IsFramebuffer(GLuint framebuffer) { return GL_FALSE; }
 
-PGLDEF void glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {}
-PGLDEF void glNamedFramebufferTextureLayer(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level, GLint layer) {}
+PGLDEF void pgl_FramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {}
+PGLDEF void pgl_NamedFramebufferTextureLayer(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level, GLint layer) {}
 
-PGLDEF void glReadBuffer(GLenum mode) {}
-PGLDEF void glNamedFramebufferReadBuffer(GLuint framebuffer, GLenum mode) {}
+PGLDEF void pgl_ReadBuffer(GLenum mode) {}
+PGLDEF void pgl_NamedFramebufferReadBuffer(GLuint framebuffer, GLenum mode) {}
 
-PGLDEF void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {}
-PGLDEF void glBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {}
+PGLDEF void pgl_BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {}
+PGLDEF void pgl_BlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {}
 
-PGLDEF void glGenRenderbuffers(GLsizei n, GLuint* renderbuffers) {}
-PGLDEF void glBindRenderbuffer(GLenum target, GLuint renderbuffer) {}
-PGLDEF void glDeleteRenderbuffers(GLsizei n, const GLuint* renderbuffers) {}
-PGLDEF void glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) {}
-PGLDEF GLboolean glIsRenderbuffer(GLuint renderbuffer) { return GL_FALSE; }
+PGLDEF void pgl_GenRenderbuffers(GLsizei n, GLuint* renderbuffers) {}
+PGLDEF void pgl_BindRenderbuffer(GLenum target, GLuint renderbuffer) {}
+PGLDEF void pgl_DeleteRenderbuffers(GLsizei n, const GLuint* renderbuffers) {}
+PGLDEF void pgl_RenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) {}
+PGLDEF GLboolean pgl_IsRenderbuffer(GLuint renderbuffer) { return GL_FALSE; }
 
-PGLDEF void glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height) {}
-PGLDEF void glNamedRenderbufferStorageMultisample(GLuint renderbuffer, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height) {}
+PGLDEF void pgl_RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height) {}
+PGLDEF void pgl_NamedRenderbufferStorageMultisample(GLuint renderbuffer, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height) {}
 
-PGLDEF void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {}
+PGLDEF void pgl_FramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {}
 // Could also return GL_FRAMEBUFFER_UNDEFINED, but then I'd have to add all
 // those enums and really 0 signaling an error makes more sense
-PGLDEF GLenum glCheckFramebufferStatus(GLenum target) { return 0; }
+PGLDEF GLenum pgl_CheckFramebufferStatus(GLenum target) { return 0; }
 
-PGLDEF void glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint* value) {}
-PGLDEF void glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value) {}
-PGLDEF void glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value) {}
-PGLDEF void glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {}
-PGLDEF void glClearNamedFramebufferiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLint* value) {}
-PGLDEF void glClearNamedFramebufferuiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLuint* value) {}
-PGLDEF void glClearNamedFramebufferfv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLfloat* value) {}
-PGLDEF void glClearNamedFramebufferfi(GLuint framebuffer, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {}
+PGLDEF void pgl_ClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint* value) {}
+PGLDEF void pgl_ClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value) {}
+PGLDEF void pgl_ClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value) {}
+PGLDEF void pgl_ClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {}
+PGLDEF void pgl_ClearNamedFramebufferiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLint* value) {}
+PGLDEF void pgl_ClearNamedFramebufferuiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLuint* value) {}
+PGLDEF void pgl_ClearNamedFramebufferfv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLfloat* value) {}
+PGLDEF void pgl_ClearNamedFramebufferfi(GLuint framebuffer, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {}
 
-PGLDEF void glGetProgramiv(GLuint program, GLenum pname, GLint* params) { }
-PGLDEF void glGetProgramInfoLog(GLuint program, GLsizei maxLength, GLsizei* length, GLchar* infoLog) { }
-PGLDEF void glAttachShader(GLuint program, GLuint shader) { }
-PGLDEF void glCompileShader(GLuint shader) { }
-PGLDEF void glGetShaderInfoLog(GLuint shader, GLsizei maxLength, GLsizei* length, GLchar* infoLog) { }
-PGLDEF void glLinkProgram(GLuint program) { }
-PGLDEF void glShaderSource(GLuint shader, GLsizei count, const GLchar** string, const GLint* length) { }
-PGLDEF void glGetShaderiv(GLuint shader, GLenum pname, GLint* params) { }
-PGLDEF void glDeleteShader(GLuint shader) { }
-PGLDEF void glDetachShader(GLuint program, GLuint shader) { }
+PGLDEF void pgl_GetProgramiv(GLuint program, GLenum pname, GLint* params) { }
+PGLDEF void pgl_GetProgramInfoLog(GLuint program, GLsizei maxLength, GLsizei* length, GLchar* infoLog) { }
+PGLDEF void pgl_AttachShader(GLuint program, GLuint shader) { }
+PGLDEF void pgl_CompileShader(GLuint shader) { }
+PGLDEF void pgl_GetShaderInfoLog(GLuint shader, GLsizei maxLength, GLsizei* length, GLchar* infoLog) { }
+PGLDEF void pgl_LinkProgram(GLuint program) { }
+PGLDEF void pgl_ShaderSource(GLuint shader, GLsizei count, const GLchar** string, const GLint* length) { }
+PGLDEF void pgl_GetShaderiv(GLuint shader, GLenum pname, GLint* params) { }
+PGLDEF void pgl_DeleteShader(GLuint shader) { }
+PGLDEF void pgl_DetachShader(GLuint program, GLuint shader) { }
 
-PGLDEF GLuint glCreateProgram(void) { return 0; }
-PGLDEF GLuint glCreateShader(GLenum shaderType) { return 0; }
-PGLDEF GLint glGetUniformLocation(GLuint program, const GLchar* name) { return 0; }
-PGLDEF GLint glGetAttribLocation(GLuint program, const GLchar* name) { return 0; }
+PGLDEF GLuint pgl_CreateProgram(void) { return 0; }
+PGLDEF GLuint pgl_CreateShader(GLenum shaderType) { return 0; }
+PGLDEF GLint pgl_GetUniformLocation(GLuint program, const GLchar* name) { return 0; }
+PGLDEF GLint pgl_GetAttribLocation(GLuint program, const GLchar* name) { return 0; }
 
-PGLDEF GLboolean glUnmapBuffer(GLenum target) { return GL_TRUE; }
-PGLDEF GLboolean glUnmapNamedBuffer(GLuint buffer) { return GL_TRUE; }
+PGLDEF GLboolean pgl_UnmapBuffer(GLenum target) { return GL_TRUE; }
+PGLDEF GLboolean pgl_UnmapNamedBuffer(GLuint buffer) { return GL_TRUE; }
 
 // TODO?
 
-PGLDEF void glActiveTexture(GLenum texture) { }
-PGLDEF void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {}
+PGLDEF void pgl_ActiveTexture(GLenum texture) { }
+PGLDEF void pgl_TexParameterf(GLenum target, GLenum pname, GLfloat param) {}
 
-PGLDEF void glTextureParameterf(GLuint texture, GLenum pname, GLfloat param) {}
+PGLDEF void pgl_TextureParameterf(GLuint texture, GLenum pname, GLfloat param) {}
 
 // TODO what the heck are these?
-PGLDEF void glTexParameterliv(GLenum target, GLenum pname, const GLint* params) {}
-PGLDEF void glTexParameterluiv(GLenum target, GLenum pname, const GLuint* params) {}
+PGLDEF void pgl_TexParameterliv(GLenum target, GLenum pname, const GLint* params) {}
+PGLDEF void pgl_TexParameterluiv(GLenum target, GLenum pname, const GLuint* params) {}
 
-PGLDEF void glTextureParameterliv(GLuint texture, GLenum pname, const GLint* params) {}
-PGLDEF void glTextureParameterluiv(GLuint texture, GLenum pname, const GLuint* params) {}
+PGLDEF void pgl_TextureParameterliv(GLuint texture, GLenum pname, const GLint* params) {}
+PGLDEF void pgl_TextureParameterluiv(GLuint texture, GLenum pname, const GLuint* params) {}
 
-PGLDEF void glCompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const GLvoid* data) {}
-PGLDEF void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid* data) {}
-PGLDEF void glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const GLvoid* data) {}
+PGLDEF void pgl_CompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const GLvoid* data) {}
+PGLDEF void pgl_CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid* data) {}
+PGLDEF void pgl_CompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const GLvoid* data) {}
 
-PGLDEF void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) { }
-PGLDEF void glTextureBuffer(GLuint texture, GLenum internalformat, GLuint buffer) { }
+PGLDEF void pgl_TexBuffer(GLenum target, GLenum internalformat, GLuint buffer) { }
+PGLDEF void pgl_TextureBuffer(GLuint texture, GLenum internalformat, GLuint buffer) { }
 
 
-PGLDEF void glUniform1f(GLint location, GLfloat v0) { }
-PGLDEF void glUniform2f(GLint location, GLfloat v0, GLfloat v1) { }
-PGLDEF void glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2) { }
-PGLDEF void glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) { }
+PGLDEF void pgl_Uniform1f(GLint location, GLfloat v0) { }
+PGLDEF void pgl_Uniform2f(GLint location, GLfloat v0, GLfloat v1) { }
+PGLDEF void pgl_Uniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2) { }
+PGLDEF void pgl_Uniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) { }
 
-PGLDEF void glUniform1i(GLint location, GLint v0) { }
-PGLDEF void glUniform2i(GLint location, GLint v0, GLint v1) { }
-PGLDEF void glUniform3i(GLint location, GLint v0, GLint v1, GLint v2) { }
-PGLDEF void glUniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3) { }
+PGLDEF void pgl_Uniform1i(GLint location, GLint v0) { }
+PGLDEF void pgl_Uniform2i(GLint location, GLint v0, GLint v1) { }
+PGLDEF void pgl_Uniform3i(GLint location, GLint v0, GLint v1, GLint v2) { }
+PGLDEF void pgl_Uniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3) { }
 
-PGLDEF void glUniform1ui(GLint location, GLuint v0) { }
-PGLDEF void glUniform2ui(GLint location, GLuint v0, GLuint v1) { }
-PGLDEF void glUniform3ui(GLint location, GLuint v0, GLuint v1, GLuint v2) { }
-PGLDEF void glUniform4ui(GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3) { }
+PGLDEF void pgl_Uniform1ui(GLint location, GLuint v0) { }
+PGLDEF void pgl_Uniform2ui(GLint location, GLuint v0, GLuint v1) { }
+PGLDEF void pgl_Uniform3ui(GLint location, GLuint v0, GLuint v1, GLuint v2) { }
+PGLDEF void pgl_Uniform4ui(GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3) { }
 
-PGLDEF void glUniform1fv(GLint location, GLsizei count, const GLfloat* value) { }
-PGLDEF void glUniform2fv(GLint location, GLsizei count, const GLfloat* value) { }
-PGLDEF void glUniform3fv(GLint location, GLsizei count, const GLfloat* value) { }
-PGLDEF void glUniform4fv(GLint location, GLsizei count, const GLfloat* value) { }
+PGLDEF void pgl_Uniform1fv(GLint location, GLsizei count, const GLfloat* value) { }
+PGLDEF void pgl_Uniform2fv(GLint location, GLsizei count, const GLfloat* value) { }
+PGLDEF void pgl_Uniform3fv(GLint location, GLsizei count, const GLfloat* value) { }
+PGLDEF void pgl_Uniform4fv(GLint location, GLsizei count, const GLfloat* value) { }
 
-PGLDEF void glUniform1iv(GLint location, GLsizei count, const GLint* value) { }
-PGLDEF void glUniform2iv(GLint location, GLsizei count, const GLint* value) { }
-PGLDEF void glUniform3iv(GLint location, GLsizei count, const GLint* value) { }
-PGLDEF void glUniform4iv(GLint location, GLsizei count, const GLint* value) { }
+PGLDEF void pgl_Uniform1iv(GLint location, GLsizei count, const GLint* value) { }
+PGLDEF void pgl_Uniform2iv(GLint location, GLsizei count, const GLint* value) { }
+PGLDEF void pgl_Uniform3iv(GLint location, GLsizei count, const GLint* value) { }
+PGLDEF void pgl_Uniform4iv(GLint location, GLsizei count, const GLint* value) { }
 
-PGLDEF void glUniform1uiv(GLint location, GLsizei count, const GLuint* value) { }
-PGLDEF void glUniform2uiv(GLint location, GLsizei count, const GLuint* value) { }
-PGLDEF void glUniform3uiv(GLint location, GLsizei count, const GLuint* value) { }
-PGLDEF void glUniform4uiv(GLint location, GLsizei count, const GLuint* value) { }
+PGLDEF void pgl_Uniform1uiv(GLint location, GLsizei count, const GLuint* value) { }
+PGLDEF void pgl_Uniform2uiv(GLint location, GLsizei count, const GLuint* value) { }
+PGLDEF void pgl_Uniform3uiv(GLint location, GLsizei count, const GLuint* value) { }
+PGLDEF void pgl_Uniform4uiv(GLint location, GLsizei count, const GLuint* value) { }
 
-PGLDEF void glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
-PGLDEF void glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
-PGLDEF void glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
-PGLDEF void glUniformMatrix2x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
-PGLDEF void glUniformMatrix3x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
-PGLDEF void glUniformMatrix2x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
-PGLDEF void glUniformMatrix4x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
-PGLDEF void glUniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
-PGLDEF void glUniformMatrix4x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
+PGLDEF void pgl_UniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
+PGLDEF void pgl_UniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
+PGLDEF void pgl_UniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
+PGLDEF void pgl_UniformMatrix2x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
+PGLDEF void pgl_UniformMatrix3x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
+PGLDEF void pgl_UniformMatrix2x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
+PGLDEF void pgl_UniformMatrix4x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
+PGLDEF void pgl_UniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
+PGLDEF void pgl_UniformMatrix4x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) { }
 
 #endif
 
@@ -10094,7 +10094,7 @@ PGLDEF void pglSetInterp(GLsizei n, GLenum* interpolation)
     // c->vs_output_size * PGL_MAX_VERTS * sizeof(float) right here
 
     //vs_output.interpolation would be already pointing at current program's array
-    //unless the programs array was realloced since the last glUseProgram because
+    //unless the programs array was realloced since the last pgl_UseProgram because
     //they've created a bunch of programs.  Unlikely they'd be changing a shader
     //before creating all their shaders but whatever.
     c->vs_output.interpolation = c->programs.a[c->cur_program].interpolation;
@@ -10105,7 +10105,7 @@ PGLDEF void pglSetInterp(GLsizei n, GLenum* interpolation)
 // This function is designed to be used with pglDrawFrame(), you don't need it for pglDrawFrame2()
 PGLDEF GLuint pglCreateFragProgram(frag_func fragment_shader, GLboolean fragdepth_or_discard)
 {
-    // Using glAttachShader error if shader is not a shader object which
+    // Using pgl_AttachShader error if shader is not a shader object which
     // is the closest analog
     PGL_ERR_RET_VAL((!fragment_shader), GL_INVALID_OPERATION, 0);
 
@@ -10606,23 +10606,23 @@ PGLDEF int setup_default_textures(void)
     int frames = 1;
     // If this was called in init_glContext() or immediately after we would know
     // 0 was already bound
-    glBindTexture(GL_TEXTURE_1D, 0);
-    glTexImage1D(GL_TEXTURE_1D, 0, GL_COMPRESSED_RGBA, w, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_BindTexture(GL_TEXTURE_1D, 0);
+    pgl_TexImage1D(GL_TEXTURE_1D, 0, GL_COMPRESSED_RGBA, w, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_BindTexture(GL_TEXTURE_2D, 0);
+    pgl_TexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
-    glBindTexture(GL_TEXTURE_3D, 0);
-    glTexImage3D(GL_TEXTURE_3D, 0, GL_COMPRESSED_RGBA, w, h, d, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_BindTexture(GL_TEXTURE_3D, 0);
+    pgl_TexImage3D(GL_TEXTURE_3D, 0, GL_COMPRESSED_RGBA, w, h, d, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
-    glBindTexture(GL_TEXTURE_1D_ARRAY, 0);
-    glTexImage2D(GL_TEXTURE_1D_ARRAY, 0, GL_COMPRESSED_RGBA, w, frames, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_BindTexture(GL_TEXTURE_1D_ARRAY, 0);
+    pgl_TexImage2D(GL_TEXTURE_1D_ARRAY, 0, GL_COMPRESSED_RGBA, w, frames, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
-    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
-    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_COMPRESSED_RGBA, w, h, frames, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_BindTexture(GL_TEXTURE_2D_ARRAY, 0);
+    pgl_TexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_COMPRESSED_RGBA, w, h, frames, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
-    glBindTexture(GL_TEXTURE_RECTANGLE, 0);
-    glTexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_BindTexture(GL_TEXTURE_RECTANGLE, 0);
+    pgl_TexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
     GLenum cube[6] =
     {
@@ -10634,7 +10634,7 @@ PGLDEF int setup_default_textures(void)
         GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
     };
     for (int i=0; i<6; i++) {
-        glTexImage2D(cube[i], 0, GL_COMPRESSED_RGBA, w, h, 0,
+        pgl_TexImage2D(cube[i], 0, GL_COMPRESSED_RGBA, w, h, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, image);
     }
 

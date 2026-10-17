@@ -194,11 +194,21 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			   gouraud raster kernel (V5, cs_geom_tpw = 256) since the vout
 			   record layout is unchanged. */
 			int inst = !tex && strstr(vert_glsl, "PGL_G3D_INSTANCED") != NULL;
+			/* The COLOUR variant (teapot's native gouraud fast-path shape) is a
+			   mesh VS that transforms by uMVP but declares NO uNormalMat/uLightEye:
+			   attribute 1 is a precomputed per-vertex colour, not a normal, so pass 1
+			   (geom_xform_color_cs_glsl) copies it straight through instead of
+			   lighting it on the GPU.  Pass 2 (the gouraud raster kernel), the
+			   stride-6 upload and the cs_is_geom=1 daemon dispatch are shared with
+			   the lit variant unchanged. */
+			int color = !tex && !inst &&
+			            strstr(vert_glsl, "uNormalMat") == NULL;
 			const char* raster_src = tex ? geom_raster_tex_cs_glsl
 			                             : geom_raster_cs_glsl;
 			const char* xform_src  = inst ? geom_xform_inst_cs_glsl
 			                             : (tex ? geom_xform_tex_cs_glsl
-			                                    : geom_xform_cs_glsl);
+			                                    : (color ? geom_xform_color_cs_glsl
+			                                           : geom_xform_cs_glsl));
 			memset(&gres, 0, sizeof(gres));
 			memset(&xres, 0, sizeof(xres));
 			/* BOTH kernels must compile: the raster pass reads the vout

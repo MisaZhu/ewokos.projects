@@ -1,25 +1,22 @@
 #ifndef GLTOOLS_H
 #define GLTOOLS_H
 
-#define PORTABLEGL_IMPLEMENTATION
-#define USING_PORTABLEGL
+/* glcommon now targets the standard GLES2 + EGL front end (libs/gles) instead
+ * of portablegl's C-callback model.  portablegl remains the internal software
+ * rasterizer behind libGLESv2, but consumers only ever see these headers. */
+#define USING_GLES2
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#ifdef USING_PORTABLEGL
-#include "portablegl/portablegl.h"
-#elif defined(USING_GLES2)
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 
-#define GL_GLEXT_PROTOTYPES 1
-#include <SDL_opengles2.h>
+/* GLES2 has no GL_COMPRESSED_RGBA upload enum; the engine treats a plain RGBA8
+ * upload as the compressed path did under portablegl. */
+#ifndef GL_COMPRESSED_RGBA
 #define GL_COMPRESSED_RGBA GL_RGBA
-
-#else
-#include <GL/glew.h>
-//#include <glad.h>
-#include <GL/gl.h>
 #endif
 
 #include <stb_image.h>
@@ -29,11 +26,7 @@ extern "C" {
 #include <math.h>
 
 #ifndef MAX_TEX_DIM
-	#ifdef USING_PORTABLEGL
-	#define MAX_TEX_DIM PGL_MAX_TEXTURE_SIZE
-	#else
 	#define MAX_TEX_DIM 4096
-	#endif
 #endif
 
 
@@ -92,29 +85,5 @@ GLboolean load_texture_rect(const char* filename, GLenum min_filter, GLenum mag_
 #ifdef __cplusplus
 }
 #endif
-
-//
-// OpenGL Standard Compatibility Layer for PortableGL
-// These macros provide standard OpenGL naming for PortableGL specific functions
-//
-#ifdef USING_PORTABLEGL
-
-// Program and Shader functions
-#define CreateProgram pglCreateProgram
-#define SetUniform pglSetUniform
-
-// Framebuffer functions  
-#define ResizeFramebuffer pglResizeFramebuffer
-#define GetBackBuffer pglGetBackBuffer
-#define SetBackBuffer pglSetBackBuffer
-#define SetTexBackBuffer pglSetTexBackBuffer
-
-// Texture data access
-#define GetTextureData pglGetTextureData
-
-// Geometry drawing
-#define DrawGeometryRaw pglDrawGeometryRaw
-
-#endif // USING_PORTABLEGL
 
 #endif // GLTOOLS_H

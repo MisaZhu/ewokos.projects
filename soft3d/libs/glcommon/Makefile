@@ -3,8 +3,8 @@ include $(PROJS_ROOT_DIR)/make.inc
 
 BUILD_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 
-CFLAGS += -I. -Iinclude -Iinclude/glcommon -I $(BUILD_DIR)/include -I../external -I../portablegl/include -I../portablegl/include/portablegl
-CXXFLAGS += -I. -Iinclude -Iinclude/glcommon -I $(BUILD_DIR)/include -I../external -I../portablegl/include -I../portablegl/include/portablegl
+CFLAGS += -I. -Iinclude -Iinclude/glcommon -I $(BUILD_DIR)/include -I../external -I../gles/include
+CXXFLAGS += -I. -Iinclude -Iinclude/glcommon -I $(BUILD_DIR)/include -I../external -I../gles/include
 
 # C source files
 LIB_GLCOMMON_C_OBJS = \
@@ -12,6 +12,7 @@ LIB_GLCOMMON_C_OBJS = \
 	$(ARCH)/src/cprimitives.o \
 	$(ARCH)/src/chalfedge.o \
 	$(ARCH)/src/gltools.o \
+	$(ARCH)/src/hud.o \
 	$(ARCH)/src/stb_vorbis.o
 
 # C++ source files

@@ -140,7 +140,7 @@ as needed:
     // shader
     GLenum interpolation[4] = { PGL_SMOOTH4 };
     GLuint myshader = pglCreateProgram(smooth_vs, smooth_fs, 4, interpolation, GL_FALSE);
-    glUseProgram(myshader);
+    pgl_UseProgram(myshader);
 
     // v_color is not actually used since we're using per vert color
     My_Uniform the_uniforms = { IDENTITY_MAT4() };
@@ -201,7 +201,7 @@ as needed:
 
     pglResizeFramebuffer(new_width, new_height);
     backbuf = (pix_t*)pglGetBackBuffer();
-    glViewport(0, 0, new_width, new_height);
+    pgl_Viewport(0, 0, new_width, new_height);
     // anything else you need for your particular GUI/windowing system here
 
     // alternatively, if your backbuffer (ie color buffer) is changing
@@ -304,7 +304,7 @@ PGL_BETTER_THICK_LINES
     anti-aliasing (ie no changes to the alpha channel).
 
 PGL_DISABLE_COLOR_MASK
-    If defined, color masking (which is set using glColorMask()) is ignored
+    If defined, color masking (which is set using pgl_ColorMask()) is ignored
     which provides some performance benefit though it varies depending on
     what you're doing.
 
@@ -697,7 +697,7 @@ float pgl_fast_atan2(float y, float x);
 
 
 // TODO these are messy. It makes the code cleaner but I should try to simplify
-// these some more. It's the different needs of glClear() vs fragment_processing()
+// these some more. It's the different needs of pgl_Clear() vs fragment_processing()
 // combined with the different formats that makes it a headache.
 #ifdef PGL_D16
  #define PGL_MAX_Z 0xFFFF
@@ -2541,7 +2541,7 @@ enum
 	GL_TEXTURE6,
 	GL_TEXTURE7,
 	
-	//implemented glEnable options
+	//implemented pgl_Enable options
 	GL_CULL_FACE,
 	GL_DEPTH_TEST,
 	GL_DEPTH_CLAMP,
@@ -2570,7 +2570,7 @@ enum
 	GL_CCW,
 	GL_CW,
 
-	// glLogicOp logic ops
+	// pgl_LogicOp logic ops
 	GL_CLEAR,
 	GL_SET,
 	GL_COPY,
@@ -2588,7 +2588,7 @@ enum
 	GL_OR_INVERTED,
 	GL_INVERT,
 
-	// glStencilOp
+	// pgl_StencilOp
 	GL_KEEP,
 	//GL_ZERO, already defined in blend functions aggh
 	GL_REPLACE,
@@ -2610,7 +2610,7 @@ enum
 
 	GL_BITMAP,  // TODO what is this for?
 
-	//glGetString info
+	//pgl_GetString info
 	GL_VENDOR,
 	GL_RENDERER,
 	GL_VERSION,
@@ -3377,122 +3377,122 @@ PGLDEF void set_glContext(glContext* context);
 
 PGLDEF GLboolean pglResizeFramebuffer(GLsizei width, GLsizei height);
 
-PGLDEF void glViewport(GLint x, GLint y, GLsizei width, GLsizei height);
+PGLDEF void pgl_Viewport(GLint x, GLint y, GLsizei width, GLsizei height);
 
-PGLDEF void glDebugMessageCallback(GLDEBUGPROC callback, void* userParam);
+PGLDEF void pgl_DebugMessageCallback(GLDEBUGPROC callback, void* userParam);
 
-PGLDEF GLubyte* glGetString(GLenum name);
-PGLDEF GLenum glGetError(void);
-PGLDEF void glGetBooleanv(GLenum pname, GLboolean* data);
-PGLDEF void glGetFloatv(GLenum pname, GLfloat* data);
-PGLDEF void glGetIntegerv(GLenum pname, GLint* data);
-PGLDEF GLboolean glIsEnabled(GLenum cap);
-PGLDEF GLboolean glIsProgram(GLuint program);
+PGLDEF GLubyte* pgl_GetString(GLenum name);
+PGLDEF GLenum pgl_GetError(void);
+PGLDEF void pgl_GetBooleanv(GLenum pname, GLboolean* data);
+PGLDEF void pgl_GetFloatv(GLenum pname, GLfloat* data);
+PGLDEF void pgl_GetIntegerv(GLenum pname, GLint* data);
+PGLDEF GLboolean pgl_IsEnabled(GLenum cap);
+PGLDEF GLboolean pgl_IsProgram(GLuint program);
 
-PGLDEF void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha);
-PGLDEF void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
-PGLDEF void glClearDepthf(GLfloat depth);
-PGLDEF void glClearDepth(GLdouble depth);
-PGLDEF void glDepthFunc(GLenum func);
-PGLDEF void glDepthRangef(GLfloat nearVal, GLfloat farVal);
-PGLDEF void glDepthRange(GLdouble nearVal, GLdouble farVal);
-PGLDEF void glDepthMask(GLboolean flag);
-PGLDEF void glBlendFunc(GLenum sfactor, GLenum dfactor);
-PGLDEF void glBlendEquation(GLenum mode);
-PGLDEF void glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha);
-PGLDEF void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha);
-PGLDEF void glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
-PGLDEF void glClear(GLbitfield mask);
-PGLDEF void glProvokingVertex(GLenum provokeMode);
-PGLDEF void glEnable(GLenum cap);
-PGLDEF void glDisable(GLenum cap);
-PGLDEF void glCullFace(GLenum mode);
-PGLDEF void glFrontFace(GLenum mode);
-PGLDEF void glPolygonMode(GLenum face, GLenum mode);
-PGLDEF void glPointSize(GLfloat size);
-PGLDEF void glPointParameteri(GLenum pname, GLint param);
-PGLDEF void glLineWidth(GLfloat width);
-PGLDEF void glLogicOp(GLenum opcode);
-PGLDEF void glPolygonOffset(GLfloat factor, GLfloat units);
-PGLDEF void glScissor(GLint x, GLint y, GLsizei width, GLsizei height);
+PGLDEF void pgl_ColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha);
+PGLDEF void pgl_ClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
+PGLDEF void pgl_ClearDepthf(GLfloat depth);
+PGLDEF void pgl_ClearDepth(GLdouble depth);
+PGLDEF void pgl_DepthFunc(GLenum func);
+PGLDEF void pgl_DepthRangef(GLfloat nearVal, GLfloat farVal);
+PGLDEF void pgl_DepthRange(GLdouble nearVal, GLdouble farVal);
+PGLDEF void pgl_DepthMask(GLboolean flag);
+PGLDEF void pgl_BlendFunc(GLenum sfactor, GLenum dfactor);
+PGLDEF void pgl_BlendEquation(GLenum mode);
+PGLDEF void pgl_BlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha);
+PGLDEF void pgl_BlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha);
+PGLDEF void pgl_BlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
+PGLDEF void pgl_Clear(GLbitfield mask);
+PGLDEF void pgl_ProvokingVertex(GLenum provokeMode);
+PGLDEF void pgl_Enable(GLenum cap);
+PGLDEF void pgl_Disable(GLenum cap);
+PGLDEF void pgl_CullFace(GLenum mode);
+PGLDEF void pgl_FrontFace(GLenum mode);
+PGLDEF void pgl_PolygonMode(GLenum face, GLenum mode);
+PGLDEF void pgl_PointSize(GLfloat size);
+PGLDEF void pgl_PointParameteri(GLenum pname, GLint param);
+PGLDEF void pgl_LineWidth(GLfloat width);
+PGLDEF void pgl_LogicOp(GLenum opcode);
+PGLDEF void pgl_PolygonOffset(GLfloat factor, GLfloat units);
+PGLDEF void pgl_Scissor(GLint x, GLint y, GLsizei width, GLsizei height);
 #ifndef PGL_NO_STENCIL
-PGLDEF void glStencilFunc(GLenum func, GLint ref, GLuint mask);
-PGLDEF void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask);
-PGLDEF void glStencilOp(GLenum sfail, GLenum dpfail, GLenum dppass);
-PGLDEF void glStencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass);
-PGLDEF void glClearStencil(GLint s);
-PGLDEF void glStencilMask(GLuint mask);
-PGLDEF void glStencilMaskSeparate(GLenum face, GLuint mask);
+PGLDEF void pgl_StencilFunc(GLenum func, GLint ref, GLuint mask);
+PGLDEF void pgl_StencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask);
+PGLDEF void pgl_StencilOp(GLenum sfail, GLenum dpfail, GLenum dppass);
+PGLDEF void pgl_StencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass);
+PGLDEF void pgl_ClearStencil(GLint s);
+PGLDEF void pgl_StencilMask(GLuint mask);
+PGLDEF void pgl_StencilMaskSeparate(GLenum face, GLuint mask);
 #endif
 
 // textures
-PGLDEF void glGenTextures(GLsizei n, GLuint* textures);
-PGLDEF void glDeleteTextures(GLsizei n, const GLuint* textures);
-PGLDEF void glBindTexture(GLenum target, GLuint texture);
+PGLDEF void pgl_GenTextures(GLsizei n, GLuint* textures);
+PGLDEF void pgl_DeleteTextures(GLsizei n, const GLuint* textures);
+PGLDEF void pgl_BindTexture(GLenum target, GLuint texture);
 
-PGLDEF void glTexParameteri(GLenum target, GLenum pname, GLint param);
-PGLDEF void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params);
-PGLDEF void glTexParameteriv(GLenum target, GLenum pname, const GLint* params);
-PGLDEF void glTextureParameteri(GLuint texture, GLenum pname, GLint param);
-PGLDEF void glTextureParameterfv(GLuint texture, GLenum pname, const GLfloat* params);
-PGLDEF void glTextureParameteriv(GLuint texture, GLenum pname, const GLint* params);
+PGLDEF void pgl_TexParameteri(GLenum target, GLenum pname, GLint param);
+PGLDEF void pgl_TexParameterfv(GLenum target, GLenum pname, const GLfloat* params);
+PGLDEF void pgl_TexParameteriv(GLenum target, GLenum pname, const GLint* params);
+PGLDEF void pgl_TextureParameteri(GLuint texture, GLenum pname, GLint param);
+PGLDEF void pgl_TextureParameterfv(GLuint texture, GLenum pname, const GLfloat* params);
+PGLDEF void pgl_TextureParameteriv(GLuint texture, GLenum pname, const GLint* params);
 
-PGLDEF void glGetTexParameterfv(GLenum target, GLenum pname, GLfloat* params);
-PGLDEF void glGetTexParameteriv(GLenum target, GLenum pname, GLint* params);
-PGLDEF void glGetTexParameterIiv(GLenum target, GLenum pname, GLint* params);
-PGLDEF void glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint* params);
-PGLDEF void glGetTextureParameterfv(GLuint texture, GLenum pname, GLfloat* params);
-PGLDEF void glGetTextureParameteriv(GLuint texture, GLenum pname, GLint* params);
-PGLDEF void glGetTextureParameterIiv(GLuint texture, GLenum pname, GLint* params);
-PGLDEF void glGetTextureParameterIuiv(GLuint texture, GLenum pname, GLuint* params);
+PGLDEF void pgl_GetTexParameterfv(GLenum target, GLenum pname, GLfloat* params);
+PGLDEF void pgl_GetTexParameteriv(GLenum target, GLenum pname, GLint* params);
+PGLDEF void pgl_GetTexParameterIiv(GLenum target, GLenum pname, GLint* params);
+PGLDEF void pgl_GetTexParameterIuiv(GLenum target, GLenum pname, GLuint* params);
+PGLDEF void pgl_GetTextureParameterfv(GLuint texture, GLenum pname, GLfloat* params);
+PGLDEF void pgl_GetTextureParameteriv(GLuint texture, GLenum pname, GLint* params);
+PGLDEF void pgl_GetTextureParameterIiv(GLuint texture, GLenum pname, GLint* params);
+PGLDEF void pgl_GetTextureParameterIuiv(GLuint texture, GLenum pname, GLuint* params);
 
-PGLDEF void glPixelStorei(GLenum pname, GLint param);
-PGLDEF void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const GLvoid* data);
-PGLDEF void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid* data);
-PGLDEF void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const GLvoid* data);
+PGLDEF void pgl_PixelStorei(GLenum pname, GLint param);
+PGLDEF void pgl_TexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const GLvoid* data);
+PGLDEF void pgl_TexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid* data);
+PGLDEF void pgl_TexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const GLvoid* data);
 
-PGLDEF void glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const GLvoid* data);
-PGLDEF void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* data);
-PGLDEF void glTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const GLvoid* data);
+PGLDEF void pgl_TexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const GLvoid* data);
+PGLDEF void pgl_TexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* data);
+PGLDEF void pgl_TexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const GLvoid* data);
 
 
-PGLDEF void glGenVertexArrays(GLsizei n, GLuint* arrays);
-PGLDEF void glDeleteVertexArrays(GLsizei n, const GLuint* arrays);
-PGLDEF void glBindVertexArray(GLuint array);
-PGLDEF void glGenBuffers(GLsizei n, GLuint* buffers);
-PGLDEF void glDeleteBuffers(GLsizei n, const GLuint* buffers);
-PGLDEF void glBindBuffer(GLenum target, GLuint buffer);
-PGLDEF void glBufferData(GLenum target, GLsizeiptr size, const GLvoid* data, GLenum usage);
-PGLDEF void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const GLvoid* data);
-PGLDEF void* glMapBuffer(GLenum target, GLenum access);
-PGLDEF void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const GLvoid* pointer);
-PGLDEF void glVertexAttribDivisor(GLuint index, GLuint divisor);
-PGLDEF void glEnableVertexAttribArray(GLuint index);
-PGLDEF void glDisableVertexAttribArray(GLuint index);
-PGLDEF void glDrawArrays(GLenum mode, GLint first, GLsizei count);
-PGLDEF void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount);
-PGLDEF void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices);
-PGLDEF void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices, GLsizei drawcount);
-PGLDEF void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount);
-PGLDEF void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei primcount, GLuint baseinstance);
-PGLDEF void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices, GLsizei primcount);
-PGLDEF void glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices, GLsizei primcount, GLuint baseinstance);
+PGLDEF void pgl_GenVertexArrays(GLsizei n, GLuint* arrays);
+PGLDEF void pgl_DeleteVertexArrays(GLsizei n, const GLuint* arrays);
+PGLDEF void pgl_BindVertexArray(GLuint array);
+PGLDEF void pgl_GenBuffers(GLsizei n, GLuint* buffers);
+PGLDEF void pgl_DeleteBuffers(GLsizei n, const GLuint* buffers);
+PGLDEF void pgl_BindBuffer(GLenum target, GLuint buffer);
+PGLDEF void pgl_BufferData(GLenum target, GLsizeiptr size, const GLvoid* data, GLenum usage);
+PGLDEF void pgl_BufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const GLvoid* data);
+PGLDEF void* pgl_MapBuffer(GLenum target, GLenum access);
+PGLDEF void pgl_VertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const GLvoid* pointer);
+PGLDEF void pgl_VertexAttribDivisor(GLuint index, GLuint divisor);
+PGLDEF void pgl_EnableVertexAttribArray(GLuint index);
+PGLDEF void pgl_DisableVertexAttribArray(GLuint index);
+PGLDEF void pgl_DrawArrays(GLenum mode, GLint first, GLsizei count);
+PGLDEF void pgl_MultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount);
+PGLDEF void pgl_DrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices);
+PGLDEF void pgl_MultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices, GLsizei drawcount);
+PGLDEF void pgl_DrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount);
+PGLDEF void pgl_DrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei primcount, GLuint baseinstance);
+PGLDEF void pgl_DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices, GLsizei primcount);
+PGLDEF void pgl_DrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices, GLsizei primcount, GLuint baseinstance);
 
 //DSA functions (from OpenGL 4.5+)
-#define glCreateBuffers(n, buffers) glGenBuffers(n, buffers)
-PGLDEF void glNamedBufferData(GLuint buffer, GLsizeiptr size, const GLvoid* data, GLenum usage);
-PGLDEF void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const GLvoid* data);
-PGLDEF void* glMapNamedBuffer(GLuint buffer, GLenum access);
-PGLDEF void glCreateTextures(GLenum target, GLsizei n, GLuint* textures);
+#define pgl_CreateBuffers(n, buffers) pgl_GenBuffers(n, buffers)
+PGLDEF void pgl_NamedBufferData(GLuint buffer, GLsizeiptr size, const GLvoid* data, GLenum usage);
+PGLDEF void pgl_NamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const GLvoid* data);
+PGLDEF void* pgl_MapNamedBuffer(GLuint buffer, GLenum access);
+PGLDEF void pgl_CreateTextures(GLenum target, GLsizei n, GLuint* textures);
 
-PGLDEF void glEnableVertexArrayAttrib(GLuint vaobj, GLuint index);
-PGLDEF void glDisableVertexArrayAttrib(GLuint vaobj, GLuint index);
+PGLDEF void pgl_EnableVertexArrayAttrib(GLuint vaobj, GLuint index);
+PGLDEF void pgl_DisableVertexArrayAttrib(GLuint vaobj, GLuint index);
 
 
 //shaders
 PGLDEF GLuint pglCreateProgram(vert_func vertex_shader, frag_func fragment_shader, GLsizei n, GLenum* interpolation, GLboolean fragdepth_or_discard);
-PGLDEF void glDeleteProgram(GLuint program);
-PGLDEF void glUseProgram(GLuint program);
+PGLDEF void pgl_DeleteProgram(GLuint program);
+PGLDEF void pgl_UseProgram(GLuint program);
 
 // These are here, not in pgl_ext.h/c because they take the place of standard OpenGL
 // functions glUniform*() and glProgramUniform*()
@@ -3506,140 +3506,140 @@ PGLDEF void pglSetProgramUniform(GLuint program, void* uniform);
 // Stubs to let real OpenGL libs compile with minimal modifications/ifdefs
 // add what you need
 //
-PGLDEF const GLubyte* glGetStringi(GLenum name, GLuint index);
+PGLDEF const GLubyte* pgl_GetStringi(GLenum name, GLuint index);
 
-PGLDEF void glColorMaski(GLuint buf, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha);
+PGLDEF void pgl_ColorMaski(GLuint buf, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha);
 
-PGLDEF void glGenerateMipmap(GLenum target);
-PGLDEF void glActiveTexture(GLenum texture);
+PGLDEF void pgl_GenerateMipmap(GLenum target);
+PGLDEF void pgl_ActiveTexture(GLenum texture);
 
-PGLDEF void glTexParameterf(GLenum target, GLenum pname, GLfloat param);
+PGLDEF void pgl_TexParameterf(GLenum target, GLenum pname, GLfloat param);
 
-PGLDEF void glTextureParameterf(GLuint texture, GLenum pname, GLfloat param);
+PGLDEF void pgl_TextureParameterf(GLuint texture, GLenum pname, GLfloat param);
 
 // TODO what the heck are these?
-PGLDEF void glTexParameterliv(GLenum target, GLenum pname, const GLint* params);
-PGLDEF void glTexParameterluiv(GLenum target, GLenum pname, const GLuint* params);
+PGLDEF void pgl_TexParameterliv(GLenum target, GLenum pname, const GLint* params);
+PGLDEF void pgl_TexParameterluiv(GLenum target, GLenum pname, const GLuint* params);
 
-PGLDEF void glTextureParameterliv(GLuint texture, GLenum pname, const GLint* params);
-PGLDEF void glTextureParameterluiv(GLuint texture, GLenum pname, const GLuint* params);
+PGLDEF void pgl_TextureParameterliv(GLuint texture, GLenum pname, const GLint* params);
+PGLDEF void pgl_TextureParameterluiv(GLuint texture, GLenum pname, const GLuint* params);
 
-PGLDEF void glCompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const GLvoid* data);
-PGLDEF void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid* data);
-PGLDEF void glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const GLvoid* data);
+PGLDEF void pgl_CompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const GLvoid* data);
+PGLDEF void pgl_CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid* data);
+PGLDEF void pgl_CompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const GLvoid* data);
 
-PGLDEF void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer);
-PGLDEF void glTextureBuffer(GLuint texture, GLenum internalformat, GLuint buffer);
+PGLDEF void pgl_TexBuffer(GLenum target, GLenum internalformat, GLuint buffer);
+PGLDEF void pgl_TextureBuffer(GLuint texture, GLenum internalformat, GLuint buffer);
 
-PGLDEF void glGetDoublev(GLenum pname, GLdouble* params);
-PGLDEF void glGetInteger64v(GLenum pname, GLint64* params);
+PGLDEF void pgl_GetDoublev(GLenum pname, GLdouble* params);
+PGLDEF void pgl_GetInteger64v(GLenum pname, GLint64* params);
 
 // Draw buffers
-PGLDEF void glDrawBuffers(GLsizei n, const GLenum* bufs);
-PGLDEF void glNamedFramebufferDrawBuffers(GLuint framebuffer, GLsizei n, const GLenum* bufs);
+PGLDEF void pgl_DrawBuffers(GLsizei n, const GLenum* bufs);
+PGLDEF void pgl_NamedFramebufferDrawBuffers(GLuint framebuffer, GLsizei n, const GLenum* bufs);
 
 // Framebuffers/Renderbuffers
-PGLDEF void glGenFramebuffers(GLsizei n, GLuint* ids);
-PGLDEF void glBindFramebuffer(GLenum target, GLuint framebuffer);
-PGLDEF void glDeleteFramebuffers(GLsizei n, GLuint* framebuffers);
-PGLDEF void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level);
+PGLDEF void pgl_GenFramebuffers(GLsizei n, GLuint* ids);
+PGLDEF void pgl_BindFramebuffer(GLenum target, GLuint framebuffer);
+PGLDEF void pgl_DeleteFramebuffers(GLsizei n, GLuint* framebuffers);
+PGLDEF void pgl_FramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level);
 
-PGLDEF void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
-PGLDEF void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
-PGLDEF void glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint layer);
-PGLDEF GLboolean glIsFramebuffer(GLuint framebuffer);
+PGLDEF void pgl_FramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+PGLDEF void pgl_FramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+PGLDEF void pgl_FramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint layer);
+PGLDEF GLboolean pgl_IsFramebuffer(GLuint framebuffer);
 
-PGLDEF void glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer);
-PGLDEF void glNamedFramebufferTextureLayer(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level, GLint layer);
+PGLDEF void pgl_FramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer);
+PGLDEF void pgl_NamedFramebufferTextureLayer(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level, GLint layer);
 
-PGLDEF void glReadBuffer(GLenum mode);
-PGLDEF void glNamedFramebufferReadBuffer(GLuint framebuffer, GLenum mode);
+PGLDEF void pgl_ReadBuffer(GLenum mode);
+PGLDEF void pgl_NamedFramebufferReadBuffer(GLuint framebuffer, GLenum mode);
 
-PGLDEF void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
-PGLDEF void glBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
+PGLDEF void pgl_BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
+PGLDEF void pgl_BlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
 
-PGLDEF void glGenRenderbuffers(GLsizei n, GLuint* renderbuffers);
-PGLDEF void glBindRenderbuffer(GLenum target, GLuint renderbuffer);
-PGLDEF void glDeleteRenderbuffers(GLsizei n, const GLuint* renderbuffers);
-PGLDEF void glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
-GLboolean glIsRenderbuffer(GLuint renderbuffer);
-PGLDEF void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
-GLenum glCheckFramebufferStatus(GLenum target);
+PGLDEF void pgl_GenRenderbuffers(GLsizei n, GLuint* renderbuffers);
+PGLDEF void pgl_BindRenderbuffer(GLenum target, GLuint renderbuffer);
+PGLDEF void pgl_DeleteRenderbuffers(GLsizei n, const GLuint* renderbuffers);
+PGLDEF void pgl_RenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
+GLboolean pgl_IsRenderbuffer(GLuint renderbuffer);
+PGLDEF void pgl_FramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
+GLenum pgl_CheckFramebufferStatus(GLenum target);
 
-PGLDEF void glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
-PGLDEF void glNamedRenderbufferStorageMultisample(GLuint renderbuffer, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
+PGLDEF void pgl_RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
+PGLDEF void pgl_NamedRenderbufferStorageMultisample(GLuint renderbuffer, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height);
 
-PGLDEF void glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint* value);
-PGLDEF void glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value);
-PGLDEF void glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value);
-PGLDEF void glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
-PGLDEF void glClearNamedFramebufferiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLint* value);
-PGLDEF void glClearNamedFramebufferuiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLuint* value);
-PGLDEF void glClearNamedFramebufferfv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLfloat* value);
-PGLDEF void glClearNamedFramebufferfi(GLuint framebuffer, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
+PGLDEF void pgl_ClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint* value);
+PGLDEF void pgl_ClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value);
+PGLDEF void pgl_ClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value);
+PGLDEF void pgl_ClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
+PGLDEF void pgl_ClearNamedFramebufferiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLint* value);
+PGLDEF void pgl_ClearNamedFramebufferuiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLuint* value);
+PGLDEF void pgl_ClearNamedFramebufferfv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLfloat* value);
+PGLDEF void pgl_ClearNamedFramebufferfi(GLuint framebuffer, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
 
 
-PGLDEF void glGetProgramiv(GLuint program, GLenum pname, GLint* params);
-PGLDEF void glGetProgramInfoLog(GLuint program, GLsizei maxLength, GLsizei* length, GLchar* infoLog);
-PGLDEF void glAttachShader(GLuint program, GLuint shader);
-PGLDEF void glCompileShader(GLuint shader);
-PGLDEF void glGetShaderInfoLog(GLuint shader, GLsizei maxLength, GLsizei* length, GLchar* infoLog);
+PGLDEF void pgl_GetProgramiv(GLuint program, GLenum pname, GLint* params);
+PGLDEF void pgl_GetProgramInfoLog(GLuint program, GLsizei maxLength, GLsizei* length, GLchar* infoLog);
+PGLDEF void pgl_AttachShader(GLuint program, GLuint shader);
+PGLDEF void pgl_CompileShader(GLuint shader);
+PGLDEF void pgl_GetShaderInfoLog(GLuint shader, GLsizei maxLength, GLsizei* length, GLchar* infoLog);
 
 // use pglCreateProgram()
-PGLDEF GLuint glCreateProgram(void);
+PGLDEF GLuint pgl_CreateProgram(void);
 
-PGLDEF void glLinkProgram(GLuint program);
-PGLDEF void glShaderSource(GLuint shader, GLsizei count, const GLchar** string, const GLint* length);
-PGLDEF void glGetShaderiv(GLuint shader, GLenum pname, GLint* params);
-PGLDEF GLuint glCreateShader(GLenum shaderType);
-PGLDEF void glDeleteShader(GLuint shader);
-PGLDEF void glDetachShader(GLuint program, GLuint shader);
+PGLDEF void pgl_LinkProgram(GLuint program);
+PGLDEF void pgl_ShaderSource(GLuint shader, GLsizei count, const GLchar** string, const GLint* length);
+PGLDEF void pgl_GetShaderiv(GLuint shader, GLenum pname, GLint* params);
+PGLDEF GLuint pgl_CreateShader(GLenum shaderType);
+PGLDEF void pgl_DeleteShader(GLuint shader);
+PGLDEF void pgl_DetachShader(GLuint program, GLuint shader);
 
-PGLDEF GLint glGetUniformLocation(GLuint program, const GLchar* name);
-PGLDEF GLint glGetAttribLocation(GLuint program, const GLchar* name);
+PGLDEF GLint pgl_GetUniformLocation(GLuint program, const GLchar* name);
+PGLDEF GLint pgl_GetAttribLocation(GLuint program, const GLchar* name);
 
-PGLDEF GLboolean glUnmapBuffer(GLenum target);
-PGLDEF GLboolean glUnmapNamedBuffer(GLuint buffer);
+PGLDEF GLboolean pgl_UnmapBuffer(GLenum target);
+PGLDEF GLboolean pgl_UnmapNamedBuffer(GLuint buffer);
 
-PGLDEF void glUniform1f(GLint location, GLfloat v0);
-PGLDEF void glUniform2f(GLint location, GLfloat v0, GLfloat v1);
-PGLDEF void glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2);
-PGLDEF void glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3);
+PGLDEF void pgl_Uniform1f(GLint location, GLfloat v0);
+PGLDEF void pgl_Uniform2f(GLint location, GLfloat v0, GLfloat v1);
+PGLDEF void pgl_Uniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2);
+PGLDEF void pgl_Uniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3);
 
-PGLDEF void glUniform1i(GLint location, GLint v0);
-PGLDEF void glUniform2i(GLint location, GLint v0, GLint v1);
-PGLDEF void glUniform3i(GLint location, GLint v0, GLint v1, GLint v2);
-PGLDEF void glUniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3);
+PGLDEF void pgl_Uniform1i(GLint location, GLint v0);
+PGLDEF void pgl_Uniform2i(GLint location, GLint v0, GLint v1);
+PGLDEF void pgl_Uniform3i(GLint location, GLint v0, GLint v1, GLint v2);
+PGLDEF void pgl_Uniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3);
 
-PGLDEF void glUniform1ui(GLint location, GLuint v0);
-PGLDEF void glUniform2ui(GLint location, GLuint v0, GLuint v1);
-PGLDEF void glUniform3ui(GLint location, GLuint v0, GLuint v1, GLuint v2);
-PGLDEF void glUniform4ui(GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3);
+PGLDEF void pgl_Uniform1ui(GLint location, GLuint v0);
+PGLDEF void pgl_Uniform2ui(GLint location, GLuint v0, GLuint v1);
+PGLDEF void pgl_Uniform3ui(GLint location, GLuint v0, GLuint v1, GLuint v2);
+PGLDEF void pgl_Uniform4ui(GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3);
 
-PGLDEF void glUniform1fv(GLint location, GLsizei count, const GLfloat* value);
-PGLDEF void glUniform2fv(GLint location, GLsizei count, const GLfloat* value);
-PGLDEF void glUniform3fv(GLint location, GLsizei count, const GLfloat* value);
-PGLDEF void glUniform4fv(GLint location, GLsizei count, const GLfloat* value);
+PGLDEF void pgl_Uniform1fv(GLint location, GLsizei count, const GLfloat* value);
+PGLDEF void pgl_Uniform2fv(GLint location, GLsizei count, const GLfloat* value);
+PGLDEF void pgl_Uniform3fv(GLint location, GLsizei count, const GLfloat* value);
+PGLDEF void pgl_Uniform4fv(GLint location, GLsizei count, const GLfloat* value);
 
-PGLDEF void glUniform1iv(GLint location, GLsizei count, const GLint* value);
-PGLDEF void glUniform2iv(GLint location, GLsizei count, const GLint* value);
-PGLDEF void glUniform3iv(GLint location, GLsizei count, const GLint* value);
-PGLDEF void glUniform4iv(GLint location, GLsizei count, const GLint* value);
+PGLDEF void pgl_Uniform1iv(GLint location, GLsizei count, const GLint* value);
+PGLDEF void pgl_Uniform2iv(GLint location, GLsizei count, const GLint* value);
+PGLDEF void pgl_Uniform3iv(GLint location, GLsizei count, const GLint* value);
+PGLDEF void pgl_Uniform4iv(GLint location, GLsizei count, const GLint* value);
 
-PGLDEF void glUniform1uiv(GLint location, GLsizei count, const GLuint* value);
-PGLDEF void glUniform2uiv(GLint location, GLsizei count, const GLuint* value);
-PGLDEF void glUniform3uiv(GLint location, GLsizei count, const GLuint* value);
-PGLDEF void glUniform4uiv(GLint location, GLsizei count, const GLuint* value);
+PGLDEF void pgl_Uniform1uiv(GLint location, GLsizei count, const GLuint* value);
+PGLDEF void pgl_Uniform2uiv(GLint location, GLsizei count, const GLuint* value);
+PGLDEF void pgl_Uniform3uiv(GLint location, GLsizei count, const GLuint* value);
+PGLDEF void pgl_Uniform4uiv(GLint location, GLsizei count, const GLuint* value);
 
-PGLDEF void glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
-PGLDEF void glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
-PGLDEF void glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
-PGLDEF void glUniformMatrix2x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
-PGLDEF void glUniformMatrix3x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
-PGLDEF void glUniformMatrix2x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
-PGLDEF void glUniformMatrix4x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
-PGLDEF void glUniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
-PGLDEF void glUniformMatrix4x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+PGLDEF void pgl_UniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+PGLDEF void pgl_UniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+PGLDEF void pgl_UniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+PGLDEF void pgl_UniformMatrix2x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+PGLDEF void pgl_UniformMatrix3x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+PGLDEF void pgl_UniformMatrix2x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+PGLDEF void pgl_UniformMatrix4x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+PGLDEF void pgl_UniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+PGLDEF void pgl_UniformMatrix4x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
 
 #endif
 
@@ -3675,7 +3675,7 @@ PGLDEF void pglClearScreen(void);
 PGLDEF void pglSetInterp(GLsizei n, GLenum* interpolation);
 
 #define pglVertexAttribPointer(index, size, type, normalized, stride, offset) \
-glVertexAttribPointer(index, size, type, normalized, stride, (void*)(offset))
+pgl_VertexAttribPointer(index, size, type, normalized, stride, (void*)(offset))
 
 
 PGLDEF GLuint pglCreateFragProgram(frag_func fragment_shader, GLboolean fragdepth_or_discard);
@@ -3784,7 +3784,7 @@ PGLDEF void pgl_ff_tex_modulate(float* fs_input, Shader_Builtins* builtins, void
 #ifdef PGL_G3D
 /* Force the GPU 3D target live and adopt pgl_g3d_pixels() as portablegl's back
  * buffer, so an app's compiled-mesh draws (which render into pgl_g3d_pixels())
- * and its CPU glDrawArrays fallback share ONE surface and the present blit stays
+ * and its CPU pgl_DrawArrays fallback share ONE surface and the present blit stays
  * zero-copy.  Call once after pglInitContext with the back-buffer size; on
  * success (returns 1) refresh any cached back-buffer pointer via
  * pglGetBackBuffer().  Returns 0 when the GPU path is off/unavailable, leaving
