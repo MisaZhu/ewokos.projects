@@ -55,8 +55,8 @@
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_gles2.h"
 
-static int win_width = 800;
-static int win_height = 600;
+static int win_width = 600;
+static int win_height = 400;
 
 static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
 static EGLSurface egl_surf = EGL_NO_SURFACE;

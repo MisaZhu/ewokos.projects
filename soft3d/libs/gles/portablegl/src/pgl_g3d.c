@@ -1623,7 +1623,7 @@ static void free_all(void)
    not reclaim the contig-slab run until the cache's idle sweep drops the entry
    (G2D_ATTACH_CACHE_TTL_MS == 250ms, system/gui/drivers/g2dd/g2dd.c).  The
    contig sub-allocator (kernel/kernel/src/mm/shm.c) is first-fit with a hard
-   SHM_POOL_MAX == 64 entry cap and splits a free run on every alloc, so a
+   SHM_POOL_MAX == 128 entry cap and splits a free run on every alloc, so a
    segment its owner already released still occupies a pool entry while the
    daemon pins it.
 

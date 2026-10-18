@@ -2,7 +2,7 @@
 // This needs to be used along with a Platform Backend (the EwokOS xwin/EGL one)
 
 #pragma once
-#include "imgui.h"      // IMGUI_IMPL_API
+#include "imgui/imgui.h"      // IMGUI_IMPL_API
 #ifndef IMGUI_DISABLE
 
 // Backend API

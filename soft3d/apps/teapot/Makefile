@@ -6,15 +6,20 @@ TASK_OBJS = $(ARCH)/teapot.o
 EXTRA_LIBS_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 
 # <EGL/egl.h> + <GLES2/gl2.h> are installed into the shared build include dir by
-# libs/gles, and glcommon's headers land there too.
-CFLAGS += -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/glcommon
+# libs/gles, and the Dear ImGui headers land there under include/imgui (installed
+# by libs/imgui).  teapot is now C++ (ImGui is C++): -I.. reaches the app's own
+# headers, -I.../include resolves <EGL/...>, <GLES2/...> and "imgui/...", and
+# -I.../include/imgui lets the backend header find its sibling "imgui.h".
+CFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__
+CXXFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__ -fno-threadsafe-statics
 LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib
 
-# Link order matters for static archives: the app + glcommon reference the EGL /
+# Link order matters for static archives: the app + imgui reference the EGL /
 # GLESv2 entry points.  libGLESv2.a already contains the portablegl engine and
 # (on PGL_G3D targets) the on-device mesa GLSL->QPU compiler, so an app links
-# only -lGLESv2 -lEGL and never names portablegl or v3dcompiler.
-GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libglcommon.a \
+# only libimgui + libEGL + libGLESv2 (imgui -> gl*, EGL -> engine) and never
+# names portablegl or v3dcompiler.
+GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui.a \
 	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
 
