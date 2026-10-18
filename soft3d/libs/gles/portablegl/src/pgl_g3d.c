@@ -58,9 +58,10 @@ static int      _probed;     /* init() has run (success or not) */
 static int      _enabled;    /* GPU path engaged and not latched off */
 
 static int      _w, _h;
-/* physical fb/z capacity in pixels (== _w*_h at the last alloc_target).
-   Resize reuses the contig-slab runs whenever the new viewport fits this
-   capacity, so a shrink performs zero slab alloc/free operations. */
+/* physical fb/z capacity in pixels (>= _w*_h; alloc_target reserves it with
+   grow-with-headroom, see fb_grow_capacity).  Resize reuses the contig-slab
+   runs whenever the new viewport fits this capacity, so a shrink - or any
+   in-capacity resize - performs zero slab alloc/free operations. */
 static uint32_t _fb_cap;
 static int      _fb_shm;
 static uint32_t* _fb;        /* render-target pixels (RGBA8) */
@@ -423,6 +424,26 @@ void pgl_g3d_begin_frame(uint32_t clear_rgba, float clear_z)
 	_clear_rgba = clear_rgba;
 	_clear_z = clear_z;
 	_first_frame = 1;
+}
+
+/* See pgl_g3d.h.  The colour half of the pending clear needs no work here:
+   pgl_Clear CPU-cleared the adopted back buffer (_fb) to exactly the word the
+   GPU fill would write (pix_t ARGB == the geom kernel's 0xAARRGGBB).  Only the
+   persistent depth surface is filled, mirroring draw_compute_geom's
+   first_frame fill, and the pending clear is dropped so the frame's first GPU
+   dispatch LOADs instead of erasing the CPU pixels drawn after pgl_Clear. */
+void pgl_g3d_consume_frame_clear(void)
+{
+	uint32_t n, i;
+
+	if (!_enabled || !_first_frame)
+		return;
+	if (_z != NULL) {
+		n = (uint32_t)_w * (uint32_t)_h;
+		for (i = 0; i < n; i++)
+			_z[i] = 0xFFFFFFFFu;   /* 24-bit unorm far, as the geom fill */
+	}
+	_first_frame = 0;
 }
 
 /* Field-wise equality of two ext states (avoids a padding-sensitive memcmp on
@@ -1482,20 +1503,61 @@ static void free_all(void)
 	_batch_prog = PGL_G3D_PROG_INVALID;
 }
 
-static int alloc_target(int w, int h)
+/* Grow-with-headroom capacity for the physical fb/z targets.
+ *
+   g2d_shm_free() is a client-side shmdt only; the g2dd attach cache holds its
+   own shmat reference on every segment it has drawn into, so the kernel does
+   not reclaim the contig-slab run until the cache's idle sweep drops the entry
+   (G2D_ATTACH_CACHE_TTL_MS == 250ms, system/gui/drivers/g2dd/g2dd.c).  The
+   contig sub-allocator (kernel/kernel/src/mm/shm.c) is first-fit with a hard
+   SHM_POOL_MAX == 64 entry cap and splits a free run on every alloc, so a
+   segment its owner already released still occupies a pool entry while the
+   daemon pins it.
+
+   The previous grow path reallocated fb/z to the EXACT new size on every
+   incremental resize, so a continuous drag-to-enlarge orphaned a pair of
+   segments per event (~60/s) - far faster than the 250ms sweep reclaims them.
+   Within a few hundred ms the pinned orphans exhausted the 64-entry pool,
+   shm_pool_alloc returned 0, shmget(IPC_CONTIG) failed, alloc_target failed,
+   pgl_g3d_resize returned 0 and pglResizeFramebuffer latched the GPU off
+   (_pgl_gpu_off = 1) for the rest of the process.  gears and teapot both hit
+   this because they share the portablegl resize path.
+
+   Rounding the grown capacity up to 1.5x the requested pixels (on a 16KB
+   granularity) collapses a drag's O(events) reallocations into O(log ratio):
+   the window must grow 50% in area before the next realloc, which at any
+   realistic drag speed leaves far more than one TTL between grows, so the
+   sweep reclaims each orphan before the next is created.  Resizes that fit the
+   allocated capacity stay on the zero-slab-op reuse path in pgl_g3d_resize. */
+static uint32_t fb_grow_capacity(uint32_t need_pixels)
+{
+	const uint32_t gran = 4096u;   /* 16KB slab granularity */
+	uint32_t cap = need_pixels + need_pixels / 2u;   /* 1.5x headroom */
+	return (cap + gran - 1u) & ~(gran - 1u);
+}
+
+/* Allocate the physical fb/z pair.  w/h are the LOGICAL viewport the daemon
+   renders into (fb_canvas marshals them as the canvas dims and _w*4 as the row
+   stride); cap_pixels is the physical capacity to reserve, which may exceed
+   w*h so a later in-capacity resize needs no slab operation.  The daemon writes
+   only w*h tightly-packed pixels, so the spare capacity is never touched. */
+static int alloc_target(int w, int h, uint32_t cap_pixels)
 {
 	uint32_t* px = NULL;
 	uint32_t* zpx = NULL;
 	ewokos_addr_t phy = 0, zphy = 0;
 	int shm = 0, zshm = 0;
+	uint32_t need = (uint32_t)w * (uint32_t)h;
 
 	if (w <= 0 || h <= 0)
 		return 0;
-	if (g2d_shm_alloc_phy((uint32_t)w * (uint32_t)h * 4u, &shm, &px, &phy) != 0
+	if (cap_pixels < need)
+		cap_pixels = need;
+	if (g2d_shm_alloc_phy(cap_pixels * 4u, &shm, &px, &phy) != 0
 	    || shm <= 0 || px == NULL)
 		return 0;
 	/* persistent Z32F depth surface, same footprint as the colour target */
-	if (g2d_shm_alloc_phy((uint32_t)w * (uint32_t)h * 4u, &zshm, &zpx, &zphy) != 0
+	if (g2d_shm_alloc_phy(cap_pixels * 4u, &zshm, &zpx, &zphy) != 0
 	    || zshm <= 0 || zpx == NULL) {
 		g2d_shm_free(px);
 		return 0;
@@ -1509,7 +1571,7 @@ static int alloc_target(int w, int h)
 	_z_phy = zphy;
 	_w = w;
 	_h = h;
-	_fb_cap = (uint32_t)w * (uint32_t)h;
+	_fb_cap = cap_pixels;
 	return 1;
 }
 
@@ -1544,14 +1606,18 @@ int pgl_g3d_resize(int w, int h)
 		return 1;
 	}
 
-	/* Growth beyond capacity: free the old runs FIRST so the larger freed
-	   run can satisfy the new request via split, keeping peak slab use at
-	   two segments instead of four. On failure the GPU latches off (the
-	   caller in pglResizeFramebuffer shuts down and falls back to CPU). */
+	/* Growth beyond capacity: free the old runs FIRST, then allocate the new
+	   target with 1.5x headroom (fb_grow_capacity) so a continuous drag does
+	   not reallocate - and orphan a daemon-pinned segment pair in the contig
+	   pool - on every incremental size increase.  The freed runs stay pinned
+	   by the g2dd attach cache until its 250ms sweep, so bounding the NUMBER
+	   of grows (not their order) is what keeps the 64-entry pool from
+	   exhausting.  On failure the GPU latches off (the caller in
+	   pglResizeFramebuffer shuts down and falls back to CPU). */
 	if (_fb) { g2d_shm_free(_fb); _fb = NULL; }
 	if (_z)  { g2d_shm_free(_z);  _z = NULL; }
 	_fb_cap = 0;
-	if (!alloc_target(w, h)) {
+	if (!alloc_target(w, h, fb_grow_capacity((uint32_t)w * (uint32_t)h))) {
 		_enabled = 0;
 		return 0;
 	}
@@ -1598,7 +1664,7 @@ int pgl_g3d_init(int w, int h)
 		v3d_compiler_set_version((int)v3d_ver);
 	}
 
-	if (!alloc_target(w, h))
+	if (!alloc_target(w, h, fb_grow_capacity((uint32_t)w * (uint32_t)h)))
 		return 0;
 
 	/* frame-boundary defaults so the very first dispatch clears even if a

@@ -230,6 +230,18 @@ int  pgl_g3d_batch_tri_tex(int tex_slot,
    clear rides along with the first draw).  No-op when the GPU path is off. */
 void pgl_g3d_begin_frame(uint32_t clear_rgba, float clear_z);
 
+/* Consume a pending frame clear CPU-side, BEFORE a CPU-rasterised primitive
+   writes the shared back buffer.  pgl_Clear already cleared that buffer (it
+   IS the GPU colour surface) and only deferred the GPU-side clear to the
+   frame's first draw dispatch; if a CPU draw lands first, that deferred clear
+   would erase it afterwards (e.g. a GL_LINES floor grid drawn before the
+   frame's first GPU mesh dispatch).  This drops the pending clear - its
+   colour half is already in the buffer - and fills the persistent depth
+   surface exactly as the geom first-frame fill would (far = 0xFFFFFFFF), so
+   later dispatches LOAD instead of clear and the CPU pixels survive.  No-op
+   when the GPU path is off or no clear is pending. */
+void pgl_g3d_consume_frame_clear(void);
+
 /* Free the shm target and staging and latch the GPU off.  Safe to call when
    never initialised.  Also releases every cached GLSL shader program
    (pgl_g3d_program_free_all). */

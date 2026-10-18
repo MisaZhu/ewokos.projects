@@ -3681,11 +3681,15 @@ PGLDEF int pglGpuBegin(int w, int h)
     return pgl_gpu_begin(w, h);
 }
 
-/* flush a pending GPU batch before any CPU-side drawing (painter's order) */
+/* flush a pending GPU batch before any CPU-side drawing (painter's order), and
+ * consume a pending frame clear: the deferred GPU first-dispatch clear must not
+ * run AFTER this CPU primitive wrote the shared back buffer, or it erases it. */
 static void pgl_gpu_fence(void)
 {
-    if (_pgl_gpu_active)
+    if (_pgl_gpu_active) {
         pgl_g3d_flush();
+        pgl_g3d_consume_frame_clear();
+    }
 }
 
 /* Phase D texture cache: map a GL texture name to a pgl_g3d slot, re-uploading
@@ -4777,6 +4781,13 @@ static void draw_line_clip(glVertex* v1, glVertex* v2)
             hp1 = v4_to_v3h(t1);
             hp2 = v4_to_v3h(t2);
 
+#ifdef PGL_G3D
+            /* same contract as the unclipped branch above: a clipped segment
+             * can never be offloaded (its endpoints are not the raw clip
+             * positions), so flush pending GPU work - and consume a pending
+             * frame clear - before this CPU segment lands in the buffer. */
+            pgl_gpu_fence();
+#endif
             if (c->line_smooth) {
                 draw_aa_line(hp1, hp2, t1.w, t2.w, v1_out, v2_out, provoke, 0.0f);
             } else {

@@ -272,13 +272,15 @@ static const char* reflection_fs =
     "}\n";
 
 /* Skybox: the box is drawn from the inside, so the vertex position IS the sample
- * direction; flip Y because the cubemap faces are stored top-down. */
+ * direction.  No Y flip here: the cube sampler already maps an upward direction
+ * to the top scanline of each face (t = -y, row 0 = first uploaded row), and the
+ * faces are stored top-down, so negating vDir.y would flip the sky vertically. */
 static const char* skybox_vs =
     "attribute vec3 aPosition;\n"
     "uniform mat4 uMVP;\n"
     "varying vec3 vDir;\n"
     "void main() {\n"
-    "    vDir = vec3(aPosition.x, -aPosition.y, aPosition.z);\n"
+    "    vDir = aPosition;\n"
     "    gl_Position = uMVP * vec4(aPosition, 1.0);\n"
     "}\n";
 

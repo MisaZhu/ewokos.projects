@@ -453,7 +453,7 @@ GLboolean load_texture_cubemap(const char* filename[], GLenum min_filter, GLenum
     int prev_w, prev_h;
     for (int i=0; i<6; ++i) {
         if (!(images[i] = stbi_load(filename[i], &w, &h, &n, STBI_rgb_alpha))) {
-            fprintf(stdout, "Error loading image %s\n\n", filename[i]);
+            fprintf(stdout, "Error loading image %s: %s\n\n", filename[i], stbi_failure_reason());
             return GL_FALSE;
         }
         if (i) {
