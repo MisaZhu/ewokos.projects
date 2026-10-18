@@ -731,6 +731,21 @@ typedef struct {
     int            lg_mat_off;    /* ublock float offset of vec3 uMaterial  */
     int            lg_light_off;  /* ublock float offset of vec4 uLightEye  */
     int            lg_shade_off;  /* ublock float offset of vec4 uShade     */
+    /* Native shadertoy fragment fast-path (see match_shadertoy): when
+     * st_effect >= 0 the FS runs on ff_shadertoy_frag, a hand-ported native C
+     * implementation of one of the 11 shadertoy effects (shadertoy_ff.inc),
+     * recognised at link time by an FNV-1a hash of the FS source.  The VS is
+     * the trivial passthrough and stays interpreted (a fullscreen quad issues
+     * only a handful of vertices).  Uniforms are read straight out of ublock:
+     * iGlobalTime (float), iResolution (vec3) and iChannelN sampler cells
+     * (whose .i holds the texture unit, exactly as the interpreter reads them).
+     * This is the CPU (virt / no-V3D) path; it removes the per-pixel tree-walk
+     * that made the heavy raymarchers run at <=1 FPS.  Bit-identical to the
+     * interpreter (golden_native harness, all 11 effects). */
+    int            st_effect;     /* 0..10 effect index, or -1 if not shadertoy */
+    int            st_time_off;   /* ublock offset of iGlobalTime             */
+    int            st_res_off;    /* ublock offset of iResolution (vec3)      */
+    int            st_ch_off[3];  /* ublock offsets of iChannel0..2, -1 absent */
 } interp_entry;
 
 static interp_entry  g_reg[GLES_MAX_INTERP];
@@ -788,6 +803,55 @@ static void interp_frag(float *fs_input, Shader_Builtins *builtins, void *unifor
                       (float *)&builtins->gl_FragColor, &disc, &fdepth, &wrote_depth);
     if (disc) builtins->discard = GL_TRUE;
     if (wrote_depth) builtins->gl_FragDepth = fdepth;
+}
+
+/* ------------------------------------------------------------------ *
+ * Native shadertoy fragment fast-path
+ *
+ * shadertoy_ff.inc holds hand-ported native C implementations of the 11
+ * shadertoy effects, proven bit-identical to the GLSL interpreter by the
+ * golden_native harness.  It is #included here (the real render path) and by
+ * the host harness, so the exact same code produces the pixels in both.  It
+ * needs <math.h>; portablegl.h already pulls it in, but include it explicitly
+ * so the .inc never depends on include order.
+ * ------------------------------------------------------------------ */
+#include <math.h>
+#include "shadertoy_ff.inc"
+
+/* st_texfn adapter: resolve unit -> portablegl texture name and sample 2D,
+ * identical resolution to bridge_tex_sample (all shadertoy samples are 2D). */
+static void st_bridge_tex(int unit, float u, float v, float *rgba, void *user)
+{
+    vec4 c = texture2D(gles_engine_texture_for_unit(unit), u, v);
+    (void)user;
+    rgba[0] = c.x; rgba[1] = c.y; rgba[2] = c.z; rgba[3] = c.w;
+}
+
+static void ff_shadertoy_frag(float *fs_input, Shader_Builtins *builtins, void *uniforms)
+{
+    interp_entry *e = g_active;
+    st_ctx c;
+    float out[4];
+    (void)fs_input; (void)uniforms;
+    if (!e || e->st_effect < 0) return;
+    c.fcx = builtins->gl_FragCoord.x;
+    c.fcy = builtins->gl_FragCoord.y;
+    c.gtime = e->ublock[e->st_time_off].f;
+    c.resx = e->ublock[e->st_res_off + 0].f;
+    c.resy = e->ublock[e->st_res_off + 1].f;
+    c.resz = e->ublock[e->st_res_off + 2].f;
+    /* sampler cells hold the texture unit in .i (T_SAMPLER2D is int-family),
+     * exactly the value the interpreter's ci() would read. */
+    c.ch0 = (e->st_ch_off[0] >= 0) ? e->ublock[e->st_ch_off[0]].i : 0;
+    c.ch1 = (e->st_ch_off[1] >= 0) ? e->ublock[e->st_ch_off[1]].i : 0;
+    c.ch2 = (e->st_ch_off[2] >= 0) ? e->ublock[e->st_ch_off[2]].i : 0;
+    c.tex = st_bridge_tex; c.user = NULL;
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    shadertoy_ff(e->st_effect, &c, out);
+    builtins->gl_FragColor.x = out[0];
+    builtins->gl_FragColor.y = out[1];
+    builtins->gl_FragColor.z = out[2];
+    builtins->gl_FragColor.w = out[3];
 }
 
 void gles_engine_use_program(GEuint program)
@@ -1183,6 +1247,57 @@ static int match_lit_gouraud(const glsl_program *gp, int *pos_loc, int *nrm_loc,
     return 1;
 }
 
+/* Recognise one of the 11 shadertoy fragment effects by an FNV-1a hash of its
+ * source (computed in glsl_compile_stage into glsl_stage.src_hash, which
+ * glsl_link keeps reachable via gp->fs).  A source hash is used rather than an
+ * AST shape test because 7 of the effects are a bare main() with no user
+ * functions to distinguish them by name; the hash separates all 11 exactly.
+ * The constants below MUST stay in sync with shadertoy_glsl.h - regenerate with
+ * the st_hash host tool if the GLSL ever changes.  On a match it resolves the
+ * standard shadertoy uniforms (iGlobalTime / iResolution / iChannel0..2) to
+ * their ublock offsets and returns 1; anything else returns 0 and the program
+ * keeps the interpreter, so the fast-path can never change pixels. */
+static const unsigned long long st_fs_hash[SHADERTOY_N_EFFECTS] = {
+    0x708dd5e1d8b2d0bcULL, /* [ 0] graphing_lines       */
+    0xbf43d9ff62f33032ULL, /* [ 1] graphing             */
+    0xc87b83c9830f490cULL, /* [ 2] my_tunnel            */
+    0xf65baebe8f654f32ULL, /* [ 3] running_in_the_night */
+    0x3cb175eaa867f1f2ULL, /* [ 4] square_tunnel        */
+    0x8e216dc21e883d99ULL, /* [ 5] deform_tunnel        */
+    0x5aedcbd17e393095ULL, /* [ 6] tileable_water_caustic */
+    0x03d585ef5f748d51ULL, /* [ 7] iqs_eyeball          */
+    0x7e40604832fe88afULL, /* [ 8] voronoise            */
+    0xc41d7286f7a3f311ULL, /* [ 9] the_cave             */
+    0xcb9d78f726a6d8e9ULL, /* [10] flame                */
+};
+
+static int match_shadertoy(const glsl_program *gp, int *effect, int *time_off,
+                           int *res_off, int ch_off[3])
+{
+    unsigned long long h;
+    int i, idx = -1, iT, iR, s0, s1, s2;
+    if (!gp || !gp->linked || !gp->fs) return 0;
+    if (gp->fs->uses_discard || gp->fs->uses_fragdepth) return 0;
+    h = gp->fs->src_hash;
+    for (i = 0; i < SHADERTOY_N_EFFECTS; ++i)
+        if (st_fs_hash[i] == h) { idx = i; break; }
+    if (idx < 0) return 0;
+    iT = glsl_uniform_index(gp, "iGlobalTime");
+    iR = glsl_uniform_index(gp, "iResolution");
+    if (iT < 0 || iR < 0) return 0;
+    if (gp->uniforms[iR].ncomp < 3) return 0;
+    s0 = glsl_uniform_index(gp, "iChannel0");
+    s1 = glsl_uniform_index(gp, "iChannel1");
+    s2 = glsl_uniform_index(gp, "iChannel2");
+    ch_off[0] = (s0 >= 0) ? gp->uniforms[s0].offset : -1;
+    ch_off[1] = (s1 >= 0) ? gp->uniforms[s1].offset : -1;
+    ch_off[2] = (s2 >= 0) ? gp->uniforms[s2].offset : -1;
+    *effect = idx;
+    *time_off = gp->uniforms[iT].offset;
+    *res_off = gp->uniforms[iR].offset;
+    return 1;
+}
+
 GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
                                               void *ublock, GEint ublock_cells)
 {
@@ -1194,6 +1309,7 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     int texblit, sampler_off = 0, uv_slot = 0, color_slot = -1;
     int litgou, lg_pos = 0, lg_nrm = 0, lg_mvp = 0, lg_nmat = 0;
     int lg_mat = 0, lg_light = 0, lg_shade = 0;
+    int shadertoy, st_effect = -1, st_time = 0, st_res = 0, st_ch[3] = {-1,-1,-1};
     GLboolean depth_or_discard;
     (void)ublock_cells;
     if (!gp || !gp->linked) return 0;
@@ -1210,10 +1326,13 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
                                              &lg_nmat, &lg_mat, &lg_light, &lg_shade);
     texblit = (gouraud || litgou) ? 0
             : match_texblit(gp, &sampler_off, &uv_slot, &color_slot);
+    shadertoy = (gouraud || litgou || texblit) ? 0
+              : match_shadertoy(gp, &st_effect, &st_time, &st_res, st_ch);
     id = pglCreateProgram(gouraud ? ff_gouraud_vert
                                   : (litgou ? ff_lit_gouraud_vert : interp_vert),
                           (gouraud || litgou) ? ff_gouraud_frag
-                                  : (texblit ? ff_texblit_frag : interp_frag),
+                                  : (texblit ? ff_texblit_frag
+                                  : (shadertoy ? ff_shadertoy_frag : interp_frag)),
                           (GLsizei)n, interp, depth_or_discard);
     if (!id) return 0;
     e->pgl_id = id; e->gp = gp; e->ublock = (glsl_cell *)ublock; e->in_use = 1;
@@ -1233,6 +1352,12 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     e->lg_mat_off   = litgou ? lg_mat   : 0;
     e->lg_light_off = litgou ? lg_light : 0;
     e->lg_shade_off = litgou ? lg_shade : 0;
+    e->st_effect    = shadertoy ? st_effect : -1;
+    e->st_time_off  = shadertoy ? st_time : 0;
+    e->st_res_off   = shadertoy ? st_res : 0;
+    e->st_ch_off[0] = shadertoy ? st_ch[0] : -1;
+    e->st_ch_off[1] = shadertoy ? st_ch[1] : -1;
+    e->st_ch_off[2] = shadertoy ? st_ch[2] : -1;
     return id;
 }
 

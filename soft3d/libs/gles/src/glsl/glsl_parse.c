@@ -877,6 +877,18 @@ static void resolve_pending_calls(parser *P)
     }
 }
 
+/* FNV-1a (64-bit) over a NUL-terminated string.  Used to fingerprint a stage's
+ * source so the engine can recognise a known shader at link time (see
+ * match_shadertoy in pgl_engine.c) without retaining the text.  The identical
+ * function generates the reference constants, so the two must stay in lockstep. */
+static unsigned long long glsl_fnv1a_str(const char *s)
+{
+    unsigned long long h = 0xcbf29ce484222325ULL;
+    if (!s) return h;
+    for (; *s; ++s) { h ^= (unsigned char)*s; h *= 0x100000001b3ULL; }
+    return h;
+}
+
 glsl_stage *glsl_compile_stage(const char *src, int is_vertex, char *err, int errsz)
 {
     parser P;
@@ -891,6 +903,7 @@ glsl_stage *glsl_compile_stage(const char *src, int is_vertex, char *err, int er
     st = (glsl_stage *)xalloc(sizeof(glsl_stage));
     st->is_vertex = is_vertex;
     st->main_idx = -1;
+    st->src_hash = glsl_fnv1a_str(src);
 
     memset(&P, 0, sizeof P);
     P.tk = toks; P.ntok = ntok; P.pos = 0; P.is_vertex = is_vertex; P.st = st;

@@ -300,6 +300,7 @@ glsl_program *glsl_link(glsl_stage *vs, glsl_stage *fs, char *err, int errsz)
 void glsl_free_program(glsl_program *p)
 {
     if (!p) return;
+    glsl_vm_free(p);            /* release any cached bytecode VM form */
     free(p->vs_gstore); free(p->fs_gstore);
     free(p->vs_ginit);  free(p->fs_ginit);
     free(p->scratch);   free(p->stack);

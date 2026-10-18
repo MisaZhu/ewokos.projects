@@ -40,6 +40,12 @@ typedef struct {
     int err;
 } env;
 
+/* Register-bytecode VM (defined in glsl_vm.inc, #included at the very end of
+ * this file so it can call the static math helpers above and be bit-identical).
+ * vm_run returns 1 when `stage` has a compiled VM form and was executed through
+ * it, or 0 to fall back to the tree-walker (run_main). */
+static int vm_run(glsl_program *p, glsl_stage *stage, int is_vertex, env *E);
+
 /* ------------------------------------------------------------------ */
 static glsl_cell *sc(env *E, int n)
 {
@@ -367,7 +373,7 @@ static glsl_val arith(env *E, int op, const glsl_val *a, const glsl_val *b)
         case EX_ADD: if (isfloat) d[i].f = fa + fb; else d[i].i = ia + ib; break;
         case EX_SUB: if (isfloat) d[i].f = fa - fb; else d[i].i = ia - ib; break;
         case EX_MUL: if (isfloat) d[i].f = fa * fb; else d[i].i = ia * ib; break;
-        case EX_DIV: if (isfloat) d[i].f = fb != 0 ? fa / fb : 0; else d[i].i = ib != 0 ? ia / ib : 0; break;
+        case EX_DIV: if (isfloat) d[i].f = fb != 0 ? fa / fb : (fa > 0 ? INFINITY : (fa < 0 ? -INFINITY : 0)); else d[i].i = ib != 0 ? ia / ib : 0; break;
         case EX_MOD: d[i].i = ib != 0 ? ia % ib : 0; break;
         case EX_BAND: d[i].i = ia & ib; break;
         case EX_BOR:  d[i].i = ia | ib; break;
@@ -1091,7 +1097,12 @@ void glsl_run_vertex(glsl_program *p, const float *const *attribs, int nattribs,
 {
     env E;
     int i;
-    memset(&E, 0, sizeof E);
+    /* This runs once per vertex.  Zero only what must start at 0 and SKIP the
+     * 1 KiB ret_buf (it is always written by ST_RETURN before call_user reads
+     * it), which was ~90ns/vertex of pure memset on the hot path.  ret_type..err
+     * sit after ret_buf in the struct, so they are cleared explicitly. */
+    memset(&E, 0, offsetof(env, ret_buf));
+    E.ret_type = E.ret_stid = E.ret_n = E.ret_arr = E.ret_elem = E.err = 0;
     E.prog = p; E.stage = p->vs; E.is_vertex = 1;
     E.gstore = p->vs_gstore;
     if (p->vs_ginit && p->vs_gcells > 0)
@@ -1101,7 +1112,8 @@ void glsl_run_vertex(glsl_program *p, const float *const *attribs, int nattribs,
     E.ublock = (const glsl_cell *)uniform_block;
     E.instance_id = instance_id;
     E.scratch_top = 0; E.stack_top = 0;
-    run_main(&E);
+    if (!vm_run(p, p->vs, 1, &E))
+        run_main(&E);
     for (i = 0; i < 4; ++i) out_gl_position[i] = E.gl_position[i];
 }
 
@@ -1114,7 +1126,11 @@ void glsl_run_fragment(glsl_program *p, const float *varyings_in,
 {
     env E;
     int i;
-    memset(&E, 0, sizeof E);
+    /* Once per pixel: skip the 1 KiB ret_buf memset (see glsl_run_vertex).  This
+     * was the fixed ~105ns/px floor that capped even an empty shader at ~31 FPS
+     * on 640x480.  ret_type..err follow ret_buf, so clear them explicitly. */
+    memset(&E, 0, offsetof(env, ret_buf));
+    E.ret_type = E.ret_stid = E.ret_n = E.ret_arr = E.ret_elem = E.err = 0;
     E.prog = p; E.stage = p->fs; E.is_vertex = 0;
     E.gstore = p->fs_gstore;
     if (p->fs_ginit && p->fs_gcells > 0)
@@ -1128,7 +1144,8 @@ void glsl_run_fragment(glsl_program *p, const float *varyings_in,
     E.gl_fragdepth = gl_fragcoord[2];
     E.scratch_top = 0; E.stack_top = 0;
     E.gl_fragcolor[3] = 1;
-    run_main(&E);
+    if (!vm_run(p, p->fs, 0, &E))
+        run_main(&E);
     for (i = 0; i < 4; ++i) out_gl_fragcolor[i] = E.gl_fragcolor[i];
     if (out_discard) *out_discard = (E.ctrl == CTRL_DISCARD) ? 1 : 0;
     if (out_gl_fragdepth) *out_gl_fragdepth = E.gl_fragdepth;
@@ -1171,3 +1188,9 @@ void glsl_exec_init_globals(glsl_program *p, glsl_stage *st, glsl_cell *gstore)
         }
     }
 }
+
+/* ================================================================== */
+/* Register-bytecode VM.  #included here (not a separate TU) so it can */
+/* call the static math helpers above verbatim => bit-identical output.*/
+/* ================================================================== */
+#include "glsl_vm.inc"

@@ -262,6 +262,12 @@ typedef struct glsl_stage {
     } structs[16];
     int nstructs;
     int uses_fragdepth, uses_discard;
+    /* FNV-1a (64-bit) hash of the stage source string, computed at compile
+     * time.  Lets the engine recognise a known shader (e.g. one of the 11
+     * shadertoy effects) at link time without retaining the source text.
+     * glsl_link keeps the stage pointers, so gp->fs->src_hash survives to the
+     * matchers.  Inert everywhere else. */
+    unsigned long long src_hash;
     char err[GLSL_ERR_LEN];
     int  errored;
 } glsl_stage;
@@ -291,6 +297,13 @@ typedef struct glsl_program {
      * Rendering is single-threaded per context, so these are program-owned. */
     glsl_cell *scratch; int scratch_cap;
     glsl_cell *stack;   int stack_cap;
+    /* Register-bytecode VM compiled form (NULL => run the tree-walker).
+     * Opaque to everything outside glsl_exec.c; compiled lazily on the first
+     * run of a stage and cached here.  The VM reuses the tree-walker's math
+     * helpers so its output is bit-identical; it exists only to make the
+     * per-pixel CPU path (virt / no-GPU) fast. */
+    void *vm_vs, *vm_fs;
+    int   vm_tried;           /* bit0: vs compile attempted, bit1: fs */
     char err[GLSL_ERR_LEN];
 } glsl_program;
 
@@ -315,6 +328,9 @@ void glsl_free_stage(glsl_stage *st);
  * Takes ownership of vs/fs.  Returns NULL on error (message in *err). */
 glsl_program *glsl_link(glsl_stage *vs, glsl_stage *fs, char *err, int errsz);
 void glsl_free_program(glsl_program *p);
+/* Free any VM-compiled form attached to p (defined in glsl_exec.c).  No-op if
+ * none was compiled.  Called by glsl_free_program. */
+void glsl_vm_free(glsl_program *p);
 
 /* Reflection queries used by the GLES2 object model. */
 int  glsl_uniform_index(const glsl_program *p, const char *name); /* -1 none */
