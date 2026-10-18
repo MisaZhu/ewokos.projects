@@ -20,8 +20,8 @@
  * geometry kernel (the colour variant: per-vertex position + colour, opaque,
  * depth-resolved with an atomicMin) and rasterised entirely in compute; on QEMU
  * virt / generic targets the very same source runs on libGLESv2's compiled CPU
- * gouraud fast-path.  No app-side branching and no portablegl types - the HUD
- * overlay reports which path is live.
+ * gouraud fast-path.  No app-side branching and no portablegl types - the Dear
+ * ImGui stats window drawn on top reports which path is live.
  *
  * Because that kernel carries per-vertex COLOUR but no texture, glyphs are built
  * as geometry: each 8x8 procedural mark is run-length encoded into horizontal
@@ -51,7 +51,9 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
-#include <glcommon/hud.h>
+
+#include "imgui/imgui.h"
+#include "imgui/backends/imgui_impl_gles2.h"
 
 static int win_width = 800;
 static int win_height = 600;
@@ -587,6 +589,8 @@ static void draw_rain(void)
     glDisable(GL_DEPTH_TEST);
 }
 
+static void init_imgui(void);
+
 static void init_gl(void)
 {
     GLuint vs, fs;
@@ -637,7 +641,7 @@ static void init_gl(void)
     perspective(projection_matrix, CAM_FOV,
                 (GLfloat)win_width / (GLfloat)win_height, CAM_NEAR, CAM_FAR);
 
-    hud_init();
+    init_imgui();
 }
 
 static void reshape(int width, int height)
@@ -668,11 +672,146 @@ static void update_fps(void)
     count++;
 }
 
+/* ------------------------------------------------------------------ *
+ * Dear ImGui overlay: the FPS / GPU-vs-CPU readout is presented as a
+ * small draggable ImGui window drawn on top of the rain (replacing the
+ * old glcommon bitmap HUD).  ImGui is C++ and renders through the GLES2
+ * backend; xwin mouse/keyboard events are forwarded to it so the window
+ * stays interactive, and ESC still quits like the other soft3d demos.
+ * ------------------------------------------------------------------ */
+static int  mouse_x = 0, mouse_y = 0;
+static bool mouse_buttons[3] = { false, false, false };    /* left, right, mid */
+static bool key_ctrl = false, key_shift = false, key_alt = false, key_super = false;
+
+static void init_imgui(void)
+{
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = NULL;                                 /* no imgui.ini    */
+    io.DisplaySize = ImVec2((float)win_width, (float)win_height);
+    ImGui::StyleColorsDark();
+    ImGui_ImplGLES2_Init();
+    io.Fonts->AddFontFromFileTTF("/usr/system/fonts/system.ttf", 16.0f);
+}
+
+/* Map an EwokOS key code to the matching ImGuiKey (same table as imgui_demo). */
+static ImGuiKey KeyCodeToImGuiKey(int keycode)
+{
+    switch (keycode) {
+        case 9:   return ImGuiKey_Tab;
+        case 27:  return ImGuiKey_Escape;
+        case 13:  return ImGuiKey_Enter;
+        case 8:   return ImGuiKey_Backspace;
+        case 127: return ImGuiKey_Delete;
+        case 32:  return ImGuiKey_Space;
+        case 276: return ImGuiKey_LeftArrow;
+        case 275: return ImGuiKey_RightArrow;
+        case 273: return ImGuiKey_UpArrow;
+        case 274: return ImGuiKey_DownArrow;
+        case 278: return ImGuiKey_Home;
+        case 279: return ImGuiKey_End;
+        case 280: return ImGuiKey_PageUp;
+        case 281: return ImGuiKey_PageDown;
+        case 277: return ImGuiKey_Insert;
+        case '0': return ImGuiKey_0;
+        case '1': return ImGuiKey_1;
+        case '2': return ImGuiKey_2;
+        case '3': return ImGuiKey_3;
+        case '4': return ImGuiKey_4;
+        case '5': return ImGuiKey_5;
+        case '6': return ImGuiKey_6;
+        case '7': return ImGuiKey_7;
+        case '8': return ImGuiKey_8;
+        case '9': return ImGuiKey_9;
+        case 'a': case 'A': return ImGuiKey_A;
+        case 'b': case 'B': return ImGuiKey_B;
+        case 'c': case 'C': return ImGuiKey_C;
+        case 'd': case 'D': return ImGuiKey_D;
+        case 'e': case 'E': return ImGuiKey_E;
+        case 'f': case 'F': return ImGuiKey_F;
+        case 'g': case 'G': return ImGuiKey_G;
+        case 'h': case 'H': return ImGuiKey_H;
+        case 'i': case 'I': return ImGuiKey_I;
+        case 'j': case 'J': return ImGuiKey_J;
+        case 'k': case 'K': return ImGuiKey_K;
+        case 'l': case 'L': return ImGuiKey_L;
+        case 'm': case 'M': return ImGuiKey_M;
+        case 'n': case 'N': return ImGuiKey_N;
+        case 'o': case 'O': return ImGuiKey_O;
+        case 'p': case 'P': return ImGuiKey_P;
+        case 'q': case 'Q': return ImGuiKey_Q;
+        case 'r': case 'R': return ImGuiKey_R;
+        case 's': case 'S': return ImGuiKey_S;
+        case 't': case 'T': return ImGuiKey_T;
+        case 'u': case 'U': return ImGuiKey_U;
+        case 'v': case 'V': return ImGuiKey_V;
+        case 'w': case 'W': return ImGuiKey_W;
+        case 'x': case 'X': return ImGuiKey_X;
+        case 'y': case 'Y': return ImGuiKey_Y;
+        case 'z': case 'Z': return ImGuiKey_Z;
+        case 282: return ImGuiKey_F1;
+        case 283: return ImGuiKey_F2;
+        case 284: return ImGuiKey_F3;
+        case 285: return ImGuiKey_F4;
+        case 286: return ImGuiKey_F5;
+        case 287: return ImGuiKey_F6;
+        case 288: return ImGuiKey_F7;
+        case 289: return ImGuiKey_F8;
+        case 290: return ImGuiKey_F9;
+        case 291: return ImGuiKey_F10;
+        case 292: return ImGuiKey_F11;
+        case 293: return ImGuiKey_F12;
+        case ',': return ImGuiKey_Comma;
+        case '.': return ImGuiKey_Period;
+        case '/': return ImGuiKey_Slash;
+        case ';': return ImGuiKey_Semicolon;
+        case '\'': return ImGuiKey_Apostrophe;
+        case '[': return ImGuiKey_LeftBracket;
+        case ']': return ImGuiKey_RightBracket;
+        case '-': return ImGuiKey_Minus;
+        case '=': return ImGuiKey_Equal;
+        case '`': return ImGuiKey_GraveAccent;
+        default:  return ImGuiKey_None;
+    }
+}
+
+/* Build one ImGui frame: forward input, then lay out the stats window.  `gpu`
+ * is the route the rain program used this frame, queried while it was bound. */
+static void process_imgui_frame(int gpu)
+{
+    ImGuiIO& io = ImGui::GetIO();
+
+    io.DisplaySize  = ImVec2((float)win_width, (float)win_height);
+    io.MousePos     = ImVec2((float)mouse_x, (float)mouse_y);
+    io.MouseDown[0] = mouse_buttons[0];
+    io.MouseDown[1] = mouse_buttons[1];
+    io.MouseDown[2] = mouse_buttons[2];
+    io.KeyCtrl      = key_ctrl;
+    io.KeyShift     = key_shift;
+    io.KeyAlt       = key_alt;
+    io.KeySuper     = key_super;
+
+    ImGui_ImplGLES2_NewFrame();
+    ImGui::NewFrame();
+
+    ImGui::SetNextWindowPos(ImVec2(8.0f, 8.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("GLMatrix", NULL,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Text("FPS: %d", fps);
+    ImGui::TextColored(gpu ? ImVec4(0.40f, 1.00f, 0.55f, 1.0f)
+                           : ImVec4(1.00f, 0.70f, 0.30f, 1.0f),
+                       "Renderer: %s", gpu ? "GPU" : "CPU");
+    ImGui::End();
+}
+
 static void render_frame(void)
 {
     EGLint w = 0, h = 0;
     uint32_t current_tic;
     float dt;
+    int gpu;
 
     eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
     eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
@@ -690,21 +829,57 @@ static void render_frame(void)
 
     glUseProgram(program);
     draw_rain();
-    {
-        char hud[64];
-        int gpu = glGpuActiveEWOK();
-        snprintf(hud, sizeof(hud), "FPS:%d %s", fps, gpu ? "GPU" : "CPU");
-        hud_draw(program, win_width, win_height, 8, 8, hud);
-    }
+
+    /* Query the GPU/CPU route while the rain program is still bound: the engine
+     * reports the currently-bound program and ImGui binds its own next.  The
+     * readout is then presented as a Dear ImGui window drawn on top. */
+    gpu = glGpuActiveEWOK();
+    process_imgui_frame(gpu);
+    ImGui::Render();
+    ImGui_ImplGLES2_RenderDrawData(ImGui::GetDrawData());
+
     eglSwapBuffers(egl_dpy, egl_surf);
     update_fps();
 }
 
 static void on_event(xwin_t* xwin, xevent_t* ev)
 {
-    /* ESC (27) quits, matching the other soft3d demos. */
-    if (ev->type == XEVT_IM && ev->value.im.value == 27)
-        xwin_close(xwin);
+    ImGuiIO& io = ImGui::GetIO();
+
+    if (ev->type == XEVT_IM) {
+        int key = ev->value.im.value;
+        int32_t state = ev->state;                 /* XIM_STATE_PRESS/RELEASE */
+
+        key_shift = (ev->value.im.shift != 0);
+        key_ctrl  = (ev->value.im.ctrl  != 0);
+
+        /* ESC (27) quits, matching the other soft3d demos. */
+        if (key == 27 && state == XIM_STATE_PRESS) {
+            xwin_close(xwin);
+            return;
+        }
+
+        ImGuiKey ik = KeyCodeToImGuiKey(key);
+        if (ik != ImGuiKey_None)
+            io.AddKeyEvent(ik, state == XIM_STATE_PRESS);
+        if (state == XIM_STATE_PRESS && key >= 32 && key < 127)
+            io.AddInputCharacter(key);
+    }
+    else if (ev->type == XEVT_MOUSE) {
+        gpos_t pos = xwin_get_inside_pos(xwin, ev->value.mouse.x, ev->value.mouse.y);
+        int32_t state  = ev->state;
+        int32_t button = ev->value.mouse.button;
+        bool down = (state == MOUSE_STATE_DOWN || state == MOUSE_STATE_DRAG);
+
+        mouse_x = pos.x;
+        mouse_y = pos.y;
+        if (button == MOUSE_BUTTON_LEFT)
+            mouse_buttons[0] = down;
+        else if (button == MOUSE_BUTTON_RIGHT)
+            mouse_buttons[1] = down;
+        else if (button == MOUSE_BUTTON_MID)
+            mouse_buttons[2] = down;
+    }
 }
 
 static void loop(void* p)
@@ -770,6 +945,9 @@ int main(int argc, char* argv[])
 
     xwin_set_visible(xwin, true);
     x_run(&x, xwin);
+
+    ImGui_ImplGLES2_Shutdown();
+    ImGui::DestroyContext();
 
     xwin_destroy(xwin);
     eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
