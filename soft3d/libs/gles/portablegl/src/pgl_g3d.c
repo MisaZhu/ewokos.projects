@@ -23,7 +23,6 @@
 
 #include <portablegl/pgl_g3d.h>
 #include <g2dclient/g2dclient.h>
-#include <stdio.h>          /* TEMP DIAG: file dump of the texcol staging */
 #include <string.h>
 #include <stdlib.h>
 #include "pgl_g3d_shader.h"   /* private bridge: pgl_g3d_shader_upload/_daemon_handle */
@@ -1357,34 +1356,6 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			if (_z != NULL)
 				for (i = 0; i < n; i++)
 					_z[i] = 0xFFFFFFFFu;   /* 24-bit unorm far */
-		}
-	}
-
-	/* TEMP DIAG (pi5 wrong-display): dump the staged stride-10 stream and the
-	   patched uniform blob of the first few texcol draws, then remove. */
-	if (geom_texcol) {
-		static int tc_dbg = 0;
-		if (tc_dbg < 6) {
-			static FILE *tc_fp = NULL;
-			const float *pv = _pos;
-			const uint32_t *uv = _unif;
-			int i;
-			if (tc_fp == NULL)
-				tc_fp = fopen("/tmp/tc.log", "w");
-			tc_dbg++;
-			if (tc_fp) {
-				fprintf(tc_fp, "tc%d n=%u span=%u w=%d h=%d\n", tc_dbg,
-				        (unsigned)count, (unsigned)unif_n, _w, _h);
-				for (i = 0; i < 4; i++) {
-					const uint32_t *w = (const uint32_t*)(const void*)(pv + (size_t)i * 10u);
-					fprintf(tc_fp, " v%d %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
-					        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]);
-				}
-				for (i = 0; i < 32; i += 8)
-					fprintf(tc_fp, " u%02d %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
-					        uv[i], uv[i+1], uv[i+2], uv[i+3], uv[i+4], uv[i+5], uv[i+6], uv[i+7]);
-				fflush(tc_fp);
-			}
 		}
 	}
 
