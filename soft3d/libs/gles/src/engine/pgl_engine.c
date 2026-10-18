@@ -1859,6 +1859,33 @@ static int gpu_ctex_slot(GLuint name)
     return slot;
 }
 
+/* Free staged tiled slots holding textures the current program does NOT sample.
+ * The slot table is sized PGL_G3D_MAX_TEX (4) but the shadertoy texture-effects
+ * reference 5 distinct images, and slots are cached per-texture across effects.
+ * Without eviction the_cave (the first effect needing a 5th distinct texture,
+ * tex09) finds no free slot for its iChannel2, leaves that unit unbound and the
+ * compiled draw declines to the CPU - the whole effect then renders on the
+ * interpreter/fast-path instead of the V3D.  Evicting only slots unused by this
+ * program keeps every draw's own samplers stageable (<=PGL_G3D_MAX_TEX at once);
+ * the cost is a re-upload when switching back to an evicted effect. */
+static void gpu_ctex_evict_unused(const glsl_program *gp)
+{
+    GLuint need[PGL_G3D_MAX_TEX];
+    int nneed = 0, i, j;
+    for (i = 0; i < gp->nuniforms && nneed < PGL_G3D_MAX_TEX; ++i) {
+        const glsl_uniform *u = &gp->uniforms[i];
+        if (!u->is_sampler) continue;
+        need[nneed++] = gles_engine_texture_for_unit(g_active->ublock[u->offset].i);
+    }
+    for (i = 0; i < PGL_G3D_MAX_TEX; ++i) {
+        int keep = 0;
+        if (!g_gpu_ctexused[i]) continue;
+        for (j = 0; j < nneed; ++j)
+            if (need[j] == g_gpu_ctexname[i]) { keep = 1; break; }
+        if (!keep) g_gpu_ctexused[i] = 0;
+    }
+}
+
 static int gpu_try_fullscreen(gpu_entry *e, GLenum mode, GLint first, GLsizei count)
 {
     /* NDC full-screen quad (z=0) as two pos-only triangles, wound so NDC y=+1
@@ -1918,7 +1945,10 @@ static int gpu_try_fullscreen(gpu_entry *e, GLenum mode, GLint first, GLsizei co
      * texture unit U (shadertoy convention), so the sampler's unit value is also
      * the compiled FS's TMU slot index; an unstageable texture leaves its unit
      * unbound, which declines the draw back to the CPU rather than sampling a
-     * wrong image. */
+     * wrong image.  Evict slots this program doesn't sample first so an effect
+     * with more distinct textures than the free remainder still stages all of
+     * its samplers (see gpu_ctex_evict_unused). */
+    gpu_ctex_evict_unused(gp);
     for (i = 0; i < gp->nuniforms; ++i) {
         const glsl_uniform *u = &gp->uniforms[i];
         int unit, slot;
