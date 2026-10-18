@@ -413,6 +413,20 @@ pgl_g3d_mesh pgl_g3d_upload_mesh_instanced(const float* interleaved,
                                            uint32_t nverts,
                                            uint32_t stride_floats);
 
+/* Stage a static COLOUR-MODULATED TEXTURED mesh (the imgui shape) for
+   pgl_g3d_draw_mesh_compiled with a program compiled from the colour-tex
+   variant (cs_is_geom=4).  `interleaved` is nverts vertices of stride_floats
+   floats each (stride_floats >= 10), laid out exactly as the xform kernel
+   indexes binding 1:
+     [0..2] = position xyz,  [3..4] = (u, v),  [5..8] = colour rgba (floats in
+     [0,1]),  [9] = pad.
+   The stream is copied verbatim into the mesh slot (no de-interleave) and each
+   draw re-stages its sub-range into the fixed GPU pos staging at a 10-float
+   stride.  Same return contract as pgl_g3d_upload_mesh. */
+pgl_g3d_mesh pgl_g3d_upload_mesh_texcol(const float* interleaved,
+                                        uint32_t nverts,
+                                        uint32_t stride_floats);
+
 /* Release an uploaded mesh (safe on an invalid handle). */
 void pgl_g3d_free_mesh(pgl_g3d_mesh m);
 
@@ -429,6 +443,15 @@ void pgl_g3d_free_mesh(pgl_g3d_mesh m);
    change.  Returns 1 on success, 0 when the GPU path is off, the arguments are
    bad, or the allocation failed (none of which latch the GPU off). */
 int  pgl_g3d_set_instances(const float* data, uint32_t nfloats);
+
+/* Set the per-draw SCISSOR window for the next colour-modulated textured
+   pgl_g3d_draw_mesh_compiled (cs_is_geom=4, the only geom variant that clips).
+   The rect is in framebuffer row space (y down: x = left column, y = top row,
+   w/h = extent); w<=0 or h<=0 disables clipping so the draw covers the whole
+   target.  The value is patched into the raster kernel's uScissor uniform;
+   other geom variants declare no uScissor and ignore it.  Call before each
+   texcol draw (the engine derives it from glScissor). */
+void pgl_g3d_set_scissor(int32_t x, int32_t y, int32_t w, int32_t h);
 
 /* Draw vertices [first, first+count) of an uploaded mesh with a compiled program
    as one GPU dispatch: the program's compiled VS/coord QPU runs the transform +

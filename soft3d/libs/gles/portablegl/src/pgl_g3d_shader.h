@@ -72,6 +72,17 @@ int pgl_g3d_shader_is_geom(pgl_g3d_prog p);
  * (patched from the bound slot by pgl_g3d_draw_mesh_compiled). */
 int pgl_g3d_shader_geom_tex(pgl_g3d_prog p);
 
+/* Non-zero when p's geom kernel is the COLOUR-MODULATED textured variant
+ * (geom_raster_texcol_cs_glsl, attached when the app FS multiplies a vec4
+ * varying by a texture2D sample - the imgui shape gl_FragColor = vColor *
+ * texture2D(uTexture, vUV)): pass 1 (geom_xform_texcol_cs_glsl) reads pos+uv+
+ * colour interleaved at a 10-float stride from binding 1 and writes a 12-float
+ * vout record; pass 2 bilinearly samples the ctex-unit-0 raster image, modulates
+ * by the interpolated colour, alpha-blends into the fb (SRC_ALPHA /
+ * ONE_MINUS_SRC_ALPHA), honouring a uScissor ivec4 (fb row space, w/h<=0 = off)
+ * and writing no depth.  Serialised as cs_is_geom = 4. */
+int pgl_g3d_shader_geom_texcol(pgl_g3d_prog p);
+
 /* Non-zero when p's geom kernel is the INSTANCED variant
  * (geom_xform_inst_cs_glsl, attached when the app VS carries the
  * PGL_G3D_INSTANCED marker): pass 1 reads a per-vertex instance index from

@@ -9,12 +9,17 @@
 //     vertex attribute pointers are (re)bound from the VBOs every frame;
 //   - no glPolygonMode: fill is the only rasterisation mode anyway.
 //
-// The projection uniform is named uProjMtx (never uMVP) on purpose: on raspi5
-// (PGL_G3D) the engine only routes a program onto the fixed V3D geometry kernel
-// when the compiled vertex shader exposes uMVP.  ImGui multiplies a per-vertex
-// colour by a texture sample, which that kernel cannot represent, so keeping
-// uMVP out of the source latches the whole imgui draw stream onto the CPU GLSL
-// interpreter -- exactly where it rendered under PortableGL.
+// The projection uniform is named uMVP so that on raspi5 (PGL_G3D) the engine
+// recognises this program as a geometry-kernel candidate: pgl_g3d_shader.c keys
+// the compiled V3D geometry route off a uMVP in the vertex shader.  ImGui's
+// fragment stage multiplies a per-vertex colour by a texture sample
+// (gl_FragColor = vColor * texture2D(uTexture, vUV)), which selects the
+// colour-modulated textured kernel variant (cs_is_geom = 4: bilinear sampling,
+// per-vertex colour modulation, SRC_ALPHA/ONE_MINUS_SRC_ALPHA blending and
+// per-command scissor, no depth write).  That kernel reproduces this renderer's
+// exact visual design on the V3D GPU; when it cannot (no GPU, unstaged font
+// atlas, unsupported blend state) the draw declines to the CPU GLSL
+// interpreter, which renders pixel-identical output.
 
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
@@ -318,7 +323,7 @@ bool    ImGui_ImplGLES2_CreateDeviceObjects()
     ImGui_ImplGLES2_Data* bd = ImGui_ImplGLES2_GetBackendData();
 
     // GLSL ES 1.00 pair matching the classic imgui OpenGL3 renderer: a
-    // position/uv/colour vertex stream projected by uProjMtx, and a fragment
+    // position/uv/colour vertex stream projected by uMVP, and a fragment
     // stage multiplying the vertex colour by the font atlas sample.  Attribute
     // locations are bound explicitly (0=pos, 1=uv, 2=colour) so the render-state
     // setup can address them without a query round-trip.
@@ -326,14 +331,14 @@ bool    ImGui_ImplGLES2_CreateDeviceObjects()
         "attribute vec2 aPosition;\n"
         "attribute vec2 aUV;\n"
         "attribute vec4 aColor;\n"
-        "uniform mat4 uProjMtx;\n"
+        "uniform mat4 uMVP;\n"
         "varying vec2 vUV;\n"
         "varying vec4 vColor;\n"
         "void main()\n"
         "{\n"
         "    vUV = aUV;\n"
         "    vColor = aColor;\n"
-        "    gl_Position = uProjMtx * vec4(aPosition, 0.0, 1.0);\n"
+        "    gl_Position = uMVP * vec4(aPosition, 0.0, 1.0);\n"
         "}\n";
 
     const char* fragment_shader =
@@ -366,7 +371,7 @@ bool    ImGui_ImplGLES2_CreateDeviceObjects()
     glDeleteShader(vs);
     glDeleteShader(fs);
 
-    bd->AttribLocationProjMtx = glGetUniformLocation(bd->ShaderHandle, "uProjMtx");
+    bd->AttribLocationProjMtx = glGetUniformLocation(bd->ShaderHandle, "uMVP");
     bd->AttribLocationTex = glGetUniformLocation(bd->ShaderHandle, "uTexture");
     bd->AttribLocationVtxPos = 0;
     bd->AttribLocationVtxUV = 1;

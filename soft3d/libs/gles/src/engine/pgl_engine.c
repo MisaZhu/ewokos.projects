@@ -55,6 +55,8 @@ static int cpu_try_direct_blit(GLenum mode, GLint first, GLsizei count);
  * call them and silently keep the CPU interpreter path otherwise. */
 static void gpu_bringup(void);
 static int  gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count);
+static int  gpu_try_draw_elements(GLenum mode, GLsizei count, GLenum type,
+                                  const void *indices);
 static void gpu_on_texture(GLuint name, GEenum format, GEenum type,
                            GEint w, GEint h, const void *data);
 #endif
@@ -678,8 +680,15 @@ void gles_engine_draw_arrays(GEenum mode, GEint first, GEint count)
 void gles_engine_draw_elements(GEenum mode, GEint count, GEenum type, const void *indices)
 {
 #ifdef PGL_G3D
-    /* Indexed draws stay on the CPU interpreter: drain any pending coalesced
-     * geometry batch first so this draw lands after it (painter's order). */
+    /* Colour-modulated textured indexed draw (imgui, cs_is_geom=4): tessellate
+     * to a triangle list, stage pos+uv+colour at stride 10 and dispatch on the
+     * QPU.  Returns 0 when not eligible or declined, falling through to the CPU
+     * interpreter with identical pixels.  Any other indexed draw stays on the
+     * CPU: drain a pending coalesced geometry batch first so this draw lands
+     * after it (painter's order). */
+    if (gpu_try_draw_elements(EMAP(prim_map, mode), count,
+                              EMAP(type_map, type), indices))
+        return;
     gles_engine_gpu_flush();
 #endif
     pgl_DrawElements(EMAP(prim_map, mode), count, EMAP(type_map, type), indices);
@@ -1510,6 +1519,10 @@ static int cpu_try_direct_blit(GLenum mode, GLint first, GLsizei count)
 #ifdef PGL_G3D
 
 #define GPU_STAGING_STRIDE 6   /* pos.xyz + (normal.xyz | u,v,pad) */
+/* Colour-modulated textured (imgui, cs_is_geom=4) interleaved stride:
+ * pos.xyz + (u,v) + rgba + pad.  A separate constant so the gouraud/tex
+ * stride-6 staging and its cross-draw coalescing stay untouched. */
+#define GPU_TEXCOL_STRIDE  10
 #define GPU_NUNIF          6   /* uMVP .. uShade */
 
 /* The lighting uniforms the gouraud xform kernel reads, matched by name
@@ -1527,6 +1540,10 @@ typedef struct {
     pgl_g3d_prog  prog;
     int           eligible;      /* compiled to a geometry kernel         */
     int           textured;      /* attr1 is uv; needs a raster texture   */
+    int           texcol;        /* colour-modulated textured (imgui): attr2 is a
+                                    ubyte-normalised colour; indexed draws stage
+                                    pos+uv+colour at stride 10 (cs_is_geom=4) via
+                                    gpu_try_draw_elements, never gpu_try_draw_arrays */
     int           fullscreen;    /* passthrough VS + gl_FragCoord FS: routed
                                     by gpu_try_fullscreen, not the mesh path */
     int           cpu_latched;   /* a dispatch declined: stay on the CPU  */
@@ -1556,6 +1573,12 @@ static int     g_gpu_texused[PGL_G3D_MAX_TEX];
 /* one reusable interleaved staging buffer (grown on demand) */
 static float  *g_gpu_stage = NULL;
 static int     g_gpu_stage_cap = 0;   /* in vertices */
+
+/* Separate stride-10 staging for the colour-modulated textured (indexed) route.
+ * Indexed draws are never coalesced (one imgui command = one dispatch), so it
+ * does not share g_gpu_stage, whose GPU_STAGING_STRIDE is 6. */
+static float  *g_gpu_tcol = NULL;
+static int     g_gpu_tcol_cap = 0;    /* in vertices */
 
 typedef struct { float *v; int n; int cap; } gpu_stage;
 
@@ -1693,6 +1716,17 @@ static int gpu_stage_reserve(int nverts)
     return 1;
 }
 
+/* Grow the stride-10 colour-tex staging to nverts vertices (indexed route). */
+static int gpu_tcol_reserve(int nverts)
+{
+    if (g_gpu_tcol && nverts <= g_gpu_tcol_cap) return 1;
+    free(g_gpu_tcol);
+    g_gpu_tcol = (float *)malloc((size_t)nverts * GPU_TEXCOL_STRIDE * sizeof(float));
+    if (!g_gpu_tcol) { g_gpu_tcol_cap = 0; return 0; }
+    g_gpu_tcol_cap = nverts;
+    return 1;
+}
+
 /* read ncomp floats of one GL_FLOAT vertex attribute for buffer vertex vi */
 static int gpu_read_attrib(const glVertex_Attrib *v, GLsizei vi, float *out, int ncomp)
 {
@@ -1705,6 +1739,37 @@ static int gpu_read_attrib(const glVertex_Attrib *v, GLsizei vi, float *out, int
     off = v->offset + (GLsizeiptr)v->stride * (GLsizeiptr)vi;
     if (off < 0 || off + (GLsizeiptr)ncomp * 4 > (GLsizeiptr)b->size) return 0;
     memcpy(out, b->data + off, (size_t)ncomp * sizeof(float));
+    return 1;
+}
+
+/* Read ncomp components of a COLOUR vertex attribute as normalised floats.
+ * imgui supplies aColor as GL_UNSIGNED_BYTE normalised (location 2); GL_FLOAT
+ * is also accepted.  Any other type returns 0 so the draw declines to the CPU
+ * rather than mis-reading the bytes. */
+static int gpu_read_attrib_color(const glVertex_Attrib *v, GLsizei vi,
+                                 float *out, int ncomp)
+{
+    const glBuffer *b;
+    GLsizeiptr off;
+    int k, esz;
+    if (v->size < ncomp) return 0;
+    if (v->buf >= (GLuint)g_ctx.buffers.size) return 0;
+    b = &g_ctx.buffers.a[v->buf];
+    if (!b->data) return 0;
+    if (v->type == GL_FLOAT)
+        esz = 4;
+    else if (v->type == GL_UNSIGNED_BYTE && v->normalized)
+        esz = 1;
+    else
+        return 0;
+    off = v->offset + (GLsizeiptr)v->stride * (GLsizeiptr)vi;
+    if (off < 0 || off + (GLsizeiptr)ncomp * esz > (GLsizeiptr)b->size) return 0;
+    if (esz == 4) {
+        memcpy(out, b->data + off, (size_t)ncomp * sizeof(float));
+    } else {
+        const uint8_t *p = (const uint8_t *)b->data + off;
+        for (k = 0; k < ncomp; ++k) out[k] = (float)p[k] / 255.0f;
+    }
     return 1;
 }
 
@@ -1729,6 +1794,33 @@ static int gpu_stage_tri(gpu_stage *st, const glVertex_Attrib *a0,
             if (!gpu_read_attrib(a1, idx[k], q, 3)) return 0;
             dst[3] = q[0]; dst[4] = q[1]; dst[5] = q[2];
         }
+    }
+    st->n += 3;
+    return 1;
+}
+
+/* Append one INDEXED triangle to the stride-10 colour-tex staging: attr0 =
+ * position (vec2 -> xyz with z=0, matching the imgui VS's vec4(aPosition,0,1)),
+ * attr1 = uv (vec2), attr2 = colour (rgba, normalised).  Layout matches
+ * geom_xform_texcol_cs_glsl binding 1: [0..2]=pos [3..4]=uv [5..8]=rgba [9]=pad. */
+static int gpu_stage_tri_tcol(gpu_stage *st, const glVertex_Attrib *a0,
+                              const glVertex_Attrib *a1, const glVertex_Attrib *a2,
+                              GLsizei i0, GLsizei i1, GLsizei i2)
+{
+    GLsizei idx[3];
+    float p[2], q[2], cc[4], *dst;
+    int k;
+    if (st->n + 3 > st->cap) return 0;
+    idx[0] = i0; idx[1] = i1; idx[2] = i2;
+    for (k = 0; k < 3; ++k) {
+        dst = st->v + (size_t)(st->n + k) * GPU_TEXCOL_STRIDE;
+        if (!gpu_read_attrib(a0, idx[k], p, 2)) return 0;
+        dst[0] = p[0]; dst[1] = p[1]; dst[2] = 0.0f;
+        if (!gpu_read_attrib(a1, idx[k], q, 2)) return 0;
+        dst[3] = q[0]; dst[4] = q[1];
+        if (!gpu_read_attrib_color(a2, idx[k], cc, 4)) return 0;
+        dst[5] = cc[0]; dst[6] = cc[1]; dst[7] = cc[2]; dst[8] = cc[3];
+        dst[9] = 0.0f;
     }
     st->n += 3;
     return 1;
@@ -1774,6 +1866,79 @@ static int gpu_tessellate(gpu_stage *st, GLenum mode, GLint first, GLsizei count
             if (!gpu_stage_tri(st, &va[0], &va[1], e->textured,
                                (GLsizei)first, (GLsizei)(first+i-1),
                                (GLsizei)(first+i))) return 0;
+    }
+    return 1;
+}
+
+/* Resolve the glDrawElements index source exactly as portablegl's vertex_stage
+ * does: `indices` is a byte OFFSET into the bound GL_ELEMENT_ARRAY_BUFFER when
+ * one is bound, else a direct client pointer.  Bounds-checks the offset+count
+ * against the buffer for the bound case; returns NULL on an out-of-range read. */
+static const void *gpu_index_base(GLenum type, const void *indices, GLsizei count)
+{
+    int esz = (type == GL_UNSIGNED_SHORT) ? 2 : (type == GL_UNSIGNED_INT ? 4 : 1);
+    GLuint eb;
+    const glBuffer *b;
+    GLsizeiptr need;
+    if (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_INT &&
+        type != GL_UNSIGNED_BYTE)
+        return NULL;
+    if (g_ctx.bound_buffers[GL_ELEMENT_ARRAY_BUFFER - GL_ARRAY_BUFFER]) {
+        eb = g_ctx.vertex_arrays.a[g_ctx.cur_vertex_array].element_buffer;
+        if (eb >= (GLuint)g_ctx.buffers.size) return NULL;
+        b = &g_ctx.buffers.a[eb];
+        if (!b->data) return NULL;
+        need = (GLsizeiptr)(uintptr_t)indices + (GLsizeiptr)count * esz;
+        if (need > (GLsizeiptr)b->size) return NULL;
+        return (const uint8_t *)b->data + (uintptr_t)indices;
+    }
+    return indices;   /* client-side pointer: trusted, as portablegl does */
+}
+
+static long gpu_read_index(const void *base, GLenum type, GLsizei i)
+{
+    if (type == GL_UNSIGNED_SHORT) return (long)((const uint16_t *)base)[i];
+    if (type == GL_UNSIGNED_INT)   return (long)((const uint32_t *)base)[i];
+    return (long)((const uint8_t *)base)[i];
+}
+
+/* Tessellate an indexed [0,count) draw of `mode` into the stride-10 colour-tex
+ * staging, replicating portablegl's winding (see gpu_tessellate) through the
+ * resolved index base.  Appends at st->n; returns 0 on an attrib fault. */
+static int gpu_tessellate_elements(gpu_stage *st, GLenum mode, GLsizei count,
+                                   const void *base, GLenum type,
+                                   const glVertex_Attrib *va)
+{
+    GLsizei i;
+    long c0, c1, c2;
+    if (mode == GL_TRIANGLES) {
+        for (i = 0; i + 2 < count; i += 3) {
+            c0 = gpu_read_index(base, type, i);
+            c1 = gpu_read_index(base, type, i + 1);
+            c2 = gpu_read_index(base, type, i + 2);
+            if (!gpu_stage_tri_tcol(st, &va[0], &va[1], &va[2],
+                                    (GLsizei)c0, (GLsizei)c1, (GLsizei)c2)) return 0;
+        }
+    } else if (mode == GL_TRIANGLE_STRIP) {
+        long ia = gpu_read_index(base, type, 0);
+        long ib = gpu_read_index(base, type, 1);
+        int toggle = 0;
+        for (i = 2; i < count; ++i) {
+            c2 = gpu_read_index(base, type, i);
+            if (!gpu_stage_tri_tcol(st, &va[0], &va[1], &va[2],
+                                    (GLsizei)ia, (GLsizei)ib, (GLsizei)c2)) return 0;
+            if (!toggle) ia = c2; else ib = c2;
+            toggle = !toggle;
+        }
+    } else { /* GL_TRIANGLE_FAN */
+        long i0 = gpu_read_index(base, type, 0);
+        long prev = gpu_read_index(base, type, 1);
+        for (i = 2; i < count; ++i) {
+            c2 = gpu_read_index(base, type, i);
+            if (!gpu_stage_tri_tcol(st, &va[0], &va[1], &va[2],
+                                    (GLsizei)i0, (GLsizei)prev, (GLsizei)c2)) return 0;
+            prev = c2;
+        }
     }
     return 1;
 }
@@ -1995,6 +2160,10 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
      * the fixed geometry kernels (it exposes no uMVP, so it is not eligible). */
     if (e->fullscreen) return gpu_try_fullscreen(e, mode, first, count);
     if (!e->eligible) return 0;
+    /* The colour-modulated textured variant is indexed-only: its pos+uv+colour
+     * stride-10 staging is built by gpu_try_draw_elements, so it must never be
+     * tessellated here at GPU_STAGING_STRIDE. */
+    if (e->texcol) return 0;
 
     /* the fixed kernels rasterise triangles only */
     if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP && mode != GL_TRIANGLE_FAN)
@@ -2093,6 +2262,127 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
     return 1;
 }
 
+/* The colour-tex raster kernel hardcodes imgui's blend state: enabled, FUNC_ADD,
+ * glBlendFuncSeparate(SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ONE, ONE_MINUS_SRC_ALPHA)
+ * - RGB modulated by the source alpha, alpha by GL_ONE.  Anything else declines
+ * so the CPU reproduces the exact blend. */
+static int gpu_blend_texcol_ok(void)
+{
+    if (!g_ctx.blend) return 0;
+    if (g_ctx.blend_eqRGB != GL_FUNC_ADD || g_ctx.blend_eqA != GL_FUNC_ADD) return 0;
+    if (g_ctx.blend_sRGB != GL_SRC_ALPHA ||
+        g_ctx.blend_dRGB != GL_ONE_MINUS_SRC_ALPHA) return 0;
+    if (g_ctx.blend_sA != GL_ONE ||
+        g_ctx.blend_dA != GL_ONE_MINUS_SRC_ALPHA) return 0;
+    return 1;
+}
+
+/* Colour-modulated textured INDEXED draw (imgui, cs_is_geom=4).  Mirrors the
+ * textured branch of gpu_try_draw_arrays but reads a GL_ELEMENT_ARRAY_BUFFER,
+ * stages pos(vec2)+uv+ubyte-colour at stride 10, marshals the raster font atlas
+ * as ctex unit 0, and passes the per-command scissor window (converted to fb row
+ * space) via pgl_g3d_set_scissor.  Returns 1 when the GPU ran the draw, 0 to
+ * fall through to the CPU interpreter (identical pixels). */
+static int gpu_try_draw_elements(GLenum mode, GLsizei count, GLenum type,
+                                 const void *indices)
+{
+    gpu_entry *e;
+    const glVertex_Attrib *va;
+    const void *base;
+    gpu_stage st;
+    uint32_t blob[PGL_G3D_MAX_UNIF];
+    uint32_t depth, mask, cull;
+    GLsizei nout, i;
+    pgl_g3d_mesh mesh;
+    int slot, ok, sx, sy, sw, sh;
+
+    gpu_bringup();
+    if (!g_gpu_ready) return 0;
+    if (!g_active || !g_active->gp || !g_active->ublock) return 0;
+    e = gpu_find_entry(g_active->pgl_id);
+    if (!e || e->cpu_latched || e->fullscreen) return 0;
+    if (!e->eligible || !e->texcol) return 0;
+
+    if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP && mode != GL_TRIANGLE_FAN)
+        return 0;
+    if (count < 3) return 0;
+    if (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_INT &&
+        type != GL_UNSIGNED_BYTE) return 0;
+
+    /* The kernel's fixed state: SRC_ALPHA blend, no depth, no culling.  imgui
+     * disables the depth test and face culling, so require that; any other
+     * state declines to the CPU. */
+    if (!gpu_blend_texcol_ok()) return 0;
+    if (g_ctx.depth_test || g_ctx.cull_face) return 0;
+
+    va = g_ctx.vertex_arrays.a[g_ctx.cur_vertex_array].vertex_attribs;
+    /* attr0 = pos vec2 (float), attr1 = uv vec2 (float), attr2 = colour (ubyte
+     * normalised or float); all three must be enabled for the stride-10 stage. */
+    if (!va[0].enabled || va[0].type != GL_FLOAT || va[0].size < 2) return 0;
+    if (!va[1].enabled || va[1].type != GL_FLOAT || va[1].size < 2) return 0;
+    if (!va[2].enabled) return 0;
+
+    nout = (mode == GL_TRIANGLES) ? (count / 3) * 3 : (count - 2) * 3;
+    if (nout < 3 || nout > (GLsizei)PGL_G3D_MAX_VERTS) return 0;
+
+    base = gpu_index_base(type, indices, count);
+    if (!base) return 0;
+
+    /* Scissor -> fb row space (y down), matching portablegl's ext conversion
+     * (scissor_y = fb_h - uy).  An empty window draws nothing, exactly as the
+     * CPU clip would, so claim the draw without dispatching. */
+    if (g_ctx.scissor_test) {
+        int lx = g_ctx.scissor_lx, ly = g_ctx.scissor_ly;
+        int ux = lx + g_ctx.scissor_w, uy = ly + g_ctx.scissor_h;
+        if (lx < 0) lx = 0;
+        if (ly < 0) ly = 0;
+        if (ux > g_w) ux = g_w;
+        if (uy > g_h) uy = g_h;
+        if (ux <= lx || uy <= ly) return 1;   /* fully clipped: nothing to draw */
+        sx = lx; sy = g_h - uy; sw = ux - lx; sh = uy - ly;
+    } else {
+        sx = sy = sw = sh = 0;   /* disabled */
+    }
+
+    /* Pack the per-draw uniform blob (uMVP) exactly as the array route does;
+     * draw_mesh_compiled patches the derived uViewportWH/uFbStride/uTriFirst/
+     * uTriCount/uVertCount/uTexW/uTexH/uScissor by name into the same blob. */
+    gpu_resolve_app_uniforms(e, g_active->gp);
+    memset(blob, 0, sizeof(blob));
+    for (i = 0; i < GPU_NUNIF; ++i) {
+        int k, n;
+        if (e->koff[i] < 0 || e->aoff[i] < 0) continue;
+        n = e->knc[i] < e->anc[i] ? e->knc[i] : e->anc[i];
+        for (k = 0; k < n && e->koff[i] + k < (int)PGL_G3D_MAX_UNIF; ++k) {
+            float fv = g_active->ublock[e->aoff[i] + k].f;
+            memcpy(&blob[e->koff[i] + k], &fv, 4);
+        }
+    }
+    depth = gpu_depth_code();
+    mask  = g_ctx.depth_mask ? 1u : 0u;
+    cull  = gpu_cull_code();
+
+    gpu_coalesce_flush();
+    if (!g_gpu_ready) return 0;   /* a flush may have latched the GPU off */
+    if (!gpu_tcol_reserve(nout)) return 0;
+    st.v = g_gpu_tcol; st.n = 0; st.cap = nout;
+    if (!gpu_tessellate_elements(&st, mode, count, base, type, va)) return 0;
+    if (st.n != nout) return 0;   /* defensive: tessellation/staging mismatch */
+
+    pgl_g3d_set_uniforms(blob, PGL_G3D_MAX_UNIF);
+    slot = gpu_tex_slot(gles_engine_texture_for_unit(0), 0);
+    if (slot < 0) return 0;   /* font atlas not staged as a raster slot: CPU */
+    pgl_g3d_bind_tex_unit(0, slot);
+    pgl_g3d_set_scissor(sx, sy, sw, sh);
+    mesh = pgl_g3d_upload_mesh_texcol(g_gpu_tcol, (uint32_t)nout, GPU_TEXCOL_STRIDE);
+    if (mesh == PGL_G3D_MESH_INVALID) return 0;   /* transient (OOM): CPU this draw */
+    ok = pgl_g3d_draw_mesh_compiled(e->prog, mesh, 0, (uint32_t)nout,
+                                    depth, mask, cull);
+    pgl_g3d_free_mesh(mesh);
+    if (!ok) { e->cpu_latched = 1; return 0; }   /* declined: latch CPU + fall through */
+    return 1;
+}
+
 GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_src)
 {
     gpu_entry *e;
@@ -2157,6 +2447,12 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
     if (!e) { pgl_g3d_program_free(prog); return 0; }
     e->prog = prog;
     e->textured = (strstr(fs_src, "sampler") != NULL);
+    /* Colour-modulated textured (imgui): the FS multiplies a vec4 varying by a
+     * texture2D sample.  Detected with the IDENTICAL predicate pgl_g3d_shader.c
+     * uses to attach the cs_is_geom=4 kernels (tex && "* texture2D"), and the
+     * engine passes this same fs_src to pgl_g3d_program_compile, so the stride-10
+     * indexed staging can never disagree with the kernel the program got. */
+    e->texcol = e->textured && strstr(fs_src, "* texture2D") != NULL;
     e->fullscreen = is_fullscreen;
     e->eligible = 0;
     for (i = 0; i < GPU_NUNIF; ++i) {

@@ -23,6 +23,7 @@
 
 #include <portablegl/pgl_g3d.h>
 #include <g2dclient/g2dclient.h>
+#include <stdio.h>          /* TEMP DIAG: file dump of the texcol staging */
 #include <string.h>
 #include <stdlib.h>
 #include "pgl_g3d_shader.h"   /* private bridge: pgl_g3d_shader_upload/_daemon_handle */
@@ -38,9 +39,11 @@
 /* pos is modelled as a w=nverts h=3 canvas (nverts*3*4 bytes); col as a
    w=nverts h=1 canvas (nverts*1*4 bytes) so g2d_attach's size >= w*h*4 holds.
    The TEXTURED geom variant interleaves pos+uv into the pos staging at a
-   6-float stride (V3D 7.1 compute exposes only 4 SSBO bindings), so the pos
-   buffer is sized for the worst case of either layout: nverts*6*4 bytes. */
-#define PGL_G3D_POS_BYTES (PGL_G3D_MAX_VERTS * 6u * 4u)
+   6-float stride, and the COLOUR-MODULATED textured variant (imgui,
+   cs_is_geom=4) interleaves pos+uv+colour at a 10-float stride (V3D 7.1
+   compute exposes only 4 SSBO bindings), so the pos buffer is sized for the
+   worst case of any layout: nverts*10*4 bytes. */
+#define PGL_G3D_POS_BYTES (PGL_G3D_MAX_VERTS * 10u * 4u)
 #define PGL_G3D_COL_BYTES (PGL_G3D_MAX_VERTS * 1u * 4u)
 /* Phase D: uv float3 per vertex (u, v, pad=0) sharing the pos encoding's
    12-byte stride, so the driver reuses its proven vec_size=3/type=FLOAT
@@ -103,13 +106,21 @@ static ewokos_addr_t _nrm_phy;
    phy on a hit, ignoring canvas->phy, so an offset sub-range would resolve to
    the stale base - hence dedicated base-addressed segments.  glayout records
    the kernel layout gpos/gnrm hold (0 = not staged, 1 = gouraud float3+float3,
-   2 = tex interleaved stride-6).  A slot is "used" iff .pos != NULL. */
+   2 = tex interleaved stride-6).  A slot is "used" iff .used is set: the
+   gouraud/tex/instanced layouts fill .pos (+.nrm/.idx), the colour-modulated
+   textured layout (cs_is_geom=4) fills .tcol instead and leaves .pos NULL. */
 typedef struct {
 	int      used;
 	uint32_t nverts;
 	float*   pos;   /* float3 per vertex */
 	float*   nrm;   /* float3 per vertex */
 	float*   idx;   /* float1 per vertex (instance index); NULL unless instanced */
+	/* COLOUR-MODULATED textured mesh (imgui, cs_is_geom=4): the raw
+	   interleaved pos.xyz+uv.xy+rgba+pad stream at a 10-float stride, kept
+	   verbatim (pos/nrm/idx stay NULL) and memcpy'd straight into the pos
+	   staging per draw.  tcol_stride is 10. */
+	float*   tcol;
+	uint32_t tcol_stride;
 	int      instanced;
 	int            glayout;
 	int            gpos_shm;
@@ -177,6 +188,13 @@ static int      _ctex_bind[PGL_G3D_MAX_TEX_UNITS] = { -1, -1, -1, -1 };
    colour mask); part of the homogeneity key, copied into req.ext on flush. */
 static pgl_g3d_ext_t _batch_ext;
 
+/* Per-draw scissor window for the compiled colour-modulated textured route
+   (cs_is_geom=4, imgui): fb row space (y down), w/h<=0 disables.  Set by the
+   engine from glScissor before each texcol draw and patched into the raster
+   kernel's uScissor uniform by pgl_g3d_draw_mesh_compiled; the other geom
+   variants declare no uScissor and ignore it. */
+static int32_t _scissor_x, _scissor_y, _scissor_w, _scissor_h;
+
 /* WS4 compiled-shader draw-path state: the active on-device-compiled program
    plus the per-draw GL uniform blob the daemon's QUNIFORM interpreter indexes.
    The uniform staging is a CPU-read contig-shm segment (the daemon copies the
@@ -216,6 +234,14 @@ int pgl_g3d_enabled(void)
 void* pgl_g3d_pixels(void)
 {
 	return (void*)_fb;
+}
+
+void pgl_g3d_set_scissor(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	_scissor_x = x;
+	_scissor_y = y;
+	_scissor_w = w;
+	_scissor_h = h;
 }
 
 static uint8_t clamp_u8(float f)
@@ -771,6 +797,8 @@ pgl_g3d_mesh pgl_g3d_upload_mesh(const float* interleaved, uint32_t nverts,
 	/* the GPU-resident staging builds lazily on the first whole-mesh draw
 	   (mesh_gpu_stage); a reused slot was scrubbed by pgl_g3d_free_mesh. */
 	m->idx = NULL;
+	m->tcol = NULL;
+	m->tcol_stride = 0;
 	m->instanced = 0;
 	m->glayout = 0;
 	m->gpos_shm = m->gnrm_shm = 0;
@@ -825,7 +853,54 @@ pgl_g3d_mesh pgl_g3d_upload_mesh_instanced(const float* interleaved,
 		m->idx[v]         = src[6];
 	}
 	m->nverts = nverts;
+	m->tcol = NULL;
+	m->tcol_stride = 0;
 	m->instanced = 1;
+	m->glayout = 0;
+	m->gpos_shm = m->gnrm_shm = 0;
+	m->gpos = m->gnrm = NULL;
+	m->gpos_phy = m->gnrm_phy = 0;
+	m->used = 1;
+	return (pgl_g3d_mesh)slot;
+}
+
+/* Colour-modulated textured variant of pgl_g3d_upload_mesh (imgui,
+   cs_is_geom=4): each vertex carries pos.xyz at element 0, uv at element 3 and
+   an rgba colour at element 5 (stride_floats >= 10; extra trailing floats are
+   ignored).  The stream is re-packed to a tight stride-10 and kept verbatim in
+   the slot's tcol buffer (pos/nrm/idx stay NULL); a draw memcpy's its sub-range
+   straight into the pos staging, which the geom_xform_texcol kernel reads as
+   binding 1.  Same return contract as pgl_g3d_upload_mesh. */
+pgl_g3d_mesh pgl_g3d_upload_mesh_texcol(const float* interleaved, uint32_t nverts,
+                                        uint32_t stride_floats)
+{
+	pgl_g3d_mesh_slot_t* m;
+	int slot = -1, i;
+	uint32_t v;
+
+	if (!_enabled || interleaved == NULL || nverts == 0)
+		return PGL_G3D_MESH_INVALID;
+	if (stride_floats < 10u)
+		return PGL_G3D_MESH_INVALID;
+
+	for (i = 0; i < PGL_G3D_MAX_MESH; i++)
+		if (!_mesh[i].used) { slot = i; break; }
+	if (slot < 0)
+		return PGL_G3D_MESH_INVALID;   /* table full: caller keeps its CPU path */
+	m = &_mesh[slot];
+
+	m->tcol = (float*)malloc((size_t)nverts * 10u * sizeof(float));
+	if (!m->tcol)
+		return PGL_G3D_MESH_INVALID;   /* OOM does NOT latch the GPU off */
+	for (v = 0; v < nverts; v++)
+		memcpy(m->tcol + (size_t)v * 10u,
+		       interleaved + (size_t)v * stride_floats, 10u * sizeof(float));
+	m->pos = NULL;
+	m->nrm = NULL;
+	m->idx = NULL;
+	m->nverts = nverts;
+	m->tcol_stride = 10u;
+	m->instanced = 0;
 	m->glayout = 0;
 	m->gpos_shm = m->gnrm_shm = 0;
 	m->gpos = m->gnrm = NULL;
@@ -947,9 +1022,12 @@ void pgl_g3d_free_mesh(pgl_g3d_mesh m)
 	free(s->pos);
 	free(s->nrm);
 	free(s->idx);
+	free(s->tcol);
 	s->pos = NULL;
 	s->nrm = NULL;
 	s->idx = NULL;
+	s->tcol = NULL;
+	s->tcol_stride = 0;
 	s->instanced = 0;
 	s->nverts = 0;
 	s->used = 0;
@@ -1007,6 +1085,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	int dh, res;
 	int geom;
 	int geom_tex;
+	int geom_texcol;
 	int geom_inst;
 	int mgpu = 0;
 
@@ -1049,7 +1128,11 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		return 0;
 
 	geom = pgl_g3d_shader_is_geom(prog);
-	geom_tex = geom && pgl_g3d_shader_geom_tex(prog);
+	/* texcol takes precedence: pgl_g3d_shader.c still reports geom_tex for a
+	   colour-modulated program, so exclude texcol before testing geom_tex to
+	   keep it off the stride-6 textured path. */
+	geom_texcol = geom && pgl_g3d_shader_geom_texcol(prog);
+	geom_tex = geom && !geom_texcol && pgl_g3d_shader_geom_tex(prog);
 	geom_inst = geom && pgl_g3d_shader_geom_inst(prog);
 	/* A whole-mesh geom draw (the teapot/gears shape: first == 0 and count ==
 	   nverts) stages the mesh ONCE into the slot's dedicated GPU-resident
@@ -1057,7 +1140,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	   re-stage entirely; a sub-range draw keeps the re-stage because it
 	   re-bases the range to vertex 0, which a base-addressed whole-mesh
 	   segment cannot do. */
-	if (geom && first == 0 && count == m->nverts)
+	if (geom && !geom_texcol && first == 0 && count == m->nverts)
 		mgpu = mesh_gpu_stage(m, geom_inst ? 3 : (geom_tex ? 2 : 1));
 	if (mgpu) {
 		/* nothing to re-stage: gpos/gnrm already hold the whole mesh in the
@@ -1077,6 +1160,15 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			_nrm[v*3u + 1u] = sn[1];
 			_nrm[v*3u + 2u] = sn[2];
 		}
+	} else if (geom_texcol) {
+		/* Colour-modulated textured variant (imgui): pos+uv+colour already
+		   interleaved at a 10-float stride in the mesh's tcol stream (staged
+		   by pgl_g3d_upload_mesh_texcol), so a straight sub-range copy into
+		   the pos buffer re-bases it to vertex 0. */
+		if (m->tcol == NULL)
+			return 0;
+		memcpy(_pos, m->tcol + (size_t)first * 10u,
+		       (size_t)count * 10u * sizeof(float));
 	} else if (geom_tex) {
 		/* Textured variant: V3D compute has only 4 SSBO bindings, so pos and
 		   uv SHARE the pos staging as one interleaved stream, stride 6 floats
@@ -1130,6 +1222,13 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			col.phy = m->gnrm_phy;
 		}
 		pos.phy = m->gpos_phy;
+	} else if (geom_texcol) {
+		/* pos+uv+colour interleaved stride-10: model the canvas w=count h=10
+		 * (count*40 bytes) so g2dd's pos.w==nverts check and the size>=w*h*4
+		 * attach check both pass; col is unused (zero canvas). */
+		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 10, 1);
+		col = g2d_canvas(0, 0, 0, 0, 0);
+		pos.phy = _pos_phy;
 	} else if (geom_tex) {
 		/* pos+uv interleaved stride-6: the g2dd handler requires
 		 * pos.w == nverts, so model the canvas w=count h=6 (the
@@ -1169,13 +1268,14 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	     as-is).  _clear_rgba is the back end's 0xAABBGGRR; the kernel's fb
 	     layout is the shadertoy-route 0xAARRGGBB, so R and B swap. */
 	geom = pgl_g3d_shader_is_geom(prog);
-	geom_tex = geom && pgl_g3d_shader_geom_tex(prog);
+	geom_texcol = geom && pgl_g3d_shader_geom_texcol(prog);
+	geom_tex = geom && !geom_texcol && pgl_g3d_shader_geom_tex(prog);
 	geom_inst = geom && pgl_g3d_shader_geom_inst(prog);
 	unif_n = _unif_count;
 	if (geom) {
 		uint32_t one[1], wh[2], span;
 		float fw = (float)_w, fh = (float)_h;
-		if (geom_tex) {
+		if (geom_tex || geom_texcol) {
 			/* Textured variant: attr1 carries (u,v,0) per vertex and the
 			   texture rides ctex unit 0 as a LINEAR (raster) uint32 image
 			   the kernel indexes directly (no TMU).  Require the bound slot
@@ -1222,6 +1322,20 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		one[0] = count;
 		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 		                             "uVertCount", one, 1u);
+		if (geom_texcol) {
+			/* The colour-modulated route is the only geom kernel that clips:
+			   pack the per-draw scissor window (fb row space, set by the
+			   engine via pgl_g3d_set_scissor) into the raster kernel's
+			   uScissor.  w/h<=0 leaves it disabled, so a full-frame draw
+			   needs no special case. */
+			uint32_t sc[4];
+			sc[0] = (uint32_t)_scissor_x;
+			sc[1] = (uint32_t)_scissor_y;
+			sc[2] = (uint32_t)_scissor_w;
+			sc[3] = (uint32_t)_scissor_h;
+			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+			                             "uScissor", sc, 4u);
+		}
 		/* The daemon splits the blob at the program's cs2_uniform_blob_dwords,
 		   so it must receive the FULL concatenated span [xform | raster] even
 		   where the app staged fewer words.  Size it exactly. */
@@ -1243,6 +1357,34 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			if (_z != NULL)
 				for (i = 0; i < n; i++)
 					_z[i] = 0xFFFFFFFFu;   /* 24-bit unorm far */
+		}
+	}
+
+	/* TEMP DIAG (pi5 wrong-display): dump the staged stride-10 stream and the
+	   patched uniform blob of the first few texcol draws, then remove. */
+	if (geom_texcol) {
+		static int tc_dbg = 0;
+		if (tc_dbg < 6) {
+			static FILE *tc_fp = NULL;
+			const float *pv = _pos;
+			const uint32_t *uv = _unif;
+			int i;
+			if (tc_fp == NULL)
+				tc_fp = fopen("/tmp/tc.log", "w");
+			tc_dbg++;
+			if (tc_fp) {
+				fprintf(tc_fp, "tc%d n=%u span=%u w=%d h=%d\n", tc_dbg,
+				        (unsigned)count, (unsigned)unif_n, _w, _h);
+				for (i = 0; i < 4; i++) {
+					const uint32_t *w = (const uint32_t*)(const void*)(pv + (size_t)i * 10u);
+					fprintf(tc_fp, " v%d %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
+					        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]);
+				}
+				for (i = 0; i < 32; i += 8)
+					fprintf(tc_fp, " u%02d %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
+					        uv[i], uv[i+1], uv[i+2], uv[i+3], uv[i+4], uv[i+5], uv[i+6], uv[i+7]);
+				fflush(tc_fp);
+			}
 		}
 	}
 
@@ -1271,7 +1413,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 	   bound.  The binner route binds only tiled slots (the TMU cannot sample
 	   a raster image); an unbound unit the FS references makes the back end
 	   decline the draw (CPU fallback). */
-	if (geom_tex) {
+	if (geom_tex || geom_texcol) {
 		const pgl_g3d_tex_slot_t* t = &_tex[_ctex_bind[0]];
 		req.ctex[0] = g2d_canvas(t->shm, t->size,
 		                         (uint32_t)t->w, (uint32_t)t->h, 1);

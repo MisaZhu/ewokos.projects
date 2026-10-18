@@ -562,4 +562,224 @@ static const char geom_raster_tex_cs_glsl[] =
 "    }\n"
 "}\n";
 
+/* ---- Pass 1: COLOUR-MODULATED TEXTURED vertex transform ------------------
+ * imgui variant (cs_is_geom = 4).  pos, uv AND a per-vertex colour SHARE
+ * binding 1 as one interleaved float stream with a 10-float stride:
+ *   [i*10+0..2] = pos.xyz, [i*10+3..4] = (u, v), [i*10+5..8] = (r,g,b,a),
+ *   [i*10+9] = pad   (V3D 7.1 compute exposes only 4 SSBO bindings, so the
+ * colour cannot ride a 5th binding - it is interleaved with pos+uv exactly as
+ * the plain tex variant interleaves pos+uv).  Applies uMVP and passes uv and
+ * colour through to vout unchanged; the raster kernel interpolates both and
+ * does the V-flip + bilinear fetch.  vout record grows to a 12-float stride:
+ *   [0]=sx [1]=sy [2]=z [3]=iw [4]=u [5]=v [6]=r [7]=g [8]=b [9]=a
+ *   [10]=pad [11]=pad. */
+static const char geom_xform_texcol_cs_glsl[] =
+"#version 310 es\n"
+"precision highp float;\n"
+"precision highp int;\n"
+"\n"
+"layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n"
+"\n"
+"layout(std430, binding = 0) buffer V3dCsVout { float vout[];  };\n"
+"layout(std430, binding = 1) buffer V3dCsAttr { float vattr[]; };\n"
+"\n"
+"uniform mat4 uMVP;\n"
+"uniform vec2 uViewportWH;\n"
+"uniform int  uVertCount;\n"
+"\n"
+"void main()\n"
+"{\n"
+"    int v = int(gl_WorkGroupID.x) * 64 +\n"
+"            int(gl_LocalInvocationID.y) * 8 + int(gl_LocalInvocationID.x);\n"
+"    if (v >= uVertCount)\n"
+"        return;\n"
+"\n"
+"    vec3 p = vec3(vattr[v*10+0], vattr[v*10+1], vattr[v*10+2]);\n"
+"    vec2 t = vec2(vattr[v*10+3], vattr[v*10+4]);\n"
+"    vec4 col = vec4(vattr[v*10+5], vattr[v*10+6],\n"
+"                    vattr[v*10+7], vattr[v*10+8]);\n"
+"\n"
+"    vec4 c = uMVP * vec4(p, 1.0);\n"
+"    vec2 W = uViewportWH;\n"
+"    float iw = (c.w > 0.0) ? (1.0 / c.w) : 0.0;   /* clip sentinel */\n"
+"    vec2 s = vec2((c.x * iw * 0.5 + 0.5) * W.x, (0.5 - c.y * iw * 0.5) * W.y);\n"
+"    float z = c.z * iw * 0.5 + 0.5;\n"
+"\n"
+"    vout[v*12+0] = s.x;\n"
+"    vout[v*12+1] = s.y;\n"
+"    vout[v*12+2] = z;\n"
+"    vout[v*12+3] = iw;\n"
+"    vout[v*12+4] = t.x;\n"
+"    vout[v*12+5] = t.y;\n"
+"    vout[v*12+6] = col.r;\n"
+"    vout[v*12+7] = col.g;\n"
+"    vout[v*12+8] = col.b;\n"
+"    vout[v*12+9] = col.a;\n"
+"    vout[v*12+10] = 0.0;\n"
+"    vout[v*12+11] = 0.0;\n"
+"}\n";
+
+/* ---- Pass 2: COLOUR-MODULATED TEXTURED rasterizer (one workgroup / tri) ---
+ * imgui variant (cs_is_geom = 4), same 8x8-workgroup-per-triangle dispatch as
+ * geom_raster_tex_cs_glsl (cs_geom_tpw = 0).  Differences from the plain tex
+ * raster, all required to reproduce imgui's fixed-function GL state:
+ *   - the vout record carries a per-vertex COLOUR (stride 12) as well as (u,v);
+ *     both are perspective-correct interpolated, and (u,v) is V-flipped;
+ *   - BILINEAR sampling with CLAMP-to-edge (imgui's font atlas is GL_LINEAR):
+ *     a 2x2 texel neighbourhood is fetched, unpacked from the fb's 0xAARRGGBB
+ *     word to [0,1] and lerped on the fractional texel centre;
+ *   - COLOUR MODULATION: src = texel * vColor, matching the imgui FS
+ *     gl_FragColor = vColor * texture2D(uTexture, vUV);
+ *   - ALPHA BLEND matching imgui's glBlendFuncSeparate(SRC_ALPHA,
+ *     ONE_MINUS_SRC_ALPHA, ONE, ONE_MINUS_SRC_ALPHA): with dst = fb[idx], RGB
+ *     is src.rgb*src.a + dst.rgb*(1-src.a) and ALPHA is src.a*1 +
+ *     dst.a*(1-src.a) (the alpha source factor is ONE, not SRC_ALPHA), then
+ *     repacked and written.  This is a read-modify-write, but imgui's half-open
+ *     edge rule gives every covered pixel to exactly one triangle, so a single
+ *     draw command's triangles do not race on the same fb word;
+ *   - NO DEPTH: imgui disables the depth test, so this variant skips the
+ *     atomicMin / depth write entirely (binding 2 stays bound but unused);
+ *   - SCISSOR: uScissor = (x, y, w, h) in fb row space (y down); w/h <= 0
+ *     disables it.  The bbox is clamped to the window before the sweep, so
+ *     per-command clip rects cost nothing outside the covered rows/cols.
+ * Bindings: 0 fb, 1 vout, 2 depth(unused), 3 tex.  uTexW/uTexH/uScissor are
+ * patched into the per-draw blob. */
+static const char geom_raster_texcol_cs_glsl[] =
+"#version 310 es\n"
+"precision highp float;\n"
+"precision highp int;\n"
+"\n"
+"layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n"
+"\n"
+"layout(std430, binding = 0) buffer V3dCsFb    { uint  fb[];    };\n"
+"layout(std430, binding = 1) buffer V3dCsVout  { float vout[];  };\n"
+"layout(std430, binding = 2) buffer V3dCsDepth { uint  depth[]; };\n"
+"layout(std430, binding = 3) buffer V3dCsTex   { uint  tex[];   };\n"
+"\n"
+"uniform vec2 uViewportWH;\n"
+"uniform int  uFbStride;\n"
+"uniform int  uTriFirst;\n"
+"uniform int  uTriCount;\n"
+"uniform int  uTexW;\n"
+"uniform int  uTexH;\n"
+"uniform ivec4 uScissor;\n"
+"\n"
+"float edgef(vec2 a, vec2 b, vec2 p)\n"
+"{\n"
+"    return (p.x - a.x) * (b.y - a.y) - (p.y - a.y) * (b.x - a.x);\n"
+"}\n"
+"\n"
+"vec4 unpack(uint w)\n"
+"{\n"
+"    return vec4(float((w >> 16) & 0xFFu), float((w >> 8) & 0xFFu),\n"
+"                float(w & 0xFFu), float((w >> 24) & 0xFFu)) / 255.0;\n"
+"}\n"
+"\n"
+"void main()\n"
+"{\n"
+"    int tri = int(gl_WorkGroupID.x) + uTriFirst;\n"
+"    if (tri >= uTriFirst + uTriCount)\n"
+"        return;\n"
+"\n"
+"    int i0 = tri * 3;\n"
+"    int i1 = i0 + 1;\n"
+"    int i2 = i0 + 2;\n"
+"\n"
+"    float iw0 = vout[i0*12+3], iw1 = vout[i1*12+3], iw2 = vout[i2*12+3];\n"
+"    if (iw0 <= 0.0 || iw1 <= 0.0 || iw2 <= 0.0)\n"
+"        return;   /* a vertex crossed w=0: near-plane clip guard */\n"
+"\n"
+"    vec2 s0 = vec2(vout[i0*12+0], vout[i0*12+1]);\n"
+"    vec2 s1 = vec2(vout[i1*12+0], vout[i1*12+1]);\n"
+"    vec2 s2 = vec2(vout[i2*12+0], vout[i2*12+1]);\n"
+"    vec2 t0 = vec2(vout[i0*12+4], vout[i0*12+5]);\n"
+"    vec2 t1 = vec2(vout[i1*12+4], vout[i1*12+5]);\n"
+"    vec2 t2 = vec2(vout[i2*12+4], vout[i2*12+5]);\n"
+"    vec4 c0 = vec4(vout[i0*12+6], vout[i0*12+7], vout[i0*12+8], vout[i0*12+9]);\n"
+"    vec4 c1 = vec4(vout[i1*12+6], vout[i1*12+7], vout[i1*12+8], vout[i1*12+9]);\n"
+"    vec4 c2 = vec4(vout[i2*12+6], vout[i2*12+7], vout[i2*12+8], vout[i2*12+9]);\n"
+"\n"
+"    vec2 W = uViewportWH;\n"
+"    int minx = int(floor(min(s0.x, min(s1.x, s2.x))));\n"
+"    int maxx = int(ceil (max(s0.x, max(s1.x, s2.x))));\n"
+"    int miny = int(floor(min(s0.y, min(s1.y, s2.y))));\n"
+"    int maxy = int(ceil (max(s0.y, max(s1.y, s2.y))));\n"
+"    if (minx < 0) minx = 0;\n"
+"    if (miny < 0) miny = 0;\n"
+"    if (maxx > int(W.x) - 1) maxx = int(W.x) - 1;\n"
+"    if (maxy > int(W.y) - 1) maxy = int(W.y) - 1;\n"
+"    if (uScissor.z > 0 && uScissor.w > 0) {\n"
+"        if (minx < uScissor.x) minx = uScissor.x;\n"
+"        if (miny < uScissor.y) miny = uScissor.y;\n"
+"        if (maxx > uScissor.x + uScissor.z - 1) maxx = uScissor.x + uScissor.z - 1;\n"
+"        if (maxy > uScissor.y + uScissor.w - 1) maxy = uScissor.y + uScissor.w - 1;\n"
+"    }\n"
+"    if (minx > maxx || miny > maxy)\n"
+"        return;\n"
+"\n"
+"    /* 8x8 lane tile swept over the bbox. */\n"
+"    int lx = int(gl_LocalInvocationID.x);\n"
+"    int ly = int(gl_LocalInvocationID.y);\n"
+"    for (int py = miny + ly; py <= maxy; py += 8) {\n"
+"    for (int px = minx + lx; px <= maxx; px += 8) {\n"
+"        vec2 P = vec2(float(px) + 0.5, float(py) + 0.5);\n"
+"\n"
+"        float w0 = edgef(s1, s2, P);\n"
+"        float w1 = edgef(s2, s0, P);\n"
+"        float w2 = edgef(s0, s1, P);\n"
+"        float area = w0 + w1 + w2;\n"
+"        if (area == 0.0)\n"
+"            continue;\n"
+"        if (area < 0.0) {\n"
+"            if (w0 > 0.0 || w1 > 0.0 || w2 > 0.0) continue;\n"
+"        } else {\n"
+"            if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) continue;\n"
+"        }\n"
+"        float inv_area = 1.0 / area;\n"
+"        vec3 bary = vec3(w0, w1, w2) * inv_area;\n"
+"\n"
+"        float iw = bary.x * iw0 + bary.y * iw1 + bary.z * iw2;\n"
+"        if (iw <= 0.0) continue;\n"
+"        float rw = 1.0 / iw;\n"
+"        vec2 uv = (bary.x * t0 * iw0 + bary.y * t1 * iw1 +\n"
+"                   bary.z * t2 * iw2) * rw;\n"
+"        vec4 vc = (bary.x * c0 * iw0 + bary.y * c1 * iw1 +\n"
+"                   bary.z * c2 * iw2) * rw;\n"
+"\n"
+"        /* Bilinear + CLAMP-to-edge.  NO V-flip here: imgui's VS passes the\n"
+"           atlas v coordinate through unchanged and the atlas rows are\n"
+"           uploaded top-first, matching the fb's y-down row space (the\n"
+"           plain tex kernel flips because THAT app's VS pre-flips v). */\n"
+"        float fx = uv.x * float(uTexW) - 0.5;\n"
+"        float fy = uv.y * float(uTexH) - 0.5;\n"
+"        int x0 = int(floor(fx));\n"
+"        int y0 = int(floor(fy));\n"
+"        float ax = fx - float(x0);\n"
+"        float ay = fy - float(y0);\n"
+"        int xa = clamp(x0, 0, uTexW - 1);\n"
+"        int xb = clamp(x0 + 1, 0, uTexW - 1);\n"
+"        int ya = clamp(y0, 0, uTexH - 1);\n"
+"        int yb = clamp(y0 + 1, 0, uTexH - 1);\n"
+"        vec4 q00 = unpack(tex[ya * uTexW + xa]);\n"
+"        vec4 q10 = unpack(tex[ya * uTexW + xb]);\n"
+"        vec4 q01 = unpack(tex[yb * uTexW + xa]);\n"
+"        vec4 q11 = unpack(tex[yb * uTexW + xb]);\n"
+"        vec4 texel = mix(mix(q00, q10, ax), mix(q01, q11, ax), ay);\n"
+"\n"
+"        vec4 src = texel * vc;   /* colour modulation */\n"
+"        int idx = py * uFbStride + px;\n"
+"        vec4 dst = unpack(fb[idx]);\n"
+"        float sa = clamp(src.a, 0.0, 1.0);\n"
+"        /* RGB: SRC_ALPHA / ONE_MINUS_SRC_ALPHA.  A: ONE / ONE_MINUS_SRC_ALPHA\n"
+"           (imgui's glBlendFuncSeparate uses GL_ONE for the alpha source). */\n"
+"        vec3 outrgb = src.rgb * sa + dst.rgb * (1.0 - sa);\n"
+"        float outa = sa + dst.a * (1.0 - sa);\n"
+"\n"
+"        uvec3 u = uvec3(clamp(outrgb, 0.0, 1.0) * 255.0 + 0.5);\n"
+"        uint a8 = uint(clamp(outa, 0.0, 1.0) * 255.0 + 0.5);\n"
+"        fb[idx] = (a8 << 24) | (u.r << 16) | (u.g << 8) | u.b;\n"
+"    }\n"
+"    }\n"
+"}\n";
+
 #endif /* GEOM_RASTER_CS_H */

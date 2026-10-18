@@ -72,6 +72,7 @@ typedef struct {
 	int      is_geom;
 	int      geom_model;
 	int      geom_tex;
+	int      geom_texcol;
 	int      geom_inst;
 	int      geom_tpw;
 	struct v3d_compiled_program prog;
@@ -114,6 +115,7 @@ static void entry_clear(prog_entry_t* e)
 	e->is_geom = 0;
 	e->geom_model = 0;
 		e->geom_tex = 0;
+	e->geom_texcol = 0;
 	e->geom_inst = 0;
 	e->used = 0;
 }
@@ -186,6 +188,17 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 		if (strstr(vert_glsl, "uMVP") != NULL) {
 			struct v3d_compiled_program gres, xres;
 			int tex = strstr(frag_glsl, "sampler") != NULL;
+			/* COLOUR-MODULATED textured variant (imgui): the FS multiplies a
+			   vec4 varying by the texture sample (gl_FragColor = vColor *
+			   texture2D(...)), which the plain TEX_MOD kernel cannot express
+			   (it writes the fetched texel verbatim, no per-vertex colour).  Sniff
+			   that product shape; when present, select the texcol kernels - the
+			   per-vertex colour is interleaved into binding 1 at a 10-float
+			   stride (V3D 7.1 compute has only 4 SSBO bindings), the vout record
+			   grows to 12 floats, and pass 2 does bilinear sampling + colour
+			   modulation + SRC_ALPHA/ONE_MINUS_SRC_ALPHA blending + scissor with
+			   no depth write.  Serialised as cs_is_geom = 4. */
+			int texcol = tex && strstr(frag_glsl, "* texture2D") != NULL;
 			/* The INSTANCED variant (gears) is selected by a marker in the
 			   app VS: it swaps pass 1 for geom_xform_inst_cs_glsl, which reads
 			   a per-vertex instance index from pos.w and the per-gear matrices
@@ -203,12 +216,14 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			   the lit variant unchanged. */
 			int color = !tex && !inst &&
 			            strstr(vert_glsl, "uNormalMat") == NULL;
-			const char* raster_src = tex ? geom_raster_tex_cs_glsl
-			                             : geom_raster_cs_glsl;
+			const char* raster_src = texcol ? geom_raster_texcol_cs_glsl
+			                             : (tex ? geom_raster_tex_cs_glsl
+			                                    : geom_raster_cs_glsl);
 			const char* xform_src  = inst ? geom_xform_inst_cs_glsl
-			                             : (tex ? geom_xform_tex_cs_glsl
-			                                    : (color ? geom_xform_color_cs_glsl
-			                                           : geom_xform_cs_glsl));
+			                             : (texcol ? geom_xform_texcol_cs_glsl
+			                                    : (tex ? geom_xform_tex_cs_glsl
+			                                           : (color ? geom_xform_color_cs_glsl
+			                                                  : geom_xform_cs_glsl)));
 			memset(&gres, 0, sizeof(gres));
 			memset(&xres, 0, sizeof(xres));
 			/* BOTH kernels must compile: the raster pass reads the vout
@@ -230,6 +245,7 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 				       sizeof(xres.stage[V3D_STAGE_COMPUTE]));
 				_progs[slot].is_geom = 1;
 				_progs[slot].geom_tex = tex;
+				_progs[slot].geom_texcol = texcol;
 				_progs[slot].geom_inst = inst;
 				/* the tex kernel is the legacy one-workgroup-per-triangle shape
 				   (0); the gouraud kernel is one-lane-per-triangle and covers 256
@@ -316,6 +332,14 @@ int pgl_g3d_shader_geom_tex(pgl_g3d_prog p)
 	if (!pgl_g3d_program_valid(p))
 		return 0;
 	return _progs[p].geom_tex &&
+	       _progs[p].prog.stage[V3D_STAGE_COMPUTE].qpu_word_count != 0;
+}
+
+int pgl_g3d_shader_geom_texcol(pgl_g3d_prog p)
+{
+	if (!pgl_g3d_program_valid(p))
+		return 0;
+	return _progs[p].geom_texcol &&
 	       _progs[p].prog.stage[V3D_STAGE_COMPUTE].qpu_word_count != 0;
 }
 
@@ -550,8 +574,10 @@ static int program_upload(const prog_entry_t* e)
 	/* the geometry rasterizer rides the same VERSION-3 wire stage; the
 	   daemon switches its dispatch shape (per-triangle grid + SSBO layout)
 	   on this byte: 1 = gouraud (fb/pos/nrm/depth), 2 = textured
-	   (fb/interleaved pos+uv/depth/tex). */
-	hdr.cs_is_geom       = e->is_geom ? (e->geom_tex ? 2 : (e->geom_inst ? 3 : 1)) : 0;
+	   (fb/interleaved pos+uv/depth/tex), 3 = instanced (fb/pos+idx/nrm/depth/
+	   matrices), 4 = colour-modulated textured (fb/interleaved pos+uv+colour/
+	   depth(unused)/tex, bilinear + blend + scissor). */
+	hdr.cs_is_geom       = e->is_geom ? (e->geom_texcol ? 4 : (e->geom_tex ? 2 : (e->geom_inst ? 3 : 1))) : 0;
 	/* raster-pass workgroup geometry (rides the VERSION-3 reserved byte):
 	   0 = one workgroup per triangle; 64/256 = the V4/V5 one-lane-per-triangle
 	   kernels, so the daemon dispatches ceil(ntris/tpw) workgroups instead. */
