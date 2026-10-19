@@ -85,9 +85,10 @@ const float NSLOT   = 6.0;   /* procedural rain slots kept alive            */
 const float INTERVAL= 0.62;  /* seconds between procedural drops            */
 const float LIFE    = 3.0;   /* ripple lifetime (s)                         */
 const float SPEED   = 60.0;  /* ring expansion speed (world units / s)      */
-const float WAVELEN = 6.5;   /* ripple wavelength (world units); finer -> more crests */
+const float WAVELEN = 18.0;  /* ripple wavelength (world units); larger -> wider-spaced, fewer crests (density = 2/3 of the 12.0 baseline) */
 const float WIDTH   = 9.0;   /* base length of the trailing wave train (world units)  */
 const float TRAIN_GROW = 1.1;/* rate the train lengthens with age (dispersive spread) */
+const float TAIL    = 0.22;  /* envelope tail softness: smaller = longer, more gradual fade behind the front */
 const float DAMP    = 1.20;  /* viscous temporal damping (finer ripples damp faster)  */
 const float SPREAD  = 0.033; /* cylindrical (1/sqrt r) geometric spreading            */
 const float NSCALE  = 2.5;   /* normal strength                                       */
@@ -141,21 +142,23 @@ vec3 waveG(vec2 p, vec2 c, float tb, float a) {
      * front radius (more rings the further it spreads) while every crest is
      * attenuated by geometric spreading 1/sqrt(r) and viscous loss exp(-t) --
      * the physical damping law for surface ripples.  u is how far behind the
-     * front a point lies, in train-lengths; the bell keeps the train trailing
-     * the front (nothing runs ahead of it) and lets the source return to calm
-     * once the train has passed. */
+     * front a point lies, in train-lengths.  The gate keeps the train trailing
+     * the front (nothing runs ahead of it); the exp(-TAIL*u*u) bell is a LONG,
+     * slowly-decaying tail (TAIL << 1) rather than a tight packet, so crests
+     * linger far behind the front and a given water point keeps rippling and
+     * only gradually settles -- it never snaps instantly calm. */
     float trainLen = WIDTH * (1.0 + age * TRAIN_GROW);
     float u     = (R - r) / trainLen;
-    float env   = exp(-u * u) * smoothstep(-1.0, 0.0, u);
+    float env   = exp(-TAIL * u * u) * smoothstep(-1.0, 0.0, u);
     float decay = exp(-age * DAMP) / sqrt(1.0 + r * SPREAD);
     float ph    = k * (r - R);
     float s     = sin(ph);
     float co    = cos(ph);
     float amp   = a * alive * env * decay;
-    /* d(height)/dr = amp*[k*cos(ph) + (2u/trainLen)*sin(ph)]: the carrier slope
-     * plus the envelope's own taper.  The slow 1/sqrt(r) gradient is negligible
-     * beside k and is dropped.  Chain to world x/z via d(r)/d(p) = (p-c)/r. */
-    float dhdr  = amp * (k * co + (2.0 * u / trainLen) * s);
+    /* d(height)/dr = amp*[k*cos(ph) + (2*TAIL*u/trainLen)*sin(ph)]: the carrier
+     * slope plus the envelope's own taper.  The slow 1/sqrt(r) gradient is
+     * negligible beside k and is dropped.  Chain to world x/z via d(r)/d(p)=(p-c)/r. */
+    float dhdr  = amp * (k * co + (2.0 * TAIL * u / trainLen) * s);
     vec2  grad  = d * (dhdr / r);
     return vec3(amp * s, grad.x, grad.y);
 }
@@ -210,6 +213,62 @@ float vnoise(vec2 p) {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
+/* 4-octave fBm: layered value noise whose sum gives CONNECTED, organic maria
+ * blobs with crisper boundaries than a single octave.  Literal loop bound. */
+float fbm4(vec2 p) {
+    float s = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 4; i++) {
+        s += a * vnoise(p);
+        p = p * 2.03 + 11.7;
+        a *= 0.5;
+    }
+    return s;
+}
+
+/* Procedural impact CRATERS summed over a fixed set of hashed centres
+ * (literal loop bound).  Each contributes the three real albedo signatures of
+ * an impact: a bright raised RIM ring, a darker sunken FLOOR, and a faint
+ * bright EJECTA blanket just outside the rim -- so craters read as circles,
+ * not noise blobs.  Returns a signed shading offset. */
+float craterShade(vec2 muv) {
+    float sh = 0.0;
+    for (int i = 0; i < 7; i++) {
+        float fi = float(i);
+        vec2  cc = (hash2(fi * 3.7 + 21.5) - 0.5) * 1.6;              /* centre  */
+        float rr = 0.05 + 0.10 * fract(sin(fi * 91.7) * 43758.5453);  /* radius  */
+        float d  = length(muv - cc);
+        sh += 0.15 * smoothstep(rr * 0.70, rr * 0.92, d)              /* rim     */
+                  * (1.0 - smoothstep(rr * 0.92, rr * 1.25, d));
+        /* floor: a SMALL, GREY sunken interior -- never a black hole.  The
+         * darkening is gentle and confined to the inner half of the crater. */
+        sh -= 0.04 * (1.0 - smoothstep(rr * 0.45, rr * 0.75, d));     /* floor   */
+        sh += 0.06 * smoothstep(rr * 1.05, rr * 1.30, d)              /* ejecta  */
+                  * (1.0 - smoothstep(rr * 1.30, rr * 1.90, d));
+    }
+    return sh;
+}
+
+/* Bright RAY SYSTEMS (Tycho / Copernicus style): thin radial spokes from a
+ * young crater.  The spoke pattern varies with polar angle ONLY, so streaks
+ * run radially outward; brightness fades with distance and is hidden inside
+ * the source crater.  atan(y,x) is in the engine builtin table. */
+float rayShade(vec2 muv) {
+    float sh = 0.0;
+    for (int i = 0; i < 2; i++) {
+        float fi  = float(i);
+        vec2  c   = (hash2(fi * 5.3 + 47.1) - 0.5) * 1.1;
+        vec2  w   = muv - c;
+        float r   = length(w);
+        float ang = atan(w.y, w.x);
+        float sp  = vnoise(vec2(ang * 7.0 + fi * 13.7, 4.2));  /* angle-only    */
+        float ray = smoothstep(0.70, 0.95, sp);               /* thin spokes   */
+        ray *= exp(-r * 2.0) * smoothstep(0.10, 0.22, r);
+        sh += ray;
+    }
+    return sh;
+}
+
 /* Night sky radiance along a normalized direction: a near-black gradient, a
  * sparse star field, and the moon -- a textured lunar disc (maria + craters +
  * limb darkening) with a soft halo.  Sampled both for the sky pixels and, via
@@ -261,13 +320,21 @@ vec3 skyColorDir(vec3 dir) {
         vec2 muv = dv.xy / MOON_R;
         float rr = clamp(length(muv), 0.0, 1.0);
         float limb = 0.55 + 0.45 * sqrt(max(1.0 - rr * rr, 0.0));  /* limb darkening */
-        float m1 = vnoise(muv * 1.7 + 3.1);
-        float m2 = vnoise(muv * 3.4 + 7.7);
-        float maria = smoothstep(0.34, 0.62, m1 * 0.66 + m2 * 0.34); /* 0 dark sea,1 highland */
-        float crater = smoothstep(0.48, 0.78, vnoise(muv * 9.5 + 1.3));
-        vec3 mc = MOON_C * (0.22 + 0.46 * maria) * limb;
-        mc += MOON_C * crater * 0.16 * limb;
-        mc += MOON_C * smoothstep(0.86, 1.0, rr) * 0.12;   /* bright limb ring */
+        /* Maria: connected organic dark seas from a 4-octave fBm, thresholded
+         * with a TIGHT window so the sea/highland boundary reads crisp rather
+         * than a soft blur (matches the real near-side albedo map). */
+        float maria = smoothstep(0.42, 0.55, fbm4(muv * 1.6 + 3.1));
+        /* Fine regolith mottling: a high-frequency, low-amplitude speckle. */
+        float mot = vnoise(muv * 17.0 + 5.5) - 0.5;
+        /* Accumulate a scalar albedo then clamp once, so craters/rays can add
+         * detail without ever clipping the disc to flat white. */
+        float mb = (0.30 + 0.45 * maria) * limb;
+        mb += mot * 0.10 * limb;
+        mb += craterShade(muv) * limb;        /* rim rings + dark floors + ejecta */
+        mb += rayShade(muv) * 0.25 * limb;    /* bright radial ray streaks        */
+        mb += smoothstep(0.86, 1.0, rr) * 0.12;   /* bright limb ring */
+        mb = clamp(mb, 0.22, 0.92);
+        vec3 mc = MOON_C * mb;
         sky = mix(sky, mc, disc);
     }
     return sky;

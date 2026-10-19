@@ -14,19 +14,26 @@
  * (a passthrough VS with no uMVP + an FS reading gl_FragCoord is recognised as
  * a fullscreen effect).  glGpuActiveEWOK() reports which path is live for the
  * on-screen HUD.  This app deliberately does NOT call glForceCpuEWOK() -- it
- * wants the GPU target adopted, unlike the CPU-composited matrix/Fireworks.
+ * wants the GPU target adopted and the water scene kept on the GPU.
  *
- * The HUD is the glcommon CPU text overlay (as shadertoy uses), NOT Dear ImGui:
- * a fullscreen compute effect and ImGui's GPU texcol raster do not composite
- * reliably in one frame, whereas the HUD program declares no uMVP so the engine
- * never claims it -- it always rasterizes on the CPU interpreter and composites
- * correctly over the fullscreen effect on both virt and raspi5.
+ * The HUD is a Dear ImGui window (same 16px TTF font, titled auto-resize panel,
+ * FPS + colour-coded Renderer as glmatrix).  ImGui rasterizes through a
+ * GPU-eligible texcol program, which cannot composite with the water scene's
+ * fullscreen-compute dispatch in one frame, so this app calls the narrower
+ * glForceCpuRasterEWOK(): that lever declines ONLY the mesh/texcol raster
+ * dispatches to the CPU interpreter -- ImGui then composites into the same
+ * NOCACHE fb the GPU scene wrote (the path the glcommon CPU hud already used,
+ * proven to overlay correctly on virt and raspi5) -- while gpu_try_fullscreen
+ * keeps the water scene on the V3D GPU and gpu_bringup/g_gpu_ready are
+ * untouched.  Unlike glForceCpuEWOK (which pins the whole context to the CPU and
+ * would drop the ~35s/frame water path), this keeps the scene fast.
  */
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h>       /* glGpuActiveEWOK */
+#include <GLES2/gl2ext.h>       /* glGpuActiveEWOK, glForceCpuRasterEWOK */
 
-#include "glcommon/hud.h"       /* CPU-rasterized FPS / GPU-CPU text overlay */
+#include "imgui/imgui.h"                      /* Dear ImGui HUD (as glmatrix) */
+#include "imgui/backends/imgui_impl_gles2.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,6 +155,48 @@ static void init_shaders(void)
     loc_res  = glGetUniformLocation(prog, "iResolution");
 }
 
+/* ------------------------------------------------------------------
+ * Dear ImGui HUD (mirrors glmatrix): a display-only stats window drawn on
+ * top of the water scene.  ImGui is C++ and renders through the GLES2
+ * backend; the app calls glForceCpuRasterEWOK() once in main so ImGui's
+ * texcol raster falls back to the CPU interpreter and composites into the
+ * same fb the GPU fullscreen scene wrote.  The HUD is read-only, so no
+ * xwin input is forwarded and the window is marked NoInputs.
+ * ------------------------------------------------------------------ */
+static void init_imgui(void)
+{
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = NULL;                                 /* no imgui.ini    */
+    io.DisplaySize = ImVec2((float)win_width, (float)win_height);
+    ImGui::StyleColorsDark();
+    ImGui_ImplGLES2_Init();
+    io.Fonts->AddFontFromFileTTF("/usr/system/fonts/system.ttf", 16.0f);
+}
+
+/* Build one ImGui frame: lay out the read-only stats window.  `gpu` is the
+ * route the water program used this frame, queried while it was bound. */
+static void process_imgui_frame(int gpu)
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)win_width, (float)win_height);
+
+    ImGui_ImplGLES2_NewFrame();
+    ImGui::NewFrame();
+
+    ImGui::SetNextWindowPos(ImVec2(8.0f, 8.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("Waterdrop", NULL,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize
+                 | ImGuiWindowFlags_NoInputs);
+    ImGui::Text("FPS: %d", fps);
+    ImGui::TextColored(gpu ? ImVec4(0.40f, 1.00f, 0.55f, 1.0f)
+                           : ImVec4(1.00f, 0.70f, 0.30f, 1.0f),
+                       "Renderer: %s", gpu ? "GPU" : "CPU");
+    ImGui::End();
+}
+
 static int init_egl(xwin_t* xwin)
 {
     EGLint major, minor, ncfg = 0;
@@ -205,23 +254,17 @@ static void render_frame(void)
     glDrawArrays(GL_TRIANGLES, 0, 6);
     glDisableVertexAttribArray(0);
 
-    /* Overlay the FPS / Renderer readout, matching glmatrix's two-line HUD
-     * ("FPS: N", then a colour-coded "Renderer: GPU/CPU").  Query the route
-     * while the water program is still bound (the engine reports the
-     * currently-bound program).  The glcommon HUD declares no uMVP, so it always
-     * rasterizes on the CPU interpreter and composites correctly over the
-     * fullscreen GPU compute effect on both virt and raspi5 -- unlike a GPU Dear
-     * ImGui overlay, which does not survive mixing with the fullscreen dispatch
-     * in one frame.  hud_draw re-binds `prog` before returning. */
-    char hud[64];
+    /* Overlay the FPS / Renderer readout as a Dear ImGui window, matching
+     * glmatrix ("FPS: N", then a colour-coded "Renderer: GPU/CPU").  Query the
+     * route while the water program is still bound (the engine reports the
+     * currently-bound program and ImGui binds its own next).  glForceCpuRasterEWOK()
+     * (called once in main) makes ImGui's texcol raster fall back to the CPU
+     * interpreter so it composites into the same fb the GPU fullscreen scene
+     * wrote -- correctly overlaying on both virt and raspi5. */
     int gpu = glGpuActiveEWOK();
-    hud_set_color(1.0f, 1.0f, 1.0f, 1.0f);
-    snprintf(hud, sizeof(hud), "FPS: %d", fps);
-    hud_draw(prog, win_width, win_height, 8, 8, hud);
-    if (gpu) hud_set_color(0.40f, 1.00f, 0.55f, 1.0f);
-    else     hud_set_color(1.00f, 0.70f, 0.30f, 1.0f);
-    snprintf(hud, sizeof(hud), "Renderer: %s", gpu ? "GPU" : "CPU");
-    hud_draw(prog, win_width, win_height, 8, 20, hud);
+    process_imgui_frame(gpu);
+    ImGui::Render();
+    ImGui_ImplGLES2_RenderDrawData(ImGui::GetDrawData());
 
     eglSwapBuffers(egl_dpy, egl_surf);
     update_fps();
@@ -297,12 +340,21 @@ int main(int argc, char** argv)
 
     init_quad();
     init_shaders();
-    hud_init();
+
+    /* Force ONLY the mesh/texcol raster dispatches (Dear ImGui's HUD) onto the
+     * CPU interpreter so they composite into the same fb the GPU fullscreen
+     * water scene wrote; gpu_try_fullscreen keeps the scene on the V3D GPU.
+     * Must be set before the first frame is presented. */
+    glForceCpuRasterEWOK();
+    init_imgui();
 
     start_time = kernel_tic_ms(0);
 
     xwin_set_visible(xwin, true);
     x_run(&x, xwin);
+
+    ImGui_ImplGLES2_Shutdown();
+    ImGui::DestroyContext();
 
     xwin_destroy(xwin);
     eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

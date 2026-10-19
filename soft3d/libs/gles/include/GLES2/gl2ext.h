@@ -4210,11 +4210,23 @@ GL_APICALL void GL_APIENTRY glEndTilingQCOM (GLbitfield preserveMask);
  * back buffer, splitting the frame between the CPU blit and GPU tile dispatches
  * so the app's own content is lost.  With this set, the overlay too renders
  * through the CPU interpreter into the same cached buffer.  Inert on builds
+ * without a GPU backend.
+ *
+ * glForceCpuRasterEWOK is a NARROWER lever for an app whose MAIN scene is a
+ * fullscreen-compute effect (its vertex shader has no uMVP and its fragment
+ * shader reads gl_FragCoord, e.g. waterdrop/shadertoy).  Such a scene MUST stay
+ * on the V3D GPU -- its CPU-interpreter path is ~35s/frame -- so glForceCpuEWOK
+ * (which pins the whole context, scene included) is unusable.  This call instead
+ * declines ONLY the raster/geometry overlay dispatches, so a GPU-eligible HUD
+ * (Dear ImGui) renders through the CPU interpreter into the SAME uncached fb the
+ * GPU scene wrote and composites on top of it, while the fullscreen scene keeps
+ * running on the GPU.  Call it once before the render loop.  Inert on builds
  * without a GPU backend. */
 #ifndef GL_EWOK_gpu_path
 #define GL_EWOK_gpu_path 1
 GL_APICALL GLint GL_APIENTRY glGpuActiveEWOK(void);
 GL_APICALL void GL_APIENTRY glForceCpuEWOK(void);
+GL_APICALL void GL_APIENTRY glForceCpuRasterEWOK(void);
 #endif /* GL_EWOK_gpu_path */
 
 #ifdef __cplusplus

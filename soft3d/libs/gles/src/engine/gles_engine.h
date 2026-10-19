@@ -214,12 +214,22 @@ void gles_engine_delete_program(GEuint program);
  *   before the render loop so gpu_bringup stays inert and the overlay too draws
  *   through the CPU interpreter into the same cached buffer.  Inert without
  *   PGL_G3D.
+ * gles_engine_force_cpu_raster: a NARROWER lever for an app whose main scene is
+ *   a fullscreen-compute effect (VS has no uMVP + FS reads gl_FragCoord, e.g.
+ *   waterdrop/shadertoy) that must stay on the V3D GPU (its CPU path is
+ *   ~35s/frame) yet also overlays a GPU-eligible raster HUD (Dear ImGui).  It
+ *   declines ONLY the mesh/texcol raster dispatches to the CPU interpreter -- so
+ *   the HUD composites into the same NOCACHE fb the GPU scene wrote (the path the
+ *   glcommon CPU hud already uses) -- while gpu_try_fullscreen keeps the scene on
+ *   the GPU and gpu_bringup/g_gpu_ready are untouched.  Call once before the
+ *   render loop.  Inert without PGL_G3D.
  * ------------------------------------------------------------------ */
 GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_src);
 void   gles_engine_gpu_delete(GEuint pgl_id);
 void   gles_engine_gpu_flush(void);
 int    gles_engine_gpu_active(void);
 void   gles_engine_force_cpu(void);
+void   gles_engine_force_cpu_raster(void);
 
 #ifdef __cplusplus
 }

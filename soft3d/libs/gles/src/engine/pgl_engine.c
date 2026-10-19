@@ -1573,6 +1573,21 @@ static int       g_gpu_has_eligible = 0;
  * interpreter into the same surface. */
 static int       g_force_cpu = 0;
 
+/* Set by gles_engine_force_cpu_raster(): a NARROWER lever than g_force_cpu for
+ * an app whose MAIN scene is a fullscreen-compute effect (VS has no uMVP + FS
+ * reads gl_FragCoord, e.g. waterdrop/shadertoy) that also overlays a
+ * GPU-eligible raster HUD (Dear ImGui).  The fullscreen scene MUST stay on the
+ * V3D GPU (its CPU-interpreter path is ~35s/frame), so g_force_cpu (which pins
+ * the whole context and would drop the scene to the interpreter) is unusable.
+ * This flag instead declines ONLY the mesh/texcol raster dispatches
+ * (gpu_try_draw_elements + the non-fullscreen branch of gpu_try_draw_arrays) so
+ * an overlay HUD renders through the CPU interpreter into the SAME adopted
+ * NOCACHE fb the GPU scene wrote -- the exact path the glcommon CPU hud already
+ * composites on -- while gpu_try_fullscreen keeps running the scene on the GPU.
+ * It does NOT touch gpu_bringup()/g_gpu_ready, so the scene's GPU adoption is
+ * unaffected.  Must be set before the render loop. */
+static int       g_force_cpu_raster = 0;
+
 /* texture-name -> raster-slot map for the textured kernel (PGL_G3D_MAX_TEX) */
 static GLuint  g_gpu_texname[PGL_G3D_MAX_TEX];
 static int     g_gpu_texused[PGL_G3D_MAX_TEX];
@@ -2170,6 +2185,10 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
     /* a fullscreen compiled program is routed by its own quad dispatch, never
      * the fixed geometry kernels (it exposes no uMVP, so it is not eligible). */
     if (e->fullscreen) return gpu_try_fullscreen(e, mode, first, count);
+    /* Raster/geometry overlay forced to the CPU interpreter (see
+     * g_force_cpu_raster).  Placed AFTER the fullscreen routing above so a
+     * fullscreen-compute main scene still runs on the GPU. */
+    if (g_force_cpu_raster) return 0;
     if (!e->eligible) return 0;
     /* The colour-modulated textured variant is indexed-only: its pos+uv+colour
      * stride-10 staging is built by gpu_try_draw_elements, so it must never be
@@ -2309,6 +2328,11 @@ static int gpu_try_draw_elements(GLenum mode, GLsizei count, GLenum type,
 
     gpu_bringup();
     if (!g_gpu_ready) return 0;
+    /* Overlay HUD forced onto the CPU interpreter (Dear ImGui over a fullscreen
+     * compute scene): decline so gles_engine_draw_elements falls through to
+     * pgl_DrawElements, compositing into the same adopted NOCACHE fb.  See
+     * g_force_cpu_raster. */
+    if (g_force_cpu_raster) return 0;
     if (!g_active || !g_active->gp || !g_active->ublock) return 0;
     e = gpu_find_entry(g_active->pgl_id);
     if (!e || e->cpu_latched || e->fullscreen) return 0;
@@ -2525,6 +2549,16 @@ void gles_engine_force_cpu(void)
     g_force_cpu = 1;
 }
 
+void gles_engine_force_cpu_raster(void)
+{
+    /* Decline ONLY the mesh/texcol raster dispatches to the CPU interpreter, so
+     * a GPU-eligible overlay HUD (Dear ImGui) composites into the same NOCACHE
+     * fb that a fullscreen-compute main scene rendered on the GPU -- without
+     * pinning that scene off the GPU the way g_force_cpu would (see
+     * g_force_cpu_raster).  Must be called before the render loop. */
+    g_force_cpu_raster = 1;
+}
+
 #else  /* !PGL_G3D: inert so the GPU-agnostic GLES2/EGL TUs link unchanged */
 
 GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_src)
@@ -2533,5 +2567,6 @@ void gles_engine_gpu_delete(GEuint pgl_id) { (void)pgl_id; }
 void gles_engine_gpu_flush(void) { }
 int  gles_engine_gpu_active(void) { return 0; }
 void gles_engine_force_cpu(void) { }
+void gles_engine_force_cpu_raster(void) { }
 
 #endif /* PGL_G3D */

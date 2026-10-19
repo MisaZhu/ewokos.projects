@@ -49,6 +49,14 @@ GLint glGpuActiveEWOK(void) { return (GLint)gles_engine_gpu_active(); }
  * GPU back buffer and split the frame. */
 void glForceCpuEWOK(void) { gles_engine_force_cpu(); }
 
+/* EWOK_gpu_path: force ONLY raster/geometry overlays (e.g. Dear ImGui) onto the
+ * CPU interpreter while a fullscreen-compute main scene stays on the GPU (see
+ * gl2ext.h).  A fullscreen-effect app (waterdrop/shadertoy) calls this before
+ * its render loop so an overlaid imgui HUD composites into the same NOCACHE fb
+ * the GPU scene wrote, instead of glForceCpuEWOK's whole-context pin that would
+ * drop the GPU-only scene to the ~35s/frame interpreter path. */
+void glForceCpuRasterEWOK(void) { gles_engine_force_cpu_raster(); }
+
 void glStencilFunc (GLenum func, GLint ref, GLuint mask) { gles_engine_stencil_func(func, ref, mask); }
 void glStencilOp (GLenum fail, GLenum zfail, GLenum zpass) { gles_engine_stencil_op(fail, zfail, zpass); }
 void glStencilMask (GLuint mask) { gles_engine_stencil_mask(mask); }

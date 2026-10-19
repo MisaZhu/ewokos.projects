@@ -5,20 +5,22 @@ TASK_OBJS = $(ARCH)/waterdrop.o
 
 EXTRA_LIBS_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 
-# <EGL/egl.h>, <GLES2/gl2.h> and "glcommon/hud.h" are all installed into the
-# shared build include dir (by libs/gles and libs/glcommon), so a single
-# -I.../include resolves every external header the app uses; -I.. reaches the
-# apps/ tree for the app's own headers.
-CFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -D__ewokos__
-CXXFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -D__ewokos__ -fno-threadsafe-statics
+# <EGL/egl.h> + <GLES2/gl2.h> are installed into the shared build include dir by
+# libs/gles, and the Dear ImGui headers land there under include/imgui (installed
+# by libs/imgui).  waterdrop is now C++ (ImGui is C++): -I.. reaches the app's own
+# headers (waterdrop_glsl.h), -I.../include resolves <EGL/...>, <GLES2/...> and
+# "imgui/...", and -I.../include/imgui lets the backend header find its sibling
+# "imgui.h".
+CFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__
+CXXFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__ -fno-threadsafe-statics
 LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib
 
-# Link order matters for static archives: libglcommon (the HUD) and libEGL both
-# resolve their gl*/egl* calls against libGLESv2, so GLESv2 comes last (the same
-# glcommon -> EGL -> GLESv2 order the demos and apps/gears use).  libGLESv2.a
-# already contains the portablegl engine and (on PGL_G3D targets) the on-device
-# mesa GLSL->QPU compiler, so the app never names portablegl or v3dcompiler.
-GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libglcommon.a \
+# Link order matters for static archives: the app + imgui reference the EGL /
+# GLESv2 entry points.  libGLESv2.a already contains the portablegl engine and
+# (on PGL_G3D targets) the on-device mesa GLSL->QPU compiler, so an app links
+# only libimgui + libEGL + libGLESv2 (imgui -> gl*, EGL -> engine) and never
+# names portablegl or v3dcompiler.  The glcommon CPU hud is no longer used.
+GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui.a \
 	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
 
