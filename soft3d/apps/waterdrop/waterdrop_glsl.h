@@ -10,7 +10,8 @@
  * Water drops fall from the TOP of the frame under gravity.  While airborne a
  * drop is projected back to screen space and drawn as a small falling bead; the
  * instant it reaches the plane (height 0) it splashes and emits an expanding
- * Gaussian wave-ring at that world spot.  Because every source is summed
+ * dispersive RIPPLE TRAIN -- a lengthening series of concentric crests -- at
+ * that world spot.  Because every source is summed
  * LINEARLY into one height field, overlapping rings interfere physically:
  * crests add (constructive), a crest meets a trough and cancels (destructive).
  *
@@ -84,11 +85,12 @@ const float NSLOT   = 6.0;   /* procedural rain slots kept alive            */
 const float INTERVAL= 0.62;  /* seconds between procedural drops            */
 const float LIFE    = 3.0;   /* ripple lifetime (s)                         */
 const float SPEED   = 60.0;  /* ring expansion speed (world units / s)      */
-const float WAVELEN = 11.0;  /* ring wavelength (world units)               */
-const float WIDTH   = 5.5;   /* Gaussian ring width (world units)           */
-const float DAMP    = 1.15;  /* temporal damping                            */
-const float SPREAD  = 0.030; /* cylindrical (1/sqrt r) spatial damping      */
-const float NSCALE  = 3.0;   /* normal strength                             */
+const float WAVELEN = 6.5;   /* ripple wavelength (world units); finer -> more crests */
+const float WIDTH   = 9.0;   /* base length of the trailing wave train (world units)  */
+const float TRAIN_GROW = 1.1;/* rate the train lengthens with age (dispersive spread) */
+const float DAMP    = 1.20;  /* viscous temporal damping (finer ripples damp faster)  */
+const float SPREAD  = 0.033; /* cylindrical (1/sqrt r) geometric spreading            */
+const float NSCALE  = 2.5;   /* normal strength                                       */
 const float SHIN    = 90.0;  /* moon-glint specular power                   */
 
 /* ---- night palette ---- */
@@ -122,29 +124,39 @@ vec3 moonDirNow() {
     return normalize(vec3(mx, my, 1.0));
 }
 
-/* One expanding ring from world source c, born at time tb, amplitude a.
- * Returns vec3(height, dHeight/dx, dHeight/dz): the ring's slope is accumulated
- * alongside its height so the surface normal needs only ONE pass over sources. */
+/* One expanding ripple TRAIN from world source c, born at time tb, amplitude a.
+ * Returns vec3(height, dHeight/dx, dHeight/dz): the slope is accumulated
+ * alongside the height so the surface normal needs only ONE pass over sources. */
 vec3 waveG(vec2 p, vec2 c, float tb, float a) {
     float age0  = iGlobalTime - tb;
     float alive = smoothstep(0.0, 0.05, age0) * (1.0 - smoothstep(LIFE - 0.6, LIFE, age0));
     float age   = clamp(age0, 0.0, LIFE);
     vec2  d     = p - c;
     float r     = max(length(d), EPS);
-    float R     = SPEED * age;
+    float R     = SPEED * age;                       /* expanding wave front   */
     float k     = 2.0 * PI / WAVELEN;
-    float z     = (r - R) / WIDTH;
-    float env   = exp(-z * z);
+
+    /* A drop is a point IMPULSE on a 2D surface, so it launches a dispersive
+     * ripple TRAIN that lengthens as it travels: the crest count grows with the
+     * front radius (more rings the further it spreads) while every crest is
+     * attenuated by geometric spreading 1/sqrt(r) and viscous loss exp(-t) --
+     * the physical damping law for surface ripples.  u is how far behind the
+     * front a point lies, in train-lengths; the bell keeps the train trailing
+     * the front (nothing runs ahead of it) and lets the source return to calm
+     * once the train has passed. */
+    float trainLen = WIDTH * (1.0 + age * TRAIN_GROW);
+    float u     = (R - r) / trainLen;
+    float env   = exp(-u * u) * smoothstep(-1.0, 0.0, u);
     float decay = exp(-age * DAMP) / sqrt(1.0 + r * SPREAD);
-    float ph    = k * r - k * SPEED * age;
+    float ph    = k * (r - R);
     float s     = sin(ph);
     float co    = cos(ph);
     float amp   = a * alive * env * decay;
-    /* d(height)/dr = amp * [ k*cos(ph) - (2z/WIDTH)*sin(ph) ]; the slow
-     * 1/sqrt(r) taper's own gradient is negligible beside the ring slope and is
-     * dropped.  Chain to world x/z with d(r)/d(p) = (p-c)/r. */
-    float dhdr = amp * (k * co - (2.0 * z / WIDTH) * s);
-    vec2  grad = d * (dhdr / r);
+    /* d(height)/dr = amp*[k*cos(ph) + (2u/trainLen)*sin(ph)]: the carrier slope
+     * plus the envelope's own taper.  The slow 1/sqrt(r) gradient is negligible
+     * beside k and is dropped.  Chain to world x/z via d(r)/d(p) = (p-c)/r. */
+    float dhdr  = amp * (k * co + (2.0 * u / trainLen) * s);
+    vec2  grad  = d * (dhdr / r);
     return vec3(amp * s, grad.x, grad.y);
 }
 
