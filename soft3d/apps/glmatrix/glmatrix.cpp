@@ -853,8 +853,12 @@ static void on_event(xwin_t* xwin, xevent_t* ev)
         key_shift = (ev->value.im.shift != 0);
         key_ctrl  = (ev->value.im.ctrl  != 0);
 
-        /* ESC (27) quits, matching the other soft3d demos. */
-        if (key == 27 && state == XIM_STATE_PRESS) {
+        /* Any key press quits (a screensaver should exit on the first sign of
+         * user activity, matching xscreensaver's "any key or button" unlock
+         * gesture).  The ImGui HUD is read-only (FPS / Renderer), so it has no
+         * interaction to preserve and never needs the key forwarded. */
+        if (state == XIM_STATE_PRESS) {
+            (void)key;
             xwin_close(xwin);
             return;
         }
@@ -870,6 +874,15 @@ static void on_event(xwin_t* xwin, xevent_t* ev)
         int32_t state  = ev->state;
         int32_t button = ev->value.mouse.button;
         bool down = (state == MOUSE_STATE_DOWN || state == MOUSE_STATE_DRAG);
+
+        /* Any button press quits, same rationale as the keyboard above.  Only
+         * the initial DOWN (not a DRAG continuation) triggers the exit so a
+         * press-and-move does not race xwin_close against further motion. */
+        if (state == MOUSE_STATE_DOWN) {
+            (void)button;
+            xwin_close(xwin);
+            return;
+        }
 
         mouse_x = pos.x;
         mouse_y = pos.y;
@@ -934,6 +947,21 @@ int main(int argc, char* argv[])
         return 1;
     }
     xwin->on_event = on_event;
+
+    /* Fullscreen BEFORE the EGL surface is created.  xwin_fullscreen() is
+     * synchronous: on return xinfo->wsr already carries the MAX-state size and
+     * ws_g has been rebuilt to match, so eglCreateWindowSurface's
+     * xwin_fetch_graph hands gles_engine_init the full display dimensions and
+     * pgl_g3d_init allocates the fb/z contig pair at that size once.  Doing it
+     * the other way round (EGL at 600x400 first, fullscreen after) routes
+     * through egl_on_resize -> pglResizeFramebuffer -> pgl_g3d_resize's grow
+     * branch, which frees the small runs and then asks the contig pool for a
+     * ~12MB pair in one shot; on any fragmentation the alloc fails, the GPU
+     * latches off (_pgl_gpu_off=1) and the whole session falls back to the CPU
+     * interpreter with no way to recover.  The initial win_width/win_height
+     * stay as the fallback should xwin_fullscreen be a no-op on a WM that
+     * rejects MAX. */
+    xwin_fullscreen(xwin);
 
     /* libEGL owns on_repaint/on_resize once the window surface is created. */
     if (!init_egl(xwin)) {
