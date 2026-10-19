@@ -20,6 +20,17 @@
 #include <portablegl/pgl_g3d.h>
 #include <v3dcompiler.h>
 
+/* Latch the app-side mesa compiler's codegen target to the live V3D silicon
+ * (Pi3 2.1 / Pi4 4.2 / Pi5 7.1) before any v3d_compile_*().  Idempotent and
+ * self-retrying: returns the cached version, or 0 when the g2dd daemon has not
+ * yet answered a version query (so the caller knows the target is still the
+ * v3d71 default).  Defined in pgl_g3d.c; called at the top of
+ * pgl_g3d_program_compile() (below) and again by pgl_g3d_init().  Without the
+ * compile-time call the geometry kernels would be emitted for V3D 7.1 and wedge
+ * the V3D 4.2 CSD on a Pi4: the version query in init runs only at the first
+ * draw, long after glLinkProgram has already compiled them. */
+uint32_t pgl_g3d_ensure_version(void);
+
 /* The cached compiled program for a valid handle, or NULL when the handle is
  * invalid / not compiled.  The returned pointer is owned by the program cache
  * and stays valid until pgl_g3d_program_free() or pgl_g3d_program_free_all()

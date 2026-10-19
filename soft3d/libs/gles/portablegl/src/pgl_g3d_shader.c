@@ -136,6 +136,12 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 		return PGL_G3D_PROG_INVALID;
 	}
 
+	/* Latch the mesa codegen target to the live silicon BEFORE compiling: the
+	   v3dcompiler default devinfo is v3d71, so without this a Pi4's geometry
+	   kernels would be emitted for V3D 7.1 and wedge the V3D 4.2 CSD on the
+	   first dispatch.  Idempotent; see pgl_g3d_ensure_version() in pgl_g3d.c. */
+	pgl_g3d_ensure_version();
+
 	h = hash_sources(vert_glsl, frag_glsl);
 
 	/* cache hit?  compare the hash first, then the exact sources. */

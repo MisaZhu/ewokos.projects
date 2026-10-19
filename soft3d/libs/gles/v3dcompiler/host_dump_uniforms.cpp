@@ -262,19 +262,28 @@ struct geom_kernel {
    const char *name;
    const char *src;
    unsigned    lsx, lsy;      /* declared local_size (z is always 1) */
-   unsigned    n_ssbo;        /* declared SSBO bindings, all must be remapped */
+   unsigned    ssbo_mask;     /* bitmask of the SSBO bindings the kernel actually
+                               * references; a sparse set is legal (the texcol
+                               * raster declares depth at binding 2 but never
+                               * touches it, so its mask is 0xb = {0,1,3}). */
 };
 
-/* All five compute kernels of the two-pass geometry rasterizer (geom_raster_cs.h):
+/* All seven compute kernels of the two-pass geometry rasterizer (geom_raster_cs.h):
  *   pass-1 gouraud xform, pass-2 gouraud raster (one lane/triangle, atomicMin),
  *   pass-1 instanced xform (4 SSBOs incl. the per-gear matrix), pass-1 textured
- *   xform (2 SSBOs), pass-2 textured raster (4 SSBOs, atomicMin). */
+ *   xform (2 SSBOs), pass-2 textured raster (4 SSBOs, atomicMin), and the
+ *   colour-modulated textured (imgui, cs_is_geom=4) pair: pass-1 texcol xform
+ *   (2 SSBOs, stride-10 pos+uv+rgba -> stride-12 vout) and pass-2 texcol raster
+ *   (binds fb/vout/tex, alpha-blends + uScissor clip, declares depth at binding
+ *   2 but never writes it, so its mask is 0xb). */
 static const struct geom_kernel geom_kernels[] = {
-   { "xform",        geom_xform_cs_glsl,      8,  8, 3 },
-   { "raster",       geom_raster_cs_glsl,    16, 16, 3 },
-   { "xform_inst",   geom_xform_inst_cs_glsl, 8,  8, 4 },
-   { "xform_tex",    geom_xform_tex_cs_glsl,  8,  8, 2 },
-   { "raster_tex",   geom_raster_tex_cs_glsl, 8,  8, 4 },
+   { "xform",         geom_xform_cs_glsl,         8,  8, 0x7 },
+   { "raster",        geom_raster_cs_glsl,       16, 16, 0x7 },
+   { "xform_inst",    geom_xform_inst_cs_glsl,    8,  8, 0xf },
+   { "xform_tex",     geom_xform_tex_cs_glsl,     8,  8, 0x3 },
+   { "raster_tex",    geom_raster_tex_cs_glsl,    8,  8, 0xf },
+   { "xform_texcol",  geom_xform_texcol_cs_glsl,  8,  8, 0x3 },
+   { "raster_texcol", geom_raster_texcol_cs_glsl, 8,  8, 0xb },
 };
 #define N_GEOM_KERNELS ((int)(sizeof(geom_kernels)/sizeof(geom_kernels[0])))
 
@@ -327,22 +336,17 @@ static int check_geom_kernel(const struct geom_kernel *k, unsigned *p_instr)
          continue;
       unsigned d = cs->uniform_data[u];
       n_ssbo++;
-      if (d < k->n_ssbo)
+      if (d < 4 && (k->ssbo_mask & (1u << d)))
          seen[d] = true;
       else {
-         printf("    !! %-11s SSBO_OFFSET binding %u out of range [0,%u)\n",
-                k->name, d, k->n_ssbo);
+         printf("    !! %-13s SSBO_OFFSET binding %u not in expected mask 0x%x\n",
+                k->name, d, k->ssbo_mask);
          fail++;
       }
    }
-   if (n_ssbo < k->n_ssbo) {
-      printf("    !! %-11s expected >=%u SSBO_OFFSET slots, got %u\n",
-             k->name, k->n_ssbo, n_ssbo);
-      fail++;
-   }
-   for (unsigned b = 0; b < k->n_ssbo; b++)
-      if (!seen[b]) {
-         printf("    !! %-11s binding %u missing from SSBO_OFFSET remap\n",
+   for (unsigned b = 0; b < 4; b++)
+      if ((k->ssbo_mask & (1u << b)) && !seen[b]) {
+         printf("    !! %-13s binding %u missing from SSBO_OFFSET remap\n",
                 k->name, b);
          fail++;
       }
@@ -369,7 +373,7 @@ static int check_geom_kernel(const struct geom_kernel *k, unsigned *p_instr)
  * RMW path, so it cannot faithfully execute these kernels (the raster passes
  * resolve depth with atomicMin into the depth SSBO over 256-lane workgroups).
  * The decisive, tooling-supported question GATE A answers is therefore whether
- * mesa EMITS valid 4.2 compute for all five kernels; a clean compile means every
+ * mesa EMITS valid 4.2 compute for all seven kernels; a clean compile means every
  * instruction packed through v3d_qpu_instr_pack for ver==42. */
 static int dump_geom(void)
 {

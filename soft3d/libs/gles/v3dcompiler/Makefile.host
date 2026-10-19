@@ -21,13 +21,13 @@ CC  ?= clang
 CXX ?= clang++
 
 V3DROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-CFG     := $(V3DROOT)/../../../../machines/raspi5/system/libs/bsp/src/g3d/mesa_config.h
+CFG     := $(V3DROOT)/../../../../../machines/raspi5/system/libs/bsp/src/g3d/mesa_config.h
 HOSTFIX := $(V3DROOT)/host/mesa_host_fixup.h
 
 INC := -Iinclude \
        -Imesa/include -Imesa/src -Imesa/src/broadcom \
        -Imesa/src/compiler -Imesa/src/compiler/glsl -Imesa/src/compiler/nir \
-       -Imesa/src/mesa -I../demos -I../../apps/teapot
+       -Imesa/src/mesa -I../../demos -I../../../apps/teapot
 
 CF   := -w -std=gnu11   $(INC) -include $(CFG) -include $(HOSTFIX) -O1
 CXXF := -w -std=gnu++17 $(INC) -include $(CFG) -include $(HOSTFIX) -O1

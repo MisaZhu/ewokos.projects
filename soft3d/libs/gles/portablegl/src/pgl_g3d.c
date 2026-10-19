@@ -1738,6 +1738,30 @@ int pgl_g3d_resize(int w, int h)
 	return 1;
 }
 
+/* Cached live V3D architecture version (0 = not queried yet).  soft3d ships ONE
+   binary across chip generations on raspix (Pi3 V3D 2.1 / Pi4 4.2 / Pi5 7.1) and
+   the mesa compiler runs in the APP process, so the codegen target must be
+   latched to the actual silicon BEFORE the first v3d_compile_*().  Shaders are
+   compiled at glLinkProgram (pgl_g3d_program_compile), which runs before
+   pgl_g3d_init()'s first-draw probe, so the query lives here and is called from
+   both sites.  Idempotent: a successful query is cached and never re-issued; a
+   failed one (daemon not yet reachable) leaves the cache at 0 so the next caller
+   retries rather than silently compiling for the v3d71 default devinfo. */
+static uint32_t _v3d_ver;
+
+uint32_t pgl_g3d_ensure_version(void)
+{
+	uint32_t v = 0;
+
+	if (_v3d_ver != 0u)
+		return _v3d_ver;
+	if (g2d_get_version(&v) == G2D_OK && v != 0u) {
+		_v3d_ver = v;
+		v3d_compiler_set_version((int)v);
+	}
+	return _v3d_ver;   /* 0 when no query has succeeded yet */
+}
+
 int pgl_g3d_init(int w, int h)
 {
 	uint32_t* pos_px = NULL;
@@ -1760,22 +1784,15 @@ int pgl_g3d_init(int w, int h)
 	if (has_g2d() != 0)
 		return 0;
 
-	/* Query the live V3D architecture version so the app-side compiler targets
-	   the actual silicon.  soft3d ships ONE binary across chip generations on
-	   raspix (Pi3 V3D 2.1 / Pi4 4.2 / Pi5 7.1) and the mesa compiler runs here
-	   in the APP process, so the codegen target must be chosen at runtime
-	   rather than baked in.  v3d_compiler_set_version() must run before the
-	   first v3d_compile_*().  A query that fails, or reports ver < 41 (VC4 /
-	   V3D 2.1 on Pi3, which has no CSD compute for the geom rasterizer),
-	   declines the GPU path entirely and portablegl keeps its CPU/NEON
-	   rasterizer.  raspi5 reports 71 and selects the same devinfo the compiler
-	   defaults to, so its emitted QPU is byte-for-byte unchanged. */
-	{
-		uint32_t v3d_ver = 0;
-		if (g2d_get_version(&v3d_ver) != G2D_OK || v3d_ver < 41u)
-			return 0;
-		v3d_compiler_set_version((int)v3d_ver);
-	}
+	/* Latch the codegen target to the live silicon (idempotent; the shaders were
+	   already compiled against it at glLinkProgram via the same call in
+	   pgl_g3d_program_compile).  A failed query, or ver < 41 (VC4 / V3D 2.1 on
+	   Pi3, which has no CSD compute for the geom rasterizer), declines the GPU
+	   path entirely and portablegl keeps its CPU/NEON rasterizer.  raspi5
+	   reports 71 and selects the same devinfo the compiler defaults to, so its
+	   emitted QPU is byte-for-byte unchanged. */
+	if (pgl_g3d_ensure_version() < 41u)
+		return 0;
 
 	if (!alloc_target(w, h, fb_grow_capacity((uint32_t)w * (uint32_t)h)))
 		return 0;

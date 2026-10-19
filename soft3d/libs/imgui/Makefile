@@ -6,6 +6,15 @@ BUILD_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 CFLAGS += -I. -Iinclude -Iinclude/imgui -I $(BUILD_DIR)/include -I../external
 CXXFLAGS += -I. -Iinclude -Iinclude/imgui -I $(BUILD_DIR)/include -I../external
 
+# Prepend the source-tree parent so backends/*.h resolve "imgui/imgui.h" to this
+# library's OWN source header, not a previously staged copy under
+# $(BUILD_DIR)/include (which make.inc adds earlier via -I $(SDK_DIR)/include).
+# imgui.h guards with #pragma once (inode-based); the staged copy is a distinct
+# inode, so letting it win double-parses the header and triggers redefinitions.
+# A library must build from its own sources, never from a stale copy of itself.
+CFLAGS := -I.. $(CFLAGS)
+CXXFLAGS := -I.. $(CXXFLAGS)
+
 # ImGui C++ source files
 LIB_IMGUI_OBJS = \
 	$(ARCH)/imgui.o \

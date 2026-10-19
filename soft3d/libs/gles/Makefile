@@ -17,9 +17,10 @@ PRIV = $(BUILD_DIR)/lib/.gles_priv
 CFLAGS += -Iinclude -Isrc/engine -Isrc/glsl -Iportablegl/include
 
 # portablegl.h is preprocessed identically here and in the private
-# libportablegl.a only if the PGL_G3D gate matches, so mirror it: raspi5 exports
-# PGL_G3D=yes, which is how libportablegl.a is built.  A mismatch would change
-# the glContext the engine TU sees vs. the one compiled into the archive.
+# libportablegl.a only if the PGL_G3D gate matches, so mirror it: the machines
+# with a V3D pipeline (raspi5, raspix) export PGL_G3D=yes, which is how
+# libportablegl.a is built.  A mismatch would change the glContext the engine TU
+# sees vs. the one compiled into the archive.
 ifeq ($(PGL_G3D),yes)
 CFLAGS += -DPGL_G3D
 endif
