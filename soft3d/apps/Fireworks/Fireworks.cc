@@ -31,6 +31,10 @@
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+
+#include "imgui/imgui.h"
+#include "imgui/backends/imgui_impl_gles2.h"
 
 #define WIDTH 1024
 #define HEIGHT 768
@@ -127,6 +131,8 @@ static const GLfloat quad_verts[] = {
      1.0f,  1.0f, 1.0f, 0.0f,
 };
 
+static void init_imgui(void);
+
 static void init_gl(void)
 {
     GLuint vs, fs;
@@ -167,6 +173,8 @@ static void init_gl(void)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glUniform1i(loc_tex, 0);
+
+    init_imgui();
 }
 
 /* (Re)allocate the CPU compositing buffers and the texture storage for a new
@@ -517,6 +525,65 @@ void draw_fireworks() {
  * fullscreen textured quad. */
 static int frame_count = 0;
 
+/* ------------------------------------------------------------------ *
+ * Dear ImGui overlay: the FPS / GPU-vs-CPU readout as a small read-only
+ * ImGui window drawn on top of the fireworks, the same overlay glmatrix
+ * uses.  ImGui is C++ and renders through the GLES2 backend after the
+ * fullscreen quad.  The HUD is display-only, so no xwin input is
+ * forwarded to it and the window is marked NoInputs; ESC still quits.
+ * ------------------------------------------------------------------ */
+static int fps = 0;
+static int fps_count = 0;
+static uint32_t fps_last_tic = 0;
+
+static void update_fps(void)
+{
+    uint32_t low;
+    kernel_tic32(NULL, NULL, &low);
+    if (fps_last_tic == 0 || (low - fps_last_tic) >= 1000000) {
+        fps_last_tic = low;
+        fps = fps_count;
+        fps_count = 0;
+    }
+    fps_count++;
+}
+
+static void init_imgui(void)
+{
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = NULL;                                 /* no imgui.ini    */
+    io.DisplaySize = ImVec2((float)WIDTH, (float)HEIGHT);
+    ImGui::StyleColorsDark();
+    ImGui_ImplGLES2_Init();
+    io.Fonts->AddFontFromFileTTF("/usr/system/fonts/system.ttf", 16.0f);
+}
+
+/* Build one ImGui frame: lay out the read-only stats window.  `gpu` is the
+ * route the quad program used this frame, queried while it was bound.  The
+ * HUD is display-only (FPS / Renderer), so no input is forwarded to ImGui
+ * and the window is marked NoInputs. */
+static void process_imgui_frame(int gpu)
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)screen_width, (float)screen_height);
+
+    ImGui_ImplGLES2_NewFrame();
+    ImGui::NewFrame();
+
+    ImGui::SetNextWindowPos(ImVec2(8.0f, 8.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("Fireworks", NULL,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize
+                 | ImGuiWindowFlags_NoInputs);
+    ImGui::Text("FPS: %d", fps);
+    ImGui::TextColored(gpu ? ImVec4(0.40f, 1.00f, 0.55f, 1.0f)
+                           : ImVec4(1.00f, 0.70f, 0.30f, 1.0f),
+                       "Renderer: %s", gpu ? "GPU" : "CPU");
+    ImGui::End();
+}
+
 static void render_frame(void)
 {
     EGLint w = 0, h = 0;
@@ -562,6 +629,11 @@ static void render_frame(void)
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
+    /* Re-bind the quad program every frame: ImGui_ImplGLES2_RenderDrawData
+     * binds its own program and (unlike the viewport / enable caps) does not
+     * restore GL_CURRENT_PROGRAM, so without this the quad would draw through
+     * ImGui's shader from the second frame on and the show would vanish. */
+    glUseProgram(program);
     glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), 0);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
@@ -572,8 +644,16 @@ static void render_frame(void)
     glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(0);
 
+    /* Query the GPU/CPU route while the quad program is still bound, then draw
+     * the ImGui stats window on top (same overlay as glmatrix). */
+    int gpu = glGpuActiveEWOK();
+    process_imgui_frame(gpu);
+    ImGui::Render();
+    ImGui_ImplGLES2_RenderDrawData(ImGui::GetDrawData());
+
     eglSwapBuffers(egl_dpy, egl_surf);
     frame_count++;
+    update_fps();
 }
 
 static void on_event(xwin_t* xwin, xevent_t* ev)
@@ -644,10 +724,22 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    /* This app composites the show on the CPU and blits it as a fullscreen
+     * textured quad; it is never GPU-eligible.  Pin the context to the CPU
+     * rasteriser BEFORE init_gl links the ImGui overlay (a GPU-eligible uMVP
+     * program): otherwise the engine would adopt the uncached GPU render target
+     * as the back buffer, splitting the frame between the CPU blit and ImGui's
+     * GPU dispatch so the fireworks disappear.  With this, ImGui too draws
+     * through the CPU interpreter into the same cached buffer. */
+    glForceCpuEWOK();
+
     init_gl();
 
     xwin_set_visible(xwin, true);
     x_run(&x, xwin);
+
+    ImGui_ImplGLES2_Shutdown();
+    ImGui::DestroyContext();
 
     xwin_destroy(xwin);
     eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

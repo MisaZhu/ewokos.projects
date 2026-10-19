@@ -1566,6 +1566,13 @@ static int       g_gpu_ready = 0;
  * draw) while CPU apps never touch NOCACHE. */
 static int       g_gpu_has_eligible = 0;
 
+/* Set by gles_engine_force_cpu(): pin the context to the CPU rasteriser so
+ * gpu_bringup() never adopts the NOCACHE pgl_g3d target, even after an
+ * overlay program (Dear ImGui) links as GPU-eligible.  A pure-CPU blit app
+ * keeps its cached malloc back buffer and the overlay draws through the
+ * interpreter into the same surface. */
+static int       g_force_cpu = 0;
+
 /* texture-name -> raster-slot map for the textured kernel (PGL_G3D_MAX_TEX) */
 static GLuint  g_gpu_texname[PGL_G3D_MAX_TEX];
 static int     g_gpu_texused[PGL_G3D_MAX_TEX];
@@ -1628,6 +1635,10 @@ static gpu_entry *gpu_alloc_entry(GLuint id)
 static void gpu_bringup(void)
 {
     if (g_gpu_ready || !g_inited) return;
+    /* App pinned to the CPU rasteriser: never adopt the NOCACHE target, even
+     * though an overlay program may have set g_gpu_has_eligible (see
+     * gles_engine_force_cpu). */
+    if (g_force_cpu) return;
     /* No GPU-eligible program yet: keep portablegl's cached malloc back buffer.
      * Adopting the NOCACHE pgl_g3d target now would make a pure-CPU app render
      * every pixel uncached (see g_gpu_has_eligible). */
@@ -2504,6 +2515,16 @@ int gles_engine_gpu_active(void)
     return (e->eligible || e->fullscreen);
 }
 
+void gles_engine_force_cpu(void)
+{
+    /* Pin the context to the CPU rasteriser before any GPU bringup: gpu_bringup
+     * then stays inert, so a pure-CPU blit app keeps its cached back buffer and
+     * an overlaid GPU-eligible program (Dear ImGui) also draws through the
+     * interpreter into that same surface instead of splitting the frame across
+     * a CPU blit and a GPU tile dispatch. */
+    g_force_cpu = 1;
+}
+
 #else  /* !PGL_G3D: inert so the GPU-agnostic GLES2/EGL TUs link unchanged */
 
 GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_src)
@@ -2511,5 +2532,6 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
 void gles_engine_gpu_delete(GEuint pgl_id) { (void)pgl_id; }
 void gles_engine_gpu_flush(void) { }
 int  gles_engine_gpu_active(void) { return 0; }
+void gles_engine_force_cpu(void) { }
 
 #endif /* PGL_G3D */

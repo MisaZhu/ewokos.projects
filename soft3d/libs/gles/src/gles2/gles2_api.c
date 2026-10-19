@@ -43,6 +43,12 @@ void glPolygonOffset (GLfloat factor, GLfloat units) { gles_engine_polygon_offse
 /* EWOK_gpu_path: which rasterizer is drawing the bound program right now. */
 GLint glGpuActiveEWOK(void) { return (GLint)gles_engine_gpu_active(); }
 
+/* EWOK_gpu_path: pin the whole context to the CPU rasterizer (see gl2ext.h).
+ * A pure-CPU blit app calls this before its render loop so an overlaid
+ * GPU-eligible program (Dear ImGui) does not trigger adoption of the uncached
+ * GPU back buffer and split the frame. */
+void glForceCpuEWOK(void) { gles_engine_force_cpu(); }
+
 void glStencilFunc (GLenum func, GLint ref, GLuint mask) { gles_engine_stencil_func(func, ref, mask); }
 void glStencilOp (GLenum fail, GLenum zfail, GLenum zpass) { gles_engine_stencil_op(fail, zfail, zpass); }
 void glStencilMask (GLuint mask) { gles_engine_stencil_mask(mask); }

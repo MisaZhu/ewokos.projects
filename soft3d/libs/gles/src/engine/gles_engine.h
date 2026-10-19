@@ -203,11 +203,23 @@ void gles_engine_delete_program(GEuint program);
  *   program is not latched to the CPU); zero when rendering is on the CPU
  *   interpreter or the build has no PGL_G3D.  A diagnostic for on-screen HUDs;
  *   it never influences routing.
+ * gles_engine_force_cpu: pin the whole context to the CPU rasteriser.  A
+ *   pure-CPU app (the fullscreen-quad texblit of Fireworks/matrix) must never
+ *   adopt the pgl_g3d NOCACHE render target as portablegl's back buffer: that
+ *   target is uncached shm, so blitting a full frame into it every refresh is
+ *   DRAM-bound and ~an order of magnitude slower than the cached malloc back
+ *   buffer.  Linking a GPU-eligible overlay program (e.g. Dear ImGui's uMVP
+ *   shader) would otherwise flip g_gpu_has_eligible and trigger that adoption,
+ *   mixing a CPU blit with GPU tile dispatches on one surface.  Call this once
+ *   before the render loop so gpu_bringup stays inert and the overlay too draws
+ *   through the CPU interpreter into the same cached buffer.  Inert without
+ *   PGL_G3D.
  * ------------------------------------------------------------------ */
 GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_src);
 void   gles_engine_gpu_delete(GEuint pgl_id);
 void   gles_engine_gpu_flush(void);
 int    gles_engine_gpu_active(void);
+void   gles_engine_force_cpu(void);
 
 #ifdef __cplusplus
 }

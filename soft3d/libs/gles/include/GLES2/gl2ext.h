@@ -4200,10 +4200,21 @@ GL_APICALL void GL_APIENTRY glEndTilingQCOM (GLbitfield preserveMask);
  * for the bound program, 0 when rendering falls back to the CPU interpreter
  * (or the build has no GPU backend).  Purely a diagnostic for on-screen HUDs;
  * it never influences routing.  Query it while the scene program is bound
- * (before drawing any overlay that switches the bound program). */
+ * (before drawing any overlay that switches the bound program).
+ *
+ * glForceCpuEWOK pins the whole context to the CPU rasterizer.  A pure-CPU app
+ * (one that composites on the CPU and blits a fullscreen textured quad, e.g.
+ * Fireworks/matrix) must call this once before its render loop if it also draws
+ * a GPU-eligible overlay such as Dear ImGui: otherwise linking the overlay's
+ * uMVP program makes the engine adopt the uncached GPU render target as the
+ * back buffer, splitting the frame between the CPU blit and GPU tile dispatches
+ * so the app's own content is lost.  With this set, the overlay too renders
+ * through the CPU interpreter into the same cached buffer.  Inert on builds
+ * without a GPU backend. */
 #ifndef GL_EWOK_gpu_path
 #define GL_EWOK_gpu_path 1
 GL_APICALL GLint GL_APIENTRY glGpuActiveEWOK(void);
+GL_APICALL void GL_APIENTRY glForceCpuEWOK(void);
 #endif /* GL_EWOK_gpu_path */
 
 #ifdef __cplusplus
