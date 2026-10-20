@@ -303,6 +303,57 @@ static void p_box(Mesh *m, float cx,float cy,float cz, float hx,float hy,float h
     mesh_quad(m, x1,y0,z0, x0,y0,z0, x0,y1,z0, x1,y1,z0);
 }
 
+/* Subdivide one planar quad a-b-c-d (a parallelogram, c == b+d-a) into an
+ * nu x nv grid of quads with the SAME winding and the SAME flat normal, so the
+ * gouraud shading is pixel-identical to the single quad.  Splitting a big flat
+ * shell face into many small triangles is what fixes the compute rasterizer's
+ * one-lane-per-triangle load imbalance: a single 150x150px face monopolises one
+ * lane (the whole 256-lane workgroup waits on it), while nu*nv coplanar cells
+ * spread the identical fill across nu*nv lanes that finish together. */
+static void p_quad_grid(Mesh *m, float ax,float ay,float az, float bx,float by,float bz,
+                        float cx,float cy,float cz, float dx,float dy,float dz, int nu, int nv)
+{
+    (void)cx; (void)cy; (void)cz;   /* c is implied: the face is a parallelogram */
+    if (nu < 1) nu = 1;
+    if (nv < 1) nv = 1;
+    float bax=bx-ax, bay=by-ay, baz=bz-az;   /* a->b edge */
+    float dax=dx-ax, day=dy-ay, daz=dz-az;   /* a->d edge */
+    for (int j = 0; j < nv; j++) {
+        float t0=(float)j/nv, t1=(float)(j+1)/nv;
+        for (int i = 0; i < nu; i++) {
+            float s0=(float)i/nu, s1=(float)(i+1)/nu;
+            mesh_quad(m,
+                ax+bax*s0+dax*t0, ay+bay*s0+day*t0, az+baz*s0+daz*t0,
+                ax+bax*s1+dax*t0, ay+bay*s1+day*t0, az+baz*s1+daz*t0,
+                ax+bax*s1+dax*t1, ay+bay*s1+day*t1, az+baz*s1+daz*t1,
+                ax+bax*s0+dax*t1, ay+bay*s0+day*t1, az+baz*s0+daz*t1);
+        }
+    }
+}
+
+/* Segments for one box axis so a face is cut into ~cell-sized quads (>=1, <=8). */
+static int grid_segs(float len, float cell)
+{
+    int n = (int)(len/cell + 0.5f);
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    return n;
+}
+
+/* p_box with every face subdivided to ~cell world units -- geometrically and
+ * shade-identical to p_box, only tessellated for even GPU lane loading. */
+static void p_box_grid(Mesh *m, float cx,float cy,float cz, float hx,float hy,float hz, float cell)
+{
+    float x0=cx-hx,x1=cx+hx,y0=cy-hy,y1=cy+hy,z0=cz-hz,z1=cz+hz;
+    int nx=grid_segs(2*hx,cell), ny=grid_segs(2*hy,cell), nz=grid_segs(2*hz,cell);
+    p_quad_grid(m, x1,y0,z1, x1,y0,z0, x1,y1,z0, x1,y1,z1, nz, ny);
+    p_quad_grid(m, x0,y0,z0, x0,y0,z1, x0,y1,z1, x0,y1,z0, nz, ny);
+    p_quad_grid(m, x0,y1,z1, x1,y1,z1, x1,y1,z0, x0,y1,z0, nx, nz);
+    p_quad_grid(m, x0,y0,z0, x1,y0,z0, x1,y0,z1, x0,y0,z1, nx, nz);
+    p_quad_grid(m, x0,y0,z1, x1,y0,z1, x1,y1,z1, x0,y1,z1, nx, ny);
+    p_quad_grid(m, x1,y0,z0, x0,y0,z0, x0,y1,z0, x1,y1,z0, nx, ny);
+}
+
 static void p_cyl_y(Mesh *m, float cx,float cz, float ybot,float ytop, float r, int segs, int caps)
 {
     if (segs < 3) segs = 3;
@@ -567,7 +618,7 @@ static void p_sprocket_z(Mesh *m, float cx, float cy, float z0, float z1,
         mesh_quad(m, hx0,hy0,z1, x0,y0,z1, x1,y1,z1, hx1,hy1,z1);/* +Z web */
         mesh_quad(m, hx0,hy0,z0, hx1,hy1,z0, x1,y1,z0, x0,y0,z0);/* -Z web */
     }
-    p_cyl_z(m, cx, cy, z0 - 0.06f, z1 + 0.06f, hub_r, 16, 3);   /* hub boss */
+    p_cyl_z(m, cx, cy, z0 - 0.06f, z1 + 0.06f, hub_r, 12, 3);   /* hub boss */
 }
 
 /* Closed external-tangent belt looped round n pulleys wound CCW.  Each pulley
@@ -601,8 +652,8 @@ static void build_belt(Mesh *m, const float *bx, const float *by, const float *b
         float a_out = atan2f(moy[i], mox[i]);
         float sweep = a_out - a_in;
         while (sweep <= 0.0f) sweep += (float)(2*M_PI);
-        int steps = (int)(sweep / 0.12f) + 1;
-        if (steps > 48) steps = 48;
+        int steps = (int)(sweep / 0.18f) + 1;
+        if (steps > 32) steps = 32;
         for (int s = 0; s <= steps && np < MAXP; s++) {
             float a = a_in + sweep * s/steps;
             float ca = cosf(a), sa = sinf(a);
@@ -699,19 +750,19 @@ static void build_block(void)
     float yhalf = (DECK_Y - BLOCK_BOT_Y) * 0.5f;
     float t = 0.10f;
     /* four walls; the top is left open (the head seals it) */
-    p_box(m, 0, ymid, -BLOCK_HZ, BLOCK_HX, yhalf, t);
-    p_box(m, 0, ymid,  BLOCK_HZ, BLOCK_HX, yhalf, t);
-    p_box(m, -BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ);
-    p_box(m,  BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ);
+    p_box_grid(m, 0, ymid, -BLOCK_HZ, BLOCK_HX, yhalf, t, 1.3f);
+    p_box_grid(m, 0, ymid,  BLOCK_HZ, BLOCK_HX, yhalf, t, 1.3f);
+    p_box_grid(m, -BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ, 1.3f);
+    p_box_grid(m,  BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ, 1.3f);
     /* bottom flange meeting the crankcase */
-    p_box(m, 0, BLOCK_BOT_Y - 0.08f, 0, BLOCK_HX, 0.08f, BLOCK_HZ);
+    p_box_grid(m, 0, BLOCK_BOT_Y - 0.08f, 0, BLOCK_HX, 0.08f, BLOCK_HZ, 1.3f);
     part_set(&P_block, MAT_block, 0.25f, 0.0f, 0);
 
     /* liners: one transparent tube per bore */
     mesh_init(&P_liner.mesh);
     for (int i = 0; i < NCYL; i++)
         p_tube_y(&P_liner.mesh, 0, cyl_z[i], BLOCK_BOT_Y + 0.05f, DECK_Y,
-                 BORE_R + 0.06f, BORE_R, 32);
+                 BORE_R + 0.06f, BORE_R, 20);
     part_set(&P_liner, MAT_liner, 0.60f, 0.0f, 0);
 }
 
@@ -725,34 +776,34 @@ static void build_head(void)
     float yhalf = (HEAD_TOP_Y - DECK_Y) * 0.5f;
     float t = 0.10f;
     /* outer casting walls */
-    p_box(m, 0, ymid, -BLOCK_HZ, BLOCK_HX, yhalf, t);
-    p_box(m, 0, ymid,  BLOCK_HZ, BLOCK_HX, yhalf, t);
-    p_box(m, -BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ);
-    p_box(m,  BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ);
+    p_box_grid(m, 0, ymid, -BLOCK_HZ, BLOCK_HX, yhalf, t, 1.3f);
+    p_box_grid(m, 0, ymid,  BLOCK_HZ, BLOCK_HX, yhalf, t, 1.3f);
+    p_box_grid(m, -BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ, 1.3f);
+    p_box_grid(m,  BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ, 1.3f);
     /* cam-cover mounting face (top) and deck/gasket face (bottom) */
-    p_box(m, 0, HEAD_TOP_Y, 0, BLOCK_HX, 0.08f, BLOCK_HZ);
-    p_box(m, 0, DECK_Y - 0.05f, 0, BLOCK_HX, 0.05f, BLOCK_HZ);
+    p_box_grid(m, 0, HEAD_TOP_Y, 0, BLOCK_HX, 0.08f, BLOCK_HZ, 1.3f);
+    p_box_grid(m, 0, DECK_Y - 0.05f, 0, BLOCK_HX, 0.05f, BLOCK_HZ, 1.3f);
 
     for (int i = 0; i < NCYL; i++) {
         float z = cyl_z[i];
         /* combustion-chamber roof: a shallow dome, not a sphere */
-        p_chamber_dome(m, z, DECK_Y, CHAMBER_CEIL, BORE_R - 0.06f, 26, 6);
+        p_chamber_dome(m, z, DECK_Y, CHAMBER_CEIL, BORE_R - 0.06f, 20, 5);
         /* valve seat rings inserted into the chamber roof */
         p_tube_y(m, -VALVE_X, z, VALVE_SEAT_Y - 0.05f, VALVE_SEAT_Y + 0.10f,
-                 VALVE_HEAD_R + 0.05f, VALVE_HEAD_R - 0.02f, 18);
+                 VALVE_HEAD_R + 0.05f, VALVE_HEAD_R - 0.02f, 14);
         p_tube_y(m,  VALVE_X, z, VALVE_SEAT_Y - 0.05f, VALVE_SEAT_Y + 0.10f,
-                 VALVE_HEAD_R + 0.05f, VALVE_HEAD_R - 0.02f, 18);
+                 VALVE_HEAD_R + 0.05f, VALVE_HEAD_R - 0.02f, 14);
         /* valve guides: stems pass up through the roof into the head */
         p_tube_y(m, -VALVE_X, z, VALVE_SEAT_Y + 0.12f, HEAD_TOP_Y - 0.05f,
-                 0.16f, VALVE_STEM_R + 0.02f, 12);
+                 0.16f, VALVE_STEM_R + 0.02f, 10);
         p_tube_y(m,  VALVE_X, z, VALVE_SEAT_Y + 0.12f, HEAD_TOP_Y - 0.05f,
-                 0.16f, VALVE_STEM_R + 0.02f, 12);
+                 0.16f, VALVE_STEM_R + 0.02f, 10);
         /* spark-plug tube through the centre of the chamber + top boss */
-        p_tube_y(m, 0, z, CHAMBER_CEIL - 0.05f, HEAD_TOP_Y + 0.05f, 0.26f, 0.15f, 14);
-        p_cyl_y(m, 0, z, HEAD_TOP_Y + 0.05f, HEAD_TOP_Y + 0.30f, 0.30f, 14, 3);
+        p_tube_y(m, 0, z, CHAMBER_CEIL - 0.05f, HEAD_TOP_Y + 0.05f, 0.26f, 0.15f, 12);
+        p_cyl_y(m, 0, z, HEAD_TOP_Y + 0.05f, HEAD_TOP_Y + 0.30f, 0.30f, 12, 3);
         /* spring seats: the valve springs rest on these pads in the head */
-        p_disc_y(m, -VALVE_X, SPRING_SEAT_Y - 0.02f, z, 0.34f, 0.17f, 18, 0);
-        p_disc_y(m,  VALVE_X, SPRING_SEAT_Y - 0.02f, z, 0.34f, 0.17f, 18, 0);
+        p_disc_y(m, -VALVE_X, SPRING_SEAT_Y - 0.02f, z, 0.34f, 0.17f, 14, 0);
+        p_disc_y(m,  VALVE_X, SPRING_SEAT_Y - 0.02f, z, 0.34f, 0.17f, 14, 0);
     }
 
     /* camshaft bearing pedestals + caps sit between the lobes (both cams) */
@@ -771,8 +822,8 @@ static void build_head(void)
 
     /* cam cover: sits on the head top deck and encloses cams + bucket tappets */
     mesh_init(&P_camcover.mesh);
-    p_box(&P_camcover.mesh, 0, 7.45f, 0, 1.55f, 0.65f, BLOCK_HZ);
-    p_box(&P_camcover.mesh, 0, HEAD_TOP_Y + 0.08f, 0, 1.45f, 0.10f, BLOCK_HZ - 0.05f);
+    p_box_grid(&P_camcover.mesh, 0, 7.45f, 0, 1.55f, 0.65f, BLOCK_HZ, 1.3f);
+    p_box_grid(&P_camcover.mesh, 0, HEAD_TOP_Y + 0.08f, 0, 1.45f, 0.10f, BLOCK_HZ - 0.05f, 1.3f);
     part_set(&P_camcover, MAT_camcover, 0.20f, 0.0f, 0);
 
     /* head bolts along both rails */
@@ -792,15 +843,15 @@ static void build_crankcase(void)
 {
     Mesh *m = &P_crankcase.mesh; mesh_init(m);
     float ymid = -0.30f, yhalf = 1.70f, t = 0.10f;
-    p_box(m, 0, ymid, -BLOCK_HZ - 0.1f, BLOCK_HX, yhalf, t);
-    p_box(m, 0, ymid,  BLOCK_HZ + 0.1f, BLOCK_HX, yhalf, t);
-    p_box(m, -BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ + 0.1f);
-    p_box(m,  BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ + 0.1f);
+    p_box_grid(m, 0, ymid, -BLOCK_HZ - 0.1f, BLOCK_HX, yhalf, t, 1.3f);
+    p_box_grid(m, 0, ymid,  BLOCK_HZ + 0.1f, BLOCK_HX, yhalf, t, 1.3f);
+    p_box_grid(m, -BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ + 0.1f, 1.3f);
+    p_box_grid(m,  BLOCK_HX, ymid, 0, t, yhalf, BLOCK_HZ + 0.1f, 1.3f);
     part_set(&P_crankcase, MAT_crankcase, 0.20f, 0.0f, 0);
 
     mesh_init(&P_baseplate.mesh);
-    p_box(&P_baseplate.mesh, 0, -2.10f, 0, BLOCK_HX + 0.05f, 0.15f, BLOCK_HZ + 0.15f);
-    p_box(&P_baseplate.mesh, 0, -2.45f, 0, BLOCK_HX - 0.35f, 0.22f, BLOCK_HZ - 0.5f);
+    p_box_grid(&P_baseplate.mesh, 0, -2.10f, 0, BLOCK_HX + 0.05f, 0.15f, BLOCK_HZ + 0.15f, 1.3f);
+    p_box_grid(&P_baseplate.mesh, 0, -2.45f, 0, BLOCK_HX - 0.35f, 0.22f, BLOCK_HZ - 0.5f, 1.3f);
     part_set(&P_baseplate, MAT_base, 0.25f, 0.0f, 0);
 }
 
@@ -810,18 +861,18 @@ static void build_crank(void)
 {
     Mesh *m = &P_crank.mesh; mesh_init(m);
     float zmin = -BLOCK_HZ - 0.5f, zmax = BLOCK_HZ + 0.5f;
-    p_cyl_z(m, 0, 0, zmin, zmax, 0.34f, 20, 3);   /* main journal */
+    p_cyl_z(m, 0, 0, zmin, zmax, 0.34f, 16, 3);   /* main journal */
     for (int i = 0; i < NCYL; i++) {
         float sgn = (cyl_pin[i] == 0.0f) ? 1.0f : -1.0f;
         float py = sgn * CRANK_R, zc = cyl_z[i], zh = 0.30f, wh = 0.11f;
-        p_cyl_z(m, 0, py, zc - zh, zc + zh, 0.30f, 18, 3);   /* crank pin */
+        p_cyl_z(m, 0, py, zc - zh, zc + zh, 0.30f, 14, 3);   /* crank pin */
         for (int s = 0; s < 2; s++) {
             float zw = zc + (s == 0 ? -(zh + wh) : (zh + wh));
             /* web plate from journal to pin */
             p_box(m, 0, sgn * CRANK_R * 0.5f, zw, 0.36f, CRANK_R * 0.5f + 0.34f, wh);
             /* counterweight: half disc opposite the pin */
             float a_start = (sgn > 0) ? (float)M_PI : 0.0f;
-            int N = 14;
+            int N = 10;
             for (int j = 0; j < N; j++) {
                 float ang0 = a_start + (float)M_PI * j / N;
                 float ang1 = a_start + (float)M_PI * (j+1) / N;
@@ -835,10 +886,10 @@ static void build_crank(void)
         }
     }
     /* flywheel (-Z) and nose pulley (+Z) */
-    p_cyl_z(m, 0, 0, zmin - 0.45f, zmin, 1.15f, 28, 3);
-    p_torus_z(m, 0, 0, zmin - 0.45f, 1.15f, 0.07f, 24, 6);
-    p_cyl_z(m, 0, 0, zmax, zmax + 0.35f, 0.78f, 24, 3);
-    p_torus_z(m, 0, 0, zmax + 0.35f, 0.78f, 0.06f, 20, 6);
+    p_cyl_z(m, 0, 0, zmin - 0.45f, zmin, 1.15f, 22, 3);
+    p_torus_z(m, 0, 0, zmin - 0.45f, 1.15f, 0.07f, 18, 4);
+    p_cyl_z(m, 0, 0, zmax, zmax + 0.35f, 0.78f, 20, 3);
+    p_torus_z(m, 0, 0, zmax + 0.35f, 0.78f, 0.06f, 16, 4);
     p_cyl_z(m, 0, 0, zmax + 0.35f, TIM_Z1, 0.24f, 12, 0);  /* nose carrying the timing sprocket */
     part_set(&P_crank, MAT_crank, 0.55f, 0.14f, 1);
 }
@@ -860,10 +911,10 @@ static float cam_bump(float a)
 static void build_camshaft(Mesh *m, int exhaust)
 {
     mesh_init(m);
-    p_cyl_z(m, 0, 0, -BLOCK_HZ - 0.2f, BLOCK_HZ + 0.2f, CAM_BASE_R, 18, 3);
+    p_cyl_z(m, 0, 0, -BLOCK_HZ - 0.2f, BLOCK_HZ + 0.2f, CAM_BASE_R, 14, 3);
     p_cyl_z(m, 0, 0, BLOCK_HZ + 0.2f, TIM_Z1, CAM_BASE_R, 12, 0);  /* nose to the timing sprocket */
     float peak = exhaust ? EXHAUST_PEAK : INTAKE_PEAK;
-    int segs = 40;
+    int segs = 28;
     for (int i = 0; i < NCYL; i++) {
         /* lobe nose must point -Y when cam_rot = crank/2 reaches (peak+off)/2 */
         float beta = (-90.0f - (peak + cyl_off[i]) * 0.5f) * (float)M_PI / 180.0f;
@@ -903,12 +954,12 @@ static void build_plugs(void)
     for (int i = 0; i < NCYL; i++) {
         float z = cyl_z[i];
         float base = HEAD_TOP_Y + 0.25f;
-        p_cyl_y(m, 0, z, base - 0.80f, base - 0.10f, 0.13f, 10, 0);   /* threads */
+        p_cyl_y(m, 0, z, base - 0.80f, base - 0.10f, 0.13f, 8, 0);   /* threads */
         p_cyl_y(m, 0, z, base - 0.10f, base + 0.18f, 0.21f, 6, 3);    /* hex shell */
-        p_cone_y(m, 0, z, base + 0.18f, base + 0.78f, 0.17f, 0.09f, 14); /* ceramic */
-        p_cyl_y(m, 0, z, base + 0.78f, base + 1.00f, 0.09f, 10, 3);   /* terminal */
+        p_cone_y(m, 0, z, base + 0.18f, base + 0.78f, 0.17f, 0.09f, 10); /* ceramic */
+        p_cyl_y(m, 0, z, base + 0.78f, base + 1.00f, 0.09f, 8, 3);   /* terminal */
         /* centre electrode down into the chamber + L-shaped side electrode */
-        p_cyl_y(t, 0, z, PLUG_TIP_Y - 0.05f, base - 0.80f, 0.045f, 8, 3);
+        p_cyl_y(t, 0, z, PLUG_TIP_Y - 0.05f, base - 0.80f, 0.045f, 6, 3);
         p_box(t, 0.12f, PLUG_TIP_Y + 0.05f, z, 0.028f, 0.10f, 0.028f);
         p_box(t, 0.06f, PLUG_TIP_Y - 0.05f, z, 0.085f, 0.023f, 0.028f);
     }
@@ -926,11 +977,11 @@ static void build_ports(void)
     for (int i = 0; i < NCYL; i++) {
         float z = cyl_z[i];
         /* intake runner */
-        for (int k = 0; k < 8; k++) {
-            float t0 = k/8.0f, t1 = (k+1)/8.0f;
+        for (int k = 0; k < 6; k++) {
+            float t0 = k/6.0f, t1 = (k+1)/6.0f;
             float y0 = HEAD_TOP_Y - 0.05f + t0*1.25f, y1 = HEAD_TOP_Y - 0.05f + t1*1.25f;
             float x0 = -VALVE_X - t0*1.05f, x1 = -VALVE_X - t1*1.05f, r = 0.26f;
-            int sg = 12;
+            int sg = 10;
             for (int s = 0; s < sg; s++) {
                 float a0=(float)(2*M_PI*s/sg), a1=(float)(2*M_PI*(s+1)/sg);
                 float c0=cosf(a0),s0=sinf(a0),c1=cosf(a1),s1=sinf(a1);
@@ -940,11 +991,11 @@ static void build_ports(void)
         }
         p_box(&P_port_in.mesh, -VALVE_X-1.05f, HEAD_TOP_Y+1.22f, z, 0.40f, 0.07f, 0.40f);
         /* exhaust header */
-        for (int k = 0; k < 8; k++) {
-            float t0 = k/8.0f, t1 = (k+1)/8.0f;
+        for (int k = 0; k < 6; k++) {
+            float t0 = k/6.0f, t1 = (k+1)/6.0f;
             float y0 = HEAD_TOP_Y - 0.05f + t0*1.25f, y1 = HEAD_TOP_Y - 0.05f + t1*1.25f;
             float x0 = VALVE_X + t0*1.05f, x1 = VALVE_X + t1*1.05f, r = 0.24f;
-            int sg = 12;
+            int sg = 10;
             for (int s = 0; s < sg; s++) {
                 float a0=(float)(2*M_PI*s/sg), a1=(float)(2*M_PI*(s+1)/sg);
                 float c0=cosf(a0),s0=sinf(a0),c1=cosf(a1),s1=sinf(a1);
@@ -958,20 +1009,20 @@ static void build_ports(void)
     part_set(&P_port_ex, MAT_port_ex, 0.30f, 0.18f, 1);
 
     /* flow tubes built at z=0, instanced per cylinder */
-    for (int k = 0; k < 6; k++) {
-        float t0=k/6.0f, t1=(k+1)/6.0f;
+    for (int k = 0; k < 5; k++) {
+        float t0=k/5.0f, t1=(k+1)/5.0f;
         float y0=HEAD_TOP_Y+0.15f+t0*1.00f, y1=HEAD_TOP_Y+0.15f+t1*1.00f;
         float x0=-VALVE_X-t0*0.85f, x1=-VALVE_X-t1*0.85f, r=0.18f;
-        int sg=10;
+        int sg=8;
         for (int s=0;s<sg;s++){ float a0=(float)(2*M_PI*s/sg),a1=(float)(2*M_PI*(s+1)/sg);
             float c0=cosf(a0),s0=sinf(a0),c1=cosf(a1),s1=sinf(a1);
             mesh_quad(&P_flow_in.mesh, x0+r*c0,y0,r*s0, x0+r*c1,y0,r*s1, x1+r*c1,y1,r*s1, x1+r*c0,y1,r*s0); }
     }
-    for (int k = 0; k < 6; k++) {
-        float t0=k/6.0f, t1=(k+1)/6.0f;
+    for (int k = 0; k < 5; k++) {
+        float t0=k/5.0f, t1=(k+1)/5.0f;
         float y0=HEAD_TOP_Y+0.15f+t0*1.00f, y1=HEAD_TOP_Y+0.15f+t1*1.00f;
         float x0=VALVE_X+t0*0.85f, x1=VALVE_X+t1*0.85f, r=0.16f;
-        int sg=10;
+        int sg=8;
         for (int s=0;s<sg;s++){ float a0=(float)(2*M_PI*s/sg),a1=(float)(2*M_PI*(s+1)/sg);
             float c0=cosf(a0),s0=sinf(a0),c1=cosf(a1),s1=sinf(a1);
             mesh_quad(&P_flow_ex.mesh, x0+r*c0,y0,r*s0, x1+r*c0,y1,r*s0, x1+r*c1,y1,r*s1, x0+r*c1,y0,r*s1); }
@@ -985,31 +1036,31 @@ static void build_ports(void)
 static void build_piston(void)
 {
     Mesh *m = &P_piston.mesh; mesh_init(m);
-    p_cyl_y(m, 0, 0, -0.70f, 0.60f, BORE_R - 0.03f, 28, 0);
-    p_disc_y(m, 0, 0.60f, 0, BORE_R - 0.03f, 0, 28, 0);
-    p_disc_y(m, 0, -0.70f, 0, BORE_R - 0.03f, 0.34f, 28, 1);
+    p_cyl_y(m, 0, 0, -0.70f, 0.60f, BORE_R - 0.03f, 22, 0);
+    p_disc_y(m, 0, 0.60f, 0, BORE_R - 0.03f, 0, 22, 0);
+    p_disc_y(m, 0, -0.70f, 0, BORE_R - 0.03f, 0.34f, 22, 1);
     for (int i = 0; i < 3; i++)
-        p_torus_y(m, 0, 0.36f - 0.17f*i, 0, BORE_R - 0.03f, 0.045f, 22, 6);
-    p_cyl_z(m, 0, 0, -0.55f, 0.55f, 0.19f, 14, 0);   /* wrist pin bosses */
-    p_cyl_z(m, 0, 0, -0.72f, 0.72f, 0.14f, 14, 3);   /* wrist pin */
+        p_torus_y(m, 0, 0.36f - 0.17f*i, 0, BORE_R - 0.03f, 0.045f, 16, 4);
+    p_cyl_z(m, 0, 0, -0.55f, 0.55f, 0.19f, 12, 0);   /* wrist pin bosses */
+    p_cyl_z(m, 0, 0, -0.72f, 0.72f, 0.14f, 12, 3);   /* wrist pin */
     part_set(&P_piston, MAT_piston, 0.40f, 0.22f, 1);
 }
 
 static void build_rod(void)
 {
     Mesh *m = &P_rod.mesh; mesh_init(m);
-    p_cyl_z(m, 0, 0, -0.30f, 0.30f, 0.55f, 22, 0);
-    p_torus_z(m, 0, 0, -0.30f, 0.55f, 0.09f, 18, 6);
-    p_torus_z(m, 0, 0,  0.30f, 0.55f, 0.09f, 18, 6);
-    p_disc_z(m, 0, 0, -0.30f, 0.55f, 0.36f, 22, 1);
-    p_disc_z(m, 0, 0,  0.30f, 0.55f, 0.36f, 22, 0);
-    p_cyl_z(m, 0, ROD_L, -0.22f, 0.22f, 0.28f, 18, 0);
-    p_torus_z(m, 0, ROD_L, -0.22f, 0.28f, 0.07f, 16, 6);
-    p_torus_z(m, 0, ROD_L,  0.22f, 0.28f, 0.07f, 16, 6);
-    p_disc_z(m, 0, ROD_L, -0.22f, 0.28f, 0.17f, 18, 1);
-    p_disc_z(m, 0, ROD_L,  0.22f, 0.28f, 0.17f, 18, 0);
-    for (int i = 0; i < 12; i++) {
-        float t0 = i/12.0f, t1 = (i+1)/12.0f;
+    p_cyl_z(m, 0, 0, -0.30f, 0.30f, 0.55f, 18, 0);
+    p_torus_z(m, 0, 0, -0.30f, 0.55f, 0.09f, 14, 4);
+    p_torus_z(m, 0, 0,  0.30f, 0.55f, 0.09f, 14, 4);
+    p_disc_z(m, 0, 0, -0.30f, 0.55f, 0.36f, 16, 1);
+    p_disc_z(m, 0, 0,  0.30f, 0.55f, 0.36f, 16, 0);
+    p_cyl_z(m, 0, ROD_L, -0.22f, 0.22f, 0.28f, 14, 0);
+    p_torus_z(m, 0, ROD_L, -0.22f, 0.28f, 0.07f, 12, 4);
+    p_torus_z(m, 0, ROD_L,  0.22f, 0.28f, 0.07f, 12, 4);
+    p_disc_z(m, 0, ROD_L, -0.22f, 0.28f, 0.17f, 14, 1);
+    p_disc_z(m, 0, ROD_L,  0.22f, 0.28f, 0.17f, 14, 0);
+    for (int i = 0; i < 7; i++) {
+        float t0 = i/7.0f, t1 = (i+1)/7.0f;
         float y0 = 0.45f + t0*(ROD_L-0.90f), y1 = 0.45f + t1*(ROD_L-0.90f);
         float w0 = 0.34f - 0.09f*t0, h0 = 0.13f - 0.04f*t0;
         p_box(m, 0, (y0+y1)*0.5f, 0, w0*0.45f, (y1-y0)*0.5f, h0);
@@ -1026,12 +1077,12 @@ static void build_rod(void)
 static void build_valve(Part *p, const GLfloat color[4])
 {
     Mesh *m = &p->mesh; mesh_init(m);
-    p_cone_y(m, 0, 0, 0.0f, VALVE_HEAD_T, VALVE_HEAD_R, VALVE_HEAD_R*0.55f, 22);
-    p_disc_y(m, 0, 0.0f, 0, VALVE_HEAD_R, 0, 22, 1);
-    p_cyl_y(m, 0, 0, VALVE_HEAD_T, 1.55f, VALVE_STEM_R, 10, 0);   /* stem */
-    p_cyl_y(m, 0, 0, 1.18f, 1.30f, 0.30f, 16, 3);                 /* spring retainer */
-    p_tube_y(m, 0, 0, 1.32f, 1.57f, 0.26f, 0.20f, 16);            /* bucket tappet cup */
-    p_disc_y(m, 0, 1.57f, 0, 0.26f, 0, 16, 0);                    /* bucket top / cam pad */
+    p_cone_y(m, 0, 0, 0.0f, VALVE_HEAD_T, VALVE_HEAD_R, VALVE_HEAD_R*0.55f, 16);
+    p_disc_y(m, 0, 0.0f, 0, VALVE_HEAD_R, 0, 16, 1);
+    p_cyl_y(m, 0, 0, VALVE_HEAD_T, 1.55f, VALVE_STEM_R, 8, 0);   /* stem */
+    p_cyl_y(m, 0, 0, 1.18f, 1.30f, 0.30f, 12, 3);                 /* spring retainer */
+    p_tube_y(m, 0, 0, 1.32f, 1.57f, 0.26f, 0.20f, 12);            /* bucket tappet cup */
+    p_disc_y(m, 0, 1.57f, 0, 0.26f, 0, 12, 0);                    /* bucket top / cam pad */
     part_set(p, color, 0.65f, 0.20f, 1);
 }
 
@@ -1041,10 +1092,10 @@ static void build_springs(void)
      * (world VALVE_SEAT_Y + 1.18 = SPRING_SEAT_Y + 0.58), so they compress by
      * exactly the valve lift and stay clear of the camshaft. */
     mesh_init(&P_spring_in.mesh);
-    p_spring_y(&P_spring_in.mesh, 0, 0, SPRING_SEAT_Y, SPRING_SEAT_Y + 0.58f, 0.21f, 0.042f, 6, 16, 6);
+    p_spring_y(&P_spring_in.mesh, 0, 0, SPRING_SEAT_Y, SPRING_SEAT_Y + 0.58f, 0.21f, 0.042f, 6, 12, 4);
     part_set(&P_spring_in, MAT_spring, 0.50f, 0.18f, 1);
     mesh_init(&P_spring_ex.mesh);
-    p_spring_y(&P_spring_ex.mesh, 0, 0, SPRING_SEAT_Y, SPRING_SEAT_Y + 0.58f, 0.21f, 0.042f, 6, 16, 6);
+    p_spring_y(&P_spring_ex.mesh, 0, 0, SPRING_SEAT_Y, SPRING_SEAT_Y + 0.58f, 0.21f, 0.042f, 6, 12, 4);
     part_set(&P_spring_ex, MAT_spring, 0.50f, 0.18f, 1);
 }
 
@@ -1057,13 +1108,13 @@ static void build_charge_flame(void)
      *   P_chamber_gas : the fixed domed combustion-chamber volume above the deck
      * Together they fill from the crown up into the domed chamber roof. */
     mesh_init(&P_charge.mesh);
-    p_cyl_y(&P_charge.mesh, 0, 0, -0.5f, 0.5f, BORE_R - 0.06f, 22, 3);
+    p_cyl_y(&P_charge.mesh, 0, 0, -0.5f, 0.5f, BORE_R - 0.06f, 18, 3);
     part_set(&P_charge, charge_color, 0.05f, 0.35f, 1);
 
     /* fixed domed chamber volume (template at z=0, instanced per cylinder) */
     mesh_init(&P_chamber_gas.mesh);
-    p_chamber_dome(&P_chamber_gas.mesh, 0, DECK_Y, CHAMBER_CEIL, BORE_R - 0.06f, 26, 6);
-    p_disc_y(&P_chamber_gas.mesh, 0, DECK_Y, 0, BORE_R - 0.06f, 0, 26, 1);
+    p_chamber_dome(&P_chamber_gas.mesh, 0, DECK_Y, CHAMBER_CEIL, BORE_R - 0.06f, 20, 5);
+    p_disc_y(&P_chamber_gas.mesh, 0, DECK_Y, 0, BORE_R - 0.06f, 0, 20, 1);
     part_set(&P_chamber_gas, charge_color, 0.05f, 0.35f, 1);
 }
 
@@ -1454,6 +1505,13 @@ static void draw_charges(void)
         float ph = cyl_phase(i, crank_angle);
         float burn = burn_intensity(ph);
         charge_color_for(ph, burn, charge_color);
+        /* A charge whose alpha has faded to ~0 (late exhaust stroke) blends to
+         * nothing over the internals, but still costs two full translucent
+         * raster draws (read-modify-write over the whole bore column + dome).
+         * Skipping it is pixel-identical and removes the cheapest-looking but
+         * most overdrawn pass-2 draws. */
+        if (charge_color[3] <= 0.02f)
+            continue;
         float emis = 0.35f + 0.65f*charge_color[3];
         P_charge.color[0]=charge_color[0]; P_charge.color[1]=charge_color[1];
         P_charge.color[2]=charge_color[2]; P_charge.color[3]=charge_color[3];
