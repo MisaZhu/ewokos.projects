@@ -388,6 +388,37 @@ static void p_disc_y(Mesh *m, float cx,float cy,float cz, float r_out,float r_in
     }
 }
 
+/* Disc/annulus lying in the XY plane with its normal along Z (matches
+ * p_cyl_z's cap orientation).  flip=0 -> +Z normal, flip=1 -> -Z normal. */
+static void p_disc_z(Mesh *m, float cx,float cy,float cz, float r_out,float r_in, int segs, int flip)
+{
+    float nz = flip ? -1.0f : 1.0f;
+    if (segs < 3) segs = 3;
+    for (int i = 0; i < segs; i++) {
+        float a0=(float)(2*M_PI*i/segs), a1=(float)(2*M_PI*(i+1)/segs);
+        float c0=cosf(a0),s0=sinf(a0),c1=cosf(a1),s1=sinf(a1);
+        mesh_reserve(m,6);
+        if (r_in > 0.0f) {
+            if (!flip) {
+                mesh_v(m,cx+r_out*c0,cy+r_out*s0,cz,0,0,nz); mesh_v(m,cx+r_out*c1,cy+r_out*s1,cz,0,0,nz);
+                mesh_v(m,cx+r_in*c1,cy+r_in*s1,cz,0,0,nz);
+                mesh_v(m,cx+r_out*c0,cy+r_out*s0,cz,0,0,nz); mesh_v(m,cx+r_in*c1,cy+r_in*s1,cz,0,0,nz);
+                mesh_v(m,cx+r_in*c0,cy+r_in*s0,cz,0,0,nz);
+            } else {
+                mesh_v(m,cx+r_out*c0,cy+r_out*s0,cz,0,0,nz); mesh_v(m,cx+r_in*c0,cy+r_in*s0,cz,0,0,nz);
+                mesh_v(m,cx+r_in*c1,cy+r_in*s1,cz,0,0,nz);
+                mesh_v(m,cx+r_out*c0,cy+r_out*s0,cz,0,0,nz); mesh_v(m,cx+r_in*c1,cy+r_in*s1,cz,0,0,nz);
+                mesh_v(m,cx+r_out*c1,cy+r_out*s1,cz,0,0,nz);
+            }
+        } else {
+            if (!flip) { mesh_v(m,cx,cy,cz,0,0,nz); mesh_v(m,cx+r_out*c0,cy+r_out*s0,cz,0,0,nz);
+                         mesh_v(m,cx+r_out*c1,cy+r_out*s1,cz,0,0,nz); }
+            else       { mesh_v(m,cx,cy,cz,0,0,nz); mesh_v(m,cx+r_out*c1,cy+r_out*s1,cz,0,0,nz);
+                         mesh_v(m,cx+r_out*c0,cy+r_out*s0,cz,0,0,nz); }
+        }
+    }
+}
+
 /* Downward-facing combustion-chamber roof: a shallow dome revolved from the
  * bore rim (radius r_rim at height y_rim) up to the chamber ceiling y_top at
  * the centre.  Normals point down into the chamber so the roof is lit from
@@ -453,6 +484,31 @@ static void p_torus_y(Mesh *m, float cx,float cy,float cz, float R,float r, int 
             mesh_v(m,cx+r0*cu0,cy+r*sv0,cz+r0*su0, cv0*cu0,sv0,cv0*su0);
             mesh_v(m,cx+r1*cu1,cy+r*sv1,cz+r1*su1, cv1*cu1,sv1,cv1*su1);
             mesh_v(m,cx+r1*cu0,cy+r*sv1,cz+r1*su0, cv1*cu0,sv1,cv1*su0);
+        }
+    }
+}
+
+/* Torus whose axis of symmetry is Z (major circle sweeps in the XY plane).
+ * Used for rims that wrap around cylinders extruded along Z (flywheel, nose
+ * pulley, rod big/small end eyes), matching p_cyl_z's orientation. */
+static void p_torus_z(Mesh *m, float cx,float cy,float cz, float R,float r, int su,int sv)
+{
+    if (su<3) su=3;
+    if (sv<3) sv=3;
+    for (int i=0;i<su;i++){
+        float u0=(float)(2*M_PI*i/su),u1=(float)(2*M_PI*(i+1)/su);
+        float cu0=cosf(u0),su0=sinf(u0),cu1=cosf(u1),su1=sinf(u1);
+        for (int j=0;j<sv;j++){
+            float v0=(float)(2*M_PI*j/sv),v1=(float)(2*M_PI*(j+1)/sv);
+            float cv0=cosf(v0),sv0=sinf(v0),cv1=cosf(v1),sv1=sinf(v1);
+            float r0=R+r*cv0, r1=R+r*cv1;
+            mesh_reserve(m,6);
+            mesh_v(m,cx+r0*cu0,cy+r0*su0,cz+r*sv0, cv0*cu0,cv0*su0,sv0);
+            mesh_v(m,cx+r0*cu1,cy+r0*su1,cz+r*sv0, cv0*cu1,cv0*su1,sv0);
+            mesh_v(m,cx+r1*cu1,cy+r1*su1,cz+r*sv1, cv1*cu1,cv1*su1,sv1);
+            mesh_v(m,cx+r0*cu0,cy+r0*su0,cz+r*sv0, cv0*cu0,cv0*su0,sv0);
+            mesh_v(m,cx+r1*cu1,cy+r1*su1,cz+r*sv1, cv1*cu1,cv1*su1,sv1);
+            mesh_v(m,cx+r1*cu0,cy+r1*su0,cz+r*sv1, cv1*cu0,cv1*su0,sv1);
         }
     }
 }
@@ -591,29 +647,34 @@ static Part P_piston, P_rod, P_valve_in, P_valve_ex, P_spring_in, P_spring_ex;
 static Part P_flow_in, P_flow_ex, P_charge, P_chamber_gas;
 
 /* ---------------- material presets ----------------------------------------- */
-static const GLfloat MAT_block[4]      = { 0.72f, 0.73f, 0.76f, 0.22f };
-static const GLfloat MAT_head[4]       = { 0.68f, 0.70f, 0.74f, 0.22f };
-static const GLfloat MAT_camcover[4]   = { 0.55f, 0.57f, 0.62f, 0.24f };
-static const GLfloat MAT_crankcase[4]  = { 0.42f, 0.43f, 0.47f, 0.24f };
-static const GLfloat MAT_liner[4]      = { 0.55f, 0.58f, 0.62f, 0.13f };  /* very clear so piston shows */
-static const GLfloat MAT_piston[4]     = { 0.70f, 0.70f, 0.72f, 1.00f };
-static const GLfloat MAT_rod[4]        = { 0.56f, 0.57f, 0.61f, 1.00f };
-static const GLfloat MAT_crank[4]      = { 0.44f, 0.45f, 0.49f, 1.00f };
-static const GLfloat MAT_valve_in[4]   = { 0.74f, 0.75f, 0.78f, 1.00f };
-static const GLfloat MAT_valve_ex[4]   = { 0.64f, 0.56f, 0.48f, 1.00f };
-static const GLfloat MAT_spring[4]     = { 0.30f, 0.32f, 0.36f, 1.00f };
-static const GLfloat MAT_cam[4]        = { 0.52f, 0.54f, 0.58f, 1.00f };
-static const GLfloat MAT_plug_cer[4]   = { 0.92f, 0.88f, 0.78f, 1.00f };
-static const GLfloat MAT_copper[4]     = { 0.80f, 0.46f, 0.22f, 1.00f };
-static const GLfloat MAT_port_in[4]    = { 0.34f, 0.42f, 0.56f, 1.00f };
-static const GLfloat MAT_port_ex[4]    = { 0.56f, 0.38f, 0.31f, 1.00f };
-static const GLfloat MAT_flow_in[4]    = { 0.35f, 0.65f, 1.00f, 0.55f };
-static const GLfloat MAT_flow_ex[4]    = { 0.60f, 0.60f, 0.64f, 0.55f };
-static const GLfloat MAT_base[4]       = { 0.28f, 0.29f, 0.32f, 1.00f };
-static const GLfloat MAT_bolt[4]       = { 0.26f, 0.27f, 0.30f, 1.00f };
-static const GLfloat MAT_sprocket[4]   = { 0.50f, 0.51f, 0.55f, 1.00f };
-static const GLfloat MAT_belt[4]       = { 0.12f, 0.12f, 0.13f, 1.00f };
-static GLfloat charge_color[4]         = { 0.35f, 0.55f, 0.95f, 0.35f };
+/* Each component gets a distinct hue so the cutaway reads at a glance:
+ *   cast aluminum (block / head / cam cover), hardened steel (liner, valves,
+ *   springs), forged steel (rod, crank), ceramic (plug), copper (electrode),
+ *   green intake tract + green in-cylinder air/fuel charge, warm rust exhaust
+ *   tract + smoky exhaust gas, dark oil pan and rubber belt. */
+static const GLfloat MAT_block[4]      = { 0.82f, 0.84f, 0.90f, 0.24f };  /* cool cast aluminum, semi transparent */
+static const GLfloat MAT_head[4]       = { 0.90f, 0.84f, 0.74f, 0.24f };  /* warm aluminum head casting */
+static const GLfloat MAT_camcover[4]   = { 0.80f, 0.68f, 0.50f, 0.26f };  /* bronze-tinted magnesium cover */
+static const GLfloat MAT_crankcase[4]  = { 0.48f, 0.54f, 0.66f, 0.26f };  /* bluish cast-iron crankcase */
+static const GLfloat MAT_liner[4]      = { 0.70f, 0.82f, 0.96f, 0.14f };  /* hardened steel liner, very clear */
+static const GLfloat MAT_piston[4]     = { 1.00f, 0.97f, 0.90f, 1.00f };  /* bright forged aluminum piston */
+static const GLfloat MAT_rod[4]        = { 0.72f, 0.82f, 1.00f, 1.00f };  /* forged steel rod, bright blue tint */
+static const GLfloat MAT_crank[4]      = { 0.68f, 0.62f, 0.78f, 1.00f };  /* forged steel crank, bright purple tint */
+static const GLfloat MAT_valve_in[4]   = { 0.96f, 1.00f, 1.00f, 1.00f };  /* polished stainless intake valve */
+static const GLfloat MAT_valve_ex[4]   = { 1.00f, 0.76f, 0.48f, 1.00f };  /* inconel exhaust valve, warm bright */
+static const GLfloat MAT_spring[4]     = { 0.66f, 0.72f, 0.82f, 1.00f };  /* spring steel, lifted */
+static const GLfloat MAT_cam[4]        = { 0.82f, 0.74f, 0.94f, 1.00f };  /* chilled iron camshaft, bright */
+static const GLfloat MAT_plug_cer[4]   = { 1.00f, 0.96f, 0.86f, 1.00f };  /* ceramic insulator */
+static const GLfloat MAT_copper[4]     = { 1.00f, 0.58f, 0.26f, 1.00f };  /* copper electrode */
+static const GLfloat MAT_port_in[4]    = { 0.32f, 0.92f, 0.42f, 0.42f };  /* intake runner: translucent bright green */
+static const GLfloat MAT_port_ex[4]    = { 0.88f, 0.44f, 0.26f, 0.42f };  /* exhaust header: translucent warm rust */
+static const GLfloat MAT_flow_in[4]    = { 0.45f, 1.00f, 0.50f, 0.90f };  /* intake air stream: bright green */
+static const GLfloat MAT_flow_ex[4]    = { 0.72f, 0.62f, 0.56f, 0.70f };  /* exhaust gas: smoky warm gray */
+static const GLfloat MAT_base[4]       = { 0.34f, 0.42f, 0.56f, 1.00f };  /* oil pan: deep steel blue */
+static const GLfloat MAT_bolt[4]       = { 0.42f, 0.42f, 0.48f, 1.00f };  /* dark zinc hardware */
+static const GLfloat MAT_sprocket[4]   = { 0.76f, 0.72f, 0.62f, 1.00f };  /* machined steel sprocket */
+static const GLfloat MAT_belt[4]       = { 0.20f, 0.20f, 0.24f, 1.00f };  /* rubber timing belt */
+static GLfloat charge_color[4]         = { 0.40f, 1.00f, 0.45f, 0.55f };  /* default: bright green intake charge */
 
 static void part_set(Part *p, const GLfloat c[4], GLfloat spec, GLfloat emis, int dyn)
 {
@@ -769,11 +830,11 @@ static void build_crank(void)
     }
     /* flywheel (-Z) and nose pulley (+Z) */
     p_cyl_z(m, 0, 0, zmin - 0.45f, zmin, 1.15f, 28, 3);
-    p_torus_y(m, 0, 0, zmin - 0.45f, 1.15f, 0.07f, 24, 6);
+    p_torus_z(m, 0, 0, zmin - 0.45f, 1.15f, 0.07f, 24, 6);
     p_cyl_z(m, 0, 0, zmax, zmax + 0.35f, 0.78f, 24, 3);
-    p_torus_y(m, 0, 0, zmax + 0.35f, 0.78f, 0.06f, 20, 6);
+    p_torus_z(m, 0, 0, zmax + 0.35f, 0.78f, 0.06f, 20, 6);
     p_cyl_z(m, 0, 0, zmax + 0.35f, TIM_Z1, 0.24f, 12, 0);  /* nose carrying the timing sprocket */
-    part_set(&P_crank, MAT_crank, 0.55f, 0.0f, 1);
+    part_set(&P_crank, MAT_crank, 0.55f, 0.14f, 1);
 }
 
 /* Cam lobe radius profile: smooth cos^2 nose centred at local angle -pi/2. */
@@ -821,9 +882,9 @@ static void build_camshaft(Mesh *m, int exhaust)
 static void build_cams(void)
 {
     build_camshaft(&P_cam_in.mesh, 0);
-    part_set(&P_cam_in, MAT_cam, 0.55f, 0.0f, 1);
+    part_set(&P_cam_in, MAT_cam, 0.55f, 0.18f, 1);
     build_camshaft(&P_cam_ex.mesh, 1);
-    part_set(&P_cam_ex, MAT_cam, 0.55f, 0.0f, 1);
+    part_set(&P_cam_ex, MAT_cam, 0.55f, 0.18f, 1);
 }
 
 /* Spark plugs (4) and their electrodes. */
@@ -887,8 +948,8 @@ static void build_ports(void)
         }
         p_box(&P_port_ex.mesh, VALVE_X+1.05f, HEAD_TOP_Y+1.22f, z, 0.40f, 0.07f, 0.40f);
     }
-    part_set(&P_port_in, MAT_port_in, 0.30f, 0.0f, 0);
-    part_set(&P_port_ex, MAT_port_ex, 0.30f, 0.0f, 0);
+    part_set(&P_port_in, MAT_port_in, 0.30f, 0.30f, 1);
+    part_set(&P_port_ex, MAT_port_ex, 0.30f, 0.18f, 1);
 
     /* flow tubes built at z=0, instanced per cylinder */
     for (int k = 0; k < 6; k++) {
@@ -909,8 +970,8 @@ static void build_ports(void)
             float c0=cosf(a0),s0=sinf(a0),c1=cosf(a1),s1=sinf(a1);
             mesh_quad(&P_flow_ex.mesh, x0+r*c0,y0,r*s0, x1+r*c0,y1,r*s0, x1+r*c1,y1,r*s1, x0+r*c1,y0,r*s1); }
     }
-    part_set(&P_flow_in, MAT_flow_in, 0.10f, 0.40f, 1);
-    part_set(&P_flow_ex, MAT_flow_ex, 0.10f, 0.30f, 1);
+    part_set(&P_flow_in, MAT_flow_in, 0.10f, 0.70f, 1);
+    part_set(&P_flow_ex, MAT_flow_ex, 0.10f, 0.45f, 1);
 }
 
 /* ---------------- per-cylinder template builders --------------------------- */
@@ -925,22 +986,22 @@ static void build_piston(void)
         p_torus_y(m, 0, 0.36f - 0.17f*i, 0, BORE_R - 0.03f, 0.045f, 22, 6);
     p_cyl_z(m, 0, 0, -0.55f, 0.55f, 0.19f, 14, 0);   /* wrist pin bosses */
     p_cyl_z(m, 0, 0, -0.72f, 0.72f, 0.14f, 14, 3);   /* wrist pin */
-    part_set(&P_piston, MAT_piston, 0.40f, 0.0f, 1);
+    part_set(&P_piston, MAT_piston, 0.40f, 0.22f, 1);
 }
 
 static void build_rod(void)
 {
     Mesh *m = &P_rod.mesh; mesh_init(m);
     p_cyl_z(m, 0, 0, -0.30f, 0.30f, 0.55f, 22, 0);
-    p_torus_y(m, 0, 0, -0.30f, 0.55f, 0.09f, 18, 6);
-    p_torus_y(m, 0, 0,  0.30f, 0.55f, 0.09f, 18, 6);
-    p_disc_y(m, 0, 0, -0.30f, 0.55f, 0.36f, 22, 1);
-    p_disc_y(m, 0, 0,  0.30f, 0.55f, 0.36f, 22, 0);
+    p_torus_z(m, 0, 0, -0.30f, 0.55f, 0.09f, 18, 6);
+    p_torus_z(m, 0, 0,  0.30f, 0.55f, 0.09f, 18, 6);
+    p_disc_z(m, 0, 0, -0.30f, 0.55f, 0.36f, 22, 1);
+    p_disc_z(m, 0, 0,  0.30f, 0.55f, 0.36f, 22, 0);
     p_cyl_z(m, 0, ROD_L, -0.22f, 0.22f, 0.28f, 18, 0);
-    p_torus_y(m, 0, ROD_L, -0.22f, 0.28f, 0.07f, 16, 6);
-    p_torus_y(m, 0, ROD_L,  0.22f, 0.28f, 0.07f, 16, 6);
-    p_disc_y(m, 0, ROD_L, -0.22f, 0.28f, 0.17f, 18, 1);
-    p_disc_y(m, 0, ROD_L,  0.22f, 0.28f, 0.17f, 18, 0);
+    p_torus_z(m, 0, ROD_L, -0.22f, 0.28f, 0.07f, 16, 6);
+    p_torus_z(m, 0, ROD_L,  0.22f, 0.28f, 0.07f, 16, 6);
+    p_disc_z(m, 0, ROD_L, -0.22f, 0.28f, 0.17f, 18, 1);
+    p_disc_z(m, 0, ROD_L,  0.22f, 0.28f, 0.17f, 18, 0);
     for (int i = 0; i < 12; i++) {
         float t0 = i/12.0f, t1 = (i+1)/12.0f;
         float y0 = 0.45f + t0*(ROD_L-0.90f), y1 = 0.45f + t1*(ROD_L-0.90f);
@@ -949,7 +1010,7 @@ static void build_rod(void)
         p_box(m, 0, (y0+y1)*0.5f,  h0+0.04f, w0*0.5f, (y1-y0)*0.5f, 0.04f);
         p_box(m, 0, (y0+y1)*0.5f, -h0-0.04f, w0*0.5f, (y1-y0)*0.5f, 0.04f);
     }
-    part_set(&P_rod, MAT_rod, 0.45f, 0.0f, 1);
+    part_set(&P_rod, MAT_rod, 0.45f, 0.18f, 1);
 }
 
 /* Valve + spring retainer + bucket tappet, in valve-local coordinates.  The
@@ -965,7 +1026,7 @@ static void build_valve(Part *p, const GLfloat color[4])
     p_cyl_y(m, 0, 0, 1.18f, 1.30f, 0.30f, 16, 3);                 /* spring retainer */
     p_tube_y(m, 0, 0, 1.32f, 1.57f, 0.26f, 0.20f, 16);            /* bucket tappet cup */
     p_disc_y(m, 0, 1.57f, 0, 0.26f, 0, 16, 0);                    /* bucket top / cam pad */
-    part_set(p, color, 0.65f, 0.0f, 1);
+    part_set(p, color, 0.65f, 0.20f, 1);
 }
 
 static void build_springs(void)
@@ -975,10 +1036,10 @@ static void build_springs(void)
      * exactly the valve lift and stay clear of the camshaft. */
     mesh_init(&P_spring_in.mesh);
     p_spring_y(&P_spring_in.mesh, 0, 0, SPRING_SEAT_Y, SPRING_SEAT_Y + 0.58f, 0.21f, 0.042f, 6, 16, 6);
-    part_set(&P_spring_in, MAT_spring, 0.50f, 0.0f, 1);
+    part_set(&P_spring_in, MAT_spring, 0.50f, 0.18f, 1);
     mesh_init(&P_spring_ex.mesh);
     p_spring_y(&P_spring_ex.mesh, 0, 0, SPRING_SEAT_Y, SPRING_SEAT_Y + 0.58f, 0.21f, 0.042f, 6, 16, 6);
-    part_set(&P_spring_ex, MAT_spring, 0.50f, 0.0f, 1);
+    part_set(&P_spring_ex, MAT_spring, 0.50f, 0.18f, 1);
 }
 
 static void build_charge_flame(void)
@@ -1007,24 +1068,29 @@ static void build_timing(void)
 {
     mesh_init(&P_spr_crank.mesh);
     p_sprocket_z(&P_spr_crank.mesh, 0, 0, TIM_Z0, TIM_Z1, SPR_CRANK_R, 16, 0.13f);
-    part_set(&P_spr_crank, MAT_sprocket, 0.55f, 0.0f, 1);
+    part_set(&P_spr_crank, MAT_sprocket, 0.55f, 0.14f, 1);
 
     mesh_init(&P_spr_cam_in.mesh);
     p_sprocket_z(&P_spr_cam_in.mesh, 0, 0, TIM_Z0, TIM_Z1, SPR_CAM_R, 32, 0.20f);
-    part_set(&P_spr_cam_in, MAT_sprocket, 0.55f, 0.0f, 1);
+    part_set(&P_spr_cam_in, MAT_sprocket, 0.55f, 0.14f, 1);
 
     mesh_init(&P_spr_cam_ex.mesh);
     p_sprocket_z(&P_spr_cam_ex.mesh, 0, 0, TIM_Z0, TIM_Z1, SPR_CAM_R, 32, 0.20f);
-    part_set(&P_spr_cam_ex, MAT_sprocket, 0.55f, 0.0f, 1);
+    part_set(&P_spr_cam_ex, MAT_sprocket, 0.55f, 0.14f, 1);
 
     mesh_init(&P_tensioner.mesh);
     p_sprocket_z(&P_tensioner.mesh, 0, 0, TIM_Z0, TIM_Z1, TENS_R, 16, 0.12f);
-    part_set(&P_tensioner, MAT_sprocket, 0.45f, 0.0f, 1);
+    part_set(&P_tensioner, MAT_sprocket, 0.45f, 0.14f, 1);
 
+    /* Belt centreline must sit outside the sprocket tooth tips (pitch_r + 0.10)
+     * by half the belt thickness (0.09/2 = 0.045), otherwise the teeth poke
+     * through the ribbon.  Keep the 0.145f offset in sync with p_sprocket_z's
+     * tip height and the belt thickness passed to build_belt below. */
     /* belt looped CCW: crank -> tensioner -> exhaust cam -> intake cam */
     static const float bx[4] = { 0.0f, TENS_X,  VALVE_X, -VALVE_X };
     static const float by[4] = { 0.0f, TENS_Y,  CAM_Y,     CAM_Y   };
-    static const float br[4] = { SPR_CRANK_R, TENS_R, SPR_CAM_R, SPR_CAM_R };
+    static const float br[4] = { SPR_CRANK_R + 0.145f, TENS_R + 0.145f,
+                                 SPR_CAM_R   + 0.145f, SPR_CAM_R + 0.145f };
     mesh_init(&P_belt.mesh);
     build_belt(&P_belt.mesh, bx, by, br, 4, TIM_ZC, 0.20f, 0.09f);
     part_set(&P_belt, MAT_belt, 0.15f, 0.0f, 1);
@@ -1154,17 +1220,21 @@ static float spark_intensity(float phase)
     return sinf(t * (float)M_PI);
 }
 
-/* Mixture colour by stroke for one cylinder's phase. */
+/* Mixture colour by stroke for one cylinder's phase.
+ *   intake      (0..180)   green air/fuel charge flowing in
+ *   compression (180..360) green -> warm yellow as the mix heats up
+ *   power       (360..540) burning orange/yellow flame front (handled above)
+ *   exhaust     (540..720) fading smoky gray */
 static void charge_color_for(float phase, float burn, GLfloat out[4])
 {
     if (burn > 0.01f) {
         out[0]=1.00f; out[1]=0.40f+0.20f*(1.0f-burn); out[2]=0.12f; out[3]=0.30f*(1.0f-burn*0.6f);
     } else if (phase < 180.0f) {
         float t = phase/180.0f;
-        out[0]=0.30f; out[1]=0.55f; out[2]=0.95f; out[3]=0.16f+0.20f*t;
+        out[0]=0.30f; out[1]=1.00f; out[2]=0.42f; out[3]=0.40f+0.25f*t;
     } else if (phase < 360.0f) {
         float t = (phase-180.0f)/180.0f;
-        out[0]=0.30f+0.25f*t; out[1]=0.55f-0.10f*t; out[2]=0.95f-0.30f*t; out[3]=0.36f+0.16f*t;
+        out[0]=0.30f+0.70f*t; out[1]=1.00f-0.20f*t; out[2]=0.42f-0.20f*t; out[3]=0.65f+0.10f*t;
     } else if (phase < 540.0f) {
         float t = (phase-360.0f)/180.0f;
         out[0]=0.75f-0.20f*t; out[1]=0.55f-0.10f*t; out[2]=0.35f; out[3]=0.34f-0.14f*t;
@@ -1249,7 +1319,7 @@ static void init_gl(void)
 
     float ll = sqrtf(light_world[0]*light_world[0]+light_world[1]*light_world[1]+light_world[2]*light_world[2]);
     if (ll > 0) { light_world[0]/=ll; light_world[1]/=ll; light_world[2]/=ll; }
-    glUniform4f(loc_shade, 0.24f, 0.85f, 0.55f, 0.0f);
+    glUniform4f(loc_shade, 0.58f, 1.00f, 0.70f, 0.0f);
 
     m_perspective(projection_matrix, 50.0f, (GLfloat)win_width/(GLfloat)win_height, 0.5f, 300.0f);
     glViewport(0, 0, win_width, win_height);
@@ -1309,8 +1379,8 @@ static void draw_opaque(void)
     draw_part(&P_plug_tip, model);
     draw_part(&P_boltset, model);
     draw_part(&P_baseplate, model);
-    draw_part(&P_port_in, model);
-    draw_part(&P_port_ex, model);
+    /* intake/exhaust runners are drawn in the translucent pass (draw_flows) so
+     * the coloured flow streams inside them stay visible. */
 
     /* per-cylinder moving parts */
     for (int i = 0; i < NCYL; i++) {
@@ -1370,7 +1440,7 @@ static void draw_charges(void)
         float ph = cyl_phase(i, crank_angle);
         float burn = burn_intensity(ph);
         charge_color_for(ph, burn, charge_color);
-        float emis = 0.22f + 0.45f*charge_color[3];
+        float emis = 0.35f + 0.65f*charge_color[3];
         P_charge.color[0]=charge_color[0]; P_charge.color[1]=charge_color[1];
         P_charge.color[2]=charge_color[2]; P_charge.color[3]=charge_color[3];
         P_charge.emissive = emis;
@@ -1407,6 +1477,13 @@ static void draw_shells(void)
 
 static void draw_flows(void)
 {
+    /* translucent intake/exhaust runners first so the flow streams inside them
+     * read through the walls; both are already modelled at their world position
+     * so no per-cylinder transform is needed here. */
+    GLfloat ident[16]; ident_model(ident);
+    draw_part(&P_port_in, ident);
+    draw_part(&P_port_ex, ident);
+
     for (int i = 0; i < NCYL; i++) {
         float ph = cyl_phase(i, crank_angle);
         float li = valve_lift(ph, INTAKE_PEAK,  VALVE_DUR, MAX_LIFT);
@@ -1414,13 +1491,13 @@ static void draw_flows(void)
         GLfloat model[16]; ident_model(model);
         m_translate(model, 0, 0, cyl_z[i]);
         if (li > 0.01f) {
-            P_flow_in.color[3] = 0.55f*(li/MAX_LIFT);
-            P_flow_in.emissive = 0.45f*(li/MAX_LIFT);
+            P_flow_in.color[3] = 0.95f*(li/MAX_LIFT);
+            P_flow_in.emissive = 0.85f*(li/MAX_LIFT);
             draw_part(&P_flow_in, model);
         }
         if (le > 0.01f) {
-            P_flow_ex.color[3] = 0.55f*(le/MAX_LIFT);
-            P_flow_ex.emissive = 0.35f*(le/MAX_LIFT);
+            P_flow_ex.color[3] = 0.85f*(le/MAX_LIFT);
+            P_flow_ex.emissive = 0.55f*(le/MAX_LIFT);
             draw_part(&P_flow_ex, model);
         }
     }
@@ -1499,7 +1576,7 @@ static void render_frame(void)
     camera_angle += CAM_ORBIT_DPS*dt;
     if (camera_angle >= 360.0f) camera_angle -= 360.0f;
 
-    glClearColor(0.05f, 0.06f, 0.08f, 1.0f);
+    glClearColor(0.10f, 0.13f, 0.18f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     compute_camera();
 

@@ -647,13 +647,12 @@ static void render_frame()
 
     // --- Render the 3D viewport into its sub-rectangle --------------------
     glEnable(GL_SCISSOR_TEST);
-    // GLES scissor origin is bottom-left; our rect is top-left.
-    glScissor(vp_rect.x, win_height - (vp_rect.y + vp_rect.h),
-              vp_rect.w, vp_rect.h);
     if (g_viewport) {
-        g_viewport->resize(vp_rect.w, vp_rect.h);
-        glViewport(vp_rect.x, win_height - (vp_rect.y + vp_rect.h),
-                   vp_rect.w, vp_rect.h);
+        // GLES scissor/viewport origin is bottom-left; our rect is top-left.
+        // The viewport derives every GL rectangle (clear + corner gizmo) from
+        // this origin, so the clear always covers the whole panel rect.
+        g_viewport->resize(vp_rect.x, win_height - (vp_rect.y + vp_rect.h),
+                           vp_rect.w, vp_rect.h);
         unsigned int overlays = g_ui ? g_ui->overlays() : OVERLAY_ALL;
         g_viewport->render(*g_scene, overlays);
     }

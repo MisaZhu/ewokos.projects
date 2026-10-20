@@ -305,7 +305,8 @@ float* build_wire_cube_edges(float half_extent, int* out_count)
 // ---------------------------------------------------------------------------
 
 Viewport::Viewport()
-    : width_(640), height_(480), initialised_(false), gpu_active_(false),
+    : origin_x_(0), origin_y_(0),
+      width_(640), height_(480), initialised_(false), gpu_active_(false),
       distance_(10.0f), azimuth_deg_(45.0f), elevation_deg_(25.0f),
       fov_deg_(39.598f),      // Blender's default 50mm-equivalent FOV
       near_(0.1f), far_(1000.0f),
@@ -366,8 +367,10 @@ void Viewport::shutdown()
     initialised_ = false;
 }
 
-void Viewport::resize(int width, int height)
+void Viewport::resize(int gl_x, int gl_y, int width, int height)
 {
+    origin_x_ = gl_x;
+    origin_y_ = gl_y;
     width_  = width  > 0 ? width  : 1;
     height_ = height > 0 ? height : 1;
 }
@@ -551,8 +554,11 @@ void Viewport::render(const Scene& scene, unsigned int overlays)
     float vp_bg[3];
     rgb_to_float(theme::palette.viewport, vp_bg);
 
-    glViewport(0, 0, width_, height_);
-    glScissor(0, 0, width_, height_);
+    // Clear exactly the panel rectangle: an origin-less (0,0,w,h) rect here
+    // would leave the L-shaped gap between it and the panel unwritten, which
+    // shows stale back-buffer garbage after a resize realloc.
+    glViewport(origin_x_, origin_y_, width_, height_);
+    glScissor(origin_x_, origin_y_, width_, height_);
     glClearColor(vp_bg[0], vp_bg[1], vp_bg[2], 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -693,8 +699,8 @@ void Viewport::draw_gizmo()
     if (!vbo_gizmo_ || gizmo_vertex_count_ == 0) return;
 
     // Fixed viewport rectangle in the top-right corner, 80x80 px.
-    const int gx = width_ - 90;
-    const int gy = height_ - 90;
+    const int gx = origin_x_ + width_ - 90;
+    const int gy = origin_y_ + height_ - 90;
     const int gs = 80;
     glViewport(gx, gy, gs, gs);
     glScissor(gx, gy, gs, gs);
@@ -733,8 +739,8 @@ void Viewport::draw_gizmo()
 
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_DEPTH_TEST);
-    glViewport(0, 0, width_, height_);
-    glScissor(0, 0, width_, height_);
+    glViewport(origin_x_, origin_y_, width_, height_);
+    glScissor(origin_x_, origin_y_, width_, height_);
 }
 
 void Viewport::draw_mesh_object(const Mat4& vp, const Object& obj, bool wireframe)

@@ -44,7 +44,10 @@ public:
     void shutdown();
 
     // Resize the viewport (window resize / panel splitter drag).
-    void resize(int width, int height);
+    // (gl_x, gl_y) is the bottom-left origin of the viewport rectangle inside
+    // the framebuffer (GLES convention); the clear and the corner gizmo derive
+    // their rectangles from it so nothing lands outside the panel rect.
+    void resize(int gl_x, int gl_y, int width, int height);
 
     int width()  const { return width_; }
     int height() const { return height_; }
@@ -100,6 +103,7 @@ private:
     void draw_selection_outline(const Mat4& vp, const Object& obj);
     void draw_object_origin(const Mat4& vp, const Object& obj);
 
+    int   origin_x_, origin_y_;   // GL bottom-left origin of the panel rect
     int   width_, height_;
     bool  initialised_;
     bool  gpu_active_;

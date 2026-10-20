@@ -7119,11 +7119,23 @@ PGLDEF void pgl_DeleteVertexArrays(GLsizei n, const GLuint* arrays)
 PGLDEF void pgl_GenBuffers(GLsizei n, GLuint* buffers)
 {
     PGL_ERR(n < 0, GL_INVALID_VALUE);
+    /* Sentinel for .type on a slot that has never been through pgl_BindBuffer().
+       .type is stored as (target - GL_ARRAY_BUFFER) and is used as an index into
+       c->bound_buffers[] (length GL_NUM_BUFFER_TYPES - GL_ARRAY_BUFFER) by
+       pgl_DeleteBuffers(). cvec_extend_glBuffer() only realloc's - it does NOT
+       zero the new tail - so an unbound buffer's .type would otherwise hold
+       whatever garbage the previous heap occupant left behind, and DeleteBuffers
+       would index bound_buffers[] far out of the glContext (observed as a data
+       abort at c + garbage*4 + offsetof(bound_buffers) when yquake2's
+       GL3_Draw_ShutdownLocal deleted an ebo2D that had never been bound). */
+    const GLenum type_unbound = GL_NUM_BUFFER_TYPES - GL_ARRAY_BUFFER;
     //fill up empty slots first
     int j = 0;
     for (int i=1; i<c->buffers.size && j<n; ++i) {
         if (c->buffers.a[i].deleted) {
             c->buffers.a[i].deleted = GL_FALSE;
+            c->buffers.a[i].size = 0;
+            c->buffers.a[i].type = type_unbound;
             buffers[j++] = i;
         }
     }
@@ -7132,6 +7144,8 @@ PGLDEF void pgl_GenBuffers(GLsizei n, GLuint* buffers)
         int s = c->buffers.size;
         cvec_extend_glBuffer(&c->buffers, n-j);
         for (int i=s; j<n; i++) {
+            c->buffers.a[i].size = 0;
+            c->buffers.a[i].type = type_unbound;
             c->buffers.a[i].data = NULL;
             c->buffers.a[i].deleted = GL_FALSE;
             c->buffers.a[i].user_owned = GL_FALSE;
@@ -7151,8 +7165,15 @@ PGLDEF void pgl_DeleteBuffers(GLsizei n, const GLuint* buffers)
         // NOTE(rswinkle): type is stored as correct index not the raw enum value so no need to
         // subtract here see pgl_BindBuffer
         type = c->buffers.a[buffers[i]].type;
-        if (buffers[i] == c->bound_buffers[type])
+        /* A buffer that was generated but never bound (e.g. only ever bound
+           through a VAO, or only written via pgl_NamedBufferData) still carries
+           the type_unbound sentinel from pgl_GenBuffers. Bound-check before
+           indexing bound_buffers[] - the array is only
+           GL_NUM_BUFFER_TYPES - GL_ARRAY_BUFFER entries wide. */
+        if (type < GL_NUM_BUFFER_TYPES - GL_ARRAY_BUFFER &&
+            buffers[i] == c->bound_buffers[type]) {
             c->bound_buffers[type] = 0;
+        }
 
         if (!c->buffers.a[buffers[i]].user_owned) {
             PGL_FREE(c->buffers.a[buffers[i]].data);
