@@ -65,8 +65,7 @@
  * too. This is the canonical position mesa itself uses, so no vendored file is
  * modified.
  *
- * This is platform-INDEPENDENT compiler code; it is identical in the EwokOS
- * device build and the host oracle build. Upstream pin
+ * This is platform-INDEPENDENT compiler code. Upstream pin
  * f45825a0c724d06f231a1210484fe9af71a3ffab. See VENDORED.txt.
  */
 #include "compiler/nir/nir.h"

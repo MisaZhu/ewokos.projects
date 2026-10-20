@@ -125,6 +125,18 @@ int gles_engine_bitdepth(void)
     return PGL_BITDEPTH;
 }
 
+int gles_engine_backbuffer_shm(void)
+{
+#ifdef PGL_G3D
+    /* Only while portablegl's back buffer IS the pgl_g3d target (pglGpuBegin
+     * adopted it); a CPU-only app keeps its malloc back buffer and must stay
+     * on the CPU blit. */
+    if (pgl_g3d_enabled() && pglGetBackBuffer() == pgl_g3d_pixels())
+        return pgl_g3d_pixels_shm();
+#endif
+    return 0;
+}
+
 /* ------------------------------------------------------------------ *
  * Token translation tables (standard GLES2_GL_* -> portablegl GL_*)
  * ------------------------------------------------------------------ */
@@ -286,10 +298,14 @@ static const epair pixel_store_map[] = {
 };
 
 static const epair get_pname_map[] = {
-    { GLES2_GL_VIEWPORT,             GL_VIEWPORT             },
-    { GLES2_GL_SCISSOR_BOX,          GL_SCISSOR_BOX          },
-    { GLES2_GL_MAX_TEXTURE_SIZE,     GL_MAX_TEXTURE_SIZE     },
-    { GLES2_GL_ARRAY_BUFFER_BINDING, GL_ARRAY_BUFFER_BINDING },
+    { GLES2_GL_VIEWPORT,                     GL_VIEWPORT                     },
+    { GLES2_GL_SCISSOR_BOX,                  GL_SCISSOR_BOX                  },
+    { GLES2_GL_MAX_TEXTURE_SIZE,             GL_MAX_TEXTURE_SIZE             },
+    { GLES2_GL_ARRAY_BUFFER_BINDING,         GL_ARRAY_BUFFER_BINDING         },
+    { GLES2_GL_ELEMENT_ARRAY_BUFFER_BINDING, GL_ELEMENT_ARRAY_BUFFER_BINDING },
+    { GLES2_GL_TEXTURE_BINDING_2D,           GL_TEXTURE_BINDING_2D           },
+    /* GL_CURRENT_PROGRAM is answered in gles2_api.c: the GLES2 program handle
+     * differs from the pgl_id portablegl would report. */
 };
 
 /* ------------------------------------------------------------------ *
@@ -1969,6 +1985,50 @@ static int gpu_tessellate_elements(gpu_stage *st, GLenum mode, GLsizei count,
     return 1;
 }
 
+/* Tessellate an indexed [0,count) draw of `mode` into the stride-6 pos+attr1
+ * staging used by the textured/gouraud geometry kernels, replicating
+ * portablegl's winding (see gpu_tessellate) through the resolved index base.
+ * This is the indexed counterpart of gpu_tessellate, so a standard
+ * glDrawElements draw reaches the same kernel gpu_try_draw_arrays drives
+ * non-indexed.  Appends at st->n; returns 0 on an attrib fault. */
+static int gpu_tessellate_elements_mesh(gpu_stage *st, GLenum mode, GLsizei count,
+                                        const void *base, GLenum type,
+                                        const glVertex_Attrib *va, int textured)
+{
+    GLsizei i;
+    long c0, c1, c2;
+    if (mode == GL_TRIANGLES) {
+        for (i = 0; i + 2 < count; i += 3) {
+            c0 = gpu_read_index(base, type, i);
+            c1 = gpu_read_index(base, type, i + 1);
+            c2 = gpu_read_index(base, type, i + 2);
+            if (!gpu_stage_tri(st, &va[0], &va[1], textured,
+                               (GLsizei)c0, (GLsizei)c1, (GLsizei)c2)) return 0;
+        }
+    } else if (mode == GL_TRIANGLE_STRIP) {
+        long ia = gpu_read_index(base, type, 0);
+        long ib = gpu_read_index(base, type, 1);
+        int toggle = 0;
+        for (i = 2; i < count; ++i) {
+            c2 = gpu_read_index(base, type, i);
+            if (!gpu_stage_tri(st, &va[0], &va[1], textured,
+                               (GLsizei)ia, (GLsizei)ib, (GLsizei)c2)) return 0;
+            if (!toggle) ia = c2; else ib = c2;
+            toggle = !toggle;
+        }
+    } else { /* GL_TRIANGLE_FAN */
+        long i0 = gpu_read_index(base, type, 0);
+        long prev = gpu_read_index(base, type, 1);
+        for (i = 2; i < count; ++i) {
+            c2 = gpu_read_index(base, type, i);
+            if (!gpu_stage_tri(st, &va[0], &va[1], textured,
+                               (GLsizei)i0, (GLsizei)prev, (GLsizei)c2)) return 0;
+            prev = c2;
+        }
+    }
+    return 1;
+}
+
 /* Submit the open coalesced batch as ONE mesh through the existing, hardware-
  * validated upload_mesh + draw_mesh_compiled path, then reset the accumulator.
  * No-op when nothing is pending.  A declined dispatch latches only that program
@@ -2307,6 +2367,66 @@ static int gpu_blend_texcol_ok(void)
     return 1;
 }
 
+/* Indexed TEXTURED draw (standard glDrawElements alias/geometry): expands the
+ * index list into the stride-6 pos+uv staging and dispatches the same compiled
+ * textured kernel gpu_try_draw_arrays drives non-indexed, so an app keeps
+ * portable indexed GL while the platform still routes it onto the V3D.
+ * Mirrors the textured branch of gpu_try_draw_arrays (per-draw dispatch, no
+ * coalescing, raster slot on unit 0).  Returns 1 when the GPU ran the draw,
+ * 0 to fall through to the CPU interpreter (identical pixels). */
+static int gpu_try_draw_elements_textured(gpu_entry *e, GLenum mode, GLsizei count,
+                                          GLenum type, const void *indices,
+                                          const glVertex_Attrib *va)
+{
+    gpu_stage st;
+    uint32_t blob[PGL_G3D_MAX_UNIF];
+    uint32_t depth, mask, cull;
+    GLsizei nout, i;
+    pgl_g3d_mesh mesh;
+    const void *base;
+    int slot, ok;
+
+    nout = (mode == GL_TRIANGLES) ? (count / 3) * 3 : (count - 2) * 3;
+    if (nout < 3 || (GLuint)nout > PGL_G3D_MAX_VERTS) return 0;
+
+    base = gpu_index_base(type, indices, count);
+    if (!base) return 0;
+
+    gpu_resolve_app_uniforms(e, g_active->gp);
+    memset(blob, 0, sizeof(blob));
+    for (i = 0; i < GPU_NUNIF; ++i) {
+        int k, n;
+        if (e->koff[i] < 0 || e->aoff[i] < 0) continue;
+        n = e->knc[i] < e->anc[i] ? e->knc[i] : e->anc[i];
+        for (k = 0; k < n && e->koff[i] + k < (int)PGL_G3D_MAX_UNIF; ++k) {
+            float fv = g_active->ublock[e->aoff[i] + k].f;
+            memcpy(&blob[e->koff[i] + k], &fv, 4);
+        }
+    }
+    depth = gpu_depth_code();
+    mask  = g_ctx.depth_mask ? 1u : 0u;
+    cull  = gpu_cull_code();
+
+    gpu_coalesce_flush();
+    if (!g_gpu_ready) return 0;   /* a flush may have latched the GPU off */
+    if (!gpu_stage_reserve(nout)) return 0;
+    st.v = g_gpu_stage; st.n = 0; st.cap = nout;
+    if (!gpu_tessellate_elements_mesh(&st, mode, count, base, type, va, 1)) return 0;
+    if (st.n != nout) return 0;   /* defensive: tessellation/staging mismatch */
+
+    pgl_g3d_set_uniforms(blob, PGL_G3D_MAX_UNIF);
+    slot = gpu_tex_slot(gles_engine_texture_for_unit(0), 0);
+    if (slot < 0) return 0;   /* no raster texture staged: CPU this draw */
+    pgl_g3d_bind_tex_unit(0, slot);
+    mesh = pgl_g3d_upload_mesh(g_gpu_stage, (uint32_t)nout, GPU_STAGING_STRIDE);
+    if (mesh == PGL_G3D_MESH_INVALID) return 0;   /* transient (OOM): CPU this draw */
+    ok = pgl_g3d_draw_mesh_compiled(e->prog, mesh, 0, (uint32_t)nout,
+                                    depth, mask, cull);
+    pgl_g3d_free_mesh(mesh);
+    if (!ok) { e->cpu_latched = 1; return 0; }   /* declined: latch CPU + fall through */
+    return 1;
+}
+
 /* Colour-modulated textured INDEXED draw (imgui, cs_is_geom=4).  Mirrors the
  * textured branch of gpu_try_draw_arrays but reads a GL_ELEMENT_ARRAY_BUFFER,
  * stages pos(vec2)+uv+ubyte-colour at stride 10, marshals the raster font atlas
@@ -2336,13 +2456,24 @@ static int gpu_try_draw_elements(GLenum mode, GLsizei count, GLenum type,
     if (!g_active || !g_active->gp || !g_active->ublock) return 0;
     e = gpu_find_entry(g_active->pgl_id);
     if (!e || e->cpu_latched || e->fullscreen) return 0;
-    if (!e->eligible || !e->texcol) return 0;
+    if (!e->eligible || (!e->texcol && !e->textured)) return 0;
 
     if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP && mode != GL_TRIANGLE_FAN)
         return 0;
     if (count < 3) return 0;
     if (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_INT &&
         type != GL_UNSIGNED_BYTE) return 0;
+
+    /* Standard indexed TEXTURED draw (alias geometry): expand the indices into
+     * the stride-6 staging and dispatch the compiled textured kernel, handled
+     * before the texcol-only state gates below. */
+    if (e->textured && !e->texcol) {
+        const glVertex_Attrib *tva =
+            g_ctx.vertex_arrays.a[g_ctx.cur_vertex_array].vertex_attribs;
+        if (!tva[0].enabled || tva[0].type != GL_FLOAT || tva[0].size < 3) return 0;
+        if (!tva[1].enabled || tva[1].type != GL_FLOAT || tva[1].size < 2) return 0;
+        return gpu_try_draw_elements_textured(e, mode, count, type, indices, tva);
+    }
 
     /* The kernel's fixed state: SRC_ALPHA blend, no depth, no culling.  imgui
      * disables the depth test and face culling, so require that; any other

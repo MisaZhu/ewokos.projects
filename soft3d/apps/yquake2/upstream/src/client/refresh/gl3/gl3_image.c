@@ -1,0 +1,834 @@
+/*
+ * Copyright (C) 1997-2001 Id Software, Inc.
+ * Copyright (C) 2016-2017 Daniel Gibson
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or (at
+ * your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ *
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
+ * 02111-1307, USA.
+ *
+ * =======================================================================
+ *
+ * Texture handling for OpenGL3
+ *
+ * =======================================================================
+ */
+
+#include "header/local.h"
+
+typedef struct
+{
+	char *name;
+	int minimize, maximize;
+} glmode_t;
+
+glmode_t modes[] = {
+	{"GL_NEAREST", GL_NEAREST, GL_NEAREST},
+	{"GL_LINEAR", GL_LINEAR, GL_LINEAR},
+	{"GL_NEAREST_MIPMAP_NEAREST", GL_NEAREST_MIPMAP_NEAREST, GL_NEAREST},
+	{"GL_LINEAR_MIPMAP_NEAREST", GL_LINEAR_MIPMAP_NEAREST, GL_LINEAR},
+	{"GL_NEAREST_MIPMAP_LINEAR", GL_NEAREST_MIPMAP_LINEAR, GL_NEAREST},
+	{"GL_LINEAR_MIPMAP_LINEAR", GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR}
+};
+
+int gl_filter_min = GL_LINEAR_MIPMAP_NEAREST;
+int gl_filter_max = GL_LINEAR;
+
+gl3image_t gl3textures[MAX_GL3TEXTURES];
+int numgl3textures = 0;
+static int image_max = 0;
+
+enum {
+	SCRAP_WIDTH = 1024,
+	SCRAP_HEIGHT = 1024
+};
+
+static short scrap_allocated[SCRAP_WIDTH];
+static GLuint gl3_scrap_texnum = 0;
+static unsigned scrap_texels[SCRAP_WIDTH * SCRAP_HEIGHT];
+qboolean gl3_scrap_dirty = false;
+
+void
+GL3_Scrap_Init(void)
+{
+	memset (scrap_allocated, 0, sizeof(scrap_allocated));	// empty
+	memset (scrap_texels, 0, sizeof(scrap_texels));	// transparent
+
+	glGenTextures(1, &gl3_scrap_texnum);
+}
+
+/* returns a texture number (relative to g3_scrap_texnum) and the position inside it */
+static int
+GL3_Scrap_AllocBlock(int w, int h, int *x, int *y, const unsigned *pic)
+{
+	w += 2;	// add an empty border to all sides
+	h += 2;
+
+	int best = SCRAP_HEIGHT;
+
+	for (int i = 0; i < SCRAP_WIDTH - w; i++)
+	{
+		int j;
+		int best2 = 0;
+
+		for (j = 0; j < w; j++)
+		{
+			if (scrap_allocated[i + j] >= best)
+			{
+				break;
+			}
+
+			if (scrap_allocated[i + j] > best2)
+			{
+				best2 = scrap_allocated[i + j];
+			}
+		}
+
+		if (j == w)
+		{   /* this is a valid spot */
+			*x = i;
+			*y = best = best2;
+		}
+	}
+
+	if (best + h > SCRAP_HEIGHT)
+	{
+		return -1;
+	}
+
+	for (int i = 0; i < w; i++)
+	{
+		scrap_allocated[*x + i] = best + h;
+	}
+	(*x)++;	// jump the border
+	(*y)++;
+
+	int k=0;
+	for(int i=0; i < h-2; i++)
+	{
+		memcpy(&scrap_texels[(*y + i) * SCRAP_WIDTH + *x],
+				pic + k, (w - 2) * sizeof(unsigned));
+		k += w - 2; // -2 because of w += 2 above
+	}
+
+	gl3_scrap_dirty = true;
+
+	return 0;
+}
+
+void
+GL3_TextureMode(char *string)
+{
+	static const int num_modes = ARRLEN(modes);
+	int i;
+
+	for (i = 0; i < num_modes; i++)
+	{
+		if (!Q_stricmp(modes[i].name, string))
+		{
+			break;
+		}
+	}
+
+	if (i == num_modes)
+	{
+		Com_Printf("bad filter name '%s' (probably from gl_texturemode)\n", string);
+		return;
+	}
+
+	gl_filter_min = modes[i].minimize;
+	gl_filter_max = modes[i].maximize;
+
+	/* clamp selected anisotropy */
+	if (gl3config.anisotropic)
+	{
+		if (gl_anisotropic->value > gl3config.max_anisotropy)
+		{
+			ri.Cvar_SetValue("r_anisotropic", gl3config.max_anisotropy);
+		}
+	}
+	else
+	{
+		ri.Cvar_SetValue("r_anisotropic", 0.0);
+	}
+
+	gl3image_t *glt;
+
+	const char* nolerplist = gl_nolerp_list->string;
+	const char* lerplist = r_lerp_list->string;
+	qboolean unfiltered2D = r_2D_unfiltered->value != 0;
+	GL3_SelectTMU(GL_TEXTURE0);
+
+	/* change all the existing texture objects */
+	for (i = 0, glt = gl3textures; i < numgl3textures; i++, glt++)
+	{
+		qboolean nolerp = false;
+		/* r_2D_unfiltered and gl_nolerp_list allow rendering stuff unfiltered even if gl_filter_* is filtered */
+		if (unfiltered2D && glt->type == it_pic)
+		{
+			// exception to that exception: stuff on the r_lerp_list
+			nolerp = (lerplist == NULL) || (strstr(lerplist, glt->name) == NULL);
+		}
+		else if (nolerplist != NULL && strstr(nolerplist, glt->name) != NULL)
+		{
+			nolerp = true;
+		}
+
+		if ( !GL3_Bind(glt->texnum) )
+		{
+			continue;	// don't bother changing anything if texture was already set
+		}
+
+		if ((glt->type != it_pic) && (glt->type != it_sky)) /* mipmapped texture */
+		{
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter_min);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter_max);
+
+			/* Set anisotropic filter if supported and enabled */
+			if (gl3config.anisotropic && gl_anisotropic->value)
+			{
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, Q_max(gl_anisotropic->value, 1.f));
+			}
+		}
+		else /* texture has no mipmaps */
+		{
+			if (nolerp)
+			{
+				// this texture shouldn't be filtered at all (no gl_nolerp_list or r_2D_unfiltered case)
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			}
+			else
+			{
+				// we can't use gl_filter_min which might be GL_*_MIPMAP_*
+				// also, there's no anisotropic filtering for textures w/o mipmaps
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter_max);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter_max);
+			}
+		}
+	}
+}
+
+qboolean
+GL3_Bind(GLuint texnum)
+{
+	extern gl3image_t *draw_chars;
+
+	if (gl_nobind->value && draw_chars) /* performance evaluation option */
+	{
+		texnum = draw_chars->texnum;
+	}
+
+	if (gl3state.currenttexture == texnum)
+	{
+		return false;
+	}
+
+	gl3state.currenttexture = texnum;
+	GL3_SelectTMU(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, texnum);
+	return true;
+}
+
+void
+GL3_BindLightmap(int lightmapnum)
+{
+	int i=0;
+	if(lightmapnum < 0 || lightmapnum >= MAX_LIGHTMAPS)
+	{
+		Com_Printf("WARNING: Invalid lightmapnum %i used!\n", lightmapnum);
+		return;
+	}
+
+	if (gl3state.currentlightmap == lightmapnum)
+	{
+		return;
+	}
+
+	gl3state.currentlightmap = lightmapnum;
+	for(i=0; i<MAX_LIGHTMAPS_PER_SURFACE; ++i)
+	{
+		// this assumes that GL_TEXTURE<i+1> = GL_TEXTURE<i> + 1
+		// at least for GL_TEXTURE0 .. GL_TEXTURE31 that's true
+		GL3_SelectTMU(GL_TEXTURE1+i);
+		glBindTexture(GL_TEXTURE_2D, gl3state.lightmap_textureIDs[lightmapnum][i]);
+	}
+}
+
+/*
+ * Returns has_alpha
+ */
+static qboolean
+GL3_Upload32(unsigned *data, int width, int height, qboolean mipmap)
+{
+	qboolean res;
+
+	int i;
+	int c = width * height;
+	byte *scan = ((byte *)data) + 3;
+	int comp = gl3_tex_solid_format;
+	int samples = gl3_solid_format;
+
+	for (i = 0; i < c; i++, scan += 4)
+	{
+		if (*scan != 255)
+		{
+			samples = gl3_alpha_format;
+			comp = gl3_tex_alpha_format;
+			break;
+		}
+	}
+
+	glTexImage2D(GL_TEXTURE_2D, 0, comp, width, height,
+	             0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+
+	res = (samples == gl3_alpha_format);
+
+	if (mipmap)
+	{
+		// TODO: some hardware may require mipmapping disabled for NPOT textures!
+		glGenerateMipmap(GL_TEXTURE_2D);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter_min);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter_max);
+	}
+	else // if the texture has no mipmaps, we can't use gl_filter_min which might be GL_*_MIPMAP_*
+	{
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter_max);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter_max);
+	}
+
+	if (mipmap && gl3config.anisotropic && gl_anisotropic->value)
+	{
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, Q_max(gl_anisotropic->value, 1.f));
+	}
+
+	return res;
+}
+
+
+/*
+ * Returns has_alpha
+ */
+static qboolean
+GL3_Upload8(const byte *data, size_t width, size_t height, qboolean mipmap)
+{
+	unsigned *trans = NULL;
+	qboolean ret;
+
+	trans = R_Convert8to32(data, width, height, d_8to24table);
+	if (!trans)
+	{
+		return false;
+	}
+
+	ret = GL3_Upload32(trans, width, height, mipmap);
+	free(trans);
+	return ret;
+}
+
+void
+GL3_Scrap_Upload(void)
+{
+	GL3_Bind(gl3_scrap_texnum);
+
+	GL3_Upload32(scrap_texels, SCRAP_WIDTH, SCRAP_HEIGHT, false);
+
+	if (r_2D_unfiltered->value != 0)
+	{
+		// 2D textures shouldn't be filtered by default (r_2D_unfiltered),
+		// so the scrap shouldn't be filtered
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	}
+	else // 2D textures should be filtered by default => filter the scrap
+	{
+		// we can't use gl_filter_min which might be GL_*_MIPMAP_*
+		// also, there's no anisotropic filtering for textures w/o mipmaps
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter_max);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter_max);
+	}
+	gl3_scrap_dirty = false;
+}
+
+/*
+ * This is also used as an entry point for the generated r_notexture
+ */
+gl3image_t *
+GL3_LoadPic(char *name, byte *pic, int width, int realwidth,
+            int height, int realheight, size_t data_size,
+            imagetype_t type, int bits)
+{
+	gl3image_t *image = NULL;
+	GLuint texNum=0;
+	int i;
+
+	qboolean nolerp = false;
+	qboolean default2Dnolerp = r_2D_unfiltered->value != 0.0f;
+	if (default2Dnolerp && type == it_pic)
+	{
+		// if r_2D_unfiltered is true(ish), nolerp should usually be true,
+		// *unless* the texture is on the r_lerp_list
+		nolerp = (r_lerp_list->string == NULL) || (strstr(r_lerp_list->string, name) == NULL);
+	}
+	else if (gl_nolerp_list != NULL && gl_nolerp_list->string != NULL)
+	{
+		nolerp = strstr(gl_nolerp_list->string, name) != NULL;
+	}
+
+	/* find a free gl3image_t */
+	for (i = 0, image = gl3textures; i < numgl3textures; i++, image++)
+	{
+		if (image->texnum == 0)
+		{
+			break;
+		}
+	}
+
+	if (i == numgl3textures)
+	{
+		if (numgl3textures == MAX_GL3TEXTURES)
+		{
+			Com_Error(ERR_DROP, "MAX_GLTEXTURES");
+			return NULL;
+		}
+
+		numgl3textures++;
+	}
+
+	image = &gl3textures[i];
+
+	if (strlen(name) >= sizeof(image->name))
+	{
+		Com_Error(ERR_DROP, "%s: \"%s\" is too long", __func__, name);
+		return NULL;
+	}
+
+	strcpy(image->name, name);
+	image->registration_sequence = registration_sequence;
+
+	image->width = width;
+	image->height = height;
+	image->type = type;
+
+	if ((type == it_skin) && (bits == 8))
+	{
+		R_FloodFillSkin(pic, width, height, d_8to24table);
+	}
+
+	/* Normalize crosshair images to white so that color tinting via
+	   multiplication produces the correct hue regardless of the
+	   original palette color used in the crosshair PCX. */
+	if (bits == 8 && (strcmp(name, "pics/ch1.pcx") == 0 ||
+			strcmp(name, "pics/ch2.pcx") == 0 ||
+			strcmp(name, "pics/ch3.pcx") == 0))
+	{
+		int best = 0;
+		float best_lum = 0;
+
+		for (i = 0; i < 255; i++)
+		{
+			byte r = ((byte *)&d_8to24table[i])[0];
+			byte g = ((byte *)&d_8to24table[i])[1];
+			byte b = ((byte *)&d_8to24table[i])[2];
+			float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+
+			if (lum > best_lum)
+			{
+				best_lum = lum;
+				best = i;
+			}
+		}
+
+		for (i = 0; i < width * height; i++)
+		{
+			if (pic[i] != 255)
+			{
+				pic[i] = (byte)best;
+			}
+		}
+	}
+
+	/* load little pics into the scrap */
+	if (nolerp == default2Dnolerp && (image->type == it_pic) &&
+		(image->width <= 128) && (image->height <= 128))
+	{
+		int x=0, y=0;
+
+		/* copy the texels into the scrap block */
+		if(bits == 8)
+		{
+			unsigned *trans = R_Convert8to32(pic, width, height, d_8to24table);
+			if (trans)
+			{
+				int scrapnum = GL3_Scrap_AllocBlock(width, height, &x, &y, trans);
+				free(trans);
+				if(scrapnum == -1)
+					goto nonscrap;
+			}
+			else
+			{
+				Sys_Error("Error: Couldn't convert texture '%s' to 32bit?!\n", name);
+				return NULL;
+			}
+		}
+		else if(bits == 32)
+		{
+			if (GL3_Scrap_AllocBlock(image->width, image->height, &x, &y, (unsigned*)pic) == -1)
+			{
+				goto nonscrap;
+			}
+		}
+		else
+		{
+			Sys_Error("Error: texture '%s' has %d bits per pixel, only 8 and 32 supported!\n", name, bits);
+			return NULL;
+		}
+
+		image->texnum = gl3_scrap_texnum;
+		image->scrap = true;
+		image->has_alpha = true;
+		image->sl = (float)x / SCRAP_WIDTH;
+		image->sh = (float)(x + image->width) / SCRAP_WIDTH;
+		image->tl = (float)y / SCRAP_HEIGHT;
+		image->th = (float)(y + image->height) / SCRAP_HEIGHT;
+	}
+	else
+	{
+	nonscrap:
+
+		image->is_lava = (strstr(name, "lava") != NULL);
+		image->scrap = false;
+
+		glGenTextures(1, &texNum);
+
+		image->texnum = texNum;
+
+		GL3_SelectTMU(GL_TEXTURE0);
+		GL3_Bind(texNum);
+
+		if (bits == 8)
+		{
+			// resize 8bit images only when we forced such logic
+			if (r_scale8bittextures->value)
+			{
+				byte *image_converted;
+				int scale = 2;
+
+				// scale 3 times if lerp image
+				if (!nolerp && (vid.height >= 240 * 3))
+					scale = 3;
+
+				image_converted = malloc(width * height * scale * scale);
+				if (!image_converted)
+					return NULL;
+
+				if (scale == 3) {
+					scale3x(pic, image_converted, width, height);
+				} else {
+					scale2x(pic, image_converted, width, height);
+				}
+
+				image->has_alpha = GL3_Upload8(image_converted, width * scale, height * scale,
+							(image->type != it_pic && image->type != it_sky));
+				free(image_converted);
+			}
+			else
+			{
+				image->has_alpha = GL3_Upload8(pic, width, height,
+							(image->type != it_pic && image->type != it_sky));
+			}
+		}
+		else
+		{
+			image->has_alpha = GL3_Upload32((unsigned *)pic, width, height,
+						(image->type != it_pic && image->type != it_sky));
+		}
+
+		image->sl = 0;
+		image->sh = 1;
+		image->tl = 0;
+		image->th = 1;
+
+		if (nolerp)
+		{
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		}
+	}
+
+	if (realwidth && realheight)
+	{
+		if ((realwidth <= image->width) && (realheight <= image->height))
+		{
+			image->width = realwidth;
+			image->height = realheight;
+		}
+		else
+		{
+			Com_DPrintf(
+					"Warning, image '%s' has hi-res replacement smaller than the original! (%d x %d) < (%d x %d)\n",
+					name, image->width, image->height, realwidth, realheight);
+		}
+	}
+
+	return image;
+}
+
+/*
+ * Finds or loads the given image or NULL
+ */
+gl3image_t *
+GL3_FindImage(const char *originname, imagetype_t type)
+{
+	char namewe[256], name[256] = {0};
+	gl3image_t *image;
+	const char* ext;
+	size_t len;
+	int i;
+
+	if (!originname)
+	{
+		return NULL;
+	}
+
+	Q_strlcpy(name, originname, sizeof(name));
+
+	/* fix backslashes */
+	Q_replacebackslash(name);
+
+	ext = COM_FileExtension(name);
+	if (!ext[0])
+	{
+		/* file has no extension */
+		return NULL;
+	}
+
+	/* Remove the extension */
+	len = (ext - name) - 1;
+	if ((len < 1) || (len > sizeof(namewe) - 1))
+	{
+		Com_DPrintf("%s: Bad filename %s\n", __func__, name);
+		return NULL;
+	}
+
+	memcpy(namewe, name, len);
+	namewe[len] = 0;
+
+	/* look for it */
+	for (i = 0, image = gl3textures; i < numgl3textures; i++, image++)
+	{
+		if (!strcmp(name, image->name))
+		{
+			image->registration_sequence = registration_sequence;
+			return image;
+		}
+	}
+
+	//
+	// load the pic from disk
+	//
+	image = (gl3image_t *)R_LoadImage(name, namewe, ext, type,
+		r_retexturing->value, (loadimage_t)GL3_LoadPic);
+
+	if (!image && r_validation->value)
+	{
+		Com_Printf("%s: can't load %s\n", __func__, name);
+	}
+
+	return image;
+}
+
+gl3image_t *
+GL3_RegisterSkin(const char *name)
+{
+	return GL3_FindImage(name, it_skin);
+}
+
+/*
+ * Any image that was not touched on
+ * this registration sequence
+ * will be freed.
+ */
+void
+GL3_FreeUnusedImages(void)
+{
+	int i;
+	gl3image_t *image;
+
+	/* never free r_notexture or particle texture */
+	gl3_notexture->registration_sequence = registration_sequence;
+	gl3_particletexture->registration_sequence = registration_sequence;
+
+	for (i = 0, image = gl3textures; i < numgl3textures; i++, image++)
+	{
+		if (image->registration_sequence == registration_sequence)
+		{
+			continue; /* used this sequence */
+		}
+
+		if (!image->registration_sequence)
+		{
+			continue; /* free image_t slot */
+		}
+
+		if (image->type == it_pic)
+		{
+			continue; /* don't free pics */
+		}
+
+		/* free it */
+		glDeleteTextures(1, &image->texnum);
+		memset(image, 0, sizeof(*image));
+	}
+}
+
+qboolean
+GL3_ImageHasFreeSpace(void)
+{
+	int		i, used;
+	gl3image_t	*image;
+
+	used = 0;
+
+	for (i = 0, image = gl3textures; i < numgl3textures; i++, image++)
+	{
+		if (!image->name[0])
+			continue;
+		if (image->registration_sequence == registration_sequence)
+		{
+			used ++;
+		}
+	}
+
+	if (image_max < used)
+	{
+		image_max = used;
+	}
+
+	// should same size of free slots as currently used
+	return (numgl3textures + used) < MAX_GL3TEXTURES;
+}
+
+void
+GL3_ShutdownImages(void)
+{
+	int i;
+	gl3image_t *image;
+
+	for (i = 0, image = gl3textures; i < numgl3textures; i++, image++)
+	{
+		if (!image->registration_sequence)
+		{
+			continue; /* free image_t slot */
+		}
+
+		/* free it */
+		glDeleteTextures(1, &image->texnum);
+		memset(image, 0, sizeof(*image));
+	}
+
+	glDeleteTextures(1, &gl3_scrap_texnum);
+}
+
+static qboolean IsNPOT(int v)
+{
+	unsigned int uv = v;
+	// just try all the power of two values between 1 and 1 << 15 (32k)
+	for(unsigned int i=0; i<16; ++i)
+	{
+		unsigned int pot = (1u << i);
+		if(uv & pot)
+		{
+			return uv != pot;
+		}
+	}
+
+	return true;
+}
+
+void
+GL3_ImageList_f(void)
+{
+	int i, used, texels;
+	qboolean	freeup;
+	gl3image_t *image;
+	const char *formatstrings[2] = {
+		"RGB ",
+		"RGBA"
+	};
+
+	const char* potstrings[2] = {
+		" POT", "NPOT"
+	};
+
+	Com_Printf("------------------\n");
+	texels = 0;
+	used = 0;
+
+	for (i = 0, image = gl3textures; i < numgl3textures; i++, image++)
+	{
+		int w, h;
+		char *in_use = "";
+		qboolean isNPOT = false;
+		if (image->texnum == 0)
+		{
+			continue;
+		}
+
+		if (image->registration_sequence == registration_sequence)
+		{
+			in_use = "*";
+			used++;
+		}
+
+		w = image->width;
+		h = image->height;
+
+		isNPOT = IsNPOT(w) || IsNPOT(h);
+
+		texels += w*h;
+
+		char imageType = '?';
+		switch (image->type)
+		{
+			case it_skin:
+				imageType = 'M';
+				break;
+			case it_sprite:
+				imageType = 'S';
+				break;
+			case it_wall:
+				imageType = 'W';
+				break;
+			case it_pic:
+				imageType = 'P';
+				break;
+			case it_sky:
+				imageType = 'Y';
+				break;
+			default:
+				imageType = '?';
+				break;
+		}
+		char isScrap = image->scrap ? 'S' : ' ';
+		char isLava = image->is_lava ? 'L' : ' ';
+
+		Com_Printf("%c%c%c %3i %3i %s %s: %s %s\n", isScrap, imageType, isLava, w, h,
+		         formatstrings[image->has_alpha], potstrings[isNPOT], image->name, in_use);
+	}
+
+	Com_Printf("Total texel count (not counting mipmaps): %i\n", texels);
+	freeup = GL3_ImageHasFreeSpace();
+	Com_Printf("Used %d of %d images%s.\n", used, image_max, freeup ? ", has free space" : "");
+}

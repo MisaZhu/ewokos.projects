@@ -72,6 +72,10 @@ int  gles_engine_resize(GEint w, GEint h);
 void *gles_engine_backbuffer(void);
 void  gles_engine_backbuffer_size(GEint *w, GEint *h);
 int   gles_engine_bitdepth(void);
+/* Contig shm id of the back buffer when it is the adopted GPU render target
+ * (PGL_G3D), else 0.  Lets the present blit go through g2d instead of a CPU
+ * read of the NOCACHE target.  Query after gles_engine_backbuffer(). */
+int   gles_engine_backbuffer_shm(void);
 
 /* Bridge to the self-contained CPU GLSL ES 1.00 interpreter (src/glsl).
  * `gp` is an already-linked glsl_program (owned by the caller) and `ublock` is

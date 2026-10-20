@@ -71,10 +71,10 @@ enum v3d_shader_stage {
  * The client MUST pack per-draw uniform values BY NAME through this table,
  * never by a fixed [iGlobalTime, iResolution.xyz] layout: mesa's linker
  * dead-strips uniforms the shader never reads, which shifts the surviving
- * uniforms' dword offsets per effect.  Verified with the WS6 host oracle:
- * effects that never read iGlobalTime (e.g. graphing_lines / graphing /
- * voronoise) place iResolution.x at dword 0, while effects that do read it
- * place iGlobalTime at dword 0 and iResolution.x at dword 1.  dword_offset is
+ * uniforms' dword offsets per effect.  Effects that never read iGlobalTime
+ * (e.g. graphing_lines / graphing / voronoise) place iResolution.x at dword 0,
+ * while effects that do read it place iGlobalTime at dword 0 and iResolution.x
+ * at dword 1.  dword_offset is
  * exactly the QUNIFORM_UNIFORM data value the backend emits (the load_uniform
  * byte base / 4); num_components is the variable's consecutive-dword width
  * (scalar = 1, vec3 = 3).  Opaque uniforms (samplers/images) are excluded:

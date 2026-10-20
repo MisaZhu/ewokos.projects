@@ -131,6 +131,12 @@ int  pgl_g3d_enabled(void);
    through the existing GPU path for free.  Valid only while enabled. */
 void* pgl_g3d_pixels(void);
 
+/* The contig shm id backing pgl_g3d_pixels(), 0 while not enabled.  A present
+   blit that tags its source graph with this id (shm_contig=1) is routed by
+   graph_blt to the g2d GPU copy instead of a CPU read of the whole NOCACHE
+   target.  Re-query per present: a resize may reallocate the segment. */
+int   pgl_g3d_pixels_shm(void);
+
 /* Reallocate the render target for a new w x h (viewport resize), preserving
    nothing (the caller re-clears).  Returns 1 on success, 0 (latched off) if the
    allocation fails. */
@@ -321,9 +327,9 @@ void pgl_g3d_set_uniforms(const uint32_t* data, uint32_t count);
    The value MUST be resolved by name through this query, never assumed from a
    fixed [iGlobalTime, iResolution.xyz] layout: mesa's linker dead-strips
    uniforms a given effect never reads, which shifts the surviving uniforms'
-   dword offsets per effect (verified with the WS6 host oracle - effects that
-   never read iGlobalTime place iResolution.x at dword 0, while effects that do
-   place iGlobalTime at 0 and iResolution.x at 1).  Returns the non-negative
+   dword offsets per effect (effects that never read iGlobalTime place
+   iResolution.x at dword 0, while effects that do place iGlobalTime at 0 and
+   iResolution.x at 1).  Returns the non-negative
    dword offset, or -1 when p is invalid, no such default-block uniform exists,
    or name is NULL.  When num_components != NULL it receives the uniform's
    consecutive-dword width (scalar = 1, vec3 = 3).  Opaque uniforms (samplers /

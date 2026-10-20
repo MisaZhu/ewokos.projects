@@ -169,14 +169,13 @@ MAINEXT_C = $(S)/mesa/main/extensions_table.c
 C11_C = $(S)/c11/impl/threads_posix.c $(S)/c11/impl/time.c
 
 # Portable vendoring stubs (the algebraic no-ops that are pure optimisations,
-# _mesa_error_no_memory, the GLSL #include cursor trio). Platform-independent;
-# identical in the device and host builds.
+# _mesa_error_no_memory, the GLSL #include cursor trio). Platform-independent.
 STUBS_C = v3dcompiler_stubs.c
 
 # EwokOS-only glue (util_get_process_name, util_tls_qsort_r, mkstemps,
 # pthread_getcpuclockid, open_memstream): the SDK/libc gaps libv3dcompiler.a
-# needs, archived in so an app links the compiler self-contained. The WS6 host
-# oracle build omits this one file (glibc/macOS supply the symbols).
+# needs, archived in so an app links the compiler self-contained. A glibc/macOS
+# host supplies these symbols, so this is the only EwokOS-specific object.
 EWOKOS_GLUE_C = v3dcompiler_ewokos.c
 
 # === WS2-entry: the v3d_compile_glsl() driver ================================
@@ -193,7 +192,7 @@ EWOKOS_GLUE_C = v3dcompiler_ewokos.c
 #                          backend-supported primitives (the generated generic
 #                          pass is not vendored; the backend abort()s on those
 #                          opcodes otherwise).
-# All three are platform-independent (identical in the device and host builds).
+# All three are platform-independent.
 ENTRY_C   = v3dcompiler_backend.c v3dcompiler_algebraic.c v3dcompiler_texlayout.c
 ENTRY_CXX = v3dcompiler_glsl.cpp
 

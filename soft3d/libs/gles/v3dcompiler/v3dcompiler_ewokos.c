@@ -7,10 +7,10 @@
  * an app links libv3dcompiler.a and resolves everything with no extra -l flags
  * and no dependency on the daemon-side libbsp.
  *
- * The WS6 host/oracle build compiles the SAME mesa sources + v3dcompiler_stubs.c
- * but OMITS this file, because glibc/macOS supply every symbol here. That is the
- * only reason this glue is a separate translation unit rather than folded into
- * the portable stubs: it is the single EwokOS-specific object in the archive.
+ * This glue is kept as a separate translation unit rather than folded into the
+ * portable stubs (v3dcompiler_stubs.c) because it is the single EwokOS-specific
+ * object in the archive: a glibc/macOS host supplies every symbol here, so the
+ * stubs stay portable while this file fills the EwokOS-SDK libc/util gaps.
  *
  * The vendored mesa code itself stays platform-independent, and nothing here is
  * board-specific either - these are EwokOS-SDK libc/util gaps, identical on any

@@ -24,8 +24,7 @@
  *   - Two-sided lighting: flip N when it faces away from the viewer (the teapot
  *     renders with culling disabled).
  *
- * Plain C string literals so this header is includable from BOTH teapot.c (C)
- * and the v3dcompiler host oracle host_dump_uniforms.cpp (C++).
+ * Plain C string literals so this header is includable from teapot.c (C).
  */
 #ifndef TEAPOT_GLSL_H
 #define TEAPOT_GLSL_H

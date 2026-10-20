@@ -305,6 +305,11 @@ void glUseProgram(GLuint program)
     }
 }
 
+/* GL_CURRENT_PROGRAM must report the GLES2 handle, not the engine-side
+ * pgl_id behind it; glGetIntegerv (gles2_api.c) asks here instead of the
+ * engine. */
+GLuint gles2_current_program_handle(void) { return g_cur ? g_cur->handle : 0; }
+
 void glValidateProgram(GLuint program) { (void)program; /* always valid if linked */ }
 GLboolean glIsProgram(GLuint program) { return find_program(program) ? GL_TRUE : GL_FALSE; }
 

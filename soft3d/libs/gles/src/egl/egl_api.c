@@ -104,8 +104,15 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
      * No lock here: this callback runs inside xwin_repaint, which already holds
      * xwin->painting_lock across the on_repaint call.  Re-locking it would
      * self-deadlock (EwokOS pthread_mutex_t is non-recursive), so the blit into
-     * ws_g is done directly, exactly like the SDL backend's fb_on_repaint. */
+     * ws_g is done directly, exactly like the SDL backend's fb_on_repaint.
+     *
+     * When the back buffer is the adopted GPU target it lives in NOCACHE contig
+     * shm; tag the source graph with that segment so graph_blt takes the g2d
+     * copy (GPU, same daemon that just rendered it) rather than the CPU reading
+     * the whole uncached frame.  A CPU back buffer (shm 0) keeps the CPU blit. */
     graph_init(&src, (const uint32_t *)bb, bw, bh);
+    src.shm_id = gles_engine_backbuffer_shm();
+    src.shm_contig = src.shm_id > 0;
     graph_blt(&src, 0, 0, bw, bh, g, 0, 0, g->w, g->h);
 }
 

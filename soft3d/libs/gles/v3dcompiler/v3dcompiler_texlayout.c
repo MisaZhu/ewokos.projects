@@ -10,7 +10,7 @@
  * (v3d_store_tiled_image), which is the same code gallium uses for
  * transfer_map uploads.
  *
- * Platform-independent: identical in the device and host builds.
+ * Platform-independent.
  */
 #include <string.h>
 #include "util/box.h"

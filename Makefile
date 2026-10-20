@@ -2,6 +2,7 @@
 DIRS = macemu \
 	nesemu \
 	soft3d \
+	blender \
 	doom \
 	cards \
 	mine

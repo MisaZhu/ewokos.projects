@@ -129,9 +129,8 @@ type_size_uniform_bytes(const struct glsl_type *type, bool bindless)
  * nir_lower_io(nir_var_uniform) leaves them untouched.
  *
  * Iteration is the shader's variable-declaration order (stable), so the
- * resulting QUNIFORM_UNIFORM dword indices are reproducible -- the WS6 host
- * oracle dumps them as the ground truth the client uniform blob is packed
- * against by name. */
+ * resulting QUNIFORM_UNIFORM dword indices are reproducible, so the client
+ * uniform blob can be packed against them by name. */
 static void
 assign_uniform_driver_locations(nir_shader *nir)
 {
