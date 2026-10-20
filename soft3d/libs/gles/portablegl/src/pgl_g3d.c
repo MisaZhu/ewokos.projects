@@ -186,6 +186,13 @@ static pgl_g3d_ext_t _batch_ext;
    variants declare no uScissor and ignore it. */
 static int32_t _scissor_x, _scissor_y, _scissor_w, _scissor_h;
 
+/* Per-draw fragment blend mode (PGL_G3D_BLEND_*) patched into the gouraud
+   raster kernel's uBlendMode uniform.  Set by the engine from its glBlendFunc
+   state before each draw/batch; only the INSTANCED-LIT/gouraud raster kernel
+   reads it (the textured/texcol kernels keep their fixed equations and ignore
+   the patch since they declare no uBlendMode). */
+static int _blend_mode = PGL_G3D_BLEND_OPAQUE;
+
 /* WS4 compiled-shader draw-path state: the active on-device-compiled program
    plus the per-draw GL uniform blob the daemon's QUNIFORM interpreter indexes.
    The uniform staging is a CPU-read contig-shm segment (the daemon copies the
@@ -238,6 +245,11 @@ void pgl_g3d_set_scissor(int32_t x, int32_t y, int32_t w, int32_t h)
 	_scissor_y = y;
 	_scissor_w = w;
 	_scissor_h = h;
+}
+
+void pgl_g3d_set_blend(int mode)
+{
+	_blend_mode = mode;
 }
 
 static uint8_t clamp_u8(float f)
@@ -951,6 +963,29 @@ int pgl_g3d_set_instances(const float* data, uint32_t nfloats)
 	return 1;
 }
 
+/* Map a PGL_G3D_CULL_* config onto the gouraud raster kernel's uCullSign
+ * (0 = keep both windings, 1 = keep area<0, 2 = keep area>0, 3 = cull all).
+ * The kernel's window-space shoelace `area` equals -1 * portablegl's
+ * is_front_facing `a` (same y-down screen coords, opposite edge-function sign),
+ * and portablegl keeps a triangle when (front_face==CW ? -a : a) > 0 for a BACK
+ * cull.  Derivation per code:
+ *   BACK_CCW  keep front (CCW, a>0)  -> keep area<0 -> 1
+ *   BACK_CW   keep front (CW,  a<0)  -> keep area>0 -> 2
+ *   FRONT_CCW keep back  (a<=0)      -> keep area>0 -> 2
+ *   FRONT_CW  keep back  (a>0)       -> keep area<0 -> 1
+ *   BOTH      cull everything        -> 3 */
+static uint32_t pgl_g3d_cull_sign(uint32_t cull)
+{
+	switch (cull) {
+	case PGL_G3D_CULL_BACK_CCW:  return 1u;
+	case PGL_G3D_CULL_BACK_CW:   return 2u;
+	case PGL_G3D_CULL_FRONT_CCW: return 2u;
+	case PGL_G3D_CULL_FRONT_CW:  return 1u;
+	case PGL_G3D_CULL_BOTH:      return 3u;
+	default:                     return 0u;   /* NONE */
+	}
+}
+
 int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
                                uint32_t first, uint32_t count,
                                uint32_t depth_func, uint32_t depth_mask,
@@ -1170,6 +1205,27 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		one[0] = count;
 		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 		                             "uVertCount", one, 1u);
+		/* Per-draw render state for the gouraud raster kernel (uBlendMode /
+		   uDepthWrite / uCullSign).  The INSTANCED-LIT/gouraud route honours
+		   the app's blend, depth-mask and cull state so translucent shells and
+		   additive glows composite on the GPU.  EVERY OTHER route is pinned to
+		   the historical hardcoded behaviour (opaque overwrite, always depth-
+		   write, no cull) so teapot/gears/texcol pixels are byte-identical to
+		   before these uniforms existed - those kernels either declare none of
+		   them (textured/texcol: the patch is a no-op) or, for the plain gouraud
+		   kernel, would otherwise start culling/blending they never did. */
+		{
+			int inst_lit = pgl_g3d_shader_geom_inst_lit(prog);
+			one[0] = inst_lit ? (uint32_t)_blend_mode : PGL_G3D_BLEND_OPAQUE;
+			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+			                             "uBlendMode", one, 1u);
+			one[0] = inst_lit ? (depth_mask ? 1u : 0u) : 1u;
+			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+			                             "uDepthWrite", one, 1u);
+			one[0] = inst_lit ? pgl_g3d_cull_sign(cull) : 0u;
+			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+			                             "uCullSign", one, 1u);
+		}
 		if (geom_texcol) {
 			/* The colour-modulated route is the only geom kernel that clips:
 			   pack the per-draw scissor window (fb row space, set by the

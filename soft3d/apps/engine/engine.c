@@ -42,7 +42,13 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
-#include <glcommon/hud.h>
+
+/* Dear ImGui overlay, implemented in engine_hud.cpp (C++ TU) exactly like
+ * glmatrix's HUD: read-only FPS / Renderer / crank-state window. */
+void engine_hud_init(int w, int h);
+void engine_hud_frame(int w, int h, int fps, int gpu,
+                      int crank_deg, const char *stroke);
+void engine_hud_shutdown(void);
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1127,6 +1133,7 @@ static void build_all_parts(void)
 
 /* ---------------- shaders --------------------------------------------------- */
 static const char *engine_vs =
+    "// PGL_G3D_INSTANCED_LIT\n"
     "attribute vec3 aPosition;\n"
     "attribute vec3 aNormal;\n"
     "uniform mat4 uMVP;\n"
@@ -1254,6 +1261,13 @@ static void bind_part(Part *p)
     glEnableVertexAttribArray(1);
 }
 
+/* Per-second segment profile (ms summed over one second, one slog line per
+ * second, readable via `cat /dev/log` over ssh) plus draw/triangle counters:
+ * attributes a slow frame to a pass on the device without a debugger.
+ * Reset by update_fps(). */
+static uint32_t prof_p1, prof_p2, prof_p3, prof_hud, prof_swap, prof_loop;
+static uint32_t prof_draws, prof_tris;
+
 static void draw_part(Part *p, const GLfloat model[16])
 {
     if (p->mesh.vbo == 0 || p->mesh.nverts <= 0) return;
@@ -1269,6 +1283,7 @@ static void draw_part(Part *p, const GLfloat model[16])
     glUniform1f(loc_emissive, p->emissive);
     bind_part(p);
     glDrawArrays(GL_TRIANGLES, 0, p->mesh.nverts);
+    prof_draws++; prof_tris += (uint32_t)p->mesh.nverts / 3u;
 }
 
 static void draw_at(Part *p, float tx,float ty,float tz, float rot,float rx,float ry,float rz,
@@ -1325,7 +1340,6 @@ static void init_gl(void)
     glViewport(0, 0, win_width, win_height);
 
     build_all_parts();
-    hud_init();
 }
 
 static void reshape(int w, int h)
@@ -1460,13 +1474,15 @@ static void draw_charges(void)
 static void draw_shells(void)
 {
     GLfloat model[16]; ident_model(model);
-    /* far side then near side for plausible transparency sorting */
-    glCullFace(GL_FRONT);
-    draw_part(&P_crankcase, model);
-    draw_part(&P_block, model);
-    draw_part(&P_liner, model);
-    draw_part(&P_head, model);
-    draw_part(&P_camcover, model);
+    /* Single near-side pass.  The old far-then-near duplicate drew every shell
+     * TWICE (glCullFace FRONT, then BACK) purely "for transparency sorting";
+     * but this pass has depth-write OFF, so the two cull modes just double-
+     * blend the SAME very-transparent thin walls (block/head/camcover/crankcase
+     * /liner, alpha 0.14-0.26) over the opaque internals -- doubling pass-2
+     * raster coverage, which is the dominant frame cost.  One near-side pass
+     * keeps the same see-through tint at half the pixels.  NOTE: this removes a
+     * redundant DUPLICATE DRAW, not mesh detail -- the shell geometry (and its
+     * tessellation) is unchanged. */
     glCullFace(GL_BACK);
     draw_part(&P_crankcase, model);
     draw_part(&P_block, model);
@@ -1545,7 +1561,17 @@ static uint32_t last_tic=0, last_frame_tic=0;
 static void update_fps(void)
 {
     uint32_t low; kernel_tic32(NULL, NULL, &low);
-    if (last_tic == 0 || (low - last_tic) >= 1000000) { last_tic = low; fps = count; count = 0; }
+    if (last_tic == 0 || (low - last_tic) >= 1000000) {
+        last_tic = low; fps = count; count = 0;
+        /* one line per second: ms spent in each segment over that second, so
+         * ms/s of loop ~= 1000 when the loop is the only consumer.  slog (not
+         * klog) so the line lands in /dev/log and is visible over ssh. */
+        slog("engine: fps=%d gpu=%d %dx%d ms/s loop=%u p1=%u p2=%u p3=%u hud=%u swap=%u draws=%u tris=%u\n",
+             fps, glGpuActiveEWOK(), win_width, win_height, prof_loop, prof_p1, prof_p2, prof_p3,
+             prof_hud, prof_swap, prof_draws, prof_tris);
+        prof_loop = prof_p1 = prof_p2 = prof_p3 = 0;
+        prof_hud = prof_swap = prof_draws = prof_tris = 0;
+    }
     count++;
 }
 
@@ -1571,6 +1597,13 @@ static void render_frame(void)
     if (dt > 0.1f) dt = 0.1f;
     if (dt < 0.0f) dt = 0.0f;
 
+    /* segment profiling: loop = entry-to-entry cadence, the rest split the
+     * frame (see prof_* counters). */
+    static uint32_t prev_entry;
+    uint32_t t0 = cur, t1;
+    if (prev_entry) prof_loop += (cur - prev_entry)/1000u;
+    prev_entry = cur;
+
     crank_angle += CRANK_DPS*dt;
     while (crank_angle >= 720.0f) crank_angle -= 720.0f;
     camera_angle += CAM_ORBIT_DPS*dt;
@@ -1580,12 +1613,18 @@ static void render_frame(void)
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     compute_camera();
 
+    /* Re-bind the scene program every frame: the ImGui GLES2 backend binds
+     * its own program in RenderDrawData and never restores the previous one
+     * (same trap that blanked matrix/Fireworks when their HUD landed). */
+    glUseProgram(program);
+
     /* pass 1: opaque internals */
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
     draw_opaque();
+    kernel_tic32(NULL, NULL, &t1); prof_p1 += (t1 - t0)/1000u; t0 = t1;
 
     /* pass 2: translucent (charge, shells, port flow) */
     glEnable(GL_BLEND);
@@ -1594,24 +1633,26 @@ static void render_frame(void)
     draw_charges();
     draw_shells();
     draw_flows();
+    kernel_tic32(NULL, NULL, &t1); prof_p2 += (t1 - t0)/1000u; t0 = t1;
 
     /* pass 3: additive emissive (flame + spark) */
     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
     draw_combustion();
+    kernel_tic32(NULL, NULL, &t1); prof_p3 += (t1 - t0)/1000u; t0 = t1;
 
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
     glCullFace(GL_BACK);
 
     {
-        char hud[128];
         int gpu = glGpuActiveEWOK();
         float ph1 = cyl_phase(0, crank_angle);
-        snprintf(hud, sizeof(hud), "FPS:%d %s  inline-4  1-3-4-2  crank:%3d  cyl1:%s",
-                 fps, gpu ? "GPU" : "CPU", (int)crank_angle, stroke_name(ph1));
-        hud_draw(program, win_width, win_height, 8, 8, hud);
+        engine_hud_frame(win_width, win_height, fps, gpu,
+                         (int)crank_angle, stroke_name(ph1));
     }
+    kernel_tic32(NULL, NULL, &t1); prof_hud += (t1 - t0)/1000u; t0 = t1;
     eglSwapBuffers(egl_dpy, egl_surf);
+    kernel_tic32(NULL, NULL, &t1); prof_swap += (t1 - t0)/1000u;
     update_fps();
 }
 
@@ -1654,6 +1695,20 @@ int main(int argc, char* argv[])
 {
     x_t x; xwin_t* xwin;
     (void)argc; (void)argv;
+
+    /* Unforgeable build fingerprint so a device log can be matched to this
+     * exact binary (probe discipline: version first, data second). */
+    slog("engine: build %s %s\n", __DATE__, __TIME__);
+
+    /* This scene now runs on the V3D GPU: engine_vs carries the
+     * PGL_G3D_INSTANCED_LIT marker, so pgl_engine coalesces every draw of a
+     * pass (opaque, translucent shells, additive flame) into ONE instanced
+     * dispatch whose raster kernel honours the app's blend/depth-mask/cull
+     * state.  The old glForceCpuEWOK() pin -- which kept passes 2/3 on the
+     * CPU interpreter because the fixed geom kernels could not blend -- is
+     * gone; per-vertex lighting of ~40k tris/frame on the CPU was the ~4 FPS
+     * bottleneck this instanced-lit mechanism removes. */
+
     x_init(&x, NULL);
     x.on_loop = loop;
     xwin = xwin_open(&x, -1, 32, 32, win_width, win_height, "Inline-4 Engine", XWIN_STYLE_NORMAL);
@@ -1661,8 +1716,11 @@ int main(int argc, char* argv[])
     xwin->on_event = on_event;
     if (!init_egl(xwin)) { printf("Failed to initialize EGL\n"); return 1; }
     init_gl();
+    engine_hud_init(win_width, win_height);
+
     xwin_set_visible(xwin, true);
     x_run(&x, xwin);
+    engine_hud_shutdown();
     xwin_destroy(xwin);
     eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroySurface(egl_dpy, egl_surf);

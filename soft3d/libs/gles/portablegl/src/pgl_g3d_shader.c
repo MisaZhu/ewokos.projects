@@ -74,6 +74,11 @@ typedef struct {
 	int      geom_tex;
 	int      geom_texcol;
 	int      geom_inst;
+	/* INSTANCED-LIT flavour (PGL_G3D_INSTANCED_LIT marker): same bindings
+	   and cs_is_geom=3 dispatch as geom_inst, but the xform kernel is
+	   geom_xform_instlit_cs_glsl - 40-float per-instance records carrying
+	   emissive + alpha and the engine demo's full lighting model. */
+	int      geom_inst_lit;
 	int      geom_tpw;
 	struct v3d_compiled_program prog;
 	/* Two-pass geometry rasterizer: the VERTEX-TRANSFORM kernel (pass 1) is
@@ -117,6 +122,7 @@ static void entry_clear(prog_entry_t* e)
 		e->geom_tex = 0;
 	e->geom_texcol = 0;
 	e->geom_inst = 0;
+	e->geom_inst_lit = 0;
 	e->used = 0;
 }
 
@@ -211,8 +217,16 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			   from a 4th SSBO.  Mutually exclusive with the textured variant
 			   (an instanced mesh carries no sampler).  Pass 2 is the plain
 			   gouraud raster kernel (V5, cs_geom_tpw = 256) since the vout
-			   record layout is unchanged. */
-			int inst = !tex && strstr(vert_glsl, "PGL_G3D_INSTANCED") != NULL;
+			   record layout is unchanged.  The INSTANCED-LIT marker is a
+			   superset spelling (it CONTAINS the plain marker as a prefix, so
+			   sniff it first): 40-float records with per-instance emissive +
+			   alpha and the engine demo's reflect-spec lighting model,
+			   compiled as geom_xform_instlit_cs_glsl.  Both share the
+			   cs_is_geom=3 daemon dispatch and bindings. */
+			int inst_lit = !tex &&
+			               strstr(vert_glsl, "PGL_G3D_INSTANCED_LIT") != NULL;
+			int inst = !tex && !inst_lit &&
+			           strstr(vert_glsl, "PGL_G3D_INSTANCED") != NULL;
 			/* The COLOUR variant (teapot's native gouraud fast-path shape) is a
 			   mesh VS that transforms by uMVP but declares NO uNormalMat/uLightEye:
 			   attribute 1 is a precomputed per-vertex colour, not a normal, so pass 1
@@ -225,11 +239,12 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			const char* raster_src = texcol ? geom_raster_texcol_cs_glsl
 			                             : (tex ? geom_raster_tex_cs_glsl
 			                                    : geom_raster_cs_glsl);
-			const char* xform_src  = inst ? geom_xform_inst_cs_glsl
+			const char* xform_src  = inst_lit ? geom_xform_instlit_cs_glsl
+			                             : (inst ? geom_xform_inst_cs_glsl
 			                             : (texcol ? geom_xform_texcol_cs_glsl
 			                                    : (tex ? geom_xform_tex_cs_glsl
 			                                           : (color ? geom_xform_color_cs_glsl
-			                                                  : geom_xform_cs_glsl)));
+			                                                  : geom_xform_cs_glsl))));
 			memset(&gres, 0, sizeof(gres));
 			memset(&xres, 0, sizeof(xres));
 			/* BOTH kernels must compile: the raster pass reads the vout
@@ -252,7 +267,8 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 				_progs[slot].is_geom = 1;
 				_progs[slot].geom_tex = tex;
 				_progs[slot].geom_texcol = texcol;
-				_progs[slot].geom_inst = inst;
+				_progs[slot].geom_inst = inst || inst_lit;
+				_progs[slot].geom_inst_lit = inst_lit;
 				/* the tex kernel is the legacy one-workgroup-per-triangle shape
 				   (0); the gouraud kernel is one-lane-per-triangle and covers 256
 				   triangles per 16x16 workgroup, so the daemon dispatches the
@@ -354,6 +370,14 @@ int pgl_g3d_shader_geom_inst(pgl_g3d_prog p)
 	if (!pgl_g3d_program_valid(p))
 		return 0;
 	return _progs[p].geom_inst &&
+	       _progs[p].prog.stage[V3D_STAGE_COMPUTE].qpu_word_count != 0;
+}
+
+int pgl_g3d_shader_geom_inst_lit(pgl_g3d_prog p)
+{
+	if (!pgl_g3d_program_valid(p))
+		return 0;
+	return _progs[p].geom_inst_lit &&
 	       _progs[p].prog.stage[V3D_STAGE_COMPUTE].qpu_word_count != 0;
 }
 

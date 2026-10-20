@@ -1539,16 +1539,31 @@ static int cpu_try_direct_blit(GLenum mode, GLint first, GLsizei count)
  * pos.xyz + (u,v) + rgba + pad.  A separate constant so the gouraud/tex
  * stride-6 staging and its cross-draw coalescing stay untouched. */
 #define GPU_TEXCOL_STRIDE  10
-#define GPU_NUNIF          6   /* uMVP .. uShade */
+/* INSTANCED-LIT coalescing (engine demo, cs_is_geom=3 + PGL_G3D_INSTANCED_LIT):
+ * the vertex staging carries a per-vertex instance index at element 6 (stride
+ * 7) and each draw appends one 40-float record (MVP mat4 + normal mat4 +
+ * material rgb + emissive + alpha + 3 pad) so a whole render pass of many
+ * differently-uniformed draws transforms+lights in ONE dispatch.  See
+ * geom_xform_instlit_cs_glsl for the record contract. */
+#define GPU_INST_STRIDE    7
+#define GPU_INST_REC       40
+#define GPU_MAX_INST       1024   /* records per batch (engine uses ~36/pass) */
+#define GPU_NUNIF          7   /* uMVP .. uShade, uEmissive */
 
 /* The lighting uniforms the gouraud xform kernel reads, matched by name
  * between the compiled kernel (dword offset via pgl_g3d_shader_uniform_dword)
  * and the app's GLSL program (uniform-block float offset).  The textured xform
  * kernel declares only uMVP, so the other five resolve to -1 and are skipped;
  * pgl_g3d_draw_mesh_compiled auto-patches uViewportWH/uFbStride/uTriFirst/
- * uTriCount/uVertCount (+uTexW/uTexH) into the same blob. */
+ * uTriCount/uVertCount (+uTexW/uTexH) into the same blob.  The INSTANCED-LIT
+ * kernel declares ONLY uLightEye/uShade (its MVP/normal/material/emissive ride
+ * the per-instance record, not the blob), so for it uMVP/uModelView/uNormalMat/
+ * uMaterial/uEmissive resolve to kernel offset -1 and are packed per-instance
+ * by gpu_try_draw_arrays instead - the shared blob then holds just the two
+ * lighting uniforms, which is exactly the coalescing key's invariant part. */
 static const char *const g_gpu_uname[GPU_NUNIF] = {
-    "uMVP", "uModelView", "uNormalMat", "uMaterial", "uLightEye", "uShade"
+    "uMVP", "uModelView", "uNormalMat", "uMaterial", "uLightEye", "uShade",
+    "uEmissive"
 };
 
 typedef struct {
@@ -1562,6 +1577,12 @@ typedef struct {
                                     gpu_try_draw_elements, never gpu_try_draw_arrays */
     int           fullscreen;    /* passthrough VS + gl_FragCoord FS: routed
                                     by gpu_try_fullscreen, not the mesh path */
+    int           inst_lit;      /* PGL_G3D_INSTANCED_LIT kernel attached: draws
+                                    coalesce across DIFFERENT uniforms into one
+                                    instanced dispatch (per-vertex instance index
+                                    at staging element 6 + one 40-float record per
+                                    draw), and the raster kernel honours the app's
+                                    blend/depth-mask/cull state. */
     int           cpu_latched;   /* a dispatch declined: stay on the CPU  */
     int           unif_resolved;
     int           in_use;
@@ -1618,7 +1639,25 @@ static int     g_gpu_stage_cap = 0;   /* in vertices */
 static float  *g_gpu_tcol = NULL;
 static int     g_gpu_tcol_cap = 0;    /* in vertices */
 
-typedef struct { float *v; int n; int cap; } gpu_stage;
+/* Separate stride-7 staging for the INSTANCED-LIT route (pos.xyz + nrm.xyz +
+ * instance index).  It never shares g_gpu_stage: an instanced batch stamps a
+ * per-vertex draw index that the stride-6 gouraud/tex staging has no room for,
+ * and the two routes never mix in one open batch (different program -> the
+ * coalesce key always mismatches -> flush). */
+static float  *g_gpu_istage = NULL;
+static int     g_gpu_istage_cap = 0;  /* in vertices */
+
+/* Per-batch instance-record staging (one 40-float record per coalesced draw,
+ * staged to the GPU by pgl_g3d_set_instances at flush). */
+static float  *g_inst_rec = NULL;
+static int     g_inst_rec_cap = 0;    /* in records */
+static int     g_inst_rec_n = 0;      /* records in the open batch */
+
+/* stride is GPU_STAGING_STRIDE (6) for the gouraud/tex routes and
+ * GPU_INST_STRIDE (7) for the instanced-lit route; inst is the instance index
+ * stamped into element 6 of every vertex gpu_stage_tri appends (ignored when
+ * stride < 7). */
+typedef struct { float *v; int n; int cap; int stride; float inst; } gpu_stage;
 
 /* Cross-draw coalescing state (the gles_engine.h contract: "the GPU path merges
  * consecutive same-state draws into one dispatch").  Eligible untextured geom
@@ -1635,6 +1674,13 @@ static uint32_t     g_coalesce_blob[PGL_G3D_MAX_UNIF];   /* open batch's uniform
 static pgl_g3d_prog g_coalesce_prog = PGL_G3D_PROG_INVALID;
 static gpu_entry   *g_coalesce_entry = NULL;
 static uint32_t     g_coalesce_depth, g_coalesce_mask, g_coalesce_cull;
+/* Open-batch flavour: 1 when the batch is an INSTANCED-LIT accumulation (staged
+ * in g_gpu_istage at stride 7 with g_inst_rec_n per-draw records, flushed via
+ * upload_mesh_instanced + set_instances), 0 for the plain stride-6 gouraud/tex
+ * batch.  g_coalesce_blend is the PGL_G3D_BLEND_* mode joined into the key so an
+ * opaque draw never batches with a translucent one. */
+static int          g_coalesce_inst = 0;
+static uint32_t     g_coalesce_blend = 0;
 
 static gpu_entry *gpu_find_entry(GLuint id)
 {
@@ -1748,6 +1794,26 @@ static uint32_t gpu_cull_code(void)
     }
 }
 
+/* Map the context's blend state onto a PGL_G3D_BLEND_* code the instanced-lit
+ * raster kernel implements, or -1 when the equation is one the kernel cannot
+ * reproduce (so the draw must stay on the CPU interpreter).  Blend disabled is
+ * opaque (0); glBlendFunc(ONE,ZERO) is a plain copy, also opaque.  The engine
+ * demo's translucent shells use SRC_ALPHA/ONE_MINUS_SRC_ALPHA (1) and its
+ * additive flame/glow pass uses SRC_ALPHA/ONE (2).  Only FUNC_ADD is supported. */
+static int gpu_blend_code(void)
+{
+    if (!g_ctx.blend) return PGL_G3D_BLEND_OPAQUE;
+    if (g_ctx.blend_eqRGB != GL_FUNC_ADD) return -1;
+    if (g_ctx.blend_sRGB == GL_ONE && g_ctx.blend_dRGB == GL_ZERO)
+        return PGL_G3D_BLEND_OPAQUE;
+    if (g_ctx.blend_sRGB == GL_SRC_ALPHA &&
+        g_ctx.blend_dRGB == GL_ONE_MINUS_SRC_ALPHA)
+        return PGL_G3D_BLEND_ALPHA;
+    if (g_ctx.blend_sRGB == GL_SRC_ALPHA && g_ctx.blend_dRGB == GL_ONE)
+        return PGL_G3D_BLEND_ADD;
+    return -1;   /* any other factor pair: keep it on the CPU */
+}
+
 static int gpu_stage_reserve(int nverts)
 {
     if (g_gpu_stage && nverts <= g_gpu_stage_cap) return 1;
@@ -1755,6 +1821,28 @@ static int gpu_stage_reserve(int nverts)
     g_gpu_stage = (float *)malloc((size_t)nverts * GPU_STAGING_STRIDE * sizeof(float));
     if (!g_gpu_stage) { g_gpu_stage_cap = 0; return 0; }
     g_gpu_stage_cap = nverts;
+    return 1;
+}
+
+/* Grow the stride-7 instanced-lit vertex staging to nverts vertices. */
+static int gpu_istage_reserve(int nverts)
+{
+    if (g_gpu_istage && nverts <= g_gpu_istage_cap) return 1;
+    free(g_gpu_istage);
+    g_gpu_istage = (float *)malloc((size_t)nverts * GPU_INST_STRIDE * sizeof(float));
+    if (!g_gpu_istage) { g_gpu_istage_cap = 0; return 0; }
+    g_gpu_istage_cap = nverts;
+    return 1;
+}
+
+/* Grow the per-draw instance-record staging to nrec 40-float records. */
+static int gpu_inst_rec_reserve(int nrec)
+{
+    if (g_inst_rec && nrec <= g_inst_rec_cap) return 1;
+    free(g_inst_rec);
+    g_inst_rec = (float *)malloc((size_t)nrec * GPU_INST_REC * sizeof(float));
+    if (!g_inst_rec) { g_inst_rec_cap = 0; return 0; }
+    g_inst_rec_cap = nrec;
     return 1;
 }
 
@@ -1826,7 +1914,7 @@ static int gpu_stage_tri(gpu_stage *st, const glVertex_Attrib *a0,
     if (st->n + 3 > st->cap) return 0;
     idx[0] = i0; idx[1] = i1; idx[2] = i2;
     for (k = 0; k < 3; ++k) {
-        dst = st->v + (size_t)(st->n + k) * GPU_STAGING_STRIDE;
+        dst = st->v + (size_t)(st->n + k) * st->stride;
         if (!gpu_read_attrib(a0, idx[k], p, 3)) return 0;
         dst[0] = p[0]; dst[1] = p[1]; dst[2] = p[2];
         if (textured) {
@@ -1836,6 +1924,7 @@ static int gpu_stage_tri(gpu_stage *st, const glVertex_Attrib *a0,
             if (!gpu_read_attrib(a1, idx[k], q, 3)) return 0;
             dst[3] = q[0]; dst[4] = q[1]; dst[5] = q[2];
         }
+        if (st->stride >= GPU_INST_STRIDE) dst[6] = st->inst;
     }
     st->n += 3;
     return 1;
@@ -2039,11 +2128,29 @@ static void gpu_coalesce_flush(void)
     pgl_g3d_mesh mesh;
     int ok;
     if (!g_coalesce_active || g_coalesce_n < 3) {
-        g_coalesce_active = 0; g_coalesce_n = 0;
+        g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0;
         return;
     }
     pgl_g3d_set_uniforms(g_coalesce_blob, PGL_G3D_MAX_UNIF);
-    mesh = pgl_g3d_upload_mesh(g_gpu_stage, (uint32_t)g_coalesce_n, GPU_STAGING_STRIDE);
+    pgl_g3d_set_blend((int)g_coalesce_blend);
+    if (g_coalesce_inst) {
+        /* INSTANCED-LIT batch: stage the per-draw 40-float records (binding 3 of
+         * the xform kernel) then submit the whole accumulated vertex stream -
+         * each vertex already stamped with its draw's instance index at element
+         * 6 - as ONE upload_mesh_instanced + draw_mesh_compiled dispatch. */
+        if (!pgl_g3d_set_instances(g_inst_rec,
+                                   (uint32_t)g_inst_rec_n * GPU_INST_REC)) {
+            if (g_coalesce_entry) g_coalesce_entry->cpu_latched = 1;
+            g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0;
+            return;
+        }
+        mesh = pgl_g3d_upload_mesh_instanced(g_gpu_istage,
+                                             (uint32_t)g_coalesce_n,
+                                             GPU_INST_STRIDE);
+    } else {
+        mesh = pgl_g3d_upload_mesh(g_gpu_stage, (uint32_t)g_coalesce_n,
+                                   GPU_STAGING_STRIDE);
+    }
     if (mesh == PGL_G3D_MESH_INVALID) {
         if (g_coalesce_entry) g_coalesce_entry->cpu_latched = 1;
     } else {
@@ -2053,7 +2160,7 @@ static void gpu_coalesce_flush(void)
         pgl_g3d_free_mesh(mesh);
         if (!ok && g_coalesce_entry) g_coalesce_entry->cpu_latched = 1;
     }
-    g_coalesce_active = 0; g_coalesce_n = 0;
+    g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -2227,6 +2334,20 @@ static int gpu_try_fullscreen(gpu_entry *e, GLenum mode, GLint first, GLsizei co
     return 1;
 }
 
+/* The fixed gouraud/tex geom kernels write every covered fb word verbatim with
+ * a forced-opaque alpha: unlike the texcol kernel (gpu_blend_texcol_ok below,
+ * which hardcodes imgui's SRC_ALPHA equation) they implement NO blending at
+ * all.  A blended draw dispatched on them would overwrite its destination
+ * instead of compositing onto it (a translucent shell renders as a solid box
+ * hiding everything inside it), so decline it to the CPU interpreter, which
+ * reproduces the blend exactly.  glBlendFunc(ONE,ZERO) is a plain copy and
+ * stays eligible. */
+static int gpu_blend_geom_ok(void)
+{
+    if (!g_ctx.blend) return 1;
+    return g_ctx.blend_sRGB == GL_ONE && g_ctx.blend_dRGB == GL_ZERO;
+}
+
 static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
 {
     gpu_entry *e;
@@ -2236,6 +2357,7 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
     uint32_t depth, mask, cull;
     GLsizei nout, i;
     int key_match, base;
+    int blend;
 
     gpu_bringup();
     if (!g_gpu_ready) return 0;
@@ -2254,6 +2376,19 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
      * stride-10 staging is built by gpu_try_draw_elements, so it must never be
      * tessellated here at GPU_STAGING_STRIDE. */
     if (e->texcol) return 0;
+
+    /* Blend eligibility.  The INSTANCED-LIT raster kernel implements opaque /
+     * SRC_ALPHA / additive blending, so an engine draw whose equation maps to a
+     * PGL_G3D_BLEND_* code stays on the GPU.  Any other equation - or ANY blend
+     * on the plain gouraud/tex kernels, which still cannot blend - drains the
+     * open batch first (painter's order across the GPU->CPU handover), then
+     * declines to the interpreter which reproduces the blend exactly. */
+    blend = gpu_blend_code();
+    if (e->inst_lit) {
+        if (blend < 0) { gpu_coalesce_flush(); return 0; }
+    } else if (!gpu_blend_geom_ok()) {
+        gpu_coalesce_flush(); return 0;
+    }
 
     /* the fixed kernels rasterise triangles only */
     if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP && mode != GL_TRIANGLE_FAN)
@@ -2298,6 +2433,7 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
         gpu_coalesce_flush();
         if (!gpu_stage_reserve(nout)) return 0;
         st.v = g_gpu_stage; st.n = 0; st.cap = nout;
+        st.stride = GPU_STAGING_STRIDE; st.inst = 0.0f;
         if (!gpu_tessellate(&st, mode, first, count, va, e)) return 0;
         if (st.n != nout) return 0;   /* defensive: tessellation/staging mismatch */
         pgl_g3d_set_uniforms(blob, PGL_G3D_MAX_UNIF);
@@ -2313,33 +2449,81 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
         return 1;
     }
 
-    /* Untextured geom: coalesce consecutive same-key draws into one mesh.  The
-     * key is (program, uniform blob, depth func/mask, cull); a change - or a
-     * batch that would overflow the staging cap - flushes the open batch first.
-     * gears re-packs an identical blob for all 76 strips of a gear and changes
-     * it only per gear, so this yields 6 dispatches/frame instead of 532. */
+    /* Untextured geom: coalesce consecutive same-key draws into one dispatch.
+     * For the plain gouraud route the key is (program, uniform blob, depth
+     * func/mask, cull) and every batched draw shares one blob (gears re-packs an
+     * identical blob for all 76 strips of a gear -> 6 dispatches/frame).  For the
+     * INSTANCED-LIT route the blob holds ONLY the shared lighting (uLightEye/
+     * uShade): the per-draw MVP / normal matrix / material / emissive ride a
+     * 40-float instance record and a per-vertex instance index, so draws with
+     * DIFFERENT transforms still batch into one dispatch.  The key adds the blend
+     * mode and the batch flavour; the blob memcmp now only compares lighting. */
     key_match = g_coalesce_active &&
                 g_coalesce_entry == e &&
                 g_coalesce_prog == e->prog &&
+                g_coalesce_inst == (e->inst_lit ? 1 : 0) &&
                 g_coalesce_depth == depth && g_coalesce_mask == mask &&
                 g_coalesce_cull == cull &&
+                g_coalesce_blend == (uint32_t)blend &&
                 memcmp(g_coalesce_blob, blob, sizeof(blob)) == 0 &&
-                g_coalesce_n + nout <= (int)PGL_G3D_MAX_VERTS;
+                g_coalesce_n + nout <= (int)PGL_G3D_MAX_VERTS &&
+                (!e->inst_lit || g_inst_rec_n + 1 <= GPU_MAX_INST);
     if (!key_match) {
         gpu_coalesce_flush();
         if (!g_gpu_ready) return 0;   /* a flush may have latched the GPU off */
         g_coalesce_entry = e;
         g_coalesce_prog  = e->prog;
+        g_coalesce_inst  = e->inst_lit ? 1 : 0;
         g_coalesce_depth = depth; g_coalesce_mask = mask; g_coalesce_cull = cull;
+        g_coalesce_blend = (uint32_t)blend;
         memcpy(g_coalesce_blob, blob, sizeof(blob));
         g_coalesce_n = 0;
+        g_inst_rec_n = 0;
         g_coalesce_active = 1;
     }
+
+    if (e->inst_lit) {
+        /* Append this draw's 40-float instance record (MVP + normal matrix +
+         * material rgb + emissive + alpha + pad), then tessellate its triangles
+         * into the stride-7 staging with every vertex stamped with the record's
+         * instance index.  The record's transforms are copied verbatim from the
+         * app's uniform block, so the kernel reconstructs the identical mat4 the
+         * interpreter's VS would have used. */
+        float *rec;
+        int mi = e->aoff[0], ni = e->aoff[2], mtl = e->aoff[3], em = e->aoff[6];
+        if (mi < 0 || ni < 0 || mtl < 0) { gpu_coalesce_flush(); return 0; }
+        if (!gpu_istage_reserve(PGL_G3D_MAX_VERTS) ||
+            !gpu_inst_rec_reserve(g_inst_rec_n + 1)) {
+            g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0; return 0;
+        }
+        rec = g_inst_rec + (size_t)g_inst_rec_n * GPU_INST_REC;
+        memset(rec, 0, GPU_INST_REC * sizeof(float));
+        memcpy(rec + 0,  &g_active->ublock[mi].f,  16 * sizeof(float));  /* uMVP */
+        memcpy(rec + 16, &g_active->ublock[ni].f,  16 * sizeof(float));  /* uNormalMat */
+        rec[32] = g_active->ublock[mtl + 0].f;   /* material rgb */
+        rec[33] = g_active->ublock[mtl + 1].f;
+        rec[34] = g_active->ublock[mtl + 2].f;
+        rec[35] = (em >= 0) ? g_active->ublock[em].f : 0.0f;   /* emissive */
+        rec[36] = g_active->ublock[mtl + 3].f;   /* alpha = uMaterial.a */
+        base = g_coalesce_n;
+        st.v = g_gpu_istage; st.n = base; st.cap = PGL_G3D_MAX_VERTS;
+        st.stride = GPU_INST_STRIDE; st.inst = (float)g_inst_rec_n;
+        if (!gpu_tessellate(&st, mode, first, count, va, e) || st.n != base + nout) {
+            g_coalesce_n = base;
+            gpu_coalesce_flush();
+            return 0;
+        }
+        g_coalesce_n = st.n;
+        g_inst_rec_n++;
+        return 1;
+    }
+
     if (!gpu_stage_reserve(PGL_G3D_MAX_VERTS)) {
         g_coalesce_active = 0; g_coalesce_n = 0; return 0;
     }
     base = g_coalesce_n;
     st.v = g_gpu_stage; st.n = base; st.cap = PGL_G3D_MAX_VERTS;
+    st.stride = GPU_STAGING_STRIDE; st.inst = 0.0f;
     if (!gpu_tessellate(&st, mode, first, count, va, e) || st.n != base + nout) {
         /* attrib-read fault mid-primitive: keep the valid prefix, dispatch it,
          * and let the caller draw THIS primitive on the CPU (no geometry lost,
@@ -2389,6 +2573,10 @@ static int gpu_try_draw_elements_textured(gpu_entry *e, GLenum mode, GLsizei cou
     nout = (mode == GL_TRIANGLES) ? (count / 3) * 3 : (count - 2) * 3;
     if (nout < 3 || (GLuint)nout > PGL_G3D_MAX_VERTS) return 0;
 
+    /* The textured geom kernel cannot blend either: drain any open coalesce
+     * batch first so painter's order holds, then decline to the CPU. */
+    if (!gpu_blend_geom_ok()) { gpu_coalesce_flush(); return 0; }
+
     base = gpu_index_base(type, indices, count);
     if (!base) return 0;
 
@@ -2411,6 +2599,7 @@ static int gpu_try_draw_elements_textured(gpu_entry *e, GLenum mode, GLsizei cou
     if (!g_gpu_ready) return 0;   /* a flush may have latched the GPU off */
     if (!gpu_stage_reserve(nout)) return 0;
     st.v = g_gpu_stage; st.n = 0; st.cap = nout;
+    st.stride = GPU_STAGING_STRIDE; st.inst = 0.0f;
     if (!gpu_tessellate_elements_mesh(&st, mode, count, base, type, va, 1)) return 0;
     if (st.n != nout) return 0;   /* defensive: tessellation/staging mismatch */
 
@@ -2620,16 +2809,22 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
      * indexed staging can never disagree with the kernel the program got. */
     e->texcol = e->textured && strstr(fs_src, "* texture2D") != NULL;
     e->fullscreen = is_fullscreen;
+    /* The INSTANCED-LIT kernel (PGL_G3D_INSTANCED_LIT marker in the app VS) is
+     * attached by pgl_g3d_program_compile; it declares only uLightEye/uShade (its
+     * MVP/normal/material/emissive ride the per-instance record), so it does NOT
+     * expose uMVP and must be recognised here rather than by the koff[0] test. */
+    e->inst_lit = pgl_g3d_shader_geom_inst_lit(prog);
     e->eligible = 0;
     for (i = 0; i < GPU_NUNIF; ++i) {
         nc = 0;
         e->koff[i] = pgl_g3d_shader_uniform_dword(prog, g_gpu_uname[i], &nc);
         e->knc[i] = (int)nc;
     }
-    /* the fixed geometry xform kernel attached exactly when it exposes uMVP; a
-     * fullscreen program has none, so it stays ineligible for the mesh path and
-     * is routed by gpu_try_fullscreen instead. */
-    e->eligible = (e->koff[0] >= 0) && !is_fullscreen;
+    /* the fixed geometry xform kernel attached exactly when it exposes uMVP (or,
+     * for the instanced-lit variant, uLightEye); a fullscreen program has none,
+     * so it stays ineligible for the mesh path and is routed by gpu_try_fullscreen
+     * instead. */
+    e->eligible = ((e->koff[0] >= 0) || e->inst_lit) && !is_fullscreen;
     e->unif_resolved = 0;
     if (e->eligible || e->fullscreen)
         g_gpu_has_eligible = 1;   /* GPU is now worth bringing up (NOCACHE fb) */

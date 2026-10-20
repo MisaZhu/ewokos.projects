@@ -92,6 +92,15 @@ extern "C" {
 #define PGL_G3D_CULL_FRONT_CW   4
 #define PGL_G3D_CULL_BOTH       5
 
+/* Fragment blend modes carried to the gouraud geometry raster kernel via
+   pgl_g3d_set_blend (patched into the kernel's uBlendMode uniform).  Only the
+   INSTANCED-LIT/gouraud raster kernel implements them; the textured/texcol
+   kernels keep their own fixed equations.  Value 0 reproduces the historical
+   opaque overwrite (alpha forced to 255). */
+#define PGL_G3D_BLEND_OPAQUE    0   /* dst = src                            */
+#define PGL_G3D_BLEND_ALPHA     1   /* dst = src*a + dst*(1-a)              */
+#define PGL_G3D_BLEND_ADD       2   /* dst = dst + src*a                    */
+
 /* Primitive-mode codes carried to the back end, value-identical to the
    g2dclient G2D_PGL_MODE_* protocol set.  A batch is homogeneous in mode too,
    so points/lines/triangles never mix in one dispatch (the GPU primitive-list
@@ -346,6 +355,13 @@ int  pgl_g3d_shader_uniform_dword(pgl_g3d_prog p, const char* name,
    (a plain or textured geom kernel, or the CPU fallback, returns 0). */
 int  pgl_g3d_shader_geom_inst(pgl_g3d_prog p);
 
+/* Report whether program p attached the INSTANCED-LIT geometry xform kernel
+   (the PGL_G3D_INSTANCED_LIT variant: 40-float per-instance records carrying
+   emissive + alpha and the engine demo's reflect-spec lighting model, staged
+   and dispatched exactly like the plain instanced variant).  Returns 1 only
+   when the compute stage is present and is that variant. */
+int  pgl_g3d_shader_geom_inst_lit(pgl_g3d_prog p);
+
 /* Add one triangle of the active compiled program to the current batch:
    n0/n1/n2 are the clip-space positions (NDC xyz, 3 floats each).  Requires an
    active program (pgl_g3d_set_shader_program) whose daemon upload succeeds;
@@ -458,6 +474,17 @@ int  pgl_g3d_set_instances(const float* data, uint32_t nfloats);
    other geom variants declare no uScissor and ignore it.  Call before each
    texcol draw (the engine derives it from glScissor). */
 void pgl_g3d_set_scissor(int32_t x, int32_t y, int32_t w, int32_t h);
+
+/* Set the fragment blend mode (PGL_G3D_BLEND_*) patched into the gouraud raster
+   kernel's uBlendMode uniform by the next pgl_g3d_draw_mesh_compiled.  Blended
+   draws read-modify-write the fb word using the per-vertex alpha the xform
+   kernel carries in vout[i*8+7]; the depth-write and cull state ride the same
+   draw's depth_mask/cull arguments.  Because lanes rasterise in parallel,
+   painter's order holds only BETWEEN dispatches, so the caller must not batch
+   overlapping blended geometry that needs a strict order.  The value is a
+   per-draw render state: call it before each draw (or batch) whose equation
+   differs. */
+void pgl_g3d_set_blend(int mode);
 
 /* Draw vertices [first, first+count) of an uploaded mesh with a compiled program
    as one GPU dispatch: the program's compiled VS/coord QPU runs the transform +

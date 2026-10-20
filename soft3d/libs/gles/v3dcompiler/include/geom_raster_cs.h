@@ -152,7 +152,7 @@ static const char geom_xform_cs_glsl[] =
 "    vout[v*8+4] = col.r;\n"
 "    vout[v*8+5] = col.g;\n"
 "    vout[v*8+6] = col.b;\n"
-"    vout[v*8+7] = 0.0;\n"
+"    vout[v*8+7] = uMaterial.a;\n"
 "}\n";
 
 /* ---- Pass 1 (colour variant): precomputed-colour vertex transform ---------
@@ -204,7 +204,7 @@ static const char geom_xform_color_cs_glsl[] =
 "    vout[v*8+4] = col.r;\n"
 "    vout[v*8+5] = col.g;\n"
 "    vout[v*8+6] = col.b;\n"
-"    vout[v*8+7] = 0.0;\n"
+"    vout[v*8+7] = 1.0;\n"
 "}\n";
 
 /* ---- Pass 2: gouraud rasterizer (ONE LANE PER TRIANGLE) ------------------
@@ -223,7 +223,24 @@ static const char geom_xform_color_cs_glsl[] =
  * performance point: device measurement on the raspi5 V3D 7.1 CSD showed the
  * raster pass is dominated by a ~3us FIXED per-workgroup dispatch overhead, so
  * collapsing 6400 workgroups to 25 took the teapot raster pass from ~19ms to
- * well under 1ms.  Per-pixel interpolation math is unchanged. */
+ * well under 1ms.  Per-pixel interpolation math is unchanged.
+ *
+ * Per-draw render state (patched by name from pgl_g3d_draw_mesh_compiled):
+ *   uBlendMode  0 = opaque overwrite (alpha forced to 255),
+ *               1 = SRC_ALPHA/ONE_MINUS_SRC_ALPHA, 2 = SRC_ALPHA/ONE;
+ *               blended modes read-modify-write the fb word with the
+ *               per-vertex alpha carried in vout[i*8+7] (the xform kernels
+ *               write the material/instance alpha there).  Blended draws must
+ *               NOT be coalesced across overlapping geometry: lanes run in
+ *               parallel, so painter's order only holds BETWEEN dispatches.
+ *   uDepthWrite 1 = atomicMin test-and-write (the historical behaviour),
+ *               0 = test-only against the existing depth (glDepthMask(FALSE)).
+ *               The depth function is fixed LESS, matching atomicMin.
+ *   uCullSign   0 = accept both windings, 1 = keep area < 0, 2 = keep area > 0.
+ *               The client maps GL cull mode + front face onto this using
+ *               portablegl's is_front_facing convention: its window-space
+ *               shoelace `a` equals -area here, so CCW-front BACK-cull (discard
+ *               a <= 0) becomes "keep area < 0". */
 static const char geom_raster_cs_glsl[] =
 "#version 310 es\n"
 "precision highp float;\n"
@@ -239,6 +256,9 @@ static const char geom_raster_cs_glsl[] =
 "uniform int  uFbStride;\n"
 "uniform int  uTriFirst;\n"
 "uniform int  uTriCount;\n"
+"uniform int  uBlendMode;\n"
+"uniform int  uDepthWrite;\n"
+"uniform int  uCullSign;\n"
 "\n"
 "float edgef(vec2 a, vec2 b, vec2 p)\n"
 "{\n"
@@ -259,6 +279,8 @@ static const char geom_raster_cs_glsl[] =
 "    float iw0 = vout[i0*8+3], iw1 = vout[i1*8+3], iw2 = vout[i2*8+3];\n"
 "    if (iw0 <= 0.0 || iw1 <= 0.0 || iw2 <= 0.0)\n"
 "        return;\n"
+"    if (uCullSign == 3)\n"
+"        return;   /* GL_FRONT_AND_BACK: every triangle is culled */\n"
 "\n"
 "    vec2 s0 = vec2(vout[i0*8+0], vout[i0*8+1]);\n"
 "    vec2 s1 = vec2(vout[i1*8+0], vout[i1*8+1]);\n"
@@ -267,6 +289,22 @@ static const char geom_raster_cs_glsl[] =
 "    vec3 col0 = vec3(vout[i0*8+4], vout[i0*8+5], vout[i0*8+6]);\n"
 "    vec3 col1 = vec3(vout[i1*8+4], vout[i1*8+5], vout[i1*8+6]);\n"
 "    vec3 col2 = vec3(vout[i2*8+4], vout[i2*8+5], vout[i2*8+6]);\n"
+"    float al0 = vout[i0*8+7], al1 = vout[i1*8+7], al2 = vout[i2*8+7];\n"
+"\n"
+"    /* area == w0+w1+w2 at EVERY pixel: the three edge functions sum to twice\n"
+"     * the signed area, independent of P, so the winding/cull verdict is one\n"
+"     * per-TRIANGLE constant.  Resolve it here and return BEFORE the bounding-\n"
+"     * box sweep, so a culled or degenerate triangle costs nothing instead of\n"
+"     * testing (and rejecting) every pixel it covers.  Pixel-identical: a culled\n"
+"     * triangle wrote nothing before either. */\n"
+"    float area = edgef(s1, s2, s0);\n"
+"    if (area == 0.0)\n"
+"        return;\n"
+"    if (uCullSign == 1 && area >= 0.0)\n"
+"        return;\n"
+"    if (uCullSign == 2 && area <= 0.0)\n"
+"        return;\n"
+"    float inv_area = 1.0 / area;\n"
 "\n"
 "    vec2 W = uViewportWH;\n"
 "    int minx = int(floor(min(s0.x, min(s1.x, s2.x))));\n"
@@ -280,37 +318,78 @@ static const char geom_raster_cs_glsl[] =
 "    if (minx > maxx || miny > maxy)\n"
 "        return;\n"
 "\n"
-"    for (int py = miny; py <= maxy; py++) {\n"
-"    for (int px = minx; px <= maxx; px++) {\n"
-"        vec2 P = vec2(float(px) + 0.5, float(py) + 0.5);\n"
+"    /* Incremental edge functions.  edgef(a,b,P) == A*P.x - B*P.y + C with\n"
+"     * A=(b.y-a.y), B=(b.x-a.x), C=B*a.y-A*a.x all per-TRIANGLE constants, so\n"
+"     * the sweep steps each edge by A across a row (one add) and re-seeds from\n"
+"     * -B*fy+C once per row, instead of re-evaluating 2 mul+2 sub per edge per\n"
+"     * pixel (~50% of every bounding box is rejected before it reaches the\n"
+"     * interpolation, so this is the hot path).  `sgn` folds the winding verdict\n"
+"     * into ONE branchless test uniform across lanes: keep the pixel iff every\n"
+"     * edge value shares area's sign, i.e. e*sgn >= 0 -- accept/reject identical\n"
+"     * to the old if(area<0)/else split, boundary e==0 kept, since sgn is +-1. */\n"
+"    float A0 = s2.y - s1.y, B0 = s2.x - s1.x, C0 = B0*s1.y - A0*s1.x;\n"
+"    float A1 = s0.y - s2.y, B1 = s0.x - s2.x, C1 = B1*s2.y - A1*s2.x;\n"
+"    float A2 = s1.y - s0.y, B2 = s1.x - s0.x, C2 = B2*s0.y - A2*s0.x;\n"
+"    float sgn = (area < 0.0) ? -1.0 : 1.0;\n"
+"    float cx = float(minx) + 0.5;\n"
 "\n"
-"        float w0 = edgef(s1, s2, P);\n"
-"        float w1 = edgef(s2, s0, P);\n"
-"        float w2 = edgef(s0, s1, P);\n"
-"        float area = w0 + w1 + w2;\n"
-"        if (area == 0.0)\n"
-"            continue;\n"
-"        if (area < 0.0) {\n"
-"            if (w0 > 0.0 || w1 > 0.0 || w2 > 0.0) continue;\n"
-"        } else {\n"
-"            if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) continue;\n"
-"        }\n"
-"        float inv_area = 1.0 / area;\n"
-"        vec3 bary = vec3(w0, w1, w2) * inv_area;\n"
+"    for (int py = miny; py <= maxy; py++) {\n"
+"        float fy = float(py) + 0.5;\n"
+"        float w0 = A0*cx - B0*fy + C0;\n"
+"        float w1 = A1*cx - B1*fy + C1;\n"
+"        float w2 = A2*cx - B2*fy + C2;\n"
+"    for (int px = minx; px <= maxx; px++) {\n"
+"        float e0 = w0, e1 = w1, e2 = w2;\n"
+"        w0 += A0; w1 += A1; w2 += A2;   /* step before any continue */\n"
+"        if (e0*sgn < 0.0 || e1*sgn < 0.0 || e2*sgn < 0.0) continue;\n"
+"        vec3 bary = vec3(e0, e1, e2) * inv_area;\n"
 "\n"
 "        float iw = bary.x * iw0 + bary.y * iw1 + bary.z * iw2;\n"
 "        if (iw <= 0.0) continue;\n"
 "        float rw = 1.0 / iw;\n"
-"        vec3 col = (bary.x * col0 * iw0 + bary.y * col1 * iw1 +\n"
-"                    bary.z * col2 * iw2) * rw;\n"
 "        float z  = (bary.x * z0 * iw0 + bary.y * z1 * iw1 +\n"
 "                    bary.z * z2 * iw2) * rw;\n"
 "\n"
 "        uint d = uint(clamp(z, 0.0, 1.0) * 16777215.0);   /* 24-bit unorm depth */\n"
 "        int idx = py * uFbStride + px;\n"
-"        uint old = atomicMin(depth[idx], d);\n"
-"        if (d < old) {\n"
+"        if (uDepthWrite != 0) {\n"
+"            /* Cheap non-atomic reject first: a fragment already behind the\n"
+"             * stored depth can never win the atomicMin, so skip the contended\n"
+"             * global read-modify-write for it.  The dense opaque internals\n"
+"             * overdraw heavily, so most fragments lose -- this turns their\n"
+"             * serialized L2 atomic into a plain (cacheable) load.  Pixel-\n"
+"             * identical: the atomic below still resolves the race for the\n"
+"             * fragments that pass the pre-read. */\n"
+"            if (d >= depth[idx]) continue;\n"
+"            uint old = atomicMin(depth[idx], d);\n"
+"            if (d >= old) continue;\n"
+"        } else {\n"
+"            if (d >= depth[idx]) continue;\n"
+"        }\n"
+"        /* Depth-surviving fragment only: interpolate colour (and, when\n"
+"         * blending, alpha) AFTER the depth test.  An occluded fragment used to\n"
+"         * pay the full perspective-correct colour+alpha math before being\n"
+"         * discarded; hoisting it below the test skips that work for every\n"
+"         * rejected pixel.  Pixel-identical: col/al have no side effects and\n"
+"         * are unchanged for the fragments that reach the blend/write. */\n"
+"        vec3 col = (bary.x * col0 * iw0 + bary.y * col1 * iw1 +\n"
+"                    bary.z * col2 * iw2) * rw;\n"
+"        if (uBlendMode == 0) {\n"
 "            vec3 cc = clamp(col, 0.0, 1.0) * 255.0 + 0.5;\n"
+"            uvec3 u = uvec3(cc);\n"
+"            fb[idx] = (255u << 24) | (u.r << 16) | (u.g << 8) | u.b;\n"
+"        } else {\n"
+"            float al = (bary.x * al0 * iw0 + bary.y * al1 * iw1 +\n"
+"                        bary.z * al2 * iw2) * rw;\n"
+"            uint dw = fb[idx];\n"
+"            vec3 dc = vec3(float((dw >> 16) & 255u),\n"
+"                           float((dw >>  8) & 255u),\n"
+"                           float( dw        & 255u)) / 255.0;\n"
+"            vec3 sc = clamp(col, 0.0, 1.0);\n"
+"            float sa = clamp(al, 0.0, 1.0);\n"
+"            vec3 oc = (uBlendMode == 2) ? (dc + sc * sa)\n"
+"                                        : (sc * sa + dc * (1.0 - sa));\n"
+"            vec3 cc = clamp(oc, 0.0, 1.0) * 255.0 + 0.5;\n"
 "            uvec3 u = uvec3(cc);\n"
 "            fb[idx] = (255u << 24) | (u.r << 16) | (u.g << 8) | u.b;\n"
 "        }\n"
@@ -445,6 +524,97 @@ static const char geom_xform_inst_cs_glsl[] =
 "    vout[v*8+5] = col.g;\n"
 "    vout[v*8+6] = col.b;\n"
 "    vout[v*8+7] = 0.0;\n"
+"}\n";
+
+/* ---- Pass 1: INSTANCED-LIT gouraud vertex transform (multi-model batch) ----
+ * Generalisation of the gears instanced kernel for apps whose draws differ in
+ * the FULL lighting state (engine demo: per-part MVP/normal matrix/material/
+ * emissive), selected by the PGL_G3D_INSTANCED_LIT marker in the app VS.  The
+ * pgl_engine coalescer stamps every vertex with its draw's instance index and
+ * appends one 40-float record per draw, so a whole render pass of many
+ * differently-uniformed draws transforms+lights in ONE dispatch.  Record
+ * layout (binding 3, stride 40):
+ *   [0..15]  model-view-projection (column-major mat4)
+ *   [16..31] normal matrix         (column-major mat4)
+ *   [32..34] material rgb   [35] emissive   [36] material alpha   [37..39] pad
+ * The lighting evaluates the engine VS verbatim: directional eye-space light
+ * along normalize(uLightEye.xyz), one-sided diffuse, a reflect-based specular
+ * lobe (rd^16 * uShade.z about the fixed eye vector +Z) and a per-instance
+ * additive emissive; alpha rides vout[7] so the shared raster kernel can blend
+ * per instance.  Bindings and the vout record layout match the plain instanced
+ * kernel (0 vout, 1 vpos stride 4 = pos.xyz+idx, 2 vnrm, 3 records), so the
+ * daemon's cs_is_geom=3 dispatch and pass 2 are reused unchanged. */
+static const char geom_xform_instlit_cs_glsl[] =
+"#version 310 es\n"
+"precision highp float;\n"
+"precision highp int;\n"
+"\n"
+"layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n"
+"\n"
+"layout(std430, binding = 0) buffer V3dCsVout { float vout[]; }\n;"
+"layout(std430, binding = 1) buffer V3dCsPos  { float vpos[]; }\n;"
+"layout(std430, binding = 2) buffer V3dCsNrm  { float vnrm[]; }\n;"
+"layout(std430, binding = 3) buffer V3dCsInst { float inst[]; }\n;"
+"\n"
+"uniform vec4 uLightEye;\n"
+"uniform vec4 uShade;\n"
+"uniform vec2 uViewportWH;\n"
+"uniform int  uVertCount;\n"
+"\n"
+"mat4 instMat4(int base)\n"
+"{\n"
+"    return mat4(vec4(inst[base+0],  inst[base+1],  inst[base+2],  inst[base+3]),\n"
+"                vec4(inst[base+4],  inst[base+5],  inst[base+6],  inst[base+7]),\n"
+"                vec4(inst[base+8],  inst[base+9],  inst[base+10], inst[base+11]),\n"
+"                vec4(inst[base+12], inst[base+13], inst[base+14], inst[base+15]));\n"
+"}\n"
+"\n"
+"void main()\n"
+"{\n"
+"    int v = int(gl_WorkGroupID.x) * 64 +\n"
+"            int(gl_LocalInvocationID.y) * 8 + int(gl_LocalInvocationID.x);\n"
+"    if (v >= uVertCount)\n"
+"        return;\n"
+"\n"
+"    vec3 p = vec3(vpos[v*4+0], vpos[v*4+1], vpos[v*4+2]);\n"
+"    int  g = int(vpos[v*4+3]);\n"
+"    vec3 n = vec3(vnrm[v*3+0], vnrm[v*3+1], vnrm[v*3+2]);\n"
+"\n"
+"    int   gb    = g * 40;\n"
+"    mat4  mvp   = instMat4(gb);\n"
+"    mat4  nmat  = instMat4(gb + 16);\n"
+"    vec3  mat   = vec3(inst[gb+32], inst[gb+33], inst[gb+34]);\n"
+"    float emis  = inst[gb+35];\n"
+"    float alpha = inst[gb+36];\n"
+"\n"
+"    vec3  ne   = normalize((nmat * vec4(n, 0.0)).xyz);\n"
+"    vec3  L    = normalize(uLightEye.xyz);\n"
+"    float diff = max(dot(ne, L), 0.0);\n"
+"    vec3  R    = (2.0 * dot(ne, L)) * ne - L;   /* reflect(-L, ne) */\n"
+"    float rd   = max(R.z, 0.0);\n"
+"    float rd2  = rd * rd;\n"
+"    float rd4  = rd2 * rd2;\n"
+"    float rd8  = rd4 * rd4;\n"
+"    float rd16 = rd8 * rd8;\n"
+"    float spec = rd16 * uShade.z;\n"
+"    vec3 col = clamp(mat * (uShade.x + uShade.y * diff + emis) + vec3(spec),\n"
+"                     0.0, 1.0);\n"
+"\n"
+"    vec4 c = mvp * vec4(p, 1.0);\n"
+"    vec2 W = uViewportWH;\n"
+"    float iw = (c.w > 0.0) ? (1.0 / c.w) : 0.0;   /* clip sentinel */\n"
+"    vec2 s = vec2((c.x * iw * 0.5 + 0.5) * W.x, (0.5 - c.y * iw * 0.5) * W.y);\n"
+"    float z = c.z * iw * 0.5 + 0.5;\n"
+"    if (c.w <= 0.0) col = vec3(0.0);\n"
+"\n"
+"    vout[v*8+0] = s.x;\n"
+"    vout[v*8+1] = s.y;\n"
+"    vout[v*8+2] = z;\n"
+"    vout[v*8+3] = iw;\n"
+"    vout[v*8+4] = col.r;\n"
+"    vout[v*8+5] = col.g;\n"
+"    vout[v*8+6] = col.b;\n"
+"    vout[v*8+7] = alpha;\n"
 "}\n";
 
 /* ---- Pass 2: TEXTURED rasterizer (one workgroup per triangle) ------------

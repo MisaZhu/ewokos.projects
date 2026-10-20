@@ -103,6 +103,15 @@ int pgl_g3d_shader_geom_texcol(pgl_g3d_prog p);
  * pgl_g3d_set_instances.  Pass 2 is the plain gouraud raster kernel. */
 int pgl_g3d_shader_geom_inst(pgl_g3d_prog p);
 
+/* Non-zero when p's geom kernel is the INSTANCED-LIT variant
+ * (geom_xform_instlit_cs_glsl, PGL_G3D_INSTANCED_LIT marker): the same
+ * cs_is_geom=3 dispatch, bindings and pos-with-instance-index staging as the
+ * plain instanced variant, but the per-instance record is 40 floats (MVP +
+ * normal matrix + material rgb + emissive + alpha + pad) and the kernel
+ * evaluates the engine demo's full directional/reflect-spec lighting model.
+ * pgl_g3d_shader_geom_inst also returns 1 for this variant. */
+int pgl_g3d_shader_geom_inst_lit(pgl_g3d_prog p);
+
 /* The geom kernel's lighting model for p: 1 = eye-space positional light,
  * two-sided, Blinn-Phong specular 48 (teapot's VS); 0 = fixed directional
  * (5,5,10) one-sided diffuse (gears' VS).  Selected at compile time by
