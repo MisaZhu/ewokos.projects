@@ -168,53 +168,38 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 	{
 		struct pglc_program res;
 		memset(&res, 0, sizeof(res));
-		if (!pglc_compile_glsl(vert_glsl, frag_glsl, &res)) {
-			/* A FULL-SCREEN program (no uMVP; shadertoy-style) executes on the
-			   GPU only through the ES 3.1 compute wrap built a few lines below,
-			   so an FS that uses GLSL ES 3.0-only syntax (explicit-size array
-			   constructors like `float[64](...)`, tanh, integer swizzles on
-			   const arrays, ...) is legitimately rejected by THIS ES 1.00 pair
-			   compile yet still runs on the GPU.  For that shape, fall back to
-			   gating on the compute wrap itself: if the 310 es kernel compiles,
-			   accept the program with an empty VS/FS pair (the fullscreen route
-			   only consumes stage[COMPUTE], filled below; the CPU-interpreter
-			   fallback is a separate compiler and is unaffected).  Non-
-			   fullscreen programs keep the original strict gate. */
-			int fullscreen = strstr(vert_glsl, "uMVP") == NULL &&
-			                 strstr(frag_glsl, "gl_FragCoord") != NULL;
-			struct pglc_program gate;
-			char gate_log[sizeof(gate.log)];
-			int gate_ok = 0;
-			memset(&gate, 0, sizeof(gate));
-			gate_log[0] = '\0';
-			if (fullscreen) {
-				gate_ok = pglc_compile_compute(frag_glsl, &gate);
-				/* Capture the compute-wrap diagnostic BEFORE releasing the
-				   gate.  This is the REAL reason a fullscreen effect cannot
-				   run on the GPU.  res.log (the ES 1.00 pair compile) is
-				   misleading for this shape: it rejects ES3-only syntax
-				   (explicit-size array constructors, const-array initialisers,
-				   ...) that the 310 es compute wrap accepts, so surfacing
-				   res.log told the developer nothing about the actual failure. */
-				snprintf(gate_log, sizeof(gate_log), "%s", gate.log);
-			}
-			pglc_program_free(&gate);
-			if (!gate_ok) {
-				if (errlog && errsz > 0) {
-					if (fullscreen)
-						snprintf(errlog, (size_t)errsz,
-						         "compute-wrap compile failed: %s",
-						         gate_log[0] ? gate_log : "(no error text)");
-					else
-						snprintf(errlog, (size_t)errsz, "%s",
-						         res.log[0] ? res.log
-						                    : "pglc_compile_glsl failed");
-				}
+		/* A FULL-SCREEN program (no uMVP; shadertoy-style) executes on the GPU
+		   ONLY through the ES 3.10 compute wrap, so the ES 1.00 graphics-pair
+		   compile is pure waste for that shape: it either rejects the ES3-only
+		   syntax the effect uses (explicit-size array constructors like
+		   `float[64](...)`, tanh, const-array initialisers, ...) or its VS/FS
+		   result is discarded once the compute wrap is attached.  On the heavy
+		   raymarch ports that waste is a SECOND full multi-minute on-device
+		   compile before the app can show its window, so gate fullscreen
+		   programs on the compute wrap ALONE and keep an empty VS/FS pair (the
+		   fullscreen route consumes only stage[COMPUTE]; the CPU-interpreter
+		   fallback is a separate compiler over the GLSL source and is
+		   unaffected).  Non-fullscreen programs keep the strict ES 1.00 gate. */
+		int fullscreen = strstr(vert_glsl, "uMVP") == NULL &&
+		                 strstr(frag_glsl, "gl_FragCoord") != NULL;
+		int fs_done = 0;
+		if (fullscreen) {
+			fs_done = pglc_compile_compute(frag_glsl, &res);
+			if (!fs_done) {
+				if (errlog && errsz > 0)
+					snprintf(errlog, (size_t)errsz,
+					         "compute-wrap compile failed: %s",
+					         res.log[0] ? res.log : "(no error text)");
 				pglc_program_free(&res);
 				return PGL_G3D_PROG_INVALID;   /* per-shader: no GPU latch-off */
 			}
+		} else if (!pglc_compile_glsl(vert_glsl, frag_glsl, &res)) {
+			if (errlog && errsz > 0)
+				snprintf(errlog, (size_t)errsz, "%s",
+				         res.log[0] ? res.log
+				                    : "pglc_compile_glsl failed");
 			pglc_program_free(&res);
-			memset(&res, 0, sizeof(res));
+			return PGL_G3D_PROG_INVALID;   /* per-shader: no GPU latch-off */
 		}
 		_progs[slot].prog = res;   /* take ownership of res.stage[].code */
 
@@ -313,7 +298,7 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			}
 			pglc_program_free(&gres);
 			pglc_program_free(&xres);
-		} else {
+		} else if (!fs_done) {
 			struct pglc_program cres;
 			memset(&cres, 0, sizeof(cres));
 			if (pglc_compile_compute(frag_glsl, &cres)) {

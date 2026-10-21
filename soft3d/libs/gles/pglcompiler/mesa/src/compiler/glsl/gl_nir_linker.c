@@ -38,31 +38,40 @@
 #include "util/perf/cpu_trace.h"
 #include "pipe/p_screen.h"
 
-/* TEMPORARY crash forensics (city fullscreen compute): the debug NIR validator
- * used to crash first and mask a later data-abort in nir_block_dominates (corrupt
- * nir_block*).  slog() writes straight into the /dev/log ring buffer, so a terse
- * breadcrumb per pass lets ONE device run reveal the last pass entered before the
- * crash.  Remove once the offending pass is fixed. */
+/* The per-pass crash-forensics breadcrumbs that lived here (NIRDBG /
+ * NIRDBGOPT / per-pass PROG logs) were TEMPORARY and are now removed: the
+ * offending pass behaviour is fixed by the oscillation break below, and the
+ * unthrottled markers flooded the 64KB /dev/log ring on every compile.  Only
+ * the single oscillation-break line remains, emitted at most once per
+ * gl_nir_opts call. */
 #include <ewoksys/klog.h>
-#define NIRDBG(fmt, ...) slog("nirdbg: " fmt "\r\n", ##__VA_ARGS__)
-/* The gl_nir_opts do-while loop iterates pathologically many times on city's
- * shader; unthrottled per-pass markers flood the 64KB /dev/log ring and wrap out
- * the coarse fedbg stage markers.  Log in-loop detail only for the first two
- * iterations and then every 200th, always tagging the iteration index. */
 static int g_opts_iter = 0;
-#define NIRDBGOPT(fmt, ...) do { if (g_opts_iter < 2 || (g_opts_iter % 200) == 0) \
-      slog("nirdbg: [it%d] " fmt "\r\n", g_opts_iter, ##__VA_ARGS__); } while (0)
-/* TEMPORARY progress attribution: wraps NIR_PASS(progress, nir, pass, ...) and
- * logs WHICH pass reported progress.  Logged for the first three iterations and
- * once more at it50 so a stable oscillation (same pass set progressing forever)
- * is unmistakable.  Remove once the non-converging pass is identified. */
+/* Wraps NIR_PASS(progress, nir, pass, ...) and additionally records that some
+ * pass OTHER than the if/cse pair progressed this iteration. */
 #define NIR_PASS_P(pass, ...) do { \
       bool _pp = false; \
       NIR_PASS(_pp, nir, pass, ##__VA_ARGS__); \
-      if (_pp) { progress = true; \
-         if (g_opts_iter < 3 || g_opts_iter == 50) \
-            slog("nirdbg: [it%d] PROG %s\r\n", g_opts_iter, #pass); } \
+      if (_pp) { progress = true; g_other_prog = true; } \
    } while (0)
+/* Same as NIR_PASS_P but routes the progress flag to `flag` instead of the
+ * generic g_other_prog, so the if/cse pair can be told apart from every other
+ * pass for the oscillation detector below. */
+#define NIR_PASS_CYCLE(pass, flag, ...) do { \
+      bool _pp = false; \
+      NIR_PASS(_pp, nir, pass, ##__VA_ARGS__); \
+      flag = _pp; \
+      if (_pp) progress = true; \
+   } while (0)
+/* Per-iteration oscillation detector state.  Device logs of the heavy
+ * fullscreen-compute ports (BladeRunner city) show the opt loop converging by
+ * it2 for EVERY pass except nir_opt_if and nir_opt_cse, which then undo each
+ * other's rewrite and progress as an isolated pair for the remaining ~60
+ * iterations -- pure waste on a several-thousand-instruction shader (minutes of
+ * compile before the app can show its window).  g_other_prog records "some pass
+ * OTHER than the if/cse pair progressed this iteration"; three consecutive
+ * iterations where ONLY the pair progressed prove a 2-cycle, which we break out
+ * of (the loop is a pure optimisation, so bailing leaves valid NIR). */
+static bool g_other_prog = false;
 /* Hard bound on the gl_nir_opts do-while.  Real shaders converge in well under
  * a dozen iterations; 64 is generous headroom that still terminates a pathological
  * oscillation long before the heap is exhausted. */
@@ -76,15 +85,15 @@ void
 gl_nir_opts(nir_shader *nir)
 {
    bool progress;
+   int cycle = 0;          /* consecutive if/cse-only iterations (see above) */
 
    MESA_TRACE_FUNC();
-
-   NIRDBG("opts ENTER stage=%d", (int)nir->info.stage);
 
    g_opts_iter = 0;
    do {
       progress = false;
-      NIRDBGOPT("iter begin stage=%d", (int)nir->info.stage);
+      g_other_prog = false;
+      bool if_prog = false, cse_prog = false;
 
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
 
@@ -123,26 +132,19 @@ gl_nir_opts(nir_shader *nir)
       NIR_PASS(_, nir, nir_lower_alu);
       NIR_PASS(_, nir, nir_lower_pack);
       NIR_PASS_P(nir_opt_copy_prop);
-      NIRDBGOPT("opts pre remove_phis");
       NIR_PASS_P(nir_opt_remove_phis);
-      NIRDBGOPT("opts post remove_phis");
       NIR_PASS_P(nir_opt_dce);
 
       bool opt_loop_progress = false;
       NIR_PASS(opt_loop_progress, nir, nir_opt_loop);
       if (opt_loop_progress) {
          progress = true;
-         if (g_opts_iter < 3 || g_opts_iter == 50) slog("nirdbg: [it%d] PROG nir_opt_loop\r\n", g_opts_iter);
          NIR_PASS_P(nir_opt_copy_prop);
          NIR_PASS_P(nir_opt_dce);
       }
-      NIRDBGOPT("opts pre if");
-      NIR_PASS_P(nir_opt_if, 0);
-      NIRDBGOPT("opts post if");
+      NIR_PASS_CYCLE(nir_opt_if, if_prog, 0);
       NIR_PASS_P(nir_opt_dead_cf);
-      NIRDBGOPT("opts pre cse");
-      NIR_PASS_P(nir_opt_cse);
-      NIRDBGOPT("opts post cse");
+      NIR_PASS_CYCLE(nir_opt_cse, cse_prog);
 
       nir_opt_peephole_select_options peephole_select_options = {
          .limit = 8,
@@ -167,6 +169,19 @@ gl_nir_opts(nir_shader *nir)
                (nir->options->lower_doubles_options & nir_lower_fp64_full_software))) {
          NIR_PASS_P(nir_opt_loop_unroll);
       }
+      /* Oscillation break: three consecutive iterations in which ONLY the
+       * nir_opt_if/nir_opt_cse pair progressed (each undoing the other) mean the
+       * loop can never clear `progress`; stop instead of spinning to the cap.
+       * Normal shaders reset `cycle` as soon as any other pass (or none) moves. */
+      if (if_prog && cse_prog && !g_other_prog) {
+         if (++cycle >= 3) {
+            slog("nirdbg: opts OSCILLATION if/cse 2-cycle break stage=%d iters=%d\r\n",
+                 (int)nir->info.stage, g_opts_iter);
+            break;
+         }
+      } else {
+         cycle = 0;
+      }
       g_opts_iter++;
       /* Defensive iteration cap.  Some heavy shadertoy-style fullscreen-compute
        * kernels drive two NIR passes into oscillation (each undoes the other's
@@ -184,7 +199,6 @@ gl_nir_opts(nir_shader *nir)
          break;
       }
    } while (progress);
-   NIRDBG("opts LOOP DONE stage=%d iters=%d", (int)nir->info.stage, g_opts_iter);
 
    unsigned lower_flrp =
       (nir->options->lower_flrp16 ? 16 : 0) |
@@ -216,13 +230,9 @@ gl_nir_inline_functions(const struct pipe_caps *caps, nir_shader *shader)
     * of the function and not at the top of its caller.
     */
    NIR_PASS(_, shader, nir_lower_variable_initializers, nir_var_all);
-   NIRDBG("inline ENTER stage=%d (post var-init)", (int)shader->info.stage);
    NIR_PASS(_, shader, nir_lower_returns);
-   NIRDBG("inline post lower_returns");
    NIR_PASS(_, shader, nir_inline_functions);
-   NIRDBG("inline post inline_functions");
    NIR_PASS(_, shader, nir_opt_deref);
-   NIRDBG("inline post opt_deref");
 
    /* We set func->is_entrypoint after nir_function_create if the function
     * is named "main", so we can use nir_remove_non_entrypoints() for this.
@@ -230,7 +240,6 @@ gl_nir_inline_functions(const struct pipe_caps *caps, nir_shader *shader)
     * func->is_entrypoint.
     */
    nir_remove_non_entrypoints(shader);
-   NIRDBG("inline post remove_non_entrypoints stage=%d", (int)shader->info.stage);
 
    /* Now that functions have been inlined remove deref_texture_src intrinisic
     * as we can now see if the texture source is bindless or not.
@@ -277,7 +286,6 @@ gl_nir_inline_functions(const struct pipe_caps *caps, nir_shader *shader)
       }
    }
 
-   NIRDBG("inline DONE stage=%d", (int)shader->info.stage);
    nir_validate_shader(shader, "after function inlining and return lowering");
 }
 

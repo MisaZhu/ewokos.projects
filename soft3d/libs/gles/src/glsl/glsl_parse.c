@@ -868,13 +868,12 @@ static void parse_function_def(parser *P)
                 if (!at(P, TK_IDENT)) perr(P, "parameter name");
                 strncpy(pn, cur(P)->text, GLSL_NAME_LEN-1); adv(P);
                 if (accept(P, TK_LBRACKET)) { if (at(P,TK_INT)) adv(P); expect(P, TK_RBRACKET, "']'"); }
-                if (F->nparams < 8) {
-                    strncpy(F->param_name[F->nparams], pn, GLSL_NAME_LEN-1);
-                    F->param_type[F->nparams] = ptype;
-                    F->param_st_id[F->nparams] = pst;
-                    F->param_array[F->nparams] = parr;
-                    F->param_inout[F->nparams] = inout;
-                }
+                if (F->nparams >= GLSL_MAX_PARAMS) perr(P, "too many parameters");
+                strncpy(F->param_name[F->nparams], pn, GLSL_NAME_LEN-1);
+                F->param_type[F->nparams] = ptype;
+                F->param_st_id[F->nparams] = pst;
+                F->param_array[F->nparams] = parr;
+                F->param_inout[F->nparams] = inout;
                 F->nparams++;
                 if (!accept(P, TK_COMMA)) break;
             }
@@ -887,7 +886,7 @@ static void parse_function_def(parser *P)
     P->cur_func = idx; P->local_cell_high = 0;
     {
         int i;
-        for (i = 0; i < F->nparams && i < 8; ++i)
+        for (i = 0; i < F->nparams && i < GLSL_MAX_PARAMS; ++i)
             add_local(P, F->param_name[i], F->param_type[i], F->param_st_id[i], F->param_array[i]);
     }
     push_scope(P);

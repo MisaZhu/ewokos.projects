@@ -165,6 +165,13 @@ typedef struct {
 	uint32_t       ub_pad;
 	uint32_t       stride;
 	uint32_t       size;     /* bytes allocated (padded image) */
+	/* Cubemap / 2D-array staging: cube != 0 marks a slot holding `depth`
+	   tiled layers stored contiguously at a 64-byte-aligned per-layer
+	   stride (arrstride64 * 64 bytes); size then covers all depth layers.
+	   A plain 2D slot leaves cube/depth/arrstride64 at 0. */
+	int            cube;
+	uint32_t       depth;
+	uint32_t       arrstride64;
 } pgl_g3d_tex_slot_t;
 static pgl_g3d_tex_slot_t _tex[PGL_G3D_MAX_TEX];
 
@@ -495,6 +502,11 @@ void pgl_g3d_flush(void)
 			req.ctex_stride[u] = t->stride;
 			req.ctex_tiling[u] = (uint8_t)t->tiling;
 			req.ctex_ub_pad[u] = (uint8_t)t->ub_pad;
+			/* A cubemap slot carries its 6-layer array geometry so the
+			   daemon builds image_depth=5 + array_stride; a plain 2D slot
+			   leaves both 0 (single-layer record, unchanged). */
+			req.ctex_depth[u]       = (uint8_t)t->depth;
+			req.ctex_arrstride64[u] = t->arrstride64;
 		}
 	}
 
@@ -1440,6 +1452,11 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			req.ctex_stride[u] = t->stride;
 			req.ctex_tiling[u] = (uint8_t)t->tiling;
 			req.ctex_ub_pad[u] = (uint8_t)t->ub_pad;
+			/* A cubemap slot carries its 6-layer array geometry so the
+			   daemon builds image_depth=5 + array_stride; a plain 2D slot
+			   leaves both 0 (single-layer record, unchanged). */
+			req.ctex_depth[u]       = (uint8_t)t->depth;
+			req.ctex_arrstride64[u] = t->arrstride64;
 		}
 	}
 
@@ -1537,6 +1554,79 @@ int pgl_g3d_upload_texture_tiled(int slot, int w, int h, const void* rgba8)
 	if (!pglc_tex_layout_2d((uint32_t)w, (uint32_t)h, 4u, &layout))
 		return 0;
 	return tex_slot_fill(slot, w, h, rgba8, &layout);
+}
+
+int pgl_g3d_upload_texture_cube_tiled(int slot, int w, int h,
+                                      const void* faces_rgba8)
+{
+	struct pglc_tex_layout layout;
+	pgl_g3d_tex_slot_t* t;
+	const uint8_t* src = (const uint8_t*)faces_rgba8;
+	uint32_t* pxw = NULL;
+	uint8_t* px;
+	ewokos_addr_t phy = 0;
+	int shm = 0;
+	uint32_t layer_size, total;
+	int f;
+
+	/* distinct negative codes so the caller can log exactly which gate
+	   failed (1 == success); a failure never latches the GPU off. */
+	if (!_enabled)
+		return -1;
+	if (slot < 0 || slot >= PGL_G3D_MAX_TEX)
+		return -2;
+	/* a cubemap is six square faces; portablegl stores them concatenated in
+	   one buffer (6*w*h*4) with w == h. */
+	if (w <= 0 || w != h || src == NULL)
+		return -3;
+	if (!pglc_tex_layout_2d((uint32_t)w, (uint32_t)h, 4u, &layout))
+		return -4;
+	if (layout.size == 0)
+		return -5;
+
+	/* Round each layer up to 64 bytes so array_stride_64_byte_aligned is an
+	   exact integer and every face base stays 64-byte aligned (the texture
+	   base pointer's low 6 bits are overlaid by flag fields). */
+	layer_size = (layout.size + 63u) & ~63u;
+	total = layer_size * 6u;
+
+	t = &_tex[slot];
+	/* Replace-in-place: free the previous image first so a re-upload of the
+	   same slot does not leak; flush a pending TEX_MOD batch on this slot so
+	   the driver never sees the freed physical base (mirrors tex_slot_fill). */
+	if (t->pixels != NULL) {
+		if (_nverts != 0 && _batch_fs == PGL_G3D_FS_TEX_MOD &&
+		    _batch_tex_slot == slot)
+			pgl_g3d_flush();
+		g2d_shm_free(t->pixels);
+		memset(t, 0, sizeof(*t));
+	}
+
+	if (g2d_shm_alloc_phy(total, &shm, &pxw, &phy) != 0
+	    || shm <= 0 || pxw == NULL)
+		return -6;   /* allocation failure does NOT latch the GPU off */
+	px = (uint8_t*)pxw;
+
+	memset(px, 0, total);
+	for (f = 0; f < 6; f++)
+		pglc_tex_store_2d(px + (size_t)f * layer_size,
+		                 src + (size_t)f * (size_t)w * (size_t)h * 4u,
+		                 (uint32_t)w * 4u, (uint32_t)w, (uint32_t)h,
+		                 4u, &layout);
+
+	t->shm = shm;
+	t->pixels = pxw;
+	t->phy = phy;
+	t->w = w;
+	t->h = h;
+	t->tiling = layout.tiling;
+	t->ub_pad = layout.ub_pad;
+	t->stride = layout.stride;
+	t->size   = total;
+	t->cube   = 1;
+	t->depth  = 6u;
+	t->arrstride64 = layer_size / 64u;
+	return 1;
 }
 
 void pgl_g3d_free_texture(int slot)

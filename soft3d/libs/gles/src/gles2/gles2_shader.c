@@ -17,6 +17,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
+#include <stdarg.h>
+#include <ewoksys/klog.h>
+
+/* TEMPORARY compile-phase wall-clock probe.  /tmp does not persist on this
+ * raspi5 image, so the file sink is dead; slog -> /dev/log is the reliable
+ * channel (the in-process mesa FEDBG markers prove it works).  city's faithful
+ * port stalls >100s and glLinkProgram runs the CPU-interpreter glsl_link()
+ * before the GPU bridge, so this brackets which of the two links burns the
+ * wall time.  Remove once the hotspot is fixed. */
+static double v3ct_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+static void v3ct_log(const char *fmt, ...)
+{
+    char buf[192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    slog("v3ct: [%8.1f] %s\r\n", v3ct_now(), buf);
+}
 
 #include "../engine/gles_engine.h"
 #include "../glsl/glsl.h"
@@ -270,7 +295,11 @@ void glLinkProgram(GLuint program)
         glsl_bind_attrib_location(vs->stage, p->bind_name[i], p->bind_loc[i]);
 
     /* glsl_link consumes both stages */
+    double _t_cpu = v3ct_now();
+    v3ct_log("glLinkProgram: ENTER cpu glsl_link");
     p->gp = glsl_link(vs->stage, fs->stage, p->log, LOG_LEN);
+    v3ct_log("glLinkProgram: cpu glsl_link ms=%.0f ok=%d", v3ct_now() - _t_cpu,
+             p->gp != NULL);
     vs->stage = NULL; fs->stage = NULL;
     if (!p->gp) return;
 
@@ -291,7 +320,10 @@ void glLinkProgram(GLuint program)
      * bridge.  It compiles them to V3D QPU and routes eligible draws onto the
      * GPU, or stays inert (CPU interpreter) when the GPU path is off.  This TU
      * passes opaque strings only - it has no GPU awareness. */
+    double _t_gpu = v3ct_now();
+    v3ct_log("glLinkProgram: ENTER gpu bridge");
     gles_engine_gpu_link(p->pgl_id, vs->src, fs->src);
+    v3ct_log("glLinkProgram: gpu bridge ms=%.0f", v3ct_now() - _t_gpu);
 }
 
 void glUseProgram(GLuint program)

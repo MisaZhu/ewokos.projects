@@ -837,18 +837,18 @@ static glsl_val call_user(env *E, const glsl_expr *e)
     int i, save_stack, save_ret_type;
     glsl_cell *frame;
     const glsl_func *save_fn; glsl_cell *save_locals;
-    glsl_val argv[8];
+    glsl_val argv[GLSL_MAX_PARAMS];
     if (e->op_builtin < 0 || e->op_builtin >= E->stage->nfuncs) { E->err = 1; return make_scalar_f(E,0); }
     F = &E->stage->funcs[e->op_builtin];
     if (!F->body) { E->err = 1; return make_scalar_f(E,0); }
-    for (i = 0; i < e->nargs && i < 8; ++i) argv[i] = eval(E, e->args[i]);
+    for (i = 0; i < e->nargs && i < GLSL_MAX_PARAMS; ++i) argv[i] = eval(E, e->args[i]);
     save_stack = E->stack_top;
     frame = stk(E, F->frame_cells > 0 ? F->frame_cells : 1);
     memset(frame, 0, (F->frame_cells>0?F->frame_cells:1) * sizeof(glsl_cell));
     save_fn = E->fn; save_locals = E->locals;
     E->fn = F; E->locals = frame;
     /* bind in/inout params */
-    for (i = 0; i < F->nparams && i < e->nargs; ++i) {
+    for (i = 0; i < F->nparams && i < e->nargs && i < GLSL_MAX_PARAMS; ++i) {
         if (F->param_inout[i] == 1) continue; /* out: no copy in */
         {
             glsl_cell *dst = frame + F->local_off[i];
@@ -887,7 +887,7 @@ static glsl_val call_user(env *E, const glsl_expr *e)
      * E->stack_top is restored only after the loop. */
     E->fn = save_fn; E->locals = save_locals;
     /* write back out/inout params */
-    for (i = 0; i < F->nparams && i < e->nargs; ++i) {
+    for (i = 0; i < F->nparams && i < e->nargs && i < GLSL_MAX_PARAMS; ++i) {
         if (F->param_inout[i] == 0) continue;
         {
             lv L; glsl_val src;

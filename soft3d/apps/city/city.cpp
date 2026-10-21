@@ -46,6 +46,7 @@
 #include <math.h>
 
 #include <unistd.h>
+#include <stdarg.h>
 #include <ewoksys/proc.h>
 #include <ewoksys/keydef.h>
 #include <ewoksys/kernel_tic.h>
@@ -66,7 +67,7 @@ extern "C" void pglc_compile_set_cs_local_size(unsigned x, unsigned y);
  * upscale to the window (same lever ocean/waterdrop/robot ship).  The city
  * trace is a very heavy 160-step raymarch with per-pixel neon-sign glyph
  * lookups (ALU-bound on V3D CSD), heavier per pixel than robot/ocean, so the
- * default denominator is 3; argv "scaleN" (N=1..9) overrides, 1 = native
+ * default denominator is 2; argv "scaleN" (N=1..9) overrides, 1 = native
  * full-res.  The shader math is unchanged (the engine patches iResolution and
  * pglc_cs_stride to the reduced geometry).  No effect on the CPU interpreter
  * path (virt / GPU-decline), which is not a compute draw. */
@@ -77,9 +78,14 @@ extern "C" void pgl_g3d_set_render_scale(int scale);
 static int win_width  = 800;
 static int win_height = 600;
 #ifdef PGL_G3D
-static int g_scale = 3;   /* faithful-compute render-scale denominator; argv "scaleN"
+static int g_scale = 2;   /* faithful-compute render-scale denominator; argv "scaleN"
                              (N=1..9) overrides, 1 = native full-res */
 #endif
+
+/* Frame-pacing target: cap the render loop at TARGET_FPS (1000/TARGET_FPS ms
+ * per frame) so the heavy raymarch keeps a steady cadence and bounded GPU
+ * load instead of free-running as fast as the V3D CSD can dispatch. */
+#define TARGET_FPS 20
 
 static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
 static EGLSurface egl_surf = EGL_NO_SURFACE;
@@ -93,6 +99,24 @@ static GLint  loc_mouse = -1;
 
 static uint32_t start_time = 0;
 static float    iGlobalTime = 0.0f;
+
+/* TEMP on-device trace.  /tmp does NOT persist on this raspi5 image (touch
+ * returns 0 but the file never appears in ls), so the file sink is dead; the
+ * reliable channel is slog -> /dev/log, which the in-process mesa compiler's
+ * FEDBG/nirdbg markers already prove works for an app process.  Emit every
+ * breadcrumb to /dev/log (primary) and mirror to /tmp/city.log (best effort). */
+static void ctr(const char* fmt, ...)
+{
+    char buf[192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    slog("city: %s\r\n", buf);
+    static FILE* f = NULL;
+    if (!f) f = fopen("/tmp/city.log", "a");
+    if (f) { fputs(buf, f); fputc('\n', f); fflush(f); }
+}
 
 /* FPS counter. */
 static int fps = 0;
@@ -290,6 +314,7 @@ static void render_frame(void)
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
     glDrawArrays(GL_TRIANGLES, 0, 6);
     glDisableVertexAttribArray(0);
+    if (frame_count < 3) ctr("frame %d: drawn", frame_count);
 
     /* Overlay the FPS / Renderer readout as a Dear ImGui window.  Query the
      * route while the city program is still bound (the engine reports the
@@ -304,6 +329,7 @@ static void render_frame(void)
     ImGui_ImplGLES2_RenderDrawData(ImGui::GetDrawData());
 
     eglSwapBuffers(egl_dpy, egl_surf);
+    if (frame_count < 3) ctr("frame %d: swapped", frame_count);
     update_fps();
 }
 
@@ -328,12 +354,25 @@ static void on_event(xwin_t* xwin, xevent_t* ev)
 static void loop(void* p)
 {
     (void)p;
+    static uint32_t frame_start = 0;
+    uint32_t now = kernel_tic_ms(0);
+    if (frame_start == 0) frame_start = now;
+
     render_frame();
-    usleep(1000);
+
+    /* Pace to the TARGET_FPS budget: sleep only the remainder of the frame
+     * interval left after rendering, so a frame that already overran the
+     * budget proceeds immediately. */
+    uint32_t budget = 1000 / TARGET_FPS;
+    uint32_t elapsed = kernel_tic_ms(0) - frame_start;
+    if (elapsed < budget)
+        usleep((budget - elapsed) * 1000);
+    frame_start = kernel_tic_ms(0);
 }
 
 int main(int argc, char** argv)
 {
+    ctr("main enter");
     /* argv: optional "WxH" sets the compute workgroup shape (GPU build, A/B
      * tuning), optional "scaleN" sets the faithful-compute render-scale
      * denominator, optional "fpslog" echoes the 1s FPS roll to stdout.  The
@@ -390,25 +429,32 @@ int main(int argc, char** argv)
      * session falls back to the CPU interpreter with no recovery.
      * win_width/win_height stay as the fallback should a WM reject MAX. */
     xwin_fullscreen(xwin);
+    ctr("xwin fullscreen ok");
 
     if (!init_egl(xwin)) {
         printf("Failed to initialize EGL\n");
         return 1;
     }
+    ctr("init_egl ok");
 
     init_quad();
+    ctr("init_quad ok, linking shaders...");
     init_shaders();
+    ctr("init_shaders ok (prog=%u)", prog);
 
     /* Force ONLY the mesh/texcol raster dispatches (Dear ImGui's HUD) onto the
      * CPU interpreter so they composite into the same fb the GPU fullscreen
      * city scene wrote; gpu_try_fullscreen keeps the scene on the V3D GPU.
      * Must be set before the first frame is presented. */
     glForceCpuRasterEWOK();
+    ctr("force cpu raster set");
     init_imgui();
+    ctr("init_imgui ok");
 
     start_time = kernel_tic_ms(0);
 
     xwin_set_visible(xwin, true);
+    ctr("set_visible ok, entering x_run");
     x_run(&x, xwin);
 
     ImGui_ImplGLES2_Shutdown();

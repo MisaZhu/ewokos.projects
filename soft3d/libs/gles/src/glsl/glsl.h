@@ -38,6 +38,7 @@ extern "C" {
 #define GLSL_MAX_FUNCS         128   /* user-defined functions per stage   */
 #define GLSL_MAX_GLOBALS       64   /* file-scope variables/constants      */
 #define GLSL_MAX_LOCALS        64   /* locals per function frame          */
+#define GLSL_MAX_PARAMS        16   /* parameters per user function       */
 #define GLSL_MAX_LOOP_DEPTH    32
 #define GLSL_MAX_EXPR_DEPTH    64
 #define GLSL_NAME_LEN          48
@@ -153,11 +154,11 @@ typedef struct glsl_func {
     int  ret_st_id;
     /* parameters: each is a local slot with a type */
     int  nparams;
-    int  param_type[8];
-    int  param_st_id[8];
-    int  param_array[8];
-    char param_name[8][GLSL_NAME_LEN];
-    int  param_inout[8];      /* 0=in 1=out 2=inout                      */
+    int  param_type[GLSL_MAX_PARAMS];
+    int  param_st_id[GLSL_MAX_PARAMS];
+    int  param_array[GLSL_MAX_PARAMS];
+    char param_name[GLSL_MAX_PARAMS][GLSL_NAME_LEN];
+    int  param_inout[GLSL_MAX_PARAMS]; /* 0=in 1=out 2=inout               */
     glsl_stmt *body;          /* compound statement                      */
     int  nlocals;             /* total local slots (params + declared)   */
     /* local frame layout, indexed by local slot (computed at parse) */

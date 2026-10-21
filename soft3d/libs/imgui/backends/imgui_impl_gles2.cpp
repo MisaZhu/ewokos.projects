@@ -137,6 +137,15 @@ static void ImGui_ImplGLES2_SetupRenderState(ImDrawData* draw_data, int fb_width
         { (R+L)/(L-R),  (T+B)/(B-T),  0.0f,   1.0f },
     };
     glUseProgram(bd->ShaderHandle);
+    // The font/white-pixel texture is sampled from unit 0 (glUniform1i below),
+    // but RenderDrawData binds it with a bare glBindTexture, which targets the
+    // CURRENTLY ACTIVE unit.  An app that ends its scene with a non-zero active
+    // unit (e.g. a multi-sampler shadertoy leaving GL_TEXTURE1 bound) would send
+    // the atlas to that unit and leave unit 0 pointing at the scene texture, so
+    // every glyph samples scene texels (mosaic).  Pin the active unit to 0 here
+    // so the bind and the sampler agree; apps re-bind their own textures each
+    // frame, so leaving unit 0 active afterwards is the documented contract.
+    glActiveTexture(GL_TEXTURE0);
     glUniform1i(bd->AttribLocationTex, 0);
     glUniformMatrix4fv(bd->AttribLocationProjMtx, 1, GL_FALSE, &ortho_projection[0][0]);
 
@@ -173,6 +182,10 @@ void    ImGui_ImplGLES2_RenderDrawData(ImDrawData* draw_data)
     GLint last_viewport[4]; glGetIntegerv(GL_VIEWPORT, last_viewport);
     GLint last_scissor_box[4]; glGetIntegerv(GL_SCISSOR_BOX, last_scissor_box);
     GLint last_array_buffer; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &last_array_buffer);
+    // The active texture unit too: SetupRenderState pins it to 0 so the font
+    // atlas bind lands on the sampler's unit, and we hand the app's unit back
+    // on restore so a multi-sampler scene is not left on unit 0.
+    GLint last_active_texture; glGetIntegerv(GL_ACTIVE_TEXTURE, &last_active_texture);
 
     GLboolean last_enable_blend = glIsEnabled(GL_BLEND);
     GLboolean last_enable_cull_face = glIsEnabled(GL_CULL_FACE);
@@ -254,6 +267,7 @@ void    ImGui_ImplGLES2_RenderDrawData(ImDrawData* draw_data)
 
     glViewport(last_viewport[0], last_viewport[1], (GLsizei)last_viewport[2], (GLsizei)last_viewport[3]);
     glScissor(last_scissor_box[0], last_scissor_box[1], (GLsizei)last_scissor_box[2], (GLsizei)last_scissor_box[3]);
+    glActiveTexture((GLenum)last_active_texture);
 }
 
 bool ImGui_ImplGLES2_CreateFontsTexture()

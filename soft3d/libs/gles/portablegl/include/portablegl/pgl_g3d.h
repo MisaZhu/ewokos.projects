@@ -217,6 +217,19 @@ int  pgl_g3d_upload_texture(int slot, int w, int h, const void* rgba8);
    rows), so pgl_g3d_batch_tri_tex ignores it.  Same return contract. */
 int  pgl_g3d_upload_texture_tiled(int slot, int w, int h, const void* rgba8);
 
+/* Cubemap variant of pgl_g3d_upload_texture_tiled: stage the six square faces
+   of a w x w cubemap (faces_rgba8 points at 6*w*w*4 bytes, the +X,-X,+Y,-Y,
+   +Z,-Z faces concatenated exactly as portablegl's texture_cubemap stores
+   them) into ONE slot as a 6-layer V3D 2D array.  Each face is tiled with the
+   same layout pgl_g3d_upload_texture_tiled would use and written at a
+   64-byte-aligned per-layer stride, so the daemon can build a texture-state
+   record with image_depth = 5 and array_stride_64_byte_aligned set - the
+   hardware-native form mesa lowers a samplerCube TMU fetch to.  Bind it to a
+   compiled-shader sampler unit with pgl_g3d_bind_tex_unit like a tiled slot.
+   Same return contract (0 leaves the unit unbound -> the draw declines). */
+int  pgl_g3d_upload_texture_cube_tiled(int slot, int w, int h,
+                                       const void* faces_rgba8);
+
 /* Release a texture slot's shm segment (safe on an unused slot).  Any open
    TEX_MOD batch referencing the slot is flushed first so the driver never
    sees a dangling physical base. */

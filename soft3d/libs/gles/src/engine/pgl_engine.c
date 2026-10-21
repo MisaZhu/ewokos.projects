@@ -527,6 +527,13 @@ void gles_engine_get_integerv(GEenum pname, GEint *data)
         if (data) *data = GL_MAX_VERTEX_ATTRIBS;
         return;
     }
+    /* The active texture unit is engine-tracked (g_active_unit) and is not in
+     * get_pname_map; overlays (e.g. the ImGui GLES2 backend) save/restore it
+     * around their draws, so answer it here rather than through portablegl. */
+    if (pname == GLES2_GL_ACTIVE_TEXTURE) {
+        if (data) *data = (GEint)(GLES2_GL_TEXTURE0 + g_active_unit);
+        return;
+    }
     pgl_GetIntegerv(EMAP(get_pname_map, pname), data);
 }
 
@@ -1629,6 +1636,17 @@ static int       g_force_cpu_raster = 0;
 /* texture-name -> raster-slot map for the textured kernel (PGL_G3D_MAX_TEX) */
 static GLuint  g_gpu_texname[PGL_G3D_MAX_TEX];
 static int     g_gpu_texused[PGL_G3D_MAX_TEX];
+/* texture-name -> tiled-ctex-slot map for compiled samplers (gpu_ctex_slot).
+ * The raster and tiled maps share the single pgl_g3d _tex[] pool, so each
+ * allocator must skip slots the other already owns: otherwise a raster upload
+ * (e.g. an ImGui font atlas staged at glTexImage time, even when that program's
+ * draw is CPU-forced) overwrites a tiled slot a cached ctex binding still
+ * references, the flush then skips the unit (raster pixels) and the compiled
+ * draw declines with "TMU unit unbound". */
+static GLuint  g_gpu_ctexname[PGL_G3D_MAX_TEX];
+static int     g_gpu_ctexused[PGL_G3D_MAX_TEX];
+static int     g_gpu_ctexw[PGL_G3D_MAX_TEX];
+static int     g_gpu_ctexh[PGL_G3D_MAX_TEX];
 
 /* one reusable interleaved staging buffer (grown on demand) */
 static float  *g_gpu_stage = NULL;
@@ -1733,7 +1751,7 @@ static int gpu_tex_slot(GLuint name, int alloc)
         if (g_gpu_texused[i] && g_gpu_texname[i] == name) return i;
     if (!alloc) return -1;
     for (i = 0; i < PGL_G3D_MAX_TEX; ++i)
-        if (!g_gpu_texused[i]) { g_gpu_texused[i] = 1; g_gpu_texname[i] = name; return i; }
+        if (!g_gpu_texused[i] && !g_gpu_ctexused[i]) { g_gpu_texused[i] = 1; g_gpu_texname[i] = name; return i; }
     return -1;   /* slot table full: this texture stays CPU-only */
 }
 
@@ -2188,29 +2206,41 @@ static void gpu_coalesce_flush(void)
  * (which gates on GL_REPEAT, the raspi5 compiled-sampler record's wrap).
  * Returns -1 when the texture cannot back a compiled sampler, leaving its unit
  * unbound so the draw declines to the CPU. */
-static GLuint  g_gpu_ctexname[PGL_G3D_MAX_TEX];
-static int     g_gpu_ctexused[PGL_G3D_MAX_TEX];
-static int     g_gpu_ctexw[PGL_G3D_MAX_TEX];
-static int     g_gpu_ctexh[PGL_G3D_MAX_TEX];
-
 static int gpu_ctex_slot(GLuint name)
 {
     const glTexture *t;
-    int i, slot = -1;
+    int i, slot = -1, is_cube;
     if (name == 0 || (int)name >= g_ctx.textures.size) return -1;
     t = &g_ctx.textures.a[name];
     if (t->deleted || !t->data || t->w <= 0 || t->h <= 0) return -1;
-    /* the raspi5 compiled-sampler record is GL_NEAREST + GL_REPEAT */
-    if (t->wrap_s != GL_REPEAT || t->wrap_t != GL_REPEAT) return -1;
+    /* portablegl stores a texture's type shifted by GL_TEXTURE_UNBOUND+1 (see
+     * pgl_BindTexture); a cubemap's six square faces are concatenated in
+     * t->data (6*w*h*4, w == h).  The raspi5 compiled-sampler record is fixed
+     * GL_NEAREST + GL_REPEAT, which a plain 2D image must match to be
+     * stageable.  A cubemap is loaded CLAMP_TO_EDGE but samples through the
+     * same record as a 6-layer 2D array (mesa lowers textureCube to an array +
+     * face-index TMU fetch, and a face coordinate never leaves [0,1]), so the
+     * wrap gate is a 2D-only check and a cube is staged by the cube upload. */
+    is_cube = (t->type == GL_TEXTURE_CUBE_MAP - (GL_TEXTURE_UNBOUND + 1));
+    if (!is_cube && (t->wrap_s != GL_REPEAT || t->wrap_t != GL_REPEAT))
+        return -1;
     for (i = 0; i < PGL_G3D_MAX_TEX; ++i)
         if (g_gpu_ctexused[i] && g_gpu_ctexname[i] == name &&
             g_gpu_ctexw[i] == (int)t->w && g_gpu_ctexh[i] == (int)t->h)
             return i;   /* already staged tiled */
     for (i = 0; i < PGL_G3D_MAX_TEX; ++i)
-        if (!g_gpu_ctexused[i]) { slot = i; break; }
+        if (!g_gpu_ctexused[i] && !g_gpu_texused[i]) { slot = i; break; }
     if (slot < 0) return -1;   /* slot table full: this texture stays CPU-only */
-    if (!pgl_g3d_upload_texture_tiled(slot, (int)t->w, (int)t->h, t->data))
+    if (is_cube) {
+        int rc = pgl_g3d_upload_texture_cube_tiled(slot, (int)t->w, (int)t->h, t->data);
+        if (rc != 1) {
+            slog("pglctex: CUBE upload fail rc=%d name=%u slot=%d w=%d h=%d type=%d data=%p\n",
+                 rc, (unsigned)name, slot, (int)t->w, (int)t->h, (int)t->type, (void*)t->data);
+            return -1;   /* transient upload failure: decline, do not latch */
+        }
+    } else if (!pgl_g3d_upload_texture_tiled(slot, (int)t->w, (int)t->h, t->data)) {
         return -1;   /* transient upload failure: decline, do not latch the GPU */
+    }
     g_gpu_ctexused[slot] = 1;
     g_gpu_ctexname[slot] = name;
     g_gpu_ctexw[slot] = (int)t->w;
@@ -2300,21 +2330,32 @@ static int gpu_try_fullscreen(gpu_entry *e, GLenum mode, GLint first, GLsizei co
     pgl_g3d_set_shader_program(e->prog);
     pgl_g3d_set_uniforms(nunif ? blob : NULL, nunif);
 
-    /* Bind each sampler to a TILED slot.  The app binds iChannelU to GLES2
-     * texture unit U (shadertoy convention), so the sampler's unit value is also
-     * the compiled FS's TMU slot index; an unstageable texture leaves its unit
-     * unbound, which declines the draw back to the CPU rather than sampling a
-     * wrong image.  Evict slots this program doesn't sample first so an effect
-     * with more distinct textures than the free remainder still stages all of
-     * its samplers (see gpu_ctex_evict_unused). */
+    /* Bind each sampler to a TILED slot.  The compiled FS's TMU slot is the
+     * sampler's DECLARATION-ORDER index (mesa's texture_index, assigned densely
+     * over the FS's samplers in v3d_tex.c), NOT the GLES2 texture unit the app
+     * bound it to with glUniform1i -- so bind ctex by declaration order (tmu)
+     * and use the sampler's unit value only to SELECT which texture image rides
+     * that slot.  An app that binds iChannel0..N to units 0..N (shadertoy) makes
+     * the two coincide; a sparse binding (grass: iChannel0->unit 0,
+     * iChannel2->unit 2) still lands each image on the slot the kernel actually
+     * samples, instead of stranding it at ctex[2] while the kernel reads TMU
+     * slot 1 (which then declines to the CPU).  An unstageable texture leaves
+     * its slot unbound, which declines the draw back to the CPU rather than
+     * sampling a wrong image.  Evict slots this program doesn't sample first so
+     * an effect with more distinct textures than the free remainder still stages
+     * all of its samplers (see gpu_ctex_evict_unused). */
     gpu_ctex_evict_unused(gp);
-    for (i = 0; i < gp->nuniforms; ++i) {
-        const glsl_uniform *u = &gp->uniforms[i];
-        int unit, slot;
-        if (!u->is_sampler) continue;
-        unit = g_active->ublock[u->offset].i;
-        slot = gpu_ctex_slot(gles_engine_texture_for_unit(unit));
-        pgl_g3d_bind_tex_unit(unit, slot);
+    {
+        int tmu = 0;
+        for (i = 0; i < gp->nuniforms; ++i) {
+            const glsl_uniform *u = &gp->uniforms[i];
+            int unit, slot;
+            if (!u->is_sampler) continue;
+            unit = g_active->ublock[u->offset].i;
+            slot = gpu_ctex_slot(gles_engine_texture_for_unit(unit));
+            pgl_g3d_bind_tex_unit(tmu, slot);
+            ++tmu;
+        }
     }
 
     /* First triangle: a declined upload (or a GPU latched off mid-call) returns
@@ -2804,20 +2845,10 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
         }
         return 0;   /* not GPU-viable: the CPU interpreter keeps this program */
     }
-    /* A samplerCube fragment shader can never drive the 2D textured geometry
-     * kernel (it samples a cube map by direction, not a raster 2D slot by uv),
-     * and cube faces are never mirrored into a GPU raster slot, so decline the
-     * program up front.  It stays on the CPU interpreter - where textureCube is
-     * fully supported - and, crucially, is NOT marked eligible: otherwise
-     * g_gpu_has_eligible would flip the framebuffer to the slow NOCACHE path for
-     * a program that can never dispatch.  Cubemaps were CPU-only under
-     * portablegl too (arbitrary C shaders never matched the fixed-function GPU
-     * gate), so this preserves behaviour and keeps the raspi5 GPU path clean for
-     * the demos that do use it. */
-    if (strstr(fs_src, "samplerCube")) {
-        pgl_g3d_program_free(prog);
-        return 0;
-    }
+    /* A samplerCube fragment shader is handled per-route below (see the
+     * is_fullscreen block): the fullscreen-compute route now stages a cubemap
+     * as a 6-layer 2D array for the TMU, while the 2D textured-geometry mesh
+     * route still cannot, so it declines there. */
     /* Three GPU mesh shapes are staged, all sharing the stride-6 pos+attr1
      * upload and the gouraud/tex raster pass:
      *   - FS declares a sampler   -> textured kernel (attr1 = uv);
@@ -2846,6 +2877,19 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
          * the fixed-kernel decline below even when its FS samples no texture. */
         is_fullscreen = (strstr(vs_src, "uMVP") == NULL &&
                          strstr(fs_src, "gl_FragCoord") != NULL);
+        /* A cubemap cannot be staged yet: gpu_ctex_slot's 6-layer 2D-array
+         * upload (pgl_g3d_upload_texture_cube_tiled) still fails on-device, so
+         * a samplerCube program that reached the fullscreen-compute route would
+         * be marked eligible (flipping the framebuffer to NOCACHE and routing
+         * the ImGui overlay through GPU geom dispatches) yet decline every draw
+         * at the unbound TMU unit - a half-GPU state that garbles the ImGui HUD.
+         * Keep samplerCube on the CPU interpreter (where textureCube is fully
+         * supported) until the array staging is proven, then relax this gate
+         * ATOMICALLY with the working upload. */
+        if (strstr(fs_src, "samplerCube") && !is_fullscreen) {
+            pgl_g3d_program_free(prog);
+            return 0;
+        }
         if (!strstr(fs_src, "sampler") && !strstr(vs_src, "uNormalMat") &&
             !gouraud_color && !is_fullscreen) {
             pgl_g3d_program_free(prog);
