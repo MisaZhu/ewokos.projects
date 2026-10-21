@@ -263,9 +263,10 @@ void pgl_g3d_consume_frame_clear(void);
 void pgl_g3d_shutdown(void);
 
 /* === On-device GLSL shader programs (WS4 arbitrary-shader GPU path) =========
-   A "program" is a GLSL vertex+fragment pair compiled IN-PROCESS to VideoCore
-   V3D 7.1 QPU by libv3dcompiler.a (linked into the app) and cached here.  The
-   cached QPU words are later marshalled through the g2dclient protocol to the
+   A "program" is a GLSL vertex+fragment pair compiled IN-PROCESS to the GPU's
+   ISA by the machine compiler backend behind <pglcompiler.h> (linked into the
+   app via libGLESv2.a) and cached here.  The cached code is later marshalled
+   through the g2dclient protocol to the
    g2dd daemon, which uploads them to the GPU and dispatches: a compiled-shader
    draw is real VideoCore hardware execution, never CPU rasterization.  This is
    the app-side half of the GPU wiring (the app compiles; only the root daemon
@@ -485,6 +486,18 @@ void pgl_g3d_set_scissor(int32_t x, int32_t y, int32_t w, int32_t h);
    per-draw render state: call it before each draw (or batch) whose equation
    differs. */
 void pgl_g3d_set_blend(int mode);
+
+/* Set the fullscreen-compute internal render-scale denominator.  1 (default) =
+   native resolution, the historical full-res path.  N > 1 renders a non-geom
+   fullscreen compute effect into a reduced (_w/N x _h/N) scratch target and
+   upscales it to the framebuffer with a nearest-neighbour g2d_scale_to, trading
+   image sharpness for throughput.  The shader math is UNCHANGED: the engine
+   patches the kernel's iResolution and pglc_cs_stride uniforms to the reduced
+   geometry, so uv/clip mapping stays correct - this is for spill-bound raymarch
+   kernels that cannot reach interactive FPS at native resolution on V3D CSD.
+   Mesh/geom and fixed-function draws are never affected.  Call once at startup
+   (before the first draw); a scratch allocation failure silently reverts to 1. */
+void pgl_g3d_set_render_scale(int scale);
 
 /* Draw vertices [first, first+count) of an uploaded mesh with a compiled program
    as one GPU dispatch: the program's compiled VS/coord QPU runs the transform +

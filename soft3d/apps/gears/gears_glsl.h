@@ -5,7 +5,7 @@
  * These sources mirror the C vertex_shader() + built-in pgl_ff_gouraud() pair
  * in gears.c EXACTLY, so the gear train looks identical whether it is lit on
  * the CPU rasterizer (the automatic fallback) or with the vertex stage compiled
- * to VideoCore VII QPU (raspi5 / V3D 7.1) by v3d_compile_glsl().
+ * to VideoCore VII QPU (raspi5 / V3D 7.1) by pglc_compile_glsl().
  *
  * Convention (identical to teapot_glsl.h):
  *   - #version 310 es with explicit layout(location=) so aPosition binds vertex

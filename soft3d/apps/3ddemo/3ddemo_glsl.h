@@ -7,7 +7,7 @@
  * pgl_ff_tex_modulate() pair in 3ddemo.cpp EXACTLY, so the model looks identical
  * whether it is textured on the CPU rasterizer (the automatic fallback) or with
  * the shaders compiled to VideoCore VII QPU (raspi5 / V3D 7.1) by
- * v3d_compile_glsl().
+ * pglc_compile_glsl().
  *
  * Convention (mesh path, as in teapot_glsl.h / gears_glsl.h):
  *   - #version 310 es with explicit layout(location=) so aPosition binds vertex

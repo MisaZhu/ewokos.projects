@@ -100,6 +100,12 @@ void glForceCpuEWOK(void) { gles_engine_force_cpu(); }
  * drop the GPU-only scene to the ~35s/frame interpreter path. */
 void glForceCpuRasterEWOK(void) { gles_engine_force_cpu_raster(); }
 
+/* EWOK_gpu_path: hand the on-device mesa compiler a GPU-only shader source
+ * pair while the CPU interpreter keeps the interpreter-safe one (see gl2ext.h
+ * and gles_engine_set_gpu_source). */
+void glSetGpuShaderSourceEWOK(const char *vs_src, const char *fs_src)
+{ gles_engine_set_gpu_source(vs_src, fs_src); }
+
 void glStencilFunc (GLenum func, GLint ref, GLuint mask) { gles_engine_stencil_func(func, ref, mask); }
 void glStencilOp (GLenum fail, GLenum zfail, GLenum zpass) { gles_engine_stencil_op(fail, zfail, zpass); }
 void glStencilMask (GLuint mask) { gles_engine_stencil_mask(mask); }

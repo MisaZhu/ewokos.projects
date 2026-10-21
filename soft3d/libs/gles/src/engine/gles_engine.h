@@ -234,6 +234,13 @@ void   gles_engine_gpu_flush(void);
 int    gles_engine_gpu_active(void);
 void   gles_engine_force_cpu(void);
 void   gles_engine_force_cpu_raster(void);
+/* gles_engine_set_gpu_source: compile a DIFFERENT (typically far heavier) pair
+ * of shader sources on the on-device mesa compiler than the ones the CPU
+ * interpreter linked, for apps whose GPU-only effect exceeds the interpreter's
+ * per-function local cap or per-pixel budget.  The interpreted program keeps
+ * owning the uniform metadata, so both sources must declare the same uniform
+ * names.  NULL fs clears.  Inert without PGL_G3D. */
+void   gles_engine_set_gpu_source(const char *vs_src, const char *fs_src);
 
 #ifdef __cplusplus
 }

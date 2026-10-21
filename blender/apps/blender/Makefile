@@ -16,7 +16,7 @@ CXXFLAGS += -I. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui 
 LDFLAGS  += -L $(EXTRA_LIBS_DIR)/lib
 
 # Match apps/imgui_demo: libimgui -> libEGL -> libGLESv2 (imgui backend calls
-# gl* / egl*, and libGLESv2 carries the engine + optional v3dcompiler).
+# gl* / egl*, and libGLESv2 carries the engine + optional pglcompiler).
 IMGUI_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui.a \
 	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a

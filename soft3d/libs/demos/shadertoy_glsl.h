@@ -2,7 +2,7 @@
  * shadertoy_glsl.h -- GLSL ES 1.00 ports of the 11 shadertoy effects.
  *
  * These sources mirror the C frag_func implementations in shadertoy.cpp so the
- * same effects can be compiled by v3d_compile_glsl() and dispatched on the
+ * same effects can be compiled by pglc_compile_glsl() and dispatched on the
  * VideoCore VII GPU (raspi5 / V3D 7.1).
  *
  * Convention (see plan todo s2):

@@ -1,20 +1,20 @@
-/* EwokOS platform glue for the mesa GLSL->QPU compiler (libv3dcompiler.a).
+/* EwokOS platform glue for the mesa GLSL->NIR compiler frontend (libpglcompiler_fe.a).
  *
- * These are the handful of symbols libv3dcompiler.a needs that the EwokOS SDK
+ * These are the handful of symbols libpglcompiler_fe.a needs that the EwokOS SDK
  * does not provide. They are compiled into the archive by THIS Makefile, which
  * is the EwokOS device build only (it is gated on the PGL_G3D capability that
- * just the raspi5 platform make.inc exports), so the compiler is self-contained:
- * an app links libv3dcompiler.a and resolves everything with no extra -l flags
+ * the GPU-capable machine make.inc files export), so the compiler is self-contained:
+ * an app links libpglcompiler_fe.a and resolves everything with no extra -l flags
  * and no dependency on the daemon-side libbsp.
  *
  * This glue is kept as a separate translation unit rather than folded into the
- * portable stubs (v3dcompiler_stubs.c) because it is the single EwokOS-specific
+ * portable stubs (pglcompiler_stubs.c) because it is the single EwokOS-specific
  * object in the archive: a glibc/macOS host supplies every symbol here, so the
  * stubs stay portable while this file fills the EwokOS-SDK libc/util gaps.
  *
  * The vendored mesa code itself stays platform-independent, and nothing here is
  * board-specific either - these are EwokOS-SDK libc/util gaps, identical on any
- * EwokOS machine that had a V3D compiler. Upstream mesa pin
+ * EwokOS machine with a GPU compiler backend. Upstream mesa pin
  * f45825a0c724d06f231a1210484fe9af71a3ffab. See VENDORED.txt.
  */
 #include <errno.h>
@@ -30,7 +30,7 @@
 const char *
 util_get_process_name(void)
 {
-   return "v3dcompiler";
+   return "pglcompiler";
 }
 
 /* util/u_qsort.cpp is excluded: it needs C++ <thread>, which EWOK_STL lacks.
@@ -111,7 +111,7 @@ open_memstream(char **bufp, size_t *sizep)
 
 /* EwokOS libcxx supplies the SCALAR C++ allocation operators (_Znwm = operator
  * new, _ZdlPv = operator delete) as weak symbols but omits the ARRAY forms,
- * which libv3dcompiler.a's C++ mesa code references (e.g. opt_function_inlining's
+ * which libpglcompiler_fe.a's C++ mesa code references (e.g. opt_function_inlining's
  * ir_call::generate_inline does `new ir_instruction[n]` / `delete[]`). Provide
  * them here, defined with their Itanium-ABI mangled names (a C identifier is
  * emitted verbatim, so it matches the C++ reference) and implemented by
@@ -120,7 +120,7 @@ open_memstream(char **bufp, size_t *sizep)
  * delete[] of a trivially-destructible or explicitly-destructed type.
  *
  * They are WEAK: libewokstl.a (which every EwokOS C++ app links) also defines
- * the array operators strongly, and now that libv3dcompiler.a is merged into
+ * the array operators strongly, and now that libpglcompiler_fe.a is merged into
  * libGLESv2.a both land in a single link. Weak lets libewokstl's strong
  * definition win, while still leaving a self-contained fallback for a link with
  * no C++ runtime library. */

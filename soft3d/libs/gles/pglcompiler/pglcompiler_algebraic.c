@@ -4,11 +4,11 @@
  * --------------------
  * Upstream mesa generates nir_opt_algebraic.c from nir_opt_algebraic.py: a
  * ~49 MB / 3.76 M-line translation unit that is impractical to vendor or to
- * compile on the Pi5. v3dcompiler_stubs.c therefore leaves the five *other*
+ * compile on the Pi5. pglcompiler_stubs.c therefore leaves the five *other*
  * algebraic entry points (nir_opt_algebraic_late, _before_ffma, ...) as no-ops,
  * which is fine because those are pure optimisations.
  *
- * nir_opt_algebraic() itself is NOT safe to no-op for the broadcom backend,
+ * nir_opt_algebraic() itself is NOT safe to no-op for the V3D backend,
  * though. The v3d gallium driver has no native QPU instruction for fdiv, fsqrt,
  * fpow, fmod/frem, ffract, flrp or ffma - nir_to_vir.c's ntq_emit_alu() hits
  * `mesa_loge("Unknown NIR ALU inst ..."); abort();` on every one of them. On a
@@ -43,8 +43,8 @@
  * aborts the compile.  Upstream mesa expands fsat back to fmin/fmax in the
  * generated generic nir_opt_algebraic under options->lower_fsat; this focused
  * pass is that generated pass's stand-in, so it performs the same expansion,
- * gated on the SAME lower_fsat option the frontend sets from the live device
- * (!v3d_be_has_unpack_sat()).  When lower_fsat is unset (V3D 7.1 / Pi5) fsat is
+ * gated on the SAME lower_fsat option the machine backend sets in its
+ * nir_shader_compiler_options.  When lower_fsat is unset (V3D 7.1 / Pi5) fsat is
  * left intact so the backend keeps the single-instruction unpack_sat and
  * raspi5's emitted QPU is byte-for-byte unchanged.
  *
@@ -72,7 +72,7 @@
 #include "compiler/nir/nir_builder.h"
 
 static bool
-lower_v3d_alu(nir_builder *b, nir_alu_instr *instr, UNUSED void *cb_data)
+lower_alu(nir_builder *b, nir_alu_instr *instr, UNUSED void *cb_data)
 {
    nir_def *lowered = NULL;
 
@@ -94,7 +94,7 @@ lower_v3d_alu(nir_builder *b, nir_alu_instr *instr, UNUSED void *cb_data)
       /* Expand ONLY when the target cannot emit the saturating unpack (V3D 4.2);
        * otherwise leave fsat for the backend's unpack_sat so V3D 7.1 output is
        * unchanged.  options->lower_fsat is set by the frontend from
-       * !v3d_be_has_unpack_sat() for the live-selected device version. */
+       * the backend's nir_shader_compiler_options (pglcompiler_frontend.h). */
       if (!b->shader->options || !b->shader->options->lower_fsat)
          return false;
       break;
@@ -190,5 +190,5 @@ nir_opt_algebraic(nir_shader *shader)
 {
    /* nir_metadata_none: the rewrites invalidate dominators/loops metadata, so
     * declare nothing preserved and let the pass manager recompute as needed. */
-   return nir_shader_alu_pass(shader, lower_v3d_alu, nir_metadata_none, NULL);
+   return nir_shader_alu_pass(shader, lower_alu, nir_metadata_none, NULL);
 }

@@ -108,7 +108,10 @@ $(UAE)/cpuemu.cpp $(UAE)/cputbl.h $(UAE)/cpustbl.cpp: $(HOST_DIR)/gencpu $(UAE)/
 	cd $(UAE) && ../../$(HOST_DIR)/gencpu
 
 ## Generated CPU core objects
-$(ARCH)/gen/cpuemu%.o: $(UAE)/cpuemu.cpp $(UAE)/cputbl.h
+# Use a static pattern rule to prevent the greedy cpuemu%.o pattern from
+# matching cascading .d.o files (cpuemu1.d.o, cpuemu1.d.d.o, etc.) which
+# creates an infinite dependency-file explosion.
+$(GEN_OBJS): $(ARCH)/gen/cpuemu%.o: $(UAE)/cpuemu.cpp $(UAE)/cputbl.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(B2_CXXFLAGS) $(CXXFLAGS) -O3 -DPART_$* -c $< -o $@
 

@@ -335,7 +335,7 @@ void glsl_vm_free(glsl_program *p);
 /* Reflection queries used by the GLES2 object model. */
 int  glsl_uniform_index(const glsl_program *p, const char *name); /* -1 none */
 int  glsl_attrib_index(const glsl_program *p, const char *name);
-int  glsl_prog_varying_count(const glsl_program *p); /* renamed: mesa v3dcompiler clash */
+int  glsl_prog_varying_count(const glsl_program *p); /* renamed: mesa pglcompiler clash */
 
 /* Bind an attribute location before link (glBindAttribLocation). */
 void glsl_bind_attrib_location(glsl_stage *vs, const char *name, int loc);

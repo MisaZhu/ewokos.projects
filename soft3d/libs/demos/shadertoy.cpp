@@ -46,11 +46,11 @@
 #include "shadertoy_glsl.h"
 
 #ifdef PGL_G3D
-/* libv3dcompiler knob: compute workgroup shape for the GPU path (A/B tuning).
+/* pglcompiler knob: compute workgroup shape for the GPU path (A/B tuning).
  * Must be set before the first glLinkProgram, which triggers the on-device
  * compile.  Not a portablegl symbol -- it belongs to the mesa compiler merged
  * into libGLESv2. */
-extern "C" void v3d_compile_set_cs_local_size(unsigned x, unsigned y);
+extern "C" void pglc_compile_set_cs_local_size(unsigned x, unsigned y);
 #endif
 
 #define NUM_TEXTURES 5
@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
             g_check_cpu = 1;
         } else if (sscanf(argv[ai], "%ux%u", &lx, &ly) == 2 && lx > 0 && ly > 0) {
 #ifdef PGL_G3D
-            v3d_compile_set_cs_local_size(lx, ly);
+            pglc_compile_set_cs_local_size(lx, ly);
 #endif
         }
     }

@@ -82,9 +82,9 @@
 #include <unistd.h>
 #include <zircon/syscalls.h>
 #elif DETECT_OS_EWOKOS
-/* EwokOS userland (raspi5) is POSIX-ish: unistd.h provides the bits os_misc.c
- * needs (getpid, etc.). Added by the v3dcompiler port; the platform build config
- * lives in the owning machine's bsp g3d dir (exported as V3D_PORT_DIR). */
+/* EwokOS userland is POSIX-ish: unistd.h provides the bits os_misc.c needs
+ * (getpid, etc.). Added by the pglcompiler port; the platform build config lives
+ * in the owning machine's GPU compiler backend dir (PGL_G3D_COMPILER_DIR/port). */
 #  include <unistd.h>
 #else
 #error unexpected platform in os_sysinfo.c

@@ -29,6 +29,7 @@
 #include "../glsl/glsl.h"
 #include "gles_gl_values.h"
 #include "gles_engine.h"
+#include <ewoksys/klog.h>   /* slog: loud GPU-decline diagnostic (/dev/log) */
 
 /* ------------------------------------------------------------------ *
  * Engine state
@@ -2738,6 +2739,39 @@ static int gpu_try_draw_elements(GLenum mode, GLsizei count, GLenum type,
     return 1;
 }
 
+/* GPU-only shader-source override.  The GLES2 front-end ALWAYS compiles the
+ * app's sources through the CPU interpreter first (it owns the CPU fallback
+ * and the uniform metadata), but the interpreter caps locals per function
+ * (GLSL_MAX_LOCALS) and runs ~22 ms/px on heavy fullscreen effects, while the
+ * on-device mesa compiler has neither limit.  An app whose GPU shader is too
+ * big for the interpreter therefore links a CHEAP interpreter-safe source and
+ * hands the faithful source here: gles_engine_gpu_link compiles THIS on mesa
+ * instead.  Uniform packing is unaffected -- gpu_try_fullscreen stages the
+ * interpreted program's uniforms BY NAME against the compiled program, so
+ * both sources must declare the same uniform names (they do: iGlobalTime /
+ * iResolution).  NULL fs clears the override. */
+static char *g_gpu_ovr_vs;
+static char *g_gpu_ovr_fs;
+
+static char *gpu_src_dup(const char *s)
+{
+    char *d;
+    size_t n;
+    if (!s) return NULL;
+    n = strlen(s) + 1;
+    d = (char *)malloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+
+void gles_engine_set_gpu_source(const char *vs_src, const char *fs_src)
+{
+    free(g_gpu_ovr_vs);
+    free(g_gpu_ovr_fs);
+    g_gpu_ovr_vs = gpu_src_dup(vs_src);
+    g_gpu_ovr_fs = gpu_src_dup(fs_src);
+}
+
 GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_src)
 {
     gpu_entry *e;
@@ -2746,10 +2780,30 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
     uint32_t nc;
     int i, is_fullscreen;
     if (!pgl_id || !vs_src || !fs_src) return 0;
+    if (g_gpu_ovr_fs) {
+        fs_src = g_gpu_ovr_fs;
+        if (g_gpu_ovr_vs) vs_src = g_gpu_ovr_vs;
+    }
     err[0] = '\0';
     prog = pgl_g3d_program_compile(vs_src, fs_src, err, (int)sizeof(err));
-    if (prog == PGL_G3D_PROG_INVALID)
+    if (prog == PGL_G3D_PROG_INVALID) {
+        /* A fullscreen-shaped effect (passthrough VS with no uMVP + FS reading
+         * gl_FragCoord, e.g. waterdrop/shadertoy/wave) is EXPECTED to run on the
+         * V3D GPU on a GPU-capable platform.  If the on-device mesa compiler
+         * rejects it -- a reserved gl_* identifier, an unsupported construct --
+         * the app would otherwise fall back to the CPU interpreter SILENTLY and
+         * merely read "Renderer: CPU" with no clue why.  Log the compiler's
+         * error text once so a GPU platform never quietly drops to software. */
+        static int fs_decline_logged = 0;
+        if (!fs_decline_logged &&
+            strstr(vs_src, "uMVP") == NULL &&
+            strstr(fs_src, "gl_FragCoord") != NULL) {
+            fs_decline_logged = 1;
+            slog("PGLG3D: fullscreen FS rejected by GPU compiler -> CPU fallback: %s\n",
+                 err[0] ? err : "(no error text)");
+        }
         return 0;   /* not GPU-viable: the CPU interpreter keeps this program */
+    }
     /* A samplerCube fragment shader can never drive the 2D textured geometry
      * kernel (it samples a cube map by direction, not a raster 2D slot by uv),
      * and cube faces are never mirrored into a GPU raster slot, so decline the
@@ -2894,5 +2948,7 @@ void gles_engine_gpu_flush(void) { }
 int  gles_engine_gpu_active(void) { return 0; }
 void gles_engine_force_cpu(void) { }
 void gles_engine_force_cpu_raster(void) { }
+void gles_engine_set_gpu_source(const char *vs_src, const char *fs_src)
+{ (void)vs_src; (void)fs_src; }
 
 #endif /* PGL_G3D */

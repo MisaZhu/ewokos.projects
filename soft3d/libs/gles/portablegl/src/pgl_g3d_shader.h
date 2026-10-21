@@ -3,12 +3,12 @@
  * the public pgl_g3d program API declared in <portablegl/pgl_g3d.h> and the
  * WS4 dispatch marshalling in pgl_g3d.c.
  *
- * The installed public header must stay free of any libv3dcompiler/mesa types
+ * The installed public header must stay free of any GPU-compiler/mesa types
  * (an app that never uses the arbitrary-shader path should not need the
  * compiler header at all).  This private header is the one place that includes
- * <v3dcompiler.h>, exposing the cached compiled program so the flush path can
- * pack its QPU words into a g2d request (t7d) without leaking the struct into
- * the public contract.
+ * <pglcompiler.h>, exposing the cached compiled program so the flush path can
+ * pack its code into a g2d request (t7d) without leaking the struct into the
+ * public contract.
  *
  * Compiled only under -DPGL_G3D (see pgl_g3d.h).
  */
@@ -18,13 +18,14 @@
 #ifdef PGL_G3D
 
 #include <portablegl/pgl_g3d.h>
-#include <v3dcompiler.h>
+#include <pglcompiler.h>
 
-/* Latch the app-side mesa compiler's codegen target to the live V3D silicon
- * (Pi3 2.1 / Pi4 4.2 / Pi5 7.1) before any v3d_compile_*().  Idempotent and
- * self-retrying: returns the cached version, or 0 when the g2dd daemon has not
- * yet answered a version query (so the caller knows the target is still the
- * v3d71 default).  Defined in pgl_g3d.c; called at the top of
+/* Latch the app-side compiler's codegen target to the live GPU (the
+ * backend-neutral g2d version code: V3D 42/71, Adreno 690) before any
+ * pglc_compile_*().  Idempotent and self-retrying: returns the cached version,
+ * or 0 when the g2dd daemon has not yet answered a version query (so the
+ * caller knows the target is still the backend's default).  Defined in
+ * pgl_g3d.c; called at the top of
  * pgl_g3d_program_compile() (below) and again by pgl_g3d_init().  Without the
  * compile-time call the geometry kernels would be emitted for V3D 7.1 and wedge
  * the V3D 4.2 CSD on a Pi4: the version query in init runs only at the first
@@ -34,12 +35,12 @@ uint32_t pgl_g3d_ensure_version(void);
 /* The cached compiled program for a valid handle, or NULL when the handle is
  * invalid / not compiled.  The returned pointer is owned by the program cache
  * and stays valid until pgl_g3d_program_free() or pgl_g3d_program_free_all()
- * releases that entry.  Both stage[] QPU buffers are the little-endian u32
- * streams documented by struct v3d_compiled_stage. */
-const struct v3d_compiled_program* pgl_g3d_shader_get(pgl_g3d_prog p);
+ * releases that entry.  Each stage[].code buffer is the little-endian u32
+ * streams documented by struct pglc_stage. */
+const struct pglc_program* pgl_g3d_shader_get(pgl_g3d_prog p);
 
 /* Upload the compiled program for handle p to the g2dd daemon (serializing its
- * QPU + uniform stream + shader-state metadata into the G2D_DEV_CNTL_PGL_PROGRAM
+ * code + uniform stream + shader-state metadata into the G2D_DEV_CNTL_PGL_PROGRAM
  * blob) and return the daemon's non-negative program handle, uploading at most
  * once - the handle is cached in the entry, so a per-frame draw call is free
  * after the first.  Returns PGL_G3D_PROG_INVALID for a bad handle, or a negative
@@ -62,7 +63,7 @@ void pgl_g3d_shader_mark_declined(pgl_g3d_prog p);
 
 /* Non-zero when p carries a compiled COMPUTE stage (the shadertoy compute
  * route): the daemon dispatches it through the CSD instead of the binner, and
- * its per-draw blob must carry the `v3d_cs_stride` uniform (frame row pitch in
+ * its per-draw blob must carry the `pglc_cs_stride` uniform (frame row pitch in
  * dwords) that pgl_g3d_set_uniforms injects. */
 int pgl_g3d_shader_has_compute(pgl_g3d_prog p);
 

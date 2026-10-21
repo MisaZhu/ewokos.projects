@@ -4227,6 +4227,14 @@ GL_APICALL void GL_APIENTRY glEndTilingQCOM (GLbitfield preserveMask);
 GL_APICALL GLint GL_APIENTRY glGpuActiveEWOK(void);
 GL_APICALL void GL_APIENTRY glForceCpuEWOK(void);
 GL_APICALL void GL_APIENTRY glForceCpuRasterEWOK(void);
+/* glSetGpuShaderSourceEWOK lets a fullscreen-effect app whose GPU shader is
+ * too big for the CPU interpreter (per-function local cap, per-pixel budget)
+ * link an interpreter-safe source pair and hand the faithful pair to the
+ * on-device mesa compiler only.  Call once after glLinkProgram, before the
+ * render loop.  The interpreted program keeps owning uniform metadata, so
+ * both source pairs must declare the same uniform names.  Passing a NULL fs
+ * clears the override.  Inert on builds without a GPU backend. */
+GL_APICALL void GL_APIENTRY glSetGpuShaderSourceEWOK(const char *vs_src, const char *fs_src);
 #endif /* GL_EWOK_gpu_path */
 
 #ifdef __cplusplus

@@ -24,8 +24,8 @@
  * EwokOS userland (raspi5). The aarch64-none-elf toolchain predefines no OS
  * macro, so key off the build-injected __ewokos__. EwokOS userland provides a
  * POSIX-ish layer (pthreads, unistd, mmap), so enable DETECT_OS_POSIX; the
- * v3dcompiler Makefile force-includes the platform mesa_config.h (found via
- * V3D_PORT_DIR) for HAVE_*.
+ * pglcompiler Makefile force-includes the platform mesa_config.h (found via
+ * $(PGL_G3D_COMPILER_DIR)/port) for HAVE_*.
  */
 #if defined(__ewokos__)
 #define DETECT_OS_EWOKOS 1

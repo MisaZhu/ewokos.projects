@@ -341,7 +341,7 @@ int glsl_attrib_index(const glsl_program *p, const char *name)
 }
 
 /* Named glsl_prog_varying_count (not glsl_varying_count) to avoid a strong-symbol
- * clash with mesa's libv3dcompiler, which exports glsl_varying_count too; the two
+ * clash with mesa's pglcompiler frontend, which exports glsl_varying_count too; the two
  * archives are only linked together in a PGL_G3D (raspi5 GPU) build. */
 int glsl_prog_varying_count(const glsl_program *p)
 {

@@ -1,10 +1,12 @@
-Vendored mesa compiler source tree (front half + back half)
-===========================================================
+Vendored mesa compiler source tree (shared front half)
+======================================================
 
 PURPOSE
-  On-device GLSL -> NIR -> VIR -> QPU compiler for V3D 7.1 (raspi5), used by
-  libvideocore to compile shadertoy fragment shaders at runtime. See the plan
-  "shadertoy On-Device NIR->QPU Compiler Port (V3D 7.1)".
+  On-device GLSL -> linked NIR frontend shared by every GPU-backed EwokOS
+  machine (pglcompiler.h contract).  The machine backends (V3D NIR->QPU on
+  raspi5/raspix, Adreno NIR->ir3 on q8b) consume the NIR this tree produces
+  to compile shadertoy fragment shaders and the geometry compute kernels at
+  runtime.  See the plan "PGL_G3D Adreno backend port".
 
 UPSTREAM PIN  (version-consistency anchor)
   repo    : https://gitlab.freedesktop.org/mesa/mesa.git  (branch main)
@@ -12,15 +14,16 @@ UPSTREAM PIN  (version-consistency anchor)
   date    : 2026-09-04 01:24:43 +0000
   subject : Revert "intel/brw: keep texture ops in large loops"
 
-  WHY THIS COMMIT: the back half bundled in
-  .tmp/videocore7-exps/g2d/third_party/mesa-src/src/broadcom/compiler is a
-  clean mesa-main snapshot. At this commit ALL 28 bundled back-half .c/.h files
-  (nir_to_vir.c, vir_to_qpu.c, vir_register_allocate.c, qpu_schedule.c,
-  v3d_compiler.h, every v3d_nir_lower_*.c, ...) are BYTE-IDENTICAL to the
-  bundled copies, and nir_opt_gcm has the 3-arg signature
-  (nir_opt_gcm(shader, value_number, keep_texture_ops_in_large_loops)) that the
-  bundled nir_to_vir.c calls. The very next commit (859fcc3b) reverts that
-  nir_opt_gcm option back to 2 args, so this is the exact last-consistent pin.
+  WHY THIS COMMIT: the V3D back half now vendored under
+  machines/raspi5|raspix/system/libs/v3dcompiler/mesa/src/broadcom/compiler
+  originated as a clean mesa-main snapshot. At this commit ALL 28 of its
+  .c/.h files (nir_to_vir.c, vir_to_qpu.c, vir_register_allocate.c,
+  qpu_schedule.c, v3d_compiler.h, every v3d_nir_lower_*.c, ...) are
+  BYTE-IDENTICAL to that snapshot, and nir_opt_gcm has the 3-arg signature
+  (nir_opt_gcm(shader, value_number, keep_texture_ops_in_large_loops)) that
+  nir_to_vir.c calls. The very next commit (859fcc3b) reverts that
+  nir_opt_gcm option back to 2 args, so this is the exact last-consistent
+  pin.  Every machine back half must stay at the same pin as this tree.
 
 VENDORED SUBTREES  (under mesa/src/, preserving mesa's include layout)
   compiler/nir/        NIR (all passes) + generated opcode/intrinsic sources
@@ -28,15 +31,18 @@ VENDORED SUBTREES  (under mesa/src/, preserving mesa's include layout)
   compiler/*.c/*.h     glsl_types, shader_enums, shader_info, list, builtin_types
   util/                ralloc, hash_table, dynarray, math, format/, ...
   c11/                 threads/compat headers
-  broadcom/compiler/   V3D back half (nir_to_vir, vir_to_qpu, reg alloc, sched)
-  broadcom/qpu/        QPU instruction pack/unpack
-  broadcom/cle/        v3d_packet.xml + generated v21/v42/v71 pack headers
-  broadcom/common/     v3d_device_info
 
-  Include roots needed by the build:  -I mesa/src   and   -I mesa/src/broadcom
-  (compiler/nir/nir.h, util/ralloc.h, util/format/u_format.h resolve via -I src;
-   common/v3d_device_info.h, cle/v3d_packet_v71_pack.h, qpu/* resolve via
-   -I src/broadcom).
+  GPU BACKENDS ARE NOT HERE.  This tree is the shared, device-neutral front
+  half only (pglcompiler = GLSL -> linked NIR).  Each machine vendors its own
+  mesa back half next to the glue that implements pglcompiler.h, at the same
+  upstream pin:
+    machines/raspi5/system/libs/v3dcompiler/mesa/src/broadcom/   V3D (NIR->QPU)
+    machines/raspix/system/libs/v3dcompiler/mesa/src/broadcom/   V3D (NIR->QPU)
+    machines/q8b/system/libs/adrenocompiler/mesa/src/freedreno/  Adreno (NIR->ir3)
+  Those backends include this tree's headers through PGLC_FE_DIR.
+
+  Include roots needed by the build:  -I mesa/src (compiler/nir/nir.h,
+  util/ralloc.h, util/format/u_format.h resolve via -I src).
 
 HOST-GENERATED FILES  (device build has NO python/bison/flex/mako)
   mesa reproduces these at build time; here they are pre-generated on the host
@@ -52,8 +58,9 @@ HOST-GENERATED FILES  (device build has NO python/bison/flex/mako)
                   cross_platform_settings_piece_all.h   (xxd-embedded .glsl)
     compiler/glsl/glcpp/glcpp-parse.{c,h} (bison) glcpp-lex.c (flex)
     util/format/u_format_{gen.h,pack.h,table.c}  util/format_srgb.c
-    broadcom/compiler/v3d_nir_lower_algebraic.c
-    broadcom/cle/v3d_packet_v{21,42,71}_pack.h
+  Backend-generated files (V3D v3d_nir_lower_algebraic.c and the cle pack
+  headers, Adreno isa/encode.h and ir3_nir_*.c) are NOT here; they live and
+  are regenerated with their backends under machines/<hw>/system/libs/.
 
 DELIBERATE DEVIATIONS FROM UPSTREAM
   * nir_opt_algebraic.c NOT vendored: the generated file is ~49 MB / 3.76 M
@@ -61,11 +68,12 @@ DELIBERATE DEVIATIONS FROM UPSTREAM
     defining the six entry points (nir_opt_algebraic, _before_ffma,
     _before_lower_int64, _late, _distribute_src_mods, _integer_promotion) as
     no-op "return false". Correctness is preserved; only the generic algebraic
-    optimisation is skipped (broadcom's own smaller v3d_nir_lower_algebraic
-    still runs). Regenerate the full file with regen_codegen.sh if a beefier
-    build host is available.
+    optimisation is skipped (each backend's own smaller lowering - V3D's
+    v3d_nir_lower_algebraic, ir3's ir3_nir_* passes - still runs). Regenerate
+    the full file with regen_codegen.sh if a beefier build host is available.
   * NOT vendored: compiler/spirv/ (the GLSL frontend does not reference it;
     SPIR-V is out of scope), gtest/ and every tests/ subdir (unit tests only).
   * NOT generated (stub in WS2 only if a vendored file references them):
-    util/driconf_static.h, util/shader_stats.h, broadcom/cle/v3d_xml.h
-    (v3d_decoder debug path), git_sha1.h (build stamp).
+    util/driconf_static.h, util/shader_stats.h, git_sha1.h (build stamp).
+    Backend-side debug headers (e.g. V3D's cle/v3d_xml.h for the v3d_decoder
+    path) are the machine backends' concern.

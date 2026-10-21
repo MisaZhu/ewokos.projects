@@ -26,7 +26,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "pgl_g3d_shader.h"   /* private bridge: pgl_g3d_shader_upload/_daemon_handle */
-#include <v3dcompiler.h>      /* v3d_tex_layout_2d / v3d_tex_store_2d (tiled uploads) */
+#include <pglcompiler.h>      /* pglc_tex_layout_2d / pglc_tex_store_2d (GPU-layout uploads) */
 
 /* PGL_G3D_MAX_VERTS (the one-dispatch vertex cap and staging size) is defined
    in the public pgl_g3d.h so apps can split an over-cap mesh into sub-ranges. */
@@ -68,6 +68,18 @@ static uint32_t _fb_cap;
 static int      _fb_shm;
 static uint32_t* _fb;        /* render-target pixels (RGBA8) */
 static ewokos_addr_t _fb_phy;
+
+/* Fullscreen-compute render-scale scratch (see pgl_g3d_set_render_scale): when
+   _render_scale > 1 a non-geom fullscreen effect is dispatched into this reduced
+   rw x rh target and upscaled to _fb, trading sharpness for throughput on
+   spill-heavy raymarch kernels that cannot reach interactive FPS at native res
+   on V3D CSD.  Grow-only like _fb; 1 = off (the historical full-res path). */
+static int      _render_scale = 1;
+static int      _rs_shm;
+static uint32_t* _rs;        /* reduced-res scratch target pixels (RGBA8) */
+static ewokos_addr_t _rs_phy;
+static uint32_t _rs_cap;     /* scratch capacity in pixels */
+static int      _rs_w, _rs_h; /* active reduced render dims (0 = full-res) */
 
 static int      _pos_shm;
 static float*   _pos;        /* float3 NDC per vertex */
@@ -138,11 +150,12 @@ static uint32_t _inst_cap;
 
 /* Phase D texture table (see PGL_G3D_MAX_TEX): each slot owns a contig-shm
    RGBA8 image addressable by physical base.  A slot is "loaded" iff
-   .pixels != NULL.  tiling is the V3D texture memory layout of the pixels
-   (enum v3d_tex_tiling): RASTER for the fixed-function TEX_MOD kernel (which
-   reads rows at w*4 pitch), one of LT/UBLINEAR/UIF for compiled-shader sampler
-   units (the TMU cannot sample a raster 2D image); stride is the allocated
-   (padded) row pitch and ub_pad the UIF level_0_ub_pad. */
+   .pixels != NULL.  tiling is the backend-defined GPU memory layout of the
+   pixels (pglc_tex_layout.tiling): PGLC_TEX_TILING_RASTER for the
+   fixed-function TEX_MOD kernel (which reads rows at w*4 pitch), a backend
+   tiled layout (V3D: LT/UBLINEAR/UIF) for compiled-shader sampler units when
+   the GPU's sampler cannot read a raster 2D image; stride is the allocated
+   (padded) row pitch and ub_pad the backend's padding (V3D UIF level_0_ub_pad). */
 typedef struct {
 	int            shm;
 	uint32_t*      pixels;
@@ -320,13 +333,60 @@ static g2d_canvas_t z_canvas(void)
 	return cv;
 }
 
+/* Reduced-resolution scratch target for the fullscreen-compute render-scale path
+   (see pgl_g3d_set_render_scale).  Grow-only like alloc_target: an in-capacity
+   resize reuses the run, so a window drag does not thrash the contig slab. */
+static int rs_ensure(int rw, int rh)
+{
+	uint32_t need = (uint32_t)rw * (uint32_t)rh;
+	uint32_t* px = NULL;
+	ewokos_addr_t phy = 0;
+	int shm = 0;
+	uint32_t cap;
+
+	if (rw <= 0 || rh <= 0)
+		return 0;
+	if (_rs && need <= _rs_cap) {
+		_rs_w = rw;
+		_rs_h = rh;
+		return 1;
+	}
+	if (_rs) { g2d_shm_free(_rs); _rs = NULL; _rs_shm = 0; _rs_phy = 0; _rs_cap = 0; }
+	cap = need + need / 2u;
+	if (g2d_shm_alloc_phy(cap * 4u, &shm, &px, &phy) != 0 || shm <= 0 || px == NULL)
+		return 0;
+	_rs_shm = shm;
+	_rs = px;
+	_rs_phy = phy;
+	_rs_cap = cap;
+	_rs_w = rw;
+	_rs_h = rh;
+	return 1;
+}
+
+static g2d_canvas_t rs_canvas(int rw, int rh)
+{
+	g2d_canvas_t cv = g2d_canvas(_rs_shm, (uint32_t)rw * (uint32_t)rh * 4u,
+	                             (uint32_t)rw, (uint32_t)rh, 1);
+	cv.phy = _rs_phy;
+	return cv;
+}
+
+void pgl_g3d_set_render_scale(int scale)
+{
+	_render_scale = (scale > 1) ? scale : 1;
+}
+
 void pgl_g3d_flush(void)
 {
 	g2d_pgl_req_t req;
 	g2d_canvas_t pos, col, z, texcv, uvcv;
+	g2d_canvas_t dstcv;
+	uint32_t dst_stride;
 	int res;
 	int tex_path;
 	int compiled;
+	int rs_active;
 
 	if (!_enabled || _nverts == 0)
 		return;
@@ -342,7 +402,7 @@ void pgl_g3d_flush(void)
 	            _batch_tex_slot >= 0 &&
 	            _batch_tex_slot < PGL_G3D_MAX_TEX &&
 	            _tex[_batch_tex_slot].pixels != NULL &&
-	            _tex[_batch_tex_slot].tiling == V3D_TEX_TILING_RASTER);
+	            _tex[_batch_tex_slot].tiling == PGLC_TEX_TILING_RASTER);
 	if (tex_path) {
 		const pgl_g3d_tex_slot_t* t = &_tex[_batch_tex_slot];
 		/* col is unused on the TEX_MOD path: send a zero-size canvas so the
@@ -367,9 +427,18 @@ void pgl_g3d_flush(void)
 		uvcv  = g2d_canvas(0, 0, 0, 0, 0);
 	}
 
-	g2d_pgl_draw_req_init(&req, fb_canvas(), pos, col,
+	/* Render-scale: dispatch a non-geom fullscreen compute into the reduced
+	   scratch target instead of the fb; the upscale to the real fb runs right
+	   after the draw below.  _rs_w/_rs_h were latched by pgl_g3d_set_uniforms
+	   this frame so the target and the injected pglc_cs_stride/iResolution agree. */
+	rs_active = (compiled && _render_scale > 1 && _rs_w > 0 && _rs != NULL &&
+	             pgl_g3d_shader_has_compute(_batch_prog) &&
+	             !pgl_g3d_shader_is_geom(_batch_prog));
+	dstcv = rs_active ? rs_canvas(_rs_w, _rs_h) : fb_canvas();
+	dst_stride = rs_active ? (uint32_t)_rs_w * 4u : (uint32_t)_w * 4u;
+	g2d_pgl_draw_req_init(&req, dstcv, pos, col,
 	                      _batch_mode, _nverts,
-	                      G2D_PGL_FMT_RGBA8, (uint32_t)_w * 4u,
+	                      G2D_PGL_FMT_RGBA8, dst_stride,
 	                      (uint32_t)_batch_fs, _batch_rgba, 0,
 	                      _batch_depth_func, (uint8_t)_batch_depth_mask,
 	                      (uint8_t)_batch_cull,
@@ -416,7 +485,7 @@ void pgl_g3d_flush(void)
 			if (s < 0 || s >= PGL_G3D_MAX_TEX || _tex[s].pixels == NULL)
 				continue;
 			t = &_tex[s];
-			if (t->tiling == V3D_TEX_TILING_RASTER)
+			if (t->tiling == PGLC_TEX_TILING_RASTER)
 				continue;
 			req.ctex[u] = g2d_canvas(t->shm, t->size,
 			                         (uint32_t)t->w, (uint32_t)t->h, 1);
@@ -431,6 +500,15 @@ void pgl_g3d_flush(void)
 
 	_nverts = 0;
 	res = g2d_pgl_draw(&req);
+	if (res == G2D_OK && rs_active) {
+		/* Upscale the reduced-res scratch to the real fb (nearest neighbour).
+		   The compute's post-job L2 writeback flushed the scratch to memory;
+		   this blit's src invalidate reads it back coherently.  A scale failure
+		   only leaves the fb stale for one frame - not worth latching off. */
+		g2d_scale_to_req_t sreq;
+		g2d_scale_to_req_init(&sreq, rs_canvas(_rs_w, _rs_h), fb_canvas());
+		g2d_scale_to(&sreq);
+	}
 	if (res != G2D_OK) {
 		/* NOT_SUPPORTED on a compiled batch is a PRE-submission decline by
 		   the back end (unbound sampler unit, unsupported uniform kind...)
@@ -696,19 +774,50 @@ void pgl_g3d_set_uniforms(const uint32_t* data, uint32_t count)
 	if (data && count)
 		memcpy(_unif, data, (size_t)count * 4u);
 	/* Compute route: the compiled compute kernel addresses the frame buffer as
-	   dword [y * v3d_cs_stride + x]; the GPU target's row pitch is _w * 4 bytes
+	   dword [y * pglc_cs_stride + x]; the GPU target's row pitch is _w * 4 bytes
 	   (fb_canvas / the draw request's stride), so inject _w dwords here where
 	   the frame size is known instead of burdening every pack callback. */
 	if (_active_prog != PGL_G3D_PROG_INVALID &&
 	    pgl_g3d_shader_has_compute(_active_prog)) {
 		uint32_t comps = 0;
-		int d = pgl_g3d_shader_uniform_dword(_active_prog, "v3d_cs_stride", &comps);
+		int rw = _w, rh = _h;
+		int scaled = 0;
+		int d, ri = -1;
+		uint32_t rc = 0;
+		/* Render-scale needs BOTH the scratch AND a by-name iResolution slot:
+		   the kernel derives uv/clip from iResolution and its fb row pitch from
+		   pglc_cs_stride, so both must move to the reduced geometry together or
+		   not at all.  Any miss falls back to the exact full-res path. */
+		if (_render_scale > 1 && !pgl_g3d_shader_is_geom(_active_prog)) {
+			rw = _w / _render_scale; if (rw < 1) rw = 1;
+			rh = _h / _render_scale; if (rh < 1) rh = 1;
+			ri = pgl_g3d_shader_uniform_dword(_active_prog, "iResolution", &rc);
+			if (rs_ensure(rw, rh) && ri >= 0 && rc >= 2u &&
+			    (uint32_t)ri + 1u < PGL_G3D_MAX_UNIF)
+				scaled = 1;
+			else {
+				_render_scale = 1;   /* disable for good: never leave partial state */
+				rw = _w; rh = _h;
+			}
+		}
+		_rs_w = scaled ? rw : 0;
+		_rs_h = scaled ? rh : 0;
+		d = pgl_g3d_shader_uniform_dword(_active_prog, "pglc_cs_stride", &comps);
 		if (d >= 0 && (uint32_t)d < PGL_G3D_MAX_UNIF) {
 			if ((uint32_t)d >= count) {
 				memset(&_unif[count], 0, ((uint32_t)d + 1u - count) * 4u);
 				count = (uint32_t)d + 1u;
 			}
-			_unif[d] = (uint32_t)_w;
+			_unif[d] = (uint32_t)rw;
+		}
+		if (scaled) {
+			float fx = (float)rw, fy = (float)rh;
+			if ((uint32_t)ri + 1u >= count) {
+				memset(&_unif[count], 0, ((uint32_t)ri + 2u - count) * 4u);
+				count = (uint32_t)ri + 2u;
+			}
+			memcpy(&_unif[ri],     &fx, 4u);
+			memcpy(&_unif[ri + 1], &fy, 4u);
 		}
 	}
 	_unif_count = count;
@@ -1166,7 +1275,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			   cannot be indexed linearly, so decline to the CPU path. */
 			int s = _ctex_bind[0];
 			if (s < 0 || s >= PGL_G3D_MAX_TEX || _tex[s].pixels == NULL ||
-			    _tex[s].tiling != V3D_TEX_TILING_RASTER)
+			    _tex[s].tiling != PGLC_TEX_TILING_RASTER)
 				return 0;
 			one[0] = (uint32_t)_tex[s].w;
 			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
@@ -1321,7 +1430,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			if (s < 0 || s >= PGL_G3D_MAX_TEX || _tex[s].pixels == NULL)
 				continue;
 			t = &_tex[s];
-			if (t->tiling == V3D_TEX_TILING_RASTER)
+			if (t->tiling == PGLC_TEX_TILING_RASTER)
 				continue;
 			req.ctex[u] = g2d_canvas(t->shm, t->size,
 			                         (uint32_t)t->w, (uint32_t)t->h, 1);
@@ -1358,7 +1467,7 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
    contig-shm image (layout->size bytes), shuffle the caller's raster rgba8
    rows into it per *layout and record the layout on the slot. */
 static int tex_slot_fill(int slot, int w, int h, const void* rgba8,
-                         const struct v3d_tex_layout* layout)
+                         const struct pglc_tex_layout* layout)
 {
 	pgl_g3d_tex_slot_t* t;
 	uint32_t* px = NULL;
@@ -1388,7 +1497,7 @@ static int tex_slot_fill(int slot, int w, int h, const void* rgba8,
 	if (g2d_shm_alloc_phy(layout->size, &shm, &px, &phy) != 0
 	    || shm <= 0 || px == NULL)
 		return 0;   /* allocation failure does NOT latch the GPU off */
-	v3d_tex_store_2d(px, rgba8, (uint32_t)w * 4u, (uint32_t)w, (uint32_t)h,
+	pglc_tex_store_2d(px, rgba8, (uint32_t)w * 4u, (uint32_t)w, (uint32_t)h,
 	                 4u, layout);
 
 	t->shm = shm;
@@ -1405,13 +1514,13 @@ static int tex_slot_fill(int slot, int w, int h, const void* rgba8,
 
 int pgl_g3d_upload_texture(int slot, int w, int h, const void* rgba8)
 {
-	struct v3d_tex_layout layout;
+	struct pglc_tex_layout layout;
 
 	if (w <= 0 || h <= 0)
 		return 0;
 	/* raster: tightly packed rows, no padding (what the TEX_MOD kernel reads) */
 	memset(&layout, 0, sizeof(layout));
-	layout.tiling   = V3D_TEX_TILING_RASTER;
+	layout.tiling   = PGLC_TEX_TILING_RASTER;
 	layout.padded_w = (uint32_t)w;
 	layout.padded_h = (uint32_t)h;
 	layout.stride   = (uint32_t)w * 4u;
@@ -1421,11 +1530,11 @@ int pgl_g3d_upload_texture(int slot, int w, int h, const void* rgba8)
 
 int pgl_g3d_upload_texture_tiled(int slot, int w, int h, const void* rgba8)
 {
-	struct v3d_tex_layout layout;
+	struct pglc_tex_layout layout;
 
 	if (w <= 0 || h <= 0)
 		return 0;
-	if (!v3d_tex_layout_2d((uint32_t)w, (uint32_t)h, 4u, &layout))
+	if (!pglc_tex_layout_2d((uint32_t)w, (uint32_t)h, 4u, &layout))
 		return 0;
 	return tex_slot_fill(slot, w, h, rgba8, &layout);
 }
@@ -1477,6 +1586,8 @@ static void free_all(void)
 
 	if (_fb)  { g2d_shm_free(_fb);  _fb = NULL; }
 	if (_z)   { g2d_shm_free(_z);   _z = NULL; }
+	if (_rs)  { g2d_shm_free(_rs);  _rs = NULL; }
+	_rs_shm = 0; _rs_phy = 0; _rs_cap = 0; _rs_w = _rs_h = 0;
 	_fb_cap = 0;
 	if (_pos) { g2d_shm_free((uint32_t*)_pos); _pos = NULL; }
 	if (_col) { g2d_shm_free(_col); _col = NULL; }
@@ -1642,28 +1753,29 @@ int pgl_g3d_resize(int w, int h)
 	return 1;
 }
 
-/* Cached live V3D architecture version (0 = not queried yet).  soft3d ships ONE
-   binary across chip generations on raspix (Pi3 V3D 2.1 / Pi4 4.2 / Pi5 7.1) and
-   the mesa compiler runs in the APP process, so the codegen target must be
-   latched to the actual silicon BEFORE the first v3d_compile_*().  Shaders are
+/* Cached live GPU version code (0 = not queried yet; g2d_get_version()'s
+   backend-neutral code, e.g. V3D 42/71, Adreno 690).  soft3d ships ONE binary
+   across chip generations on raspix (Pi3 V3D 2.1 / Pi4 4.2 / Pi5 7.1) and the
+   compiler runs in the APP process, so the codegen target must be latched to
+   the actual silicon BEFORE the first pglc_compile_*().  Shaders are
    compiled at glLinkProgram (pgl_g3d_program_compile), which runs before
    pgl_g3d_init()'s first-draw probe, so the query lives here and is called from
    both sites.  Idempotent: a successful query is cached and never re-issued; a
    failed one (daemon not yet reachable) leaves the cache at 0 so the next caller
-   retries rather than silently compiling for the v3d71 default devinfo. */
-static uint32_t _v3d_ver;
+   retries rather than silently compiling for the backend's default device. */
+static uint32_t _gpu_ver;
 
 uint32_t pgl_g3d_ensure_version(void)
 {
 	uint32_t v = 0;
 
-	if (_v3d_ver != 0u)
-		return _v3d_ver;
+	if (_gpu_ver != 0u)
+		return _gpu_ver;
 	if (g2d_get_version(&v) == G2D_OK && v != 0u) {
-		_v3d_ver = v;
-		v3d_compiler_set_version((int)v);
+		_gpu_ver = v;
+		pglc_set_version((int)v);
 	}
-	return _v3d_ver;   /* 0 when no query has succeeded yet */
+	return _gpu_ver;   /* 0 when no query has succeeded yet */
 }
 
 int pgl_g3d_init(int w, int h)
@@ -1690,12 +1802,12 @@ int pgl_g3d_init(int w, int h)
 
 	/* Latch the codegen target to the live silicon (idempotent; the shaders were
 	   already compiled against it at glLinkProgram via the same call in
-	   pgl_g3d_program_compile).  A failed query, or ver < 41 (VC4 / V3D 2.1 on
+	   pgl_g3d_program_compile).  A failed query (0), or a GPU code the machine
+	   compiler backend does not support (V3D: ver < 41, i.e. VC4 / V3D 2.1 on
 	   Pi3, which has no CSD compute for the geom rasterizer), declines the GPU
-	   path entirely and portablegl keeps its CPU/NEON rasterizer.  raspi5
-	   reports 71 and selects the same devinfo the compiler defaults to, so its
-	   emitted QPU is byte-for-byte unchanged. */
-	if (pgl_g3d_ensure_version() < 41u)
+	   path entirely and portablegl keeps its CPU/NEON rasterizer.  The backend
+	   owns that judgement (pglc_version_supported), not this shared client. */
+	if (!pglc_version_supported(pgl_g3d_ensure_version()))
 		return 0;
 
 	if (!alloc_target(w, h, fb_grow_capacity((uint32_t)w * (uint32_t)h)))

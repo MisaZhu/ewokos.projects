@@ -5,7 +5,7 @@
  * These sources mirror the C vertex_shader() + built-in pgl_ff_gouraud() pair in
  * teapot.c EXACTLY, so the teapot looks identical whether it is lit on the CPU
  * rasterizer (the automatic fallback) or with the vertex stage compiled to
- * VideoCore VII QPU (raspi5 / V3D 7.1) by v3d_compile_glsl().
+ * VideoCore VII QPU (raspi5 / V3D 7.1) by pglc_compile_glsl().
  *
  * Convention:
  *   - #version 310 es with explicit layout(location=) so aPosition binds vertex

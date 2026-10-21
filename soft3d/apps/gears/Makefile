@@ -13,7 +13,7 @@ LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib
 # Link order matters for static archives: the app + glcommon reference the EGL /
 # GLESv2 entry points.  libGLESv2.a already contains the portablegl engine and
 # (on PGL_G3D targets) the on-device mesa GLSL->QPU compiler, so an app links
-# only -lGLESv2 -lEGL and never names portablegl or v3dcompiler.
+# only -lGLESv2 -lEGL and never names portablegl or pglcompiler.
 GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libglcommon.a \
 	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
