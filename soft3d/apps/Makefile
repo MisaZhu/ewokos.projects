@@ -1,5 +1,5 @@
 
-DIRS := 3ddemo Fireworks matrix gears teapot imgui_demo glmatrix waterdrop engine wave ocean
+DIRS := 3ddemo Fireworks matrix gears teapot imgui_demo glmatrix waterdrop ocean
 
 all: $(DIRS)
 

@@ -59,6 +59,7 @@
 #endif
 
 #include <string>
+#include <cstdio>
 
 /* Passthrough vertex shader: a full-screen clip-space quad.  It intentionally
  * references no uMVP / matrices so the engine flags the program as a fullscreen
@@ -81,6 +82,17 @@ namespace ocean_gen {
  * interpreter and mesa alike (no runtime-variable trip counts). */
 static std::string build_ocean_fs(int iter_geom, int iter_frag, int steps)
 {
+    /* Upper bound of the coarse height field: each sea_octave returns a value in
+     * [0,1] and map() accumulates two of them per iteration with amp =
+     * SEA_HEIGHT * 0.22^i, so h <= 2 * SEA_HEIGHT * sum(0.22^i).  Injected as a
+     * literal so heightMapTracing can bracket the hit analytically (see there);
+     * deriving it here keeps the bound exact if the octave count is retuned. */
+    double hmax = 0.0, amp = 1.0;
+    for (int i = 0; i < iter_geom; i++) { hmax += amp; amp *= 0.22; }
+    hmax *= 2.0 * 0.6;   /* 2 octaves per iteration, SEA_HEIGHT = 0.6 */
+    char hmax_lit[32];
+    snprintf(hmax_lit, sizeof(hmax_lit), "%.6f", hmax);
+
     std::string g;
     g += OCEAN_FS_PREAMBLE;
     g += R"GLSL(
@@ -96,6 +108,12 @@ const float SEA_SPEED  = 0.8;
 const float SEA_FREQ   = 0.16;
 const vec3  SEA_BASE        = vec3(0.1, 0.19, 0.22);
 const vec3  SEA_WATER_COLOR = vec3(0.8, 0.9, 0.6);
+
+/* max value of map()'s height sum (derived from the octave count by the
+ * generator): the surface can never be above y = SEA_HMAX. */
+const float SEA_HMAX = )GLSL";
+    g += hmax_lit;
+    g += R"GLSL(;
 
 /* ---- value noise (bilinear hash lattice) ---- */
 float hash(vec2 p) {
@@ -211,14 +229,31 @@ vec3 getNormal(vec3 p, float eps) {
 }
 
 /* Height-map binary trace; returns the hit point (the reference's
- * `out vec3 p`), so no out parameter is needed. */
+ * `out vec3 p`), so no out parameter is needed.
+ *
+ * SPEED-UP vs the reference, same surface: the reference brackets the hit with
+ * the fixed interval [0, 1000] and spends its bisection steps narrowing that
+ * huge range.  Here the bracket is derived analytically instead: sea_octave()
+ * returns a value in [0,1] and map() sums non-negative amplitudes, so the
+ * height field satisfies 0 <= h <= SEA_HMAX and map(p) = p.y - h.  A downward
+ * ray (dir.y < 0, which is exactly the sea branch main() traces) is therefore
+ * still above every possible crest while p.y > SEA_HMAX and provably at or
+ * below the surface once p.y <= 0, so the crossing lies in
+ * [(eye.y - SEA_HMAX) / -dir.y, eye.y / -dir.y].  Feeding that tight interval
+ * to the same secant iteration converges in far fewer steps than [0, 1000] --
+ * the shipped step count is )GLSL";
+    g += std::to_string(steps);
+    g += R"GLSL( where the reference needs 8 -- and the hit it lands on is at
+ * least as accurate.  Upward / near-horizontal rays clamp to the reference's
+ * 1000 and take the `hx > 0` far-point return exactly as before. */
 vec3 heightMapTracing(vec3 eye, vec3 dir) {
-    float tm = 0.0;
-    float tx = 1000.0;
+    float dy = max(-dir.y, 0.0001);
+    float tm = clamp((eye.y - SEA_HMAX) / dy, 0.0, 1000.0);
+    float tx = clamp(eye.y / dy, tm, 1000.0);
     float hx = map(eye + dir * tx);
     if (hx > 0.0) return eye + dir * tx;
     float hm = map(eye + dir * tm);
-    float tmid = 0.0;
+    float tmid = tm;
     for (int i = 0; i < )GLSL";
     g += std::to_string(steps);
     g += R"GLSL(; i++) {
@@ -307,6 +342,6 @@ void main() {
  * FPS/look balance: it halves the per-pixel evaluation count versus the
  * reference while keeping the swell silhouette and overall ocean look.  The
  * reference-faithful 3/5/8 and the other experimental tiers were discarded. */
-static const std::string ocean_fs = ocean_gen::build_ocean_fs(2, 3, 5);
+static const std::string ocean_fs = ocean_gen::build_ocean_fs(2, 3, 4);
 
 #endif /* OCEAN_GLSL_H */

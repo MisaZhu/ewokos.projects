@@ -54,11 +54,24 @@
  * Must be set before the first glLinkProgram, which triggers the on-device
  * compile.  Belongs to the mesa compiler merged into libGLESv2. */
 extern "C" void pglc_compile_set_cs_local_size(unsigned x, unsigned y);
+/* Engine knob: render the fullscreen faithful compute at 1/N resolution and
+ * upscale to the window (same lever wave ships).  The ocean trace is ALU-bound
+ * on V3D CSD (~4 FPS at native fullscreen), and the kernel cost scales with
+ * the pixel count, so N=2 cuts the shaded pixels 4x for a matching FPS gain
+ * at slightly softer sharpness.  The shader math is unchanged (the engine
+ * patches iResolution and pglc_cs_stride to the reduced geometry).  No effect
+ * on the CPU interpreter path (virt / GPU-decline), which is not a compute
+ * draw. */
+extern "C" void pgl_g3d_set_render_scale(int scale);
 #endif
 
 /* Window dimensions (can be resized). */
 static int win_width  = 800;
 static int win_height = 600;
+#ifdef PGL_G3D
+static int g_scale = 2;   /* faithful-compute render-scale denominator; argv "scaleN"
+                             (N=1..9) overrides, 1 = native full-res */
+#endif
 
 static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
 static EGLSurface egl_surf = EGL_NO_SURFACE;
@@ -76,6 +89,8 @@ static float    iGlobalTime = 0.0f;
 static int fps = 0;
 static int frame_count = 0;
 static uint32_t last_tic = 0;
+static int g_fpslog = 0;   /* argv "fpslog": also print the 1s FPS roll to stdout
+                              (for headless A/B tuning over ssh; silent by default) */
 
 static void update_fps(void)
 {
@@ -85,6 +100,8 @@ static void update_fps(void)
         last_tic = low;
         fps = frame_count;
         frame_count = 0;
+        if (g_fpslog && fps > 0)
+            printf("ocean: fps=%d\n", fps);
     }
     frame_count++;
 }
@@ -188,6 +205,10 @@ static void process_imgui_frame(int gpu)
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize
                  | ImGuiWindowFlags_NoInputs);
     ImGui::Text("FPS: %d", fps);
+#ifdef PGL_G3D
+    if (gpu && g_scale > 1)
+        ImGui::Text("Scale: 1/%d res", g_scale);
+#endif
     ImGui::TextColored(gpu ? ImVec4(0.40f, 1.00f, 0.55f, 1.0f)
                            : ImVec4(1.00f, 0.70f, 0.30f, 1.0f),
                        "Renderer: %s", gpu ? "GPU" : "CPU");
@@ -295,16 +316,35 @@ static void loop(void* p)
 int main(int argc, char** argv)
 {
     /* argv: optional "WxH" sets the compute workgroup shape (GPU build, A/B
-     * tuning).  The ocean ships a single effect (the 2/3/5 tuning); there is no
-     * tier selection. */
+     * tuning), optional "scaleN" sets the faithful-compute render-scale
+     * denominator, optional "fpslog" echoes the 1s FPS roll to stdout.  The
+     * ocean ships a single effect (the 2/3/5 tuning); there is no tier
+     * selection. */
     for (int ai = 1; ai < argc && argv[ai]; ai++) {
         unsigned lx = 0, ly = 0;
+        if (strcmp(argv[ai], "fpslog") == 0) {
+            g_fpslog = 1;
+            continue;
+        }
+#ifdef PGL_G3D
+        if (strncmp(argv[ai], "scale", 5) == 0 &&
+            argv[ai][5] >= '1' && argv[ai][5] <= '9' && argv[ai][6] == '\0') {
+            g_scale = argv[ai][5] - '0';
+        } else
+#endif
         if (sscanf(argv[ai], "%ux%u", &lx, &ly) == 2 && lx > 0 && ly > 0) {
 #ifdef PGL_G3D
             pglc_compile_set_cs_local_size(lx, ly);
 #endif
         }
     }
+#ifdef PGL_G3D
+    /* Apply the (possibly argv-overridden) scale unconditionally so the
+     * default takes effect on a bare launch, not only when "scaleN" is
+     * passed.  Set before the first frame; inert on the CPU interpreter
+     * path. */
+    pgl_g3d_set_render_scale(g_scale);
+#endif
 
     x_t x;
     x_init(&x, NULL);
