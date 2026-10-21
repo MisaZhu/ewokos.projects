@@ -35,7 +35,7 @@ extern "C" {
 #define GLSL_MAX_VARYINGS      16   /* vec4 varyings shared vs->fs        */
 #define GLSL_MAX_ATTRIBS       8    /* vertex attribute locations         */
 #define GLSL_MAX_UNIFORMS      64   /* uniform leaves across both stages  */
-#define GLSL_MAX_FUNCS         32   /* user-defined functions per stage   */
+#define GLSL_MAX_FUNCS         128   /* user-defined functions per stage   */
 #define GLSL_MAX_GLOBALS       64   /* file-scope variables/constants      */
 #define GLSL_MAX_LOCALS        64   /* locals per function frame          */
 #define GLSL_MAX_LOOP_DEPTH    32
@@ -102,6 +102,9 @@ struct glsl_expr {
     int op_builtin;           /* for EX_CALL: builtin id or user fn idx  */
     int is_user_fn;           /* EX_CALL: 1 => op_builtin is func index  */
     int ctor_type;            /* EX_CTOR: glsl_basetype being built      */
+    int ctor_array;           /* EX_CTOR: >0 => array constructor type[N](...),
+                               * the element count N (GLSL ES 3.00 array
+                               * literal); 0 => ordinary scalar/vec/mat ctor */
     int var_scope;            /* EX_VAR: scope class (see VARSCOPE_*)    */
     int var_slot;             /* EX_VAR: index within scope              */
     int var_comp;             /* EX_VAR: component offset (swizzle-less) */
@@ -196,6 +199,7 @@ enum {
     BF_EQUAL, BF_NOT_EQUAL, BF_ANY, BF_ALL, BF_NOT,
     BF_TEXTURE2D, BF_TEXTURE2DPROJ, BF_TEXTURE2DLOD, BF_TEXTURECUBE,
     BF_DFDX, BF_DFDY, BF_FWIDTH,
+    BF_TANH,                  /* GLSL ES 3.00 hyperbolic tangent         */
     BF_USER_START
 };
 

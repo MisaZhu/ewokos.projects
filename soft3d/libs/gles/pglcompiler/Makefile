@@ -69,8 +69,20 @@ PGLC_FORCEINC = -include $(PORT_DIR)/mesa_config.h
 #     so they override make.rule's -std=c99 / -std=c++14 (GCC honours the last
 #     -std). gnu11/gnu++17 give mesa the statement-expressions, typeof and C++17
 #     features it relies on.
-CFLAGS   := $(PGLC_INC) $(PGLC_FORCEINC) $(CFLAGS) -w -std=gnu11
-CXXFLAGS := $(PGLC_INC) $(PGLC_FORCEINC) $(CXXFLAGS) -w -std=gnu++17
+# -DNDEBUG: build the frontend mesa in its RELEASE configuration.  Without it the
+#     debug-only NIR validator (nir_validate.c is guarded by #ifndef NDEBUG, and
+#     nir.h swaps every nir_validate_*/nir_metadata_*_validation_flag entry for a
+#     no-op inline under NDEBUG) is compiled in and run after EVERY NIR pass plus
+#     the direct calls in gl_nir_linker.c/glsl_to_nir.cpp.  That validator is a
+#     pure checker - it does not affect codegen - but it NULL-derefs (data-abort,
+#     fault=0x0) while cloning a per-element table on large fullscreen effects
+#     (city's ~51-function FS with big const arrays), crashing the app AFTER the
+#     backend already compiled+uploaded a valid compute kernel.  Defining NDEBUG
+#     here (all #else no-op inlines are present, so the link stays consistent)
+#     removes that whole crash class and the per-pass validation overhead, with
+#     byte-identical QPU output.  Scoped to this frontend archive only.
+CFLAGS   := $(PGLC_INC) $(PGLC_FORCEINC) $(CFLAGS) -w -DNDEBUG -std=gnu11
+CXXFLAGS := $(PGLC_INC) $(PGLC_FORCEINC) $(CXXFLAGS) -w -DNDEBUG -std=gnu++17
 
 # === sources ================================================================
 S = mesa/src

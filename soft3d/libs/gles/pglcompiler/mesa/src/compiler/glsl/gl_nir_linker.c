@@ -38,6 +38,36 @@
 #include "util/perf/cpu_trace.h"
 #include "pipe/p_screen.h"
 
+/* TEMPORARY crash forensics (city fullscreen compute): the debug NIR validator
+ * used to crash first and mask a later data-abort in nir_block_dominates (corrupt
+ * nir_block*).  slog() writes straight into the /dev/log ring buffer, so a terse
+ * breadcrumb per pass lets ONE device run reveal the last pass entered before the
+ * crash.  Remove once the offending pass is fixed. */
+#include <ewoksys/klog.h>
+#define NIRDBG(fmt, ...) slog("nirdbg: " fmt "\r\n", ##__VA_ARGS__)
+/* The gl_nir_opts do-while loop iterates pathologically many times on city's
+ * shader; unthrottled per-pass markers flood the 64KB /dev/log ring and wrap out
+ * the coarse fedbg stage markers.  Log in-loop detail only for the first two
+ * iterations and then every 200th, always tagging the iteration index. */
+static int g_opts_iter = 0;
+#define NIRDBGOPT(fmt, ...) do { if (g_opts_iter < 2 || (g_opts_iter % 200) == 0) \
+      slog("nirdbg: [it%d] " fmt "\r\n", g_opts_iter, ##__VA_ARGS__); } while (0)
+/* TEMPORARY progress attribution: wraps NIR_PASS(progress, nir, pass, ...) and
+ * logs WHICH pass reported progress.  Logged for the first three iterations and
+ * once more at it50 so a stable oscillation (same pass set progressing forever)
+ * is unmistakable.  Remove once the non-converging pass is identified. */
+#define NIR_PASS_P(pass, ...) do { \
+      bool _pp = false; \
+      NIR_PASS(_pp, nir, pass, ##__VA_ARGS__); \
+      if (_pp) { progress = true; \
+         if (g_opts_iter < 3 || g_opts_iter == 50) \
+            slog("nirdbg: [it%d] PROG %s\r\n", g_opts_iter, #pass); } \
+   } while (0)
+/* Hard bound on the gl_nir_opts do-while.  Real shaders converge in well under
+ * a dozen iterations; 64 is generous headroom that still terminates a pathological
+ * oscillation long before the heap is exhausted. */
+#define GL_NIR_OPTS_MAX_ITERS 64
+
 /**
  * This file included general link methods, using NIR.
  */
@@ -49,8 +79,12 @@ gl_nir_opts(nir_shader *nir)
 
    MESA_TRACE_FUNC();
 
+   NIRDBG("opts ENTER stage=%d", (int)nir->info.stage);
+
+   g_opts_iter = 0;
    do {
       progress = false;
+      NIRDBGOPT("iter begin stage=%d", (int)nir->info.stage);
 
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
 
@@ -59,14 +93,26 @@ gl_nir_opts(nir_shader *nir)
        * things. This pass will also remove variables with only stores, so we
        * might be able to make progress after it.
        */
-      NIR_PASS(progress, nir, nir_remove_dead_variables,
+      NIR_PASS_P(nir_remove_dead_variables,
                nir_var_function_temp | nir_var_shader_temp |
                nir_var_mem_shared,
                NULL);
 
-      NIR_PASS(progress, nir, nir_opt_find_array_copies);
-      NIR_PASS(progress, nir, nir_opt_copy_prop_vars);
-      NIR_PASS(progress, nir, nir_opt_dead_write_vars);
+      NIR_PASS_P(nir_opt_find_array_copies);
+      /* nir_opt_copy_prop_vars caches deref paths (nir_deref_and_path) across
+       * the opt loop and walks the parent chain in nir_deref_path_init.  The
+       * heavy shadertoy-style FULLSCREEN COMPUTE kernels (e.g. the BladeRunner
+       * city port) carry large dynamically-indexed global const arrays
+       * (FONT[64]/TXT6[119]/OFF[108]) plus mutable shader-global vars written
+       * across the raymarch helper calls; that combination leaves a stale deref
+       * in the cached copy list and the parent walk dereferences a freed instr
+       * (data-abort at nir_deref_path_init on raspi5).  copy_prop_vars is a pure
+       * optimisation (nir_lower_vars_to_ssa above already guarantees correct
+       * SSA), so skip it for compute shaders only: mesh stages keep the opt
+       * untouched and the fullscreen effects still compile correctly. */
+      if (nir->info.stage != MESA_SHADER_COMPUTE)
+         NIR_PASS_P(nir_opt_copy_prop_vars);
+      NIR_PASS_P(nir_opt_dead_write_vars);
 
       if (nir->options->lower_to_scalar) {
          NIR_PASS(_, nir, nir_lower_alu_to_scalar,
@@ -76,45 +122,69 @@ gl_nir_opts(nir_shader *nir)
 
       NIR_PASS(_, nir, nir_lower_alu);
       NIR_PASS(_, nir, nir_lower_pack);
-      NIR_PASS(progress, nir, nir_opt_copy_prop);
-      NIR_PASS(progress, nir, nir_opt_remove_phis);
-      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS_P(nir_opt_copy_prop);
+      NIRDBGOPT("opts pre remove_phis");
+      NIR_PASS_P(nir_opt_remove_phis);
+      NIRDBGOPT("opts post remove_phis");
+      NIR_PASS_P(nir_opt_dce);
 
       bool opt_loop_progress = false;
       NIR_PASS(opt_loop_progress, nir, nir_opt_loop);
       if (opt_loop_progress) {
          progress = true;
-         NIR_PASS(progress, nir, nir_opt_copy_prop);
-         NIR_PASS(progress, nir, nir_opt_dce);
+         if (g_opts_iter < 3 || g_opts_iter == 50) slog("nirdbg: [it%d] PROG nir_opt_loop\r\n", g_opts_iter);
+         NIR_PASS_P(nir_opt_copy_prop);
+         NIR_PASS_P(nir_opt_dce);
       }
-      NIR_PASS(progress, nir, nir_opt_if, 0);
-      NIR_PASS(progress, nir, nir_opt_dead_cf);
-      NIR_PASS(progress, nir, nir_opt_cse);
+      NIRDBGOPT("opts pre if");
+      NIR_PASS_P(nir_opt_if, 0);
+      NIRDBGOPT("opts post if");
+      NIR_PASS_P(nir_opt_dead_cf);
+      NIRDBGOPT("opts pre cse");
+      NIR_PASS_P(nir_opt_cse);
+      NIRDBGOPT("opts post cse");
 
       nir_opt_peephole_select_options peephole_select_options = {
          .limit = 8,
          .indirect_load_ok = true,
          .expensive_alu_ok = true,
       };
-      NIR_PASS(progress, nir, nir_opt_peephole_select, &peephole_select_options);
+      NIR_PASS_P(nir_opt_peephole_select, &peephole_select_options);
 
-      NIR_PASS(progress, nir, nir_opt_phi_precision);
-      NIR_PASS(progress, nir, nir_opt_algebraic);
-      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS_P(nir_opt_phi_precision);
+      NIR_PASS_P(nir_opt_algebraic);
+      NIR_PASS_P(nir_opt_constant_folding);
 
-      NIR_PASS(progress, nir, nir_opt_undef);
+      NIR_PASS_P(nir_opt_undef);
 
       peephole_select_options = (nir_opt_peephole_select_options){
          .limit = 0,
          .discard_ok = true,
       };
-      NIR_PASS(progress, nir, nir_opt_peephole_select, &peephole_select_options);
+      NIR_PASS_P(nir_opt_peephole_select, &peephole_select_options);
       if (nir->options->max_unroll_iterations ||
             (nir->options->max_unroll_iterations_fp64 &&
                (nir->options->lower_doubles_options & nir_lower_fp64_full_software))) {
-         NIR_PASS(progress, nir, nir_opt_loop_unroll);
+         NIR_PASS_P(nir_opt_loop_unroll);
+      }
+      g_opts_iter++;
+      /* Defensive iteration cap.  Some heavy shadertoy-style fullscreen-compute
+       * kernels drive two NIR passes into oscillation (each undoes the other's
+       * rewrite), so `progress` never clears and this do-while would otherwise
+       * spin forever, exhausting the heap until a live pointer corrupts -- which
+       * is exactly the data-abort in nir_block_dominates seen on raspi5 during
+       * city's compute opt.  The opt loop is a PURE optimisation: bailing out
+       * after GL_NIR_OPTS_MAX_ITERS leaves valid, merely less-optimised NIR that
+       * still compiles and dispatches (the backend adapts register pressure via
+       * its spill strategy).  This keeps the GPU path content-size-agnostic. */
+      if (g_opts_iter >= GL_NIR_OPTS_MAX_ITERS) {
+         if (progress)
+            slog("nirdbg: opts CAP hit stage=%d iters=%d (progress still set)\r\n",
+                 (int)nir->info.stage, g_opts_iter);
+         break;
       }
    } while (progress);
+   NIRDBG("opts LOOP DONE stage=%d iters=%d", (int)nir->info.stage, g_opts_iter);
 
    unsigned lower_flrp =
       (nir->options->lower_flrp16 ? 16 : 0) |
@@ -146,9 +216,13 @@ gl_nir_inline_functions(const struct pipe_caps *caps, nir_shader *shader)
     * of the function and not at the top of its caller.
     */
    NIR_PASS(_, shader, nir_lower_variable_initializers, nir_var_all);
+   NIRDBG("inline ENTER stage=%d (post var-init)", (int)shader->info.stage);
    NIR_PASS(_, shader, nir_lower_returns);
+   NIRDBG("inline post lower_returns");
    NIR_PASS(_, shader, nir_inline_functions);
+   NIRDBG("inline post inline_functions");
    NIR_PASS(_, shader, nir_opt_deref);
+   NIRDBG("inline post opt_deref");
 
    /* We set func->is_entrypoint after nir_function_create if the function
     * is named "main", so we can use nir_remove_non_entrypoints() for this.
@@ -156,6 +230,7 @@ gl_nir_inline_functions(const struct pipe_caps *caps, nir_shader *shader)
     * func->is_entrypoint.
     */
    nir_remove_non_entrypoints(shader);
+   NIRDBG("inline post remove_non_entrypoints stage=%d", (int)shader->info.stage);
 
    /* Now that functions have been inlined remove deref_texture_src intrinisic
     * as we can now see if the texture source is bindless or not.
@@ -202,6 +277,7 @@ gl_nir_inline_functions(const struct pipe_caps *caps, nir_shader *shader)
       }
    }
 
+   NIRDBG("inline DONE stage=%d", (int)shader->info.stage);
    nir_validate_shader(shader, "after function inlining and return lowering");
 }
 

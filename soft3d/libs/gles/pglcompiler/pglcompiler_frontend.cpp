@@ -43,6 +43,13 @@
 #include "compiler/glsl_types.h"
 #include "pipe/p_screen.h"
 
+/* TEMPORARY crash forensics (see gl_nir_linker.c NIRDBG): coarse breadcrumbs
+ * across the frontend compile pipeline so ONE device run shows whether the
+ * data-abort is in the pair or compute compile, and which step.  Remove once
+ * the offending NIR pass is fixed. */
+#include <ewoksys/klog.h>
+#define FEDBG(fmt, ...) slog("fedbg: " fmt "\r\n", ##__VA_ARGS__)
+
 #include "pglcompiler_frontend.h"   /* include/ is on the -I path */
 
 struct pglc_fe_shaders {
@@ -714,8 +721,10 @@ pglc_fe_compile_glsl(const char *vert_src, const char *frag_src,
    }
 
    /* Link to a single program, producing the IO-lowered linked NIR. */
+   FEDBG("pair: link_program enter");
    if (!link_program(sh, log, logsz))
       goto fail;
+   FEDBG("pair: link_program done");
 
    {
       nir_shader *vs_nir = pglc_fe_nir(sh, PGLC_STAGE_VERTEX);
@@ -734,6 +743,7 @@ pglc_fe_compile_glsl(const char *vert_src, const char *frag_src,
       lower_uniforms_and_samplers(fs_nir, prog);
    }
 
+   FEDBG("pair: SUCCESS");
    *out = sh;
    return true;
 
@@ -885,15 +895,19 @@ pglc_fe_compile_compute(const char *cs_src,
 
    struct gl_shader *cs =
       standalone_add_shader_source(ctx, prog, GL_COMPUTE_SHADER, cs_src);
+   FEDBG("cs: compile_shader enter");
    _mesa_glsl_compile_shader(ctx, cs, NULL, false, false, true);
+   FEDBG("cs: compile_shader done status=%d", (int)cs->CompileStatus);
    if (!cs->CompileStatus) {
       pglc_fe_log_append(log, logsz, "compute shader:\n");
       pglc_fe_log_append(log, logsz, cs->InfoLog);
       goto fail;
    }
 
+   FEDBG("cs: link_program enter");
    if (!link_program(sh, log, logsz))
       goto fail;
+   FEDBG("cs: link_program done");
 
    {
       nir_shader *cs_nir = pglc_fe_nir(sh, PGLC_STAGE_COMPUTE);
@@ -904,16 +918,21 @@ pglc_fe_compile_compute(const char *cs_src,
       }
 
       /* Same default-block uniform + sampler lowering as the graphics path. */
+      FEDBG("cs: lower_uniforms enter");
       lower_uniforms_and_samplers(cs_nir, prog);
+      FEDBG("cs: lower_uniforms done");
 
       /* SSBO: the GLSL link path leaves the SSBO blocks as nir_var_mem_ssbo
        * deref chains (gl_nir_linker never calls this itself -- upstream does it
        * in st_glsl_to_nir).  gl_nir_lower_buffers rewrites them to
        * load/store_ssbo(block_index, byte_offset); block_index is the LINKED
        * index, see pglc_fe_ssbo_binding() for the remap the backend must apply. */
+      FEDBG("cs: lower_buffers enter");
       gl_nir_lower_buffers(cs_nir, prog);
+      FEDBG("cs: lower_buffers done");
    }
 
+   FEDBG("cs: SUCCESS");
    *out = sh;
    return true;
 

@@ -207,7 +207,7 @@ static glsl_val vm_builtin(env *E, int id, const glsl_val *av, int nargs)
     case BF_RADIANS: case BF_DEGREES: case BF_SIN: case BF_COS: case BF_TAN:
     case BF_ASIN: case BF_ACOS: case BF_EXP: case BF_LOG: case BF_EXP2:
     case BF_LOG2: case BF_SQRT: case BF_INVSQRT: case BF_ABS: case BF_SIGN:
-    case BF_FLOOR: case BF_CEIL: case BF_FRACT:
+    case BF_FLOOR: case BF_CEIL: case BF_FRACT: case BF_TANH:
         return gen_unary(E, id, &a);
     case BF_ATAN:
         if (nargs >= 2) return gen_binary(E, BF_ATAN2, &a, &b);
@@ -886,7 +886,14 @@ static int vm_ce(vmc *C, const glsl_expr *e)
             slots[i] = vm_ce(C, e->args[i]);
             if (slots[i] < 0) { C->failed = 1; return -1; }
         }
-        if (e->kind == EX_CTOR) { op = VMOP_CTOR; xid = e->ctor_type; }
+        if (e->kind == EX_CTOR) {
+            /* array constructors (type[N](...)) are not VM-representable; bail
+             * so the whole stage falls back to the tree-walker (correct, just
+             * slower).  In practice they only appear in global const
+             * initialisers, which the tree-walker evaluates at link time. */
+            if (e->ctor_array > 0) { C->failed = 1; return -1; }
+            op = VMOP_CTOR; xid = e->ctor_type;
+        }
         else if (e->is_user_fn) {
             const glsl_func *F;
             if (e->op_builtin < 0 || e->op_builtin >= C->stage->nfuncs) { C->failed = 1; return -1; }

@@ -91,6 +91,7 @@ typedef struct { const char *n; int id; int nargs; } bif;
 static const bif k_bifs[] = {
     {"radians",BF_RADIANS,1},{"degrees",BF_DEGREES,1},{"sin",BF_SIN,1},{"cos",BF_COS,1},
     {"tan",BF_TAN,1},{"asin",BF_ASIN,1},{"acos",BF_ACOS,1},{"atan",BF_ATAN,-1},
+    {"tanh",BF_TANH,1},
     {"pow",BF_POW,2},{"exp",BF_EXP,1},{"log",BF_LOG,1},{"exp2",BF_EXP2,1},{"log2",BF_LOG2,1},
     {"sqrt",BF_SQRT,1},{"inversesqrt",BF_INVSQRT,1},{"abs",BF_ABS,1},{"sign",BF_SIGN,1},
     {"floor",BF_FLOOR,1},{"ceil",BF_CEIL,1},{"fract",BF_FRACT,1},{"mod",BF_MOD,2},
@@ -420,6 +421,36 @@ static glsl_expr *parse_primary(parser *P)
     }
     if (t->kind == TK_LPAREN) {
         glsl_expr *e; adv(P); e = parse_assign(P); expect(P, TK_RPAREN, "')'"); return e;
+    }
+    /* array constructor: type[N](args...)  (GLSL ES 3.00 array literal, e.g.
+     * `float[64](...)` / `int[119](...)`).  Recognised before the ordinary
+     * constructor because both start with a type token; the discriminator is
+     * the '[' that follows the type name.  Only valid in an expression (a
+     * declaration's `type name[N]` is consumed by parse_type/declarator). */
+    if (is_ctor_type(t->kind) && P->tk[P->pos+1].kind == TK_LBRACKET) {
+        int type = type_from_token(t->kind);
+        int arr = 0;
+        glsl_expr *e;
+        adv(P);                              /* consume the type token   */
+        expect(P, TK_LBRACKET, "'['");
+        if (at(P, TK_INT)) { arr = cur(P)->ival; adv(P); }
+        expect(P, TK_RBRACKET, "']'");
+        e = new_expr(EX_CTOR);
+        e->ctor_type = type;
+        e->ctor_array = arr;
+        expect(P, TK_LPAREN, "'('");
+        if (!at(P, TK_RPAREN)) {
+            for (;;) {
+                glsl_expr **na;
+                e->nargs++;
+                na = (glsl_expr **)realloc(e->args, e->nargs * sizeof(glsl_expr*));
+                e->args = na;
+                e->args[e->nargs-1] = parse_assign(P);
+                if (!accept(P, TK_COMMA)) break;
+            }
+        }
+        expect(P, TK_RPAREN, "')'");
+        return e;
     }
     /* constructor */
     if (is_ctor_type(t->kind) && P->tk[P->pos+1].kind == TK_LPAREN) {

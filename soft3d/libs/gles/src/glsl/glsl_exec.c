@@ -559,6 +559,39 @@ static glsl_val construct(env *E, int type, glsl_expr **args, int nargs)
     return v;
 }
 
+/* Array constructor (GLSL ES 3.00 array literal): `elem_type[N](args...)`.
+ * Unlike construct(), the result is an array value (array_len = N) whose cells
+ * are the flattened args, each arg contributing its own components (so a scalar
+ * arg fills one cell, a vec2 arg fills two).  Used for the city shader's
+ * `const float FONT[64] = float[64](...)` / `const int TXT6[119] = int[119](...)`
+ * font and text tables, which are evaluated once at link time by
+ * glsl_exec_init_globals and written into the global store via write_lv. */
+static glsl_val construct_array(env *E, int elem_type, int arr_len,
+                                glsl_expr **args, int nargs)
+{
+    int elem_cells = glsl_base_comps(elem_type);
+    int total, idx = 0, i, isint;
+    glsl_cell *d;
+    glsl_val v;
+    if (elem_cells < 1) elem_cells = 1;
+    if (arr_len < 1) arr_len = 1;
+    total = elem_cells * arr_len;
+    isint = glsl_is_int_family(elem_type);
+    d = sc(E, total);
+    memset(d, 0, total * sizeof(glsl_cell));
+    for (i = 0; i < nargs && idx < total; ++i) {
+        glsl_val a = eval(E, args[i]);
+        int k;
+        for (k = 0; k < a.n && idx < total; ++k) {
+            if (isint) d[idx].i = ci(a.data, a.type, k);
+            else       d[idx].f = cf(a.data, a.type, k);
+            idx++;
+        }
+    }
+    setval(&v, elem_type, -1, d, total, arr_len, elem_cells);
+    return v;
+}
+
 /* ------------------------------------------------------------------ */
 /* builtin functions */
 static float bfun1(int id, float x)
@@ -567,6 +600,7 @@ static float bfun1(int id, float x)
     case BF_RADIANS: return x * 0.017453292519943295f;
     case BF_DEGREES: return x * 57.29577951308232f;
     case BF_SIN: return sinf(x); case BF_COS: return cosf(x); case BF_TAN: return tanf(x);
+    case BF_TANH: return tanhf(x);
     case BF_ASIN: return asinf(x); case BF_ACOS: return acosf(x);
     case BF_EXP: return expf(x); case BF_LOG: return logf(x);
     case BF_EXP2: return exp2f(x); case BF_LOG2: return log2f(x);
@@ -634,7 +668,7 @@ static glsl_val builtin(env *E, int id, glsl_expr **args, int nargs)
     case BF_RADIANS: case BF_DEGREES: case BF_SIN: case BF_COS: case BF_TAN:
     case BF_ASIN: case BF_ACOS: case BF_EXP: case BF_LOG: case BF_EXP2:
     case BF_LOG2: case BF_SQRT: case BF_INVSQRT: case BF_ABS: case BF_SIGN:
-    case BF_FLOOR: case BF_CEIL: case BF_FRACT:
+    case BF_FLOOR: case BF_CEIL: case BF_FRACT: case BF_TANH:
         a = eval(E, args[0]); return gen_unary(E, id, &a);
     case BF_ATAN:
         a = eval(E, args[0]);
@@ -840,6 +874,18 @@ static glsl_val call_user(env *E, const glsl_expr *e)
      * call (it must reach the top to drop the fragment); break/continue are
      * always consumed by a loop inside the callee and never escape a function. */
     if (E->ctrl != CTRL_DISCARD) E->ctrl = CTRL_NONE;
+    /* Restore the caller's frame BEFORE writing back out/inout params.  The
+     * argument expressions e->args[i] belong to the caller's scope, so the
+     * resolve_lv below must run against the caller's E->fn/E->locals.  The old
+     * order restored them only after this loop, so resolve_lv resolved a caller
+     * local (e.g. `fragColor` in `mainImage(fragColor, ...)`) against the
+     * callee's frame and wrote the result back into the callee's own locals:
+     * out/inout args never reached the caller, and every shadertoy-style
+     * `void mainImage(out vec4 fragColor, ...)` returned black on the CPU
+     * interpreter (the GPU/mesa path was unaffected).  The callee's param
+     * storage stays readable through the saved `frame` pointer because
+     * E->stack_top is restored only after the loop. */
+    E->fn = save_fn; E->locals = save_locals;
     /* write back out/inout params */
     for (i = 0; i < F->nparams && i < e->nargs; ++i) {
         if (F->param_inout[i] == 0) continue;
@@ -854,7 +900,6 @@ static glsl_val call_user(env *E, const glsl_expr *e)
             }
         }
     }
-    E->fn = save_fn; E->locals = save_locals;
     E->stack_top = save_stack;
     {
         glsl_val v;
@@ -880,7 +925,10 @@ glsl_val eval(env *E, const glsl_expr *e)
     case EX_BOOL:  return make_bool(E, e->lit_i);
     case EX_VAR: { lv L; resolve_lv(E, e, &L); if(!L.valid) return make_scalar_f(E,0); return read_lv(E,&L); }
     case EX_INDEX: case EX_FIELD: { lv L; resolve_lv(E,e,&L); if(!L.valid) return make_scalar_f(E,0); return read_lv(E,&L); }
-    case EX_CTOR: return construct(E, e->ctor_type, e->args, e->nargs);
+    case EX_CTOR:
+        if (e->ctor_array > 0)
+            return construct_array(E, e->ctor_type, e->ctor_array, e->args, e->nargs);
+        return construct(E, e->ctor_type, e->args, e->nargs);
     case EX_CALL:
         if (e->is_user_fn) return call_user(E, e);
         return builtin(E, e->op_builtin, e->args, e->nargs);
