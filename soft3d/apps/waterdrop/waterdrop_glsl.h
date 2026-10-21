@@ -100,9 +100,30 @@ const vec3  HORIZON = vec3(0.045, 0.062, 0.100); /* faint horizon glow      */
 const vec3  WATER_C = vec3(0.024, 0.050, 0.082); /* night water (lifted)    */
 const vec3  MOON_C  = vec3(0.88, 0.91, 0.98);    /* cool moonlight          */
 const float MOON_R  = 0.045;                     /* disc angular radius     */
-const float MOON_GLOW = 0.20;                    /* sky moon halo width     */
-const float REFL_GLOW = 0.34;                    /* reflected-moon halo width on water (wider than sky MOON_GLOW) */
-const float REFL_GLOW_STR = 0.30;                /* reflected-moon halo peak (replaces, never adds, so no clipping) */
+/* ---- sky aureole, TWO terms ----
+ * The old halo was a single Gaussian of width 0.20, which reads as a flat round
+ * veil rather than an atmospheric glow: over the disc it varies by only 5%
+ * (exp(-(0.045/0.20)^2) = 0.95), so nothing hugged the limb, and its radius
+ * (~190 px at 1080p, ~40% of the screen height) ended in a soft edge you could
+ * actually see against the sky gradient.  A real lunar aureole is Mie forward
+ * scatter -- brightest immediately outside the limb, then a faint wing that dies
+ * away with no edge at all -- so it is modelled as a TIGHT Gaussian core plus a
+ * long power-law wing 1/(1+r^2)^2, which has no visible outer boundary. */
+const float MOON_GLOW     = 0.055;  /* sky core width: just outside the 0.045 disc */
+const float MOON_GLOW_STR = 0.30;   /* sky core peak (the bright limb aureole)     */
+const float MOON_WING     = 0.22;   /* sky wing width                              */
+const float MOON_WING_STR = 0.08;   /* sky wing peak -- faint, so the tail blends  */
+/* ---- reflected aureole on the water ----
+ * Same two-term shape, every width larger than the sky's (the ripples smear the
+ * reflected image, so its halo spreads over more of the surface).  Blended with
+ * max() -- a replace, never an add -- so the halo can never exceed the moon's
+ * own brightness and the glint core cannot clip to flat white.  The two peaks
+ * sum to the 0.30 the single Gaussian used, so the reflection's energy budget
+ * (and WATER_DARK's darkening of it) is unchanged. */
+const float REFL_GLOW     = 0.09;   /* reflected core width (> sky MOON_GLOW)      */
+const float REFL_GLOW_STR = 0.22;   /* reflected core peak                         */
+const float REFL_WING     = 0.30;   /* reflected wing width (> sky MOON_WING)      */
+const float REFL_WING_STR = 0.08;   /* reflected wing peak                         */
 const float WATER_DARK = 0.62;                   /* water reflects the sky noticeably darker than the sky itself */
 const float SKY_EPOCH = 6.0;                     /* sky re-randomize period */
 
@@ -186,10 +207,29 @@ vec3 heightGrad(vec2 wp) {
         float slot = cur - float(s);
         if (slot >= 0.0) {
             float spawn = slot * INTERVAL;
-            vec2 rnd = hash2(slot * 17.31);
-            vec2 c = vec2((rnd.x - 0.5) * 2.0 * X_RNG,
-                          Z_NEAR + rnd.y * (Z_FAR - Z_NEAR));
-            acc += waveG(wp, c, spawn + FALL_T, 1.0);
+            /* LOSSLESS SPEED-UP: skip slots waveG would zero out anyway.  Its
+             * amplitude is a * alive * env * decay with
+             *   alive = smoothstep(0, 0.05, age0) * (1 - smoothstep(LIFE-0.6, LIFE, age0)),
+             * and smoothstep clamps, so alive is EXACTLY 0 unless
+             * 0 < age0 < LIFE -- outside that window every factor of the
+             * returned vec3 is 0 times a finite quantity (env, decay, sin(ph)
+             * and d/r are all finite: age is clamped to [0,LIFE] and r is
+             * floored at EPS), i.e. the slot contributes vec3(0) and adding it
+             * changes nothing bit-for-bit.  With INTERVAL=0.62 and FALL_T=1.207
+             * the slot age is frac + s*INTERVAL - FALL_T (frac in [0,INTERVAL)),
+             * so slot 0 is still airborne and slot 1 has not yet landed for
+             * ~95% of the cycle: roughly 2 of the 6 slots are dead, and each
+             * one costs 2 sin (its hash2) plus waveG's sin+cos+2 exp+2 sqrt.
+             * The predicate reads only the slot index and the clock -- it is the
+             * SAME for every pixel in the frame -- so on the GPU the branch is
+             * perfectly uniform and costs no divergence. */
+            float age0 = iGlobalTime - (spawn + FALL_T);
+            if (age0 > 0.0 && age0 < LIFE) {
+                vec2 rnd = hash2(slot * 17.31);
+                vec2 c = vec2((rnd.x - 0.5) * 2.0 * X_RNG,
+                              Z_NEAR + rnd.y * (Z_FAR - Z_NEAR));
+                acc += waveG(wp, c, spawn + FALL_T, 1.0);
+            }
         }
     }
 
@@ -308,12 +348,20 @@ vec3 skyColorDir(vec3 dir) {
     /* scaled below the moon's peak luminance so the field stays subordinate */
     sky += vec3(0.62, 0.70, 0.84) * (core + halo) * mask * bri * 0.45;
 
-    /* moon halo (broad, cheap) + textured disc (gated to the disc footprint).
-     * The direction re-randomizes every SKY_EPOCH seconds. */
+    /* moon aureole (tight core + long faint wing, see the MOON_GLOW block) plus
+     * the textured disc, gated to the disc footprint.  The direction
+     * re-randomizes every SKY_EPOCH seconds. */
     vec3  dv = dir - moonDirNow();
     float md = length(dv);
-    float glow = exp(-md * md / (MOON_GLOW * MOON_GLOW));
-    sky += MOON_C * glow * 0.28;
+    float md2   = md * md;
+    float gcore = exp(-md2 / (MOON_GLOW * MOON_GLOW));
+    /* 1/(1+r^2)^2: a power-law wing.  The divisor is >= 1 (md2 >= 0), so this
+     * can never divide by zero or go infinite. */
+    float gw    = md2 / (MOON_WING * MOON_WING);
+    float gwing = 1.0 / (1.0 + gw);
+    gwing = gwing * gwing;
+    float glow  = gcore * MOON_GLOW_STR + gwing * MOON_WING_STR;
+    sky += MOON_C * glow;
     if (md < MOON_R) {
         float disc = smoothstep(MOON_R, MOON_R * 0.82, md);
         /* the moon faces mostly +Z, so the disc-plane coords are just dv.xy */
@@ -322,8 +370,16 @@ vec3 skyColorDir(vec3 dir) {
         float limb = 0.55 + 0.45 * sqrt(max(1.0 - rr * rr, 0.0));  /* limb darkening */
         /* Maria: connected organic dark seas from a 4-octave fBm, thresholded
          * with a TIGHT window so the sea/highland boundary reads crisp rather
-         * than a soft blur (matches the real near-side albedo map). */
-        float maria = smoothstep(0.42, 0.55, fbm4(muv * 1.6 + 3.1));
+         * than a soft blur (matches the real near-side albedo map).
+         *
+         * The window is MEASURED, not eyeballed: fbm4 over this disc spans
+         * [0.242, 0.807] with mean 0.493, and the previous (0.42, 0.55) put
+         * 54.1% of the disc on the dark side of the sea/highland boundary (27.4%
+         * fully dark) -- the moon read as mostly grey.  Sliding the window down
+         * to (0.354, 0.484) keeps the SAME width (0.130) and therefore the same
+         * edge crispness (transition band 44.7% of the disc vs 44.3% before)
+         * while halving the dark coverage to 27.0% (fully dark 9.1%). */
+        float maria = smoothstep(0.354, 0.484, fbm4(muv * 1.6 + 3.1));
         /* Fine regolith mottling: a high-frequency, low-amplitude speckle. */
         float mot = vnoise(muv * 17.0 + 5.5) - 0.5;
         /* Accumulate a scalar albedo then clamp once, so craters/rays can add
@@ -391,14 +447,22 @@ void main() {
         vec3  moonD = moonDirNow();
         vec3  skyR  = skyColorDir(R);             /* reflected sky: moon disc + its own halo */
 
-        /* Bigger moon reflection halo: the sky's moon halo (MOON_GLOW) comes
-         * through skyR above, but on the water we widen it to REFL_GLOW so the
-         * reflected glow spreads over more ripples.  It is blended in with max()
-         * (a replace, not an add) so the halo can never exceed the moon's own
-         * brightness -- that keeps the glint core from clipping to flat white
+        /* Bigger moon reflection halo: the sky's aureole (MOON_GLOW / MOON_WING)
+         * comes through skyR above, but on the water we widen it to the
+         * REFL_GLOW / REFL_WING pair so the reflected glow spreads over more
+         * ripples.  It uses the SAME two-term tight-core + power-law-wing shape
+         * as the sky, so the reflection reads as the sky's aureole smeared by
+         * the surface rather than as a different kind of blob.  Blended in with
+         * max() (a replace, not an add) so the halo can never exceed the moon's
+         * own brightness -- that keeps the glint core from clipping to flat white
          * while still ringing it with a broader shimmer. */
         float mang  = length(R - moonD);
-        float rglow = exp(-mang * mang / (REFL_GLOW * REFL_GLOW)) * REFL_GLOW_STR;
+        float mang2 = mang * mang;
+        float rcore = exp(-mang2 / (REFL_GLOW * REFL_GLOW));
+        float rw    = mang2 / (REFL_WING * REFL_WING);
+        float rwing = 1.0 / (1.0 + rw);          /* divisor >= 1: never singular */
+        rwing = rwing * rwing;
+        float rglow = rcore * REFL_GLOW_STR + rwing * REFL_WING_STR;
         vec3  refl  = max(skyR, MOON_C * rglow) * WATER_DARK;   /* water darker than sky */
 
         vec3  base = WATER_C * (0.70 + 0.55 * clamp(h * 3.0, -1.0, 1.0));

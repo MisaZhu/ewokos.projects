@@ -1,7 +1,18 @@
 PROJS_ROOT_DIR=../../..
 include $(PROJS_ROOT_DIR)/make.inc
 
-TASK_OBJS = $(ARCH)/waterdrop.o
+# Pin the default goal to `all` up-front: the explicit $(TASK_OBJS) rule below
+# appears before `all:` in the file, and make would otherwise pick the first
+# target it sees as the default goal.
+.DEFAULT_GOAL := all
+
+# HW-suffixed object path: -DPGL_G3D is decided by HW (see the GPU_HWS gate
+# below), so a shared $(ARCH)/waterdrop.o would let a raspi5 build leave a
+# GPU-shaped object that a subsequent virt build reuses against virt's CPU-only
+# libGLESv2.a and fails with:
+#   undefined reference to `pglc_compile_set_cs_local_size'
+# Encoding HW in the filename makes that collision impossible.
+TASK_OBJS = $(ARCH)/waterdrop.$(HW).o
 
 EXTRA_LIBS_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 
@@ -15,29 +26,79 @@ CFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui -
 CXXFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__ -fno-threadsafe-statics
 LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib
 
+# The app Makefile does NOT define -DPGL_G3D for the app translation unit even
+# when PGL_G3D=yes is passed on the make line; the app has #ifdef PGL_G3D blocks
+# (the pglc_compile_set_cs_local_size workgroup-shape argv and the
+# pgl_g3d_set_render_scale resolution argv), so add it explicitly here or those
+# GPU branches are silently compiled out and the knobs do nothing.  Guard on BOTH
+# PGL_G3D=yes AND a GPU-capable HW: virt is CPU-only and its merged
+# libGLESv2.a omits pglcompiler_frontend.o, so activating the app's
+# #ifdef PGL_G3D knob there would leave pglc_compile_set_cs_local_size
+# unresolved at link time.
+GPU_HWS := raspi5 raspix
+ifeq ($(PGL_G3D),yes)
+ifneq ($(filter $(HW),$(GPU_HWS)),)
+CFLAGS   += -DPGL_G3D
+CXXFLAGS += -DPGL_G3D
+endif
+endif
+
+# Build-time shader lint for GPU targets (the "must enter GPU" guard).  The
+# on-device mesa GLSL->QPU compiler on raspi5/raspix is a CONFORMING GLSL ES
+# compiler: it rejects user identifiers that use the reserved built-in prefix at
+# link time, which silently drops the program to the CPU interpreter (HUD reads
+# "Renderer: CPU") even though the platform supports GPU -- the CPU interpreter
+# is lenient and accepts them, so the bug only shows on-device.  Catch that class
+# of bug HERE so a GPU build can never ship a shader that would never enter the
+# GPU.  Non-GPU HWs skip the check (no mesa, no GPU route).
+.PHONY: shader-lint
+ifeq ($(filter $(HW),$(GPU_HWS)),)
+shader-lint:
+	@:
+else
+shader-lint:
+	@bad=$$(grep -ohE '\bgl_[A-Za-z0-9_]*' waterdrop_glsl.h | sort -u \
+		| grep -vE '^(gl_FragColor|gl_FragCoord|gl_Position|gl_PointCoord|gl_PointSize|gl_FragData)$$'); \
+	if [ -n "$$bad" ]; then \
+		echo "shader-lint FAIL: reserved gl_ identifier(s) in waterdrop_glsl.h would be"; \
+		echo "  rejected by the on-device mesa compiler and silently force a CPU"; \
+		echo "  fallback on $(HW) even though the platform supports GPU:"; \
+		echo "$$bad" | sed 's/^/    /'; \
+		exit 1; \
+	fi
+endif
+
+# Explicit rule (overrides make.rule's pattern rule, whose stem would look for a
+# source named waterdrop.$(HW).cpp).  -MMD -MP are already in CXXFLAGS via
+# make.rule, so the .d file lands at $(ARCH)/waterdrop.$(HW).d and gets picked
+# up by make.rule's DEP_FILES include.
+$(TASK_OBJS): waterdrop.cpp waterdrop_glsl.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # Link order matters for static archives: the app + imgui reference the EGL /
 # GLESv2 entry points.  libGLESv2.a already contains the portablegl engine and
 # (on PGL_G3D targets) the on-device mesa GLSL->QPU compiler, so an app links
 # only libimgui + libEGL + libGLESv2 (imgui -> gl*, EGL -> engine) and never
 # names portablegl or pglcompiler.  The glcommon CPU hud is no longer used.
 GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui.a \
-	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
-	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
+        $(EXTRA_LIBS_DIR)/lib/libEGL.a \
+        $(EXTRA_LIBS_DIR)/lib/libGLESv2.a
 
 TASK = waterdrop
 TASK_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)/rootfs/apps/$(TASK)
 
-all: $(TASK)
+all: shader-lint $(TASK)
 
 $(TASK): $(TASK_OBJS) $(GLES_LIBS) \
-		$(SDK_DIR)/lib/libewoksys.a \
-		$(SDK_DIR)/lib/libewokstl.a \
-		$(SDK_DIR)/lib/libx++.a \
-		$(SDK_DIR)/lib/libx.a \
-		$(SDK_DIR)/lib/libfont.a \
-		$(SDK_DIR)/lib/libgraph.a \
-		$(SDK_DIR)/lib/libwidget++.a \
-		$(SDK_DIR)/lib/libcxx.a
+                $(SDK_DIR)/lib/libewoksys.a \
+                $(SDK_DIR)/lib/libewokstl.a \
+                $(SDK_DIR)/lib/libx++.a \
+                $(SDK_DIR)/lib/libx.a \
+                $(SDK_DIR)/lib/libfont.a \
+                $(SDK_DIR)/lib/libgraph.a \
+                $(SDK_DIR)/lib/libwidget++.a \
+                $(SDK_DIR)/lib/libcxx.a
 	mkdir -p $(TASK_DIR)
 	$(LD) -Ttext=100 $(TASK_OBJS) $(GLES_LIBS) -o $(TASK_DIR)/$(TASK) $(LDFLAGS) $(EWOK_LIB_X) $(EWOK_LIB_GRAPH) $(EWOK_LIBC) -lcxx
 	cp -r res $(TASK_DIR)
