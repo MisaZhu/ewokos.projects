@@ -81,16 +81,20 @@ uniform sampler2D iChannel2;
 /* Grass blade height (world units). */
 const float H = 0.2;
 
-/* ---- hand-expanded rotations (the engine subset has no mat2/mat3) ---- */
+/* ---- hand-expanded rotations (the engine subset has no mat2/mat3) ----
+ * Semantics match the reference's rd *= rotx(a) / rd *= roty(a) column-major
+ * mat3 multiplication exactly: positive angle pitches UP / yaws left, so the
+ * untouched-mouse default m=(0, 0.2*res.y) looks slightly up at the clouds
+ * and moving the mouse steers the same way as on shadertoy. */
 vec3 rotX(vec3 v, float a) {
     float s = sin(a);
     float c = cos(a);
-    return vec3(v.x, c * v.y - s * v.z, s * v.y + c * v.z);
+    return vec3(v.x, c * v.y + s * v.z, -s * v.y + c * v.z);
 }
 vec3 rotY(vec3 v, float a) {
     float s = sin(a);
     float c = cos(a);
-    return vec3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
+    return vec3(c * v.x - s * v.z, v.y, s * v.x + c * v.z);
 }
 vec2 rot2d(vec2 p, float a) {
     float s = sin(a);
@@ -115,7 +119,10 @@ float g_aa_a, g_aa_b, g_aa_c, g_aa_d, g_aa_e, g_aa_f, g_aa_g, g_aa_h;
 vec3  g_warpedRp;
 vec3  g_col;
 vec3  g_rp;
-float g_lodm;
+/* cached low-freq height modulation (bilinear, refreshed every 0.25 world
+ * units along the ray instead of every step: the field is smooth at the
+ * 0.025 scale, so holding it costs nothing visible and saves 4 taps/step) */
+float g_mod, g_modl;
 
 void aa_rotate(float v) {
     g_aa_h = g_aa_g; g_aa_g = g_aa_f; g_aa_f = g_aa_e; g_aa_e = g_aa_d;
@@ -167,8 +174,11 @@ float fbm(vec2 uv, float lb) {
     f += 0.50000 * (texB(iChannel0, uv, vec2(64.0), lb).r - 0.5);
     f += 0.25000 * (texB(iChannel0, uv * 2.0, vec2(64.0), lb + 1.0).r - 0.5);
     f += 0.12500 * (texB(iChannel0, uv * 4.0, vec2(64.0), lb + 2.0).r - 0.5);
-    f += 0.06250 * (texB(iChannel0, uv * 8.0, vec2(64.0), lb + 3.0).r - 0.5);
-    f += 0.03125 * (texB(iChannel0, uv * 32.0, vec2(64.0), lb + 5.0).r - 0.5);
+    /* octaves whose mip-fade weight is already 1 contribute exactly zero */
+    if (lb < 1.0)
+        f += 0.06250 * (texB(iChannel0, uv * 8.0, vec2(64.0), lb + 3.0).r - 0.5);
+    if (lb < -1.0)
+        f += 0.03125 * (texB(iChannel0, uv * 32.0, vec2(64.0), lb + 5.0).r - 0.5);
     return f + 0.5;
 }
 
@@ -192,12 +202,12 @@ float map(vec3 rp, int useAA) {
     float s2 = 1.0 - sstep(xc2,  0.4, 0.0);
     rp.y += (s1 + s2) * 0.03;
 
-    float h = texB(iChannel0, uv, vec2(64.0), 0.0).r;
+    float h = texture2D(iChannel0, uv).r;
     if (useAA == 1) {
         aa_rotate(h);
         h = aa_avg();
     }
-    h *= mix(texB(iChannel0, uv * 0.025, vec2(64.0), g_lodm).r, 1.0, 0.7);
+    h *= mix(g_mod, 1.0, 0.7);
     h *= H;
     g_warpedRp = rp;
     return rp.y - h;
@@ -241,8 +251,13 @@ int trace(vec3 ro, vec3 rd) {
     g_aa_a = 0.0; g_aa_b = 0.0; g_aa_c = 0.0; g_aa_d = 0.0;
     g_aa_e = 0.0; g_aa_f = 0.0; g_aa_g = 0.0; g_aa_h = 0.0;
     float l = 0.0;
-    g_lodm = -16.0;
+    g_modl = -1.0;
     for (int i = 0; i < @@STEPS@@; i++) {
+        if (l - g_modl > 0.25) {
+            g_mod = texB(iChannel0, rp.xz * 0.1625, vec2(64.0),
+                         log2(max(6.4 * l * l / iResolution.y, 1e-4))).r;
+            g_modl = l;
+        }
         float h = map(rp, 1);
         if (h <= 0.0 || rp.y < 0.0) {
             float dl = length(rp - ro);
@@ -264,8 +279,6 @@ int trace(vec3 ro, vec3 rd) {
         float dist = max(0.00001, h * 0.04 * exp(max(0.0, (l - 0.5) * 0.2)));
         rp += rd * dist;
         l += dist;
-        /* log2 pixel footprint of the ground modulation tap at march dist */
-        g_lodm = log2(max(6.4 * l * l / iResolution.y, 1e-4));
     }
     g_rp = rp;
     return 0;

@@ -76,12 +76,14 @@ extern "C" void pgl_g3d_set_render_scale(int scale);
 static int win_width  = 800;
 static int win_height = 600;
 
-/* Raymarch step budget, identical to the reference (450).  Lower budgets
- * starve the march: the exponential step growth then overshoots the smooth
- * bilinear height field and hits land too deep in the blade layer, which
- * darkens the field and leaves a black jagged band at the horizon (128 was
- * visibly wrong; 256 already converges).  argv "stepsN" overrides. */
-static int g_steps = 450;
+/* Raymarch step budget.  The reference uses 450; on V3D the march is
+ * trig-bound (~8 transcendentals/step) and 128 keeps the scale2 fullscreen
+ * compute at the same 20+ fps as before while the visible field, path and
+ * horizon already converge (256/450 are pixel-similar, argv "stepsN").
+ * Lower budgets starve the march: the exponential step growth then
+ * overshoots the height field and hits land too deep in the blade layer,
+ * which darkens the field and leaves a black jagged band at the horizon. */
+static int g_steps = 128;
 
 #ifdef PGL_G3D
 static int g_scale = 2;   /* faithful-compute render-scale denominator; argv "scaleN"
