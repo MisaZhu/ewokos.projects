@@ -76,13 +76,11 @@ extern "C" void pgl_g3d_set_render_scale(int scale);
 static int win_width  = 800;
 static int win_height = 600;
 
-/* Raymarch step budget.  The reference uses 450; on V3D the march is
- * trig-bound (~8 transcendentals/step) and 128 keeps the scale2 fullscreen
- * compute at the same 20+ fps as before while the visible field, path and
- * horizon already converge (256/450 are pixel-similar, argv "stepsN").
- * Lower budgets starve the march: the exponential step growth then
- * overshoots the height field and hits land too deep in the blade layer,
- * which darkens the field and leaves a black jagged band at the horizon. */
+/* Raymarch step budget.  The reference uses 450; with the hit polish
+ * (bisect back onto the surface, near-surface exhaustion/cutoff shaded as
+ * hits) 128 steps is pixel-similar to 256/450 on the host probe and halves
+ * the march cost toward the 20+ fps envelope at scale2.  argv "stepsN"
+ * overrides up to the faithful 450. */
 static int g_steps = 128;
 
 #ifdef PGL_G3D
@@ -104,11 +102,22 @@ static GLint  loc_mouse = -1;
 static GLuint tex_noise_small = 0;   /* Gray Noise Small  64x64  */
 static GLuint tex_noise_med   = 0;   /* RGBA Noise Medium 256x256 */
 
-/* Look-around pointer (window pixels, y down).  Until the mouse moves it sits
- * slightly below centre so the camera pitches down onto the grass, matching the
- * reference's default of m = (0, 0.2*res.y). */
+/* Look-around pointer in ShaderToy iMouse semantics: bottom-left origin,
+ * updated only while the button is held (hover must not steer).  Until the
+ * first drag it sits at (0.5w, 0.7h) so m = (0, 0.2*res.y), the reference's
+ * untouched default that pitches down onto the grass. */
 static float g_mx = -1.0f;
 static float g_my = -1.0f;
+
+/* Last known screen rect of the ImGui HUD panel (x0,y0,x1,y1, top-left
+ * origin).  The panel is NoInputs, so a click on it is hit-tested here and
+ * closes the app. */
+static float g_hud_rect[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+/* A real button press inside our own session gates the look-around: the
+ * window manager's synthetic focus click-drag when the window maps must not
+ * yank the camera off the reference's untouched default view. */
+static int g_mdown = 0;
 
 static uint32_t start_time = 0;
 static float    iGlobalTime = 0.0f;
@@ -275,6 +284,10 @@ static void process_imgui_frame(int gpu)
     ImGui::Begin("Grass", NULL,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize
                  | ImGuiWindowFlags_NoInputs);
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 ws = ImGui::GetWindowSize();
+    g_hud_rect[0] = wp.x;          g_hud_rect[1] = wp.y;
+    g_hud_rect[2] = wp.x + ws.x;   g_hud_rect[3] = wp.y + ws.y;
     ImGui::Text("FPS: %d", fps);
 #ifdef PGL_G3D
     if (gpu && g_scale > 1)
@@ -326,9 +339,18 @@ static void render_frame(void)
     iGlobalTime = (now - start_time) / 1000.0f;
 
     /* Default look pointer (slightly below centre -> pitch down onto grass)
-     * until the mouse has moved at least once. */
-    float mx = (g_mx < 0.0f) ? (float)win_width  * 0.5f : g_mx;
-    float my = (g_my < 0.0f) ? (float)win_height * 0.7f : g_my;
+     * until a real drag happens.  The GPU route feeds the shader the SCALED
+     * compute size as iResolution, while pointer events arrive in window
+     * pixels, so everything sent as iMouse lives in iResolution space or the
+     * default m = (0, 0.2*res.y) turns into a near-vertical top-down view. */
+    float sc = 1.0f;
+#ifdef PGL_G3D
+    sc = (float)g_scale;
+#endif
+    float mw = win_width / sc;
+    float mh = win_height / sc;
+    float mx = (g_mx < 0.0f) ? mw * 0.5f : g_mx / sc;
+    float my = (g_my < 0.0f) ? mh * 0.7f : g_my / sc;
 
     glViewport(0, 0, win_width, win_height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -369,17 +391,36 @@ static void render_frame(void)
 
 static void on_event(xwin_t* xwin, xevent_t* ev)
 {
-    /* ESC quits.  Mouse motion drives the look-around (the reference's "Mouse to
-     * look around"), so unlike the screensaver-style demos a click does NOT
-     * close the window. */
+    /* ESC quits, and so does a click on the HUD panel (hit-tested against its
+     * last known rect because the panel itself is NoInputs).  The look-around
+     * follows ShaderToy iMouse: only drags steer, bottom-left origin. */
     if (ev->type == XEVT_IM) {
         if (ev->state == XIM_STATE_PRESS && ev->value.im.value == KEY_ESC)
             xwin_close(xwin);
     }
     else if (ev->type == XEVT_MOUSE) {
-        if (ev->state == MOUSE_STATE_MOVE || ev->state == MOUSE_STATE_DRAG) {
+        if (ev->state == MOUSE_STATE_DOWN) {
+            float px = (float)ev->value.mouse.x;
+            float py = (float)ev->value.mouse.y;
+            if (px >= g_hud_rect[0] && px <= g_hud_rect[2] &&
+                py >= g_hud_rect[1] && py <= g_hud_rect[3])
+                xwin_close(xwin);
+            if (kernel_tic_ms(0) - start_time >= 2000)
+                g_mdown = 1;
+        }
+        else if (ev->state == MOUSE_STATE_UP) {
+            g_mdown = 0;
+        }
+        else if (ev->state == MOUSE_STATE_DRAG) {
+            /* iMouse space: the GPU route feeds the shader the scaled compute
+             * size as iResolution, so window-pixel events are divided back
+             * into that space in render_frame.  The device reports pointer y
+             * bottom-up, hence the flip: drag down pitches down, drag right
+             * yaws left, same as the reference page. */
+            if (!g_mdown)
+                return;
             g_mx = (float)ev->value.mouse.x;
-            g_my = (float)ev->value.mouse.y;
+            g_my = (float)(win_height - ev->value.mouse.y);
         }
     }
 }

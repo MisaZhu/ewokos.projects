@@ -82,14 +82,15 @@ uniform sampler2D iChannel2;
 const float H = 0.2;
 
 /* ---- hand-expanded rotations (the engine subset has no mat2/mat3) ----
- * Semantics match the reference's rd *= rotx(a) / rd *= roty(a) column-major
- * mat3 multiplication exactly: positive angle pitches UP / yaws left, so the
- * untouched-mouse default m=(0, 0.2*res.y) looks slightly up at the clouds
- * and moving the mouse steers the same way as on shadertoy. */
+ * Semantics match the reference's rd *= rotx(a) / rd *= roty(a): the author's
+ * row matrices act as written, so a positive angle pitches DOWN onto the
+ * grass -- exactly what the reference's untouched-mouse default view shows
+ * (verified against zero-interaction canvas captures), and dragging the
+ * mouse steers the same way as on shadertoy. */
 vec3 rotX(vec3 v, float a) {
     float s = sin(a);
     float c = cos(a);
-    return vec3(v.x, c * v.y + s * v.z, -s * v.y + c * v.z);
+    return vec3(v.x, c * v.y - s * v.z, s * v.y + c * v.z);
 }
 vec3 rotY(vec3 v, float a) {
     float s = sin(a);
@@ -123,6 +124,13 @@ vec3  g_rp;
  * units along the ray instead of every step: the field is smooth at the
  * 0.025 scale, so holding it costs nothing visible and saves 4 taps/step) */
 float g_mod, g_modl;
+/* gated per-step transcendentals: the path banks, wind phase, blade-bend
+ * rotation and step-growth exp all advance far slower than the march in its
+ * early (dense) phase, so each is recomputed only once its own argument
+ * moves past a sub-texel tolerance instead of every iteration. */
+float g_s1, g_s2, g_t, g_sn, g_cs, g_expf;
+float g_px, g_pz, g_ang, g_lx;
+float g_lod, g_rdy;
 
 void aa_rotate(float v) {
     g_aa_h = g_aa_g; g_aa_g = g_aa_f; g_aa_f = g_aa_e; g_aa_e = g_aa_d;
@@ -185,24 +193,44 @@ float fbm(vec2 uv, float lb) {
 /* Terrain / grass height field: wind domain-warp, the two raised banks that
  * groove the worn path (reversed-edge smoothstep as the reference writes it),
  * the noise height optionally averaged through the AA ring, and a low-freq
- * modulation.  Records the warped point for the hit-shading lookups. */
+ * modulation.  Records the warped point for the hit-shading lookups.  All
+ * smooth per-step quantities arrive through the gated march_cache(). */
+void march_cache(vec3 rp, float l, float tol) {
+    if (abs(rp.x - g_px) > tol || abs(rp.z - g_pz) > tol) {
+        g_px = rp.x; g_pz = rp.z;
+        float gt = iGlobalTime * 0.9;
+        g_t = (sin(gt + rp.x * 1.2) + sin(gt + rp.z * 1.4)) * 0.25;
+        g_s1 = 1.0 - sstep(rp.x + sin(rp.z * 3.0) * 0.1 + sin(rp.z * 5.0) * 0.12,
+                           -0.4, 0.0);
+        g_s2 = 1.0 - sstep(rp.x - sin(rp.z * 4.4) * 0.1 + sin(rp.z * 14.0) * 0.04,
+                            0.4, 0.0);
+    }
+    float ang = rp.y * 20.0 * g_t;
+    if (abs(ang - g_ang) > 0.15) { g_ang = ang; g_sn = sin(ang); g_cs = cos(ang); }
+    if (l - g_lx > 0.25) {
+        g_lx = l;
+        g_expf = exp(max(0.0, (l - 0.5) * 0.2));
+        /* Height-tap mip level: the reference's channel0 is mipmap-filtered,
+         * so a pixel whose footprint spans N texels reads a blurred level.
+         * Footprint = 416 texels/world * world-per-pixel (arc length l times
+         * the pixel angle, stretched by the ray's ground incidence). */
+        g_lod = log2(max(416.0 * l * (2.0 / iResolution.x) /
+                         max(abs(g_rdy), 0.05), 1.0));
+    }
+}
+
 float map(vec3 rp, int useAA) {
-    float gt = iGlobalTime * 0.9;
-    float t = sin(gt + rp.x * 1.2) * 0.5;
-    t += sin(gt + rp.z * 1.4) * 0.5;
-    t *= 0.5;
-    vec2 off = rot2d(vec2(0.0, 5.0), rp.y * 20.0 * t);
-    rp.x -= off.x * 0.04;
-    rp.y -= off.y * 0.005;
+    /* rot2d(vec2(0,5),ang) = (-5*sin, 5*cos), folded into the warp scales */
+    rp.x += 0.2 * g_sn;
+    rp.y -= 0.025 * g_cs;
     vec2 uv = rp.xz * 6.5;
+    rp.y += (g_s1 + g_s2) * 0.03;
 
-    float xc1 = rp.x + sin(rp.z * 3.0) * 0.1 + sin(rp.z * 5.0) * 0.12;
-    float xc2 = rp.x - sin(rp.z * 4.4) * 0.1 + sin(rp.z * 14.0) * 0.04;
-    float s1 = 1.0 - sstep(xc1, -0.4, 0.0);
-    float s2 = 1.0 - sstep(xc2,  0.4, 0.0);
-    rp.y += (s1 + s2) * 0.03;
-
-    float h = texture2D(iChannel0, uv).r;
+    /* The reference samples iChannel0 with linear filtering: the height must
+     * vary continuously per pixel or the depth fade turns every texel jump
+     * into a black speckle.  Four NEAREST taps at texel centres are exactly
+     * the hardware bilinear (the compiled sampler stays NEAREST/REPEAT). */
+    float h = texB(iChannel0, uv, vec2(64.0), g_lod).r;
     if (useAA == 1) {
         aa_rotate(h);
         h = aa_avg();
@@ -240,6 +268,22 @@ float clouds(vec3 ro, vec3 rd) {
     return clamp(f * 1.2, 0.0, 1.0);
 }
 
+/* Shade a confirmed hit into g_col (straw/ground mix, depth fade, cloud
+ * shadow, self shadow).  g_warpedRp must already correspond to rp. */
+void shade_hit(vec3 ro, vec3 rd, vec3 rp) {
+    float dl = length(rp - ro);
+    vec3 tx = texB(iChannel2, g_warpedRp.xz * 0.5, vec2(256.0),
+                   log2(max(512.0 * dl * dl / iResolution.y, 1e-4))).rgb;
+    float strw = clamp(tx.g - 0.5, 0.0, 1.0);
+    strw /= (1.0 - 0.5);
+    vec3 strawcol = mix(vec3(1.0, 1.0, 0.0), vec3(0.8, 0.6, 0.3), strw) * 1.5;
+    vec3 c2 = texB(iChannel2, g_warpedRp.xz * 0.008, vec2(256.0), 0.0).rgb;
+    g_col = mix(c2, strawcol, 0.8);
+    g_col = mix(vec3(0.0), g_col, smoothstep(H * 0.2, H * 1.4, rp.y));
+    g_col *= 1.0 - clouds(ro, rd);
+    g_col *= mix(shadow(rp), 1.0, 0.7);
+}
+
 /* March the grass field (downward rays only); on a hit shade into g_col and
  * record the hit point in g_rp.  The reference computes grad() here but never
  * uses it, so no diffuse term is applied. */
@@ -252,7 +296,11 @@ int trace(vec3 ro, vec3 rd) {
     g_aa_e = 0.0; g_aa_f = 0.0; g_aa_g = 0.0; g_aa_h = 0.0;
     float l = 0.0;
     g_modl = -1.0;
+    g_px = 1e9; g_pz = 1e9; g_ang = 1e9; g_lx = -1.0;
+    g_rdy = rd.y; g_lod = 0.0;
+    vec3 prp = rp;
     for (int i = 0; i < @@STEPS@@; i++) {
+        march_cache(rp, l, 0.02);
         if (l - g_modl > 0.25) {
             g_mod = texB(iChannel0, rp.xz * 0.1625, vec2(64.0),
                          log2(max(6.4 * l * l / iResolution.y, 1e-4))).r;
@@ -260,25 +308,49 @@ int trace(vec3 ro, vec3 rd) {
         }
         float h = map(rp, 1);
         if (h <= 0.0 || rp.y < 0.0) {
-            float dl = length(rp - ro);
-            vec3 tx = texB(iChannel2, g_warpedRp.xz * 0.5, vec2(256.0),
-                           log2(max(512.0 * dl * dl / iResolution.y, 1e-4))).rgb;
-            float strw = clamp(tx.g - 0.5, 0.0, 1.0);
-            strw /= (1.0 - 0.5);
-            vec3 strawcol = mix(vec3(1.0, 1.0, 0.0), vec3(0.8, 0.6, 0.3), strw) * 1.5;
-            vec3 c2 = texB(iChannel2, g_warpedRp.xz * 0.008, vec2(256.0), 0.0).rgb;
-            g_col = mix(c2, strawcol, 0.8);
-            g_col = mix(vec3(0.0), g_col, smoothstep(H * 0.2, H * 1.4, rp.y));
-            g_col *= 1.0 - clouds(ro, rd);
-            g_col *= mix(shadow(rp), 1.0, 0.7);
+            /* Bisect back onto the surface: a raw crossing can land deep
+             * inside the blade layer, where smoothstep(H*0.2,H*1.4,rp.y)
+             * collapses and speckles the field with black dots. */
+            vec3 lo = prp;
+            for (int k = 0; k < 4; k++) {
+                vec3 mid = (lo + rp) * 0.5;
+                march_cache(mid, l, 0.02);
+                if (map(mid, 0) > 0.0) lo = mid; else rp = mid;
+            }
+            march_cache(rp, l, 0.02);
+            map(rp, 0);
+            shade_hit(ro, rd, rp);
             g_rp = rp;
             return 1;
         }
         vec3 diff = rp - ro;
-        if (dot(diff, diff) > 30.0) { g_rp = rp; return 0; }
-        float dist = max(0.00001, h * 0.04 * exp(max(0.0, (l - 0.5) * 0.2)));
+        if (dot(diff, diff) > 30.0) {
+            /* Cutoff miss: a grazing ray can ride the blade tops past the
+             * distance cap; shading it as a surface hit keeps the horizon
+             * silhouette free of black speckles (a raw miss here leaves col
+             * at zero inside the fog's blank window). */
+            march_cache(rp, l, 0.02);
+            if (map(rp, 0) < 0.15) {
+                shade_hit(ro, rd, rp);
+                g_rp = rp;
+                return 1;
+            }
+            g_rp = rp;
+            return 0;
+        }
+        float dist = max(0.00001, h * 0.04 * g_expf);
+        prp = rp;
         rp += rd * dist;
         l += dist;
+    }
+    /* Zeno exhaustion: the ray rides the surface asymptotically.  Shade it as
+     * a shallow hit; a miss here would leave col at zero with dist inside
+     * the fog's blank window, which is the black wedge at the horizon. */
+    march_cache(rp, l, 0.02);
+    if (map(rp, 0) < 0.15) {
+        shade_hit(ro, rd, rp);
+        g_rp = rp;
+        return 1;
     }
     g_rp = rp;
     return 0;
