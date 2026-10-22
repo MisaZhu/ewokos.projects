@@ -62,6 +62,9 @@
  * Must be set before the first glLinkProgram, which triggers the on-device
  * compile.  Belongs to the mesa compiler merged into libGLESv2. */
 extern "C" void pglc_compile_set_cs_local_size(unsigned x, unsigned y);
+/* mesa v3d compiler debug mask (v3d_debug.h; 1<<4 = dump the QPU assembly
+ * of every compiled shader to stderr): argv "qpudump", for tuning only. */
+extern "C" uint32_t v3d_mesa_debug;
 /* Engine knob: render the fullscreen faithful compute at 1/N resolution and
  * upscale to the window (the lever wave/ocean/waterdrop ship).  The grass
  * raymarcher is ALU-bound on V3D CSD and its cost scales with the shaded pixel
@@ -127,6 +130,44 @@ static int fps = 0;
 static int frame_count = 0;
 static uint32_t last_tic = 0;
 static int g_fpslog = 0;   /* argv "fpslog": also print the 1s FPS roll to stdout */
+static float g_freeze = -1.0f; /* argv "freezeN": pin iGlobalTime at N seconds so
+                                  A/B timing runs render the identical frame */
+static int g_dump = 0;     /* argv "dumpN": glReadPixels frame N to /tmp/grass.ppm
+                              and quit (headless picture check over ssh) */
+static int g_frames = 0;
+
+/* Write the just-rendered frame (scene + HUD, before the swap) as a binary
+ * PPM so it can be scp'd off the device and inspected. */
+static void dump_frame(const char* path)
+{
+    size_t n = (size_t)win_width * (size_t)win_height;
+    unsigned char* rgba = (unsigned char*)malloc(n * 4);
+    if (!rgba) return;
+    glReadPixels(0, 0, win_width, win_height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", win_width, win_height);
+        /* glReadPixels rows are bottom-up; PPM is top-down. */
+        for (int y = win_height - 1; y >= 0; y--) {
+            const unsigned char* row = rgba + (size_t)y * win_width * 4;
+            for (int x = 0; x < win_width; x++)
+                fwrite(row + (size_t)x * 4, 1, 3, f);
+        }
+        fclose(f);
+        printf("grass: dumped %dx%d to %s\n", win_width, win_height, path);
+    }
+    free(rgba);
+}
+/* fpslog phase accumulators (us over the current second): clear, scene
+ * draw, HUD overlay, swap/present. */
+static uint32_t g_ph_us[4] = { 0, 0, 0, 0 };
+
+static uint32_t tic_us(void)
+{
+    uint32_t low;
+    kernel_tic32(NULL, NULL, &low);
+    return low;
+}
 
 static void update_fps(void)
 {
@@ -136,8 +177,16 @@ static void update_fps(void)
         last_tic = low;
         fps = frame_count;
         frame_count = 0;
-        if (g_fpslog && fps > 0)
-            printf("grass: fps=%d\n", fps);
+        if (g_fpslog && fps > 0) {
+            /* per-frame phase breakdown (us), averaged over the last second,
+             * plus the surface size the compute grid was sized from (a
+             * window resize changes the draw cost, so a run is only
+             * comparable at the same size) */
+            printf("grass: fps=%d clear=%u draw=%u hud=%u swap=%u win=%dx%d\n", fps,
+                   g_ph_us[0] / fps, g_ph_us[1] / fps,
+                   g_ph_us[2] / fps, g_ph_us[3] / fps, win_width, win_height);
+        }
+        g_ph_us[0] = g_ph_us[1] = g_ph_us[2] = g_ph_us[3] = 0;
     }
     frame_count++;
 }
@@ -216,21 +265,21 @@ static void init_quad(void)
 }
 
 /* Load the two bundled noise images.  GL_REPEAT wrap is required for the
- * engine's GPU tiled-texture slot; NEAREST filtering keeps the CPU path
- * consistent with the on-device compiled sampler (fixed NEAREST/REPEAT). */
+ * engine's GPU tiled-texture slot; LINEAR filtering is carried through to the
+ * on-device compiled sampler (TMU bilinear), so texB needs a single tap. */
 static void init_textures(void)
 {
     glGenTextures(1, &tex_noise_small);
     glBindTexture(GL_TEXTURE_2D, tex_noise_small);
     if (!load_texture2D("/apps/grass/res/gray_noise_small.png",
-                        GL_NEAREST, GL_NEAREST, GL_REPEAT,
+                        GL_LINEAR, GL_LINEAR, GL_REPEAT,
                         GL_FALSE, GL_FALSE, NULL, NULL))
         printf("grass: failed to load gray_noise_small.png\n");
 
     glGenTextures(1, &tex_noise_med);
     glBindTexture(GL_TEXTURE_2D, tex_noise_med);
     if (!load_texture2D("/apps/grass/res/rgba_noise_medium.png",
-                        GL_NEAREST, GL_NEAREST, GL_REPEAT,
+                        GL_LINEAR, GL_LINEAR, GL_REPEAT,
                         GL_FALSE, GL_FALSE, NULL, NULL))
         printf("grass: failed to load rgba_noise_medium.png\n");
 }
@@ -337,6 +386,7 @@ static void render_frame(void)
 
     uint32_t now = kernel_tic_ms(0);
     iGlobalTime = (now - start_time) / 1000.0f;
+    if (g_freeze >= 0.0f) iGlobalTime = g_freeze;
 
     /* Default look pointer (slightly below centre -> pitch down onto grass)
      * until a real drag happens.  The GPU route feeds the shader the SCALED
@@ -352,9 +402,11 @@ static void render_frame(void)
     float mx = (g_mx < 0.0f) ? mw * 0.5f : g_mx / sc;
     float my = (g_my < 0.0f) ? mh * 0.7f : g_my / sc;
 
+    uint32_t t0 = tic_us();
     glViewport(0, 0, win_width, win_height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    uint32_t t1 = tic_us();
 
     /* Re-bind the scene program every frame: the engine's GPU bridge and the
      * HUD overlay each touch the current program, so an explicit bind keeps the
@@ -375,6 +427,7 @@ static void render_frame(void)
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
     glDrawArrays(GL_TRIANGLES, 0, 6);
     glDisableVertexAttribArray(0);
+    uint32_t t2 = tic_us();
 
     /* Overlay the FPS / Renderer readout.  Query the route while the scene
      * program is still bound.  glForceCpuRasterEWOK() (called once in main)
@@ -384,8 +437,20 @@ static void render_frame(void)
     process_imgui_frame(gpu);
     ImGui::Render();
     ImGui_ImplGLES2_RenderDrawData(ImGui::GetDrawData());
+    uint32_t t3 = tic_us();
+
+    g_frames++;
+    if (g_dump > 0 && g_frames == g_dump) {
+        dump_frame("/tmp/grass.ppm");
+        exit(0);
+    }
 
     eglSwapBuffers(egl_dpy, egl_surf);
+    uint32_t t4 = tic_us();
+    g_ph_us[0] += t1 - t0;
+    g_ph_us[1] += t2 - t1;
+    g_ph_us[2] += t3 - t2;
+    g_ph_us[3] += t4 - t3;
     update_fps();
 }
 
@@ -449,7 +514,19 @@ int main(int argc, char** argv)
             g_steps = n;
             continue;
         }
+        if (sscanf(argv[ai], "freeze%d", &n) == 1 && n >= 0) {
+            g_freeze = (float)n;   /* benchmark: identical frame every run */
+            continue;
+        }
+        if (sscanf(argv[ai], "dump%d", &n) == 1 && n > 0) {
+            g_dump = n;
+            continue;
+        }
 #ifdef PGL_G3D
+        if (strcmp(argv[ai], "qpudump") == 0) {
+            v3d_mesa_debug |= (1u << 4);   /* V3D_DEBUG_QPU */
+            continue;
+        }
         if (strncmp(argv[ai], "scale", 5) == 0 &&
             argv[ai][5] >= '1' && argv[ai][5] <= '9' && argv[ai][6] == '\0') {
             g_scale = argv[ai][5] - '0';

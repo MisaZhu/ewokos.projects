@@ -178,7 +178,11 @@ vec3 lampPalette(float h)
 }
 
 // Defocused point/disc light. Radiance is conserved: area fraction (r0/r)^2.
-vec3 disc(vec2 p, vec2 c, float r0, float blur, vec3 col)
+// `reach` is the distance at which the 1/d^2 veiling glare has faded to zero: every
+// caller only visits the lights of a small cell neighbourhood, so an unbounded halo
+// would be cut by the neighbourhood edge and leave faint rectangles in the sky.
+// Keep reach below the nearest possible neighbourhood edge.
+vec3 disc(vec2 p, vec2 c, float r0, float blur, vec3 col, float reach)
 {
     float r  = r0 + blur;
     float d  = length(p - c);
@@ -187,6 +191,7 @@ vec3 disc(vec2 p, vec2 c, float r0, float blur, vec3 col)
     float rim  = 1. + .6*smoothstep(.55*r, r, d);                 // spherical aberration: brighter edge
     float e    = (r0*r0)/(r*r);
     float halo = .25*r*r/(d*d + 5.*r*r);                          // veiling glare
+    halo *= 1. - smoothstep(.5*reach, reach, d);
     return col*e*(body*rim + halo);
 }
 
@@ -207,7 +212,8 @@ vec3 bokehLayer(vec2 p, float blur, float scale, float seed, float yLo, float yH
         float sz = hash21(cid*1.37 + seed + 3.1);
         vec3 lc = lampPalette(hash21(cid + seed*2.3 + 8.));
         float tw = .85 + .15*sin(gTime*(1.5 + 3.*h.x) + h.y*40.);   // atmospheric scintillation
-        acc += disc(p, c, r0*(.6 + .9*sz), blur, lc*power*(.5 + sz)*tw);
+        // a light sits at .15...85 of its cell, so the 3x3 edge is >= 1.15 cells away
+        acc += disc(p, c, r0*(.6 + .9*sz), blur, lc*power*(.5 + sz)*tw, 1.1/scale);
     }
     return acc;
 }
@@ -223,7 +229,8 @@ vec3 emitters(vec2 p, float blur)
         vec3 h = hash32(vec2(id, 77.));
         vec2 b = vec2(id*1.3 + (h.x - .5)*.7, .26 + .2*h.y);
         float blink = smoothstep(.35, .55, .5 + .5*sin(gTime*2.2 + h.z*TAU));
-        c += disc(p, b, .0035, blur, vec3(1., .05, .04)*14.*blink);
+        // beacon within +-.35 of its 1.3-wide cell: the 3-cell edge is >= 1.6 away
+        c += disc(p, b, .0035, blur, vec3(1., .05, .04)*14.*blink, 1.4);
     }
     return c;
 }
@@ -273,9 +280,15 @@ void skyline(inout vec3 col, vec2 p, float blur, float scale, float base, float 
     vec2 q   = fract(wg) - .5;
     vec3 sharp = windowCell(floor(wg), seed, litP)
                * soft(abs(q.x) - .28, w)*soft(abs(q.y) - .30, w);
-    // once the blur exceeds a window, the facade is a smooth field of the mean window light
+    // once the blur exceeds a window, the facade is a smooth field of the mean window light:
+    // the four cells around the sample, bilinearly weighted (cell centres at .5) so the
+    // defocused facade is continuous instead of a hard per-cell block.  .34 is the lit area
+    // fraction of a cell (.56 x .60).
     vec2 i0 = floor(wg - .5);
-    vec3 sm = windowCell(i0, seed, litP)*.34;
+    vec2 fw = fract(wg - .5);
+    fw = fw*fw*(3. - 2.*fw);
+    vec3 sm = mix(mix(windowCell(i0,              seed, litP), windowCell(i0 + vec2(1., 0.), seed, litP), fw.x),
+                  mix(windowCell(i0 + vec2(0., 1.), seed, litP), windowCell(i0 + vec2(1., 1.), seed, litP), fw.x), fw.y)*.34;
     vec3 win = mix(sharp, sm, smoothstep(.2, .75, w));
 
     col = mix(col, body + .02*gFlash, m);
@@ -337,7 +350,8 @@ vec3 traffic(vec2 p, float blur)
             for (int s = 0; s < 2; s++)
             {
                 vec2 c  = vec2(cx + ((s == 0) ? -sep : sep), yl);
-                acc += disc(p, c, r0, blur, colL);
+                // headlights sit at .05...95 of their sp-wide cell (+-sep): the 3-cell edge is > .9*sp away
+                acc += disc(p, c, r0, blur, colL, .9*sp);
                 vec2 dd = p - c;
                 float r = r0 + blur;
                 float len = .05 + .04*fl;

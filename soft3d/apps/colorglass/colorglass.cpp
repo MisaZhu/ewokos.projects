@@ -54,11 +54,44 @@
  * Must be set before the first glLinkProgram, which triggers the on-device
  * compile.  Belongs to the mesa compiler merged into libGLESv2. */
 extern "C" void pglc_compile_set_cs_local_size(unsigned x, unsigned y);
+/* mesa V3D_DEBUG bits (V3D_DEBUG_QPU = 1<<4 dumps the QPU assembly of every
+ * compiled shader to stderr): argv "qpudump", for tuning only. */
+extern "C" uint32_t v3d_mesa_debug;
 #endif
+
+/* argv "freezeN": pin iGlobalTime to N seconds so A/B stat windows compare
+ * the same frame (-1 = animate normally). */
+static float g_freeze = -1.0f;
 
 /* Window dimensions (can be resized). */
 static int win_width  = 800;
 static int win_height = 600;
+
+/* argv "dumpN": glReadPixels frame N to /tmp/colorglass.ppm and quit
+ * (headless picture check over ssh). */
+static int g_dump = 0;
+static int g_frames = 0;
+
+static void dump_frame(const char* path)
+{
+    size_t n = (size_t)win_width * (size_t)win_height;
+    unsigned char* rgba = (unsigned char*)malloc(n * 4);
+    if (!rgba) return;
+    glReadPixels(0, 0, win_width, win_height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", win_width, win_height);
+        /* glReadPixels rows are bottom-up; PPM is top-down. */
+        for (int y = win_height - 1; y >= 0; y--) {
+            const unsigned char* row = rgba + (size_t)y * win_width * 4;
+            for (int x = 0; x < win_width; x++)
+                fwrite(row + (size_t)x * 4, 1, 3, f);
+        }
+        fclose(f);
+        printf("colorglass: dumped %dx%d to %s\n", win_width, win_height, path);
+    }
+    free(rgba);
+}
 
 static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
 static EGLSurface egl_surf = EGL_NO_SURFACE;
@@ -272,6 +305,8 @@ static void render_frame(void)
 
     uint32_t now = kernel_tic_ms(0);
     iGlobalTime = (now - start_time) / 1000.0f;
+    if (g_freeze >= 0.0f)
+        iGlobalTime = g_freeze;
 
     glViewport(0, 0, win_width, win_height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -307,6 +342,12 @@ static void render_frame(void)
     ImGui::Render();
     ImGui_ImplGLES2_RenderDrawData(ImGui::GetDrawData());
 
+    g_frames++;
+    if (g_dump > 0 && g_frames == g_dump) {
+        dump_frame("/tmp/colorglass.ppm");
+        exit(0);
+    }
+
     eglSwapBuffers(egl_dpy, egl_surf);
     update_fps();
 }
@@ -336,13 +377,30 @@ static void loop(void* p)
 int main(int argc, char** argv)
 {
     /* argv: optional "WxH" sets the compute workgroup shape (GPU build, A/B
-     * tuning), optional "fpslog" echoes the 1s FPS roll to stdout. */
+     * tuning), optional "fpslog" echoes the 1s FPS roll to stdout, optional
+     * "freezeN" pins the clock, optional "qpudump" dumps the QPU assembly,
+     * optional "dumpN" writes frame N to /tmp/colorglass.ppm and quits. */
     for (int ai = 1; ai < argc && argv[ai]; ai++) {
         unsigned lx = 0, ly = 0;
+        int n = 0;
         if (strcmp(argv[ai], "fpslog") == 0) {
             g_fpslog = 1;
             continue;
         }
+        if (sscanf(argv[ai], "dump%d", &n) == 1 && n > 0) {
+            g_dump = n;
+            continue;
+        }
+        if (sscanf(argv[ai], "freeze%d", &n) == 1 && n >= 0) {
+            g_freeze = (float)n;
+            continue;
+        }
+#ifdef PGL_G3D
+        if (strcmp(argv[ai], "qpudump") == 0) {
+            v3d_mesa_debug |= (1u << 4);   /* V3D_DEBUG_QPU */
+            continue;
+        }
+#endif
         if (sscanf(argv[ai], "%ux%u", &lx, &ly) == 2 && lx > 0 && ly > 0) {
 #ifdef PGL_G3D
             pglc_compile_set_cs_local_size(lx, ly);

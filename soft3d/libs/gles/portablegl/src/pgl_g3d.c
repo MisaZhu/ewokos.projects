@@ -195,6 +195,9 @@ static int      _batch_tex_slot = -1;
    expansion.  Persistent GL-style unit state, re-established per frame by the
    caller (portablegl's pgl_gpu_frame). */
 static int      _ctex_bind[PGL_G3D_MAX_TEX_UNITS] = { -1, -1, -1, -1 };
+/* per-unit TMU filter (PGL_G3D_TEX_FILTER_*), set alongside the binding and
+   packed into the high nibble of req.ctex_ub_pad[u] on flush. */
+static int      _ctex_filter[PGL_G3D_MAX_TEX_UNITS];
 /* Phase B2c extended render state of the open batch (scissor / polygon offset /
    colour mask); part of the homogeneity key, copied into req.ext on flush. */
 static pgl_g3d_ext_t _batch_ext;
@@ -501,7 +504,9 @@ void pgl_g3d_flush(void)
 			req.ctex_h[u]      = (uint32_t)t->h;
 			req.ctex_stride[u] = t->stride;
 			req.ctex_tiling[u] = (uint8_t)t->tiling;
-			req.ctex_ub_pad[u] = (uint8_t)t->ub_pad;
+			req.ctex_ub_pad[u] = G2D_PGL_CTEX_UB_PAD_PACK(t->ub_pad,
+			    _ctex_filter[u] == PGL_G3D_TEX_FILTER_LINEAR ?
+			        G2D_PGL_CTEX_FILTER_LINEAR : G2D_PGL_CTEX_FILTER_NEAREST);
 			/* A cubemap slot carries its 6-layer array geometry so the
 			   daemon builds image_depth=5 + array_stride; a plain 2D slot
 			   leaves both 0 (single-layer record, unchanged). */
@@ -838,6 +843,11 @@ void pgl_g3d_set_uniforms(const uint32_t* data, uint32_t count)
 
 void pgl_g3d_bind_tex_unit(int unit, int tex_slot)
 {
+	pgl_g3d_bind_tex_unit_filter(unit, tex_slot, PGL_G3D_TEX_FILTER_NEAREST);
+}
+
+void pgl_g3d_bind_tex_unit_filter(int unit, int tex_slot, int filter)
+{
 	if (!_enabled)
 		return;
 	if (unit < 0 || unit >= PGL_G3D_MAX_TEX_UNITS)
@@ -850,6 +860,8 @@ void pgl_g3d_bind_tex_unit(int unit, int tex_slot)
 		_ctex_bind[unit] = -1;
 	else
 		_ctex_bind[unit] = tex_slot;
+	_ctex_filter[unit] = (filter == PGL_G3D_TEX_FILTER_LINEAR) ?
+	                     PGL_G3D_TEX_FILTER_LINEAR : PGL_G3D_TEX_FILTER_NEAREST;
 }
 
 int pgl_g3d_batch_tri_compiled(const float* n0, const float* n1, const float* n2,
@@ -1451,7 +1463,9 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			req.ctex_h[u]      = (uint32_t)t->h;
 			req.ctex_stride[u] = t->stride;
 			req.ctex_tiling[u] = (uint8_t)t->tiling;
-			req.ctex_ub_pad[u] = (uint8_t)t->ub_pad;
+			req.ctex_ub_pad[u] = G2D_PGL_CTEX_UB_PAD_PACK(t->ub_pad,
+			    _ctex_filter[u] == PGL_G3D_TEX_FILTER_LINEAR ?
+			        G2D_PGL_CTEX_FILTER_LINEAR : G2D_PGL_CTEX_FILTER_NEAREST);
 			/* A cubemap slot carries its 6-layer array geometry so the
 			   daemon builds image_depth=5 + array_stride; a plain 2D slot
 			   leaves both 0 (single-layer record, unchanged). */

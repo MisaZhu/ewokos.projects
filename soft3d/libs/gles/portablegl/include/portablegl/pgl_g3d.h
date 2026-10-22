@@ -397,8 +397,14 @@ int  pgl_g3d_batch_tri_compiled(const float* n0, const float* n1, const float* n
    declines the draw back to the CPU).  The binding persists until changed (like
    GL texture-unit state) and is marshalled into the draw request on flush.  Call
    after pgl_g3d_set_shader_program and before the batch/flush.  No-op when the
-   GPU path is off or unit is out of range. */
+   GPU path is off or unit is out of range.  pgl_g3d_bind_tex_unit samples the
+   unit NEAREST; pgl_g3d_bind_tex_unit_filter additionally selects the TMU's
+   mag/min filter (PGL_G3D_TEX_FILTER_*), carried per unit in the draw request
+   so the back end packs a matching sampler record. */
+#define PGL_G3D_TEX_FILTER_NEAREST 0
+#define PGL_G3D_TEX_FILTER_LINEAR  1
 void pgl_g3d_bind_tex_unit(int unit, int tex_slot);
+void pgl_g3d_bind_tex_unit_filter(int unit, int tex_slot, int filter);
 
 /* === WS4 generic compiled-mesh draw path (arbitrary 3D geometry) ============
    These drive a static vertex mesh with an on-device-compiled program whose

@@ -15,11 +15,11 @@
  *   iChannel0 = "Gray Noise Small"  (64x64, 1ch)  -- grass height + fbm clouds
  *   iChannel2 = "RGBA Noise Medium" (256x256,4ch) -- straw tint + colour patches
  * Both are uploaded with GL_REPEAT wrap (required by the engine's GPU tiled
- * texture slot) and NEAREST filtering; the on-device V3D compiled sampler is
- * fixed at NEAREST/REPEAT, so the CPU path uses the same to keep the two
- * routes pixel-consistent.  The reference samples its channels with a mipmap
- * filter, so the shader emulates bilinear + mip-fade by hand (texB) on top
- * of the NEAREST hardware taps.
+ * texture slot) and GL_LINEAR filtering, which the on-device V3D compiled
+ * sampler honours (hardware bilinear); the CPU path uses the same to keep the
+ * two routes pixel-consistent.  The reference samples its channels with a
+ * mipmap filter, so the shader adds the mip-fade by hand (texB) on top of the
+ * single bilinear hardware tap.
  *
  * GPU route (raspi5 / PGL_G3D): the vertex shader is a passthrough with no
  * uMVP and this fragment shader reads the window position, so the engine
@@ -120,17 +120,15 @@ float g_aa_a, g_aa_b, g_aa_c, g_aa_d, g_aa_e, g_aa_f, g_aa_g, g_aa_h;
 vec3  g_warpedRp;
 vec3  g_col;
 vec3  g_rp;
-/* cached low-freq height modulation (bilinear, refreshed every 0.25 world
- * units along the ray instead of every step: the field is smooth at the
- * 0.025 scale, so holding it costs nothing visible and saves 4 taps/step) */
-float g_mod, g_modl;
-/* gated per-step transcendentals: the path banks, wind phase, blade-bend
- * rotation and step-growth exp all advance far slower than the march in its
- * early (dense) phase, so each is recomputed only once its own argument
- * moves past a sub-texel tolerance instead of every iteration. */
+/* per-step march state (the reference recomputes all of these every
+ * iteration too): low-freq height modulation, path banks, wind phase,
+ * blade-bend rotation, step growth, height-tap mip level */
+float g_mod;
 float g_s1, g_s2, g_t, g_sn, g_cs, g_expf;
-float g_px, g_pz, g_ang, g_lx;
-float g_lod, g_rdy;
+float g_lod;
+/* loop invariants hoisted out of the march (set up by trace()) */
+float g_lodk;   /* texels per world unit of ray for this pixel */
+float g_modk;   /* 6.4 / iResolution.y, for the modulation mip level */
 
 void aa_rotate(float v) {
     g_aa_h = g_aa_g; g_aa_g = g_aa_f; g_aa_f = g_aa_e; g_aa_e = g_aa_d;
@@ -154,24 +152,18 @@ float flterF(float f, float a) {
 }
 
 /* Mip-emulating bilinear tap.  The reference samples both channels with
- * ShaderToy's mipmap filter; the on-device compiled sampler is fixed at
- * NEAREST, so filter by hand: four NEAREST taps at texel centres (the
- * hardware REPEAT wrap covers the edges) give the within-mip bilinear, and
- * once the pixel footprint exceeds a texel the result fades to the noise
- * mean exactly like a deep mip level would.  lod <= 0 is plain bilinear --
- * what the reference's bias(-100) height tap gets. */
+ * ShaderToy's mipmap filter.  The textures are bound GL_LINEAR, which the
+ * on-device compiled sampler now honours (the TMU blends the 2x2 footprint
+ * in hardware), so one tap replaces the former four hand-blended NEAREST
+ * taps -- a quarter of the TMU traffic in the raymarch loop and far less
+ * register pressure (four live vec4 fetches became one).  The +0.5 texel
+ * offset keeps the footprint where the hand filter put it (texel i blended
+ * with i+1 at frac(uv*sz)), so the picture is unchanged.  Once the pixel
+ * footprint exceeds a texel the result fades to the noise mean like a deep
+ * mip level would; lod <= 0 is plain bilinear -- what the reference's
+ * bias(-100) height tap gets. */
 vec4 texB(sampler2D s, vec2 uv, vec2 sz, float lod) {
-    vec2 t = uv * sz;
-    vec2 i = floor(t);
-    vec2 f = t - i;
-    vec2 c = (i + 0.5) / sz;
-    vec2 ox = vec2(1.0 / sz.x, 0.0);
-    vec2 oy = vec2(0.0, 1.0 / sz.y);
-    vec4 a = texture2D(s, c);
-    vec4 b = texture2D(s, c + ox);
-    vec4 d = texture2D(s, c + oy);
-    vec4 e = texture2D(s, c + ox + oy);
-    vec4 v = mix(mix(a, b, f.x), mix(d, e, f.x), f.y);
+    vec4 v = texture2D(s, uv + 0.5 / sz);
     return mix(v, vec4(0.5), clamp((lod - 1.0) / 3.0, 0.0, 1.0));
 }
 
@@ -194,29 +186,34 @@ float fbm(vec2 uv, float lb) {
  * groove the worn path (reversed-edge smoothstep as the reference writes it),
  * the noise height optionally averaged through the AA ring, and a low-freq
  * modulation.  Records the warped point for the hit-shading lookups.  All
- * smooth per-step quantities arrive through the gated march_cache(). */
-void march_cache(vec3 rp, float l, float tol) {
-    if (abs(rp.x - g_px) > tol || abs(rp.z - g_pz) > tol) {
-        g_px = rp.x; g_pz = rp.z;
-        float gt = iGlobalTime * 0.9;
-        g_t = (sin(gt + rp.x * 1.2) + sin(gt + rp.z * 1.4)) * 0.25;
-        g_s1 = 1.0 - sstep(rp.x + sin(rp.z * 3.0) * 0.1 + sin(rp.z * 5.0) * 0.12,
-                           -0.4, 0.0);
-        g_s2 = 1.0 - sstep(rp.x - sin(rp.z * 4.4) * 0.1 + sin(rp.z * 14.0) * 0.04,
-                            0.4, 0.0);
-    }
+ * smooth per-step quantities arrive through march_cache().
+ *
+ * march_cache() is deliberately UNGATED.  An earlier version refreshed each
+ * of these only once its argument had moved past a tolerance; the QPU dump
+ * showed what that buys on V3D: every per-lane `if` in the loop compiles to
+ * predicated execution (the block is skipped only when all 16 lanes agree,
+ * which never happens once rays desynchronise), so the sin/exp/log and the
+ * modulation tap were computed every step anyway and the gates cost ~50
+ * extra instructions of flag bookkeeping per step.  Computing them straight
+ * is the same ALU work, no stale caches (closer to the reference), and a
+ * shorter loop body. */
+void march_cache(vec3 rp, float l) {
+    float gt = iGlobalTime * 0.9;
+    g_t = (sin(gt + rp.x * 1.2) + sin(gt + rp.z * 1.4)) * 0.25;
+    g_s1 = 1.0 - sstep(rp.x + sin(rp.z * 3.0) * 0.1 + sin(rp.z * 5.0) * 0.12,
+                       -0.4, 0.0);
+    g_s2 = 1.0 - sstep(rp.x - sin(rp.z * 4.4) * 0.1 + sin(rp.z * 14.0) * 0.04,
+                        0.4, 0.0);
     float ang = rp.y * 20.0 * g_t;
-    if (abs(ang - g_ang) > 0.15) { g_ang = ang; g_sn = sin(ang); g_cs = cos(ang); }
-    if (l - g_lx > 0.25) {
-        g_lx = l;
-        g_expf = exp(max(0.0, (l - 0.5) * 0.2));
-        /* Height-tap mip level: the reference's channel0 is mipmap-filtered,
-         * so a pixel whose footprint spans N texels reads a blurred level.
-         * Footprint = 416 texels/world * world-per-pixel (arc length l times
-         * the pixel angle, stretched by the ray's ground incidence). */
-        g_lod = log2(max(416.0 * l * (2.0 / iResolution.x) /
-                         max(abs(g_rdy), 0.05), 1.0));
-    }
+    g_sn = sin(ang);
+    g_cs = cos(ang);
+    g_expf = exp(max(0.0, (l - 0.5) * 0.2));
+    /* Height-tap mip level: the reference's channel0 is mipmap-filtered,
+     * so a pixel whose footprint spans N texels reads a blurred level.
+     * Footprint = 416 texels/world * world-per-pixel (arc length l times
+     * the pixel angle, stretched by the ray's ground incidence); the
+     * per-pixel factor is g_lodk, hoisted by trace(). */
+    g_lod = log2(max(g_lodk * l, 1.0));
 }
 
 float map(vec3 rp, int useAA) {
@@ -228,8 +225,8 @@ float map(vec3 rp, int useAA) {
 
     /* The reference samples iChannel0 with linear filtering: the height must
      * vary continuously per pixel or the depth fade turns every texel jump
-     * into a black speckle.  Four NEAREST taps at texel centres are exactly
-     * the hardware bilinear (the compiled sampler stays NEAREST/REPEAT). */
+     * into a black speckle.  texB is one hardware bilinear tap plus the
+     * mip fade for the per-pixel footprint computed in march_cache(). */
     float h = texB(iChannel0, uv, vec2(64.0), g_lod).r;
     if (useAA == 1) {
         aa_rotate(h);
@@ -286,74 +283,80 @@ void shade_hit(vec3 ro, vec3 rd, vec3 rp) {
 
 /* March the grass field (downward rays only); on a hit shade into g_col and
  * record the hit point in g_rp.  The reference computes grad() here but never
- * uses it, so no diffuse term is applied. */
+ * uses it, so no diffuse term is applied.
+ *
+ * Shape matters for the QPU: GLSL inlines every call, and the earlier form
+ * returned through shade_hit() from THREE places inside the march loop
+ * (crossing, cutoff, exhaustion).  Each copy drags clouds() (two fbm, up to
+ * 40 taps) and the shadow tap into the loop body, which on V3D compiled to
+ * ~4100 instructions at a register pressure of 130-170 against the 64 regs a
+ * 2-thread QPU has - 84 TMU spills, most of them reloaded every step.  The
+ * loop below only FINDS the hit (a hit / exhaustion flag + break); the single
+ * shade_hit() lives after it, so the loop body carries just march_cache(),
+ * the modulation tap, map() and one exit test. */
 int trace(vec3 ro, vec3 rd) {
     vec3 rp = ro;
     if (rd.y > 0.0) { g_rp = rp; return 0; }
     float ydiff = rp.y - H;
-    rp += rd * (ydiff / max(abs(rd.y), 1e-4));
+    float l0 = ydiff / max(abs(rd.y), 1e-4);
+    rp += rd * l0;
     g_aa_a = 0.0; g_aa_b = 0.0; g_aa_c = 0.0; g_aa_d = 0.0;
     g_aa_e = 0.0; g_aa_f = 0.0; g_aa_g = 0.0; g_aa_h = 0.0;
     float l = 0.0;
-    g_modl = -1.0;
-    g_px = 1e9; g_pz = 1e9; g_ang = 1e9; g_lx = -1.0;
-    g_rdy = rd.y; g_lod = 0.0;
+    g_lodk = 416.0 * (2.0 / iResolution.x) / max(abs(rd.y), 0.05);
+    g_modk = 6.4 / iResolution.y;
+    /* The reference stops once dot(rp - ro, rp - ro) > 30.  rd is unit
+     * length and rp = ro + rd * (l0 + l), so that is l0 + l > sqrt(30):
+     * one compare against a hoisted constant instead of a 3-vector
+     * difference and dot product every step. */
+    float lcut = 5.477225575 - l0;
     vec3 prp = rp;
+    int hit = 0;   /* 1 = surface crossing (bisected onto the surface below) */
     for (int i = 0; i < @@STEPS@@; i++) {
-        march_cache(rp, l, 0.02);
-        if (l - g_modl > 0.25) {
-            g_mod = texB(iChannel0, rp.xz * 0.1625, vec2(64.0),
-                         log2(max(6.4 * l * l / iResolution.y, 1e-4))).r;
-            g_modl = l;
-        }
+        march_cache(rp, l);
+        g_mod = texB(iChannel0, rp.xz * 0.1625, vec2(64.0),
+                     log2(max(g_modk * l * l, 1e-4))).r;
         float h = map(rp, 1);
-        if (h <= 0.0 || rp.y < 0.0) {
-            /* Bisect back onto the surface: a raw crossing can land deep
-             * inside the blade layer, where smoothstep(H*0.2,H*1.4,rp.y)
-             * collapses and speckles the field with black dots. */
-            vec3 lo = prp;
-            for (int k = 0; k < 4; k++) {
-                vec3 mid = (lo + rp) * 0.5;
-                march_cache(mid, l, 0.02);
-                if (map(mid, 0) > 0.0) lo = mid; else rp = mid;
-            }
-            march_cache(rp, l, 0.02);
-            map(rp, 0);
-            shade_hit(ro, rd, rp);
-            g_rp = rp;
-            return 1;
-        }
-        vec3 diff = rp - ro;
-        if (dot(diff, diff) > 30.0) {
-            /* Cutoff miss: a grazing ray can ride the blade tops past the
-             * distance cap; shading it as a surface hit keeps the horizon
-             * silhouette free of black speckles (a raw miss here leaves col
-             * at zero inside the fog's blank window). */
-            march_cache(rp, l, 0.02);
-            if (map(rp, 0) < 0.15) {
-                shade_hit(ro, rd, rp);
-                g_rp = rp;
-                return 1;
-            }
-            g_rp = rp;
-            return 0;
+        /* One exit test per step: the crossing and the distance cutoff
+         * share a single branch block (each non-uniform `if` costs the QPU
+         * a 4-slot branch plus flag bookkeeping, and the loop ran two). */
+        bool cross = (h <= 0.0 || rp.y < 0.0);
+        if (cross || l > lcut) {
+            if (cross) hit = 1;   /* crossing lies in (prp, rp]: refined below */
+            break;                /* else cutoff: near-surface test below */
         }
         float dist = max(0.00001, h * 0.04 * g_expf);
         prp = rp;
         rp += rd * dist;
         l += dist;
     }
-    /* Zeno exhaustion: the ray rides the surface asymptotically.  Shade it as
-     * a shallow hit; a miss here would leave col at zero with dist inside
-     * the fog's blank window, which is the black wedge at the horizon. */
-    march_cache(rp, l, 0.02);
-    if (map(rp, 0) < 0.15) {
-        shade_hit(ro, rd, rp);
-        g_rp = rp;
-        return 1;
+    /* Bisect a crossing back onto the surface: a raw crossing can land deep
+     * inside the blade layer, where smoothstep(H*0.2,H*1.4,rp.y) collapses
+     * and speckles the field with black dots.  This lives AFTER the loop on
+     * purpose: inside it, every time ANY lane of a 16-wide QPU group crossed,
+     * the whole group re-ran the unrolled 4x(march_cache+map) block, up to 16
+     * times per group (measured at 60% of the frame on V3D).  Here it runs
+     * once per group over the recorded (prp, rp] interval - identical result. */
+    if (hit == 1) {
+        vec3 lo = prp;
+        for (int k = 0; k < 4; k++) {
+            vec3 mid = (lo + rp) * 0.5;
+            march_cache(mid, l);
+            if (map(mid, 0) > 0.0) lo = mid; else rp = mid;
+        }
     }
+    /* Cutoff and Zeno exhaustion (the ray rides the blade tops past the
+     * distance cap, or asymptotically along the surface) are shaded as a
+     * shallow hit when the ray ends within 0.15 of the surface: a raw miss
+     * leaves col at zero inside the fog's blank window, which is the black
+     * speckle / wedge at the horizon.  The bisected crossing re-runs map()
+     * here too (it only needs g_warpedRp refreshed for the shading taps). */
+    march_cache(rp, l);
+    float hm = map(rp, 0);
+    if (hm < 0.15) hit = 1;
+    if (hit == 1) shade_hit(ro, rd, rp);
     g_rp = rp;
-    return 0;
+    return hit;
 }
 
 void main() {

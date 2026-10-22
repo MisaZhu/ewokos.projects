@@ -4200,7 +4200,16 @@ static int pgl_gpu_frame(frag_func fs, void* uniforms)
         int u;
         for (u = 0; u < e->n_tex_units; u++) {
             int slot = pgl_gpu_ctex_slot(e->tex_units[u]);
-            pgl_g3d_bind_tex_unit(u, slot);
+            glTexture* ft = pgl_gpu_tex_get(e->tex_units[u]);
+            /* the TMU filters bilinearly when the GL object asks for LINEAR
+             * (mag LINEAR and a LINEAR-family min filter); anything else
+             * samples NEAREST, the historic fixed sampler. */
+            int filt = (ft && ft->mag_filter == GL_LINEAR &&
+                        ft->min_filter != GL_NEAREST &&
+                        ft->min_filter != GL_NEAREST_MIPMAP_NEAREST &&
+                        ft->min_filter != GL_NEAREST_MIPMAP_LINEAR)
+                       ? PGL_G3D_TEX_FILTER_LINEAR : PGL_G3D_TEX_FILTER_NEAREST;
+            pgl_g3d_bind_tex_unit_filter(u, slot, filt);
             if (slot < 0) {
                 static int _gf_unb = 0;
                 glTexture* t = (e->tex_units[u] && c && (int)e->tex_units[u] < c->textures.size)

@@ -2216,7 +2216,8 @@ static int gpu_ctex_slot(GLuint name)
     /* portablegl stores a texture's type shifted by GL_TEXTURE_UNBOUND+1 (see
      * pgl_BindTexture); a cubemap's six square faces are concatenated in
      * t->data (6*w*h*4, w == h).  The raspi5 compiled-sampler record is fixed
-     * GL_NEAREST + GL_REPEAT, which a plain 2D image must match to be
+     * GL_REPEAT (its filter follows the GL object, see gpu_ctex_filter), which
+     * a plain 2D image must match to be
      * stageable.  A cubemap is loaded CLAMP_TO_EDGE but samples through the
      * same record as a 6-layer 2D array (mesa lowers textureCube to an array +
      * face-index TMU fetch, and a face coordinate never leaves [0,1]), so the
@@ -2246,6 +2247,24 @@ static int gpu_ctex_slot(GLuint name)
     g_gpu_ctexw[slot] = (int)t->w;
     g_gpu_ctexh[slot] = (int)t->h;
     return slot;
+}
+
+/* TMU filter for a staged texture: the GL object's LINEAR request (mag LINEAR
+ * with a LINEAR-family min filter) maps onto the hardware's bilinear sampler;
+ * everything else samples NEAREST, the historic fixed sampler record.  Only
+ * the compiled-sampler (ctex) path honours this; the raster TEX_MOD kernel
+ * still reads texels directly. */
+static int gpu_ctex_filter(GLuint name)
+{
+    const glTexture *t;
+    if (name == 0 || (int)name >= g_ctx.textures.size) return PGL_G3D_TEX_FILTER_NEAREST;
+    t = &g_ctx.textures.a[name];
+    if (t->mag_filter != GL_LINEAR) return PGL_G3D_TEX_FILTER_NEAREST;
+    if (t->min_filter == GL_NEAREST ||
+        t->min_filter == GL_NEAREST_MIPMAP_NEAREST ||
+        t->min_filter == GL_NEAREST_MIPMAP_LINEAR)
+        return PGL_G3D_TEX_FILTER_NEAREST;
+    return PGL_G3D_TEX_FILTER_LINEAR;
 }
 
 /* Free staged tiled slots holding textures the current program does NOT sample.
@@ -2349,11 +2368,14 @@ static int gpu_try_fullscreen(gpu_entry *e, GLenum mode, GLint first, GLsizei co
         int tmu = 0;
         for (i = 0; i < gp->nuniforms; ++i) {
             const glsl_uniform *u = &gp->uniforms[i];
-            int unit, slot;
+            int unit, slot, filt;
+            GLuint tex;
             if (!u->is_sampler) continue;
             unit = g_active->ublock[u->offset].i;
-            slot = gpu_ctex_slot(gles_engine_texture_for_unit(unit));
-            pgl_g3d_bind_tex_unit(tmu, slot);
+            tex = gles_engine_texture_for_unit(unit);
+            slot = gpu_ctex_slot(tex);
+            filt = gpu_ctex_filter(tex);
+            pgl_g3d_bind_tex_unit_filter(tmu, slot, filt);
             ++tmu;
         }
     }
