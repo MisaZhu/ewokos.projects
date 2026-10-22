@@ -2150,6 +2150,9 @@ static void gpu_coalesce_flush(void)
         g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0;
         return;
     }
+    /* Uniform staging patches program-specific compute slots. Select this
+     * batch's program so a preceding fullscreen draw cannot corrupt its MVP. */
+    pgl_g3d_set_shader_program(g_coalesce_prog);
     pgl_g3d_set_uniforms(g_coalesce_blob, PGL_G3D_MAX_UNIF);
     pgl_g3d_set_blend((int)g_coalesce_blend);
     if (g_coalesce_inst) {
@@ -2500,6 +2503,7 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
         st.stride = GPU_STAGING_STRIDE; st.inst = 0.0f;
         if (!gpu_tessellate(&st, mode, first, count, va, e)) return 0;
         if (st.n != nout) return 0;   /* defensive: tessellation/staging mismatch */
+        pgl_g3d_set_shader_program(e->prog);
         pgl_g3d_set_uniforms(blob, PGL_G3D_MAX_UNIF);
         slot = gpu_tex_slot(gles_engine_texture_for_unit(0), 0);
         if (slot < 0) return 0;   /* no raster texture staged: CPU this draw */
@@ -2667,6 +2671,7 @@ static int gpu_try_draw_elements_textured(gpu_entry *e, GLenum mode, GLsizei cou
     if (!gpu_tessellate_elements_mesh(&st, mode, count, base, type, va, 1)) return 0;
     if (st.n != nout) return 0;   /* defensive: tessellation/staging mismatch */
 
+    pgl_g3d_set_shader_program(e->prog);
     pgl_g3d_set_uniforms(blob, PGL_G3D_MAX_UNIF);
     slot = gpu_tex_slot(gles_engine_texture_for_unit(0), 0);
     if (slot < 0) return 0;   /* no raster texture staged: CPU this draw */
@@ -2788,6 +2793,7 @@ static int gpu_try_draw_elements(GLenum mode, GLsizei count, GLenum type,
     if (!gpu_tessellate_elements(&st, mode, count, base, type, va)) return 0;
     if (st.n != nout) return 0;   /* defensive: tessellation/staging mismatch */
 
+    pgl_g3d_set_shader_program(e->prog);
     pgl_g3d_set_uniforms(blob, PGL_G3D_MAX_UNIF);
     slot = gpu_tex_slot(gles_engine_texture_for_unit(0), 0);
     if (slot < 0) return 0;   /* font atlas not staged as a raster slot: CPU */

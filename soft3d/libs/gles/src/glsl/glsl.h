@@ -55,7 +55,8 @@ typedef enum {
     T_FLOAT, T_VEC2, T_VEC3, T_VEC4,
     T_MAT2, T_MAT3, T_MAT4,
     T_SAMPLER2D, T_SAMPLERCUBE,
-    T_STRUCT           /* user struct: st_id gives the definition */
+    T_STRUCT,          /* user struct: st_id gives the definition */
+    T_UINT, T_UVEC2, T_UVEC3, T_UVEC4
 } glsl_basetype;
 
 /* A value is a run of cells in some storage arena (scratch for temporaries,
@@ -94,7 +95,8 @@ typedef enum {
     EX_FIELD,        /* a.name  (swizzle or struct field)                */
     EX_CALL,         /* builtin or user function                         */
     EX_CTOR,         /* type constructor                                 */
-    EX_COMMA
+    EX_COMMA,
+    EX_UINT
 } glsl_exkind;
 
 typedef struct glsl_expr glsl_expr;
@@ -201,6 +203,7 @@ enum {
     BF_TEXTURE2D, BF_TEXTURE2DPROJ, BF_TEXTURE2DLOD, BF_TEXTURECUBE,
     BF_DFDX, BF_DFDY, BF_FWIDTH,
     BF_TANH,                  /* GLSL ES 3.00 hyperbolic tangent         */
+    BF_ROUND, BF_FLOAT_BITS_TO_UINT,
     BF_USER_START
 };
 

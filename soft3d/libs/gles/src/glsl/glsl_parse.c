@@ -91,7 +91,8 @@ typedef struct { const char *n; int id; int nargs; } bif;
 static const bif k_bifs[] = {
     {"radians",BF_RADIANS,1},{"degrees",BF_DEGREES,1},{"sin",BF_SIN,1},{"cos",BF_COS,1},
     {"tan",BF_TAN,1},{"asin",BF_ASIN,1},{"acos",BF_ACOS,1},{"atan",BF_ATAN,-1},
-    {"tanh",BF_TANH,1},
+    {"tanh",BF_TANH,1}, {"round",BF_ROUND,1},
+    {"floatBitsToUint",BF_FLOAT_BITS_TO_UINT,1},
     {"pow",BF_POW,2},{"exp",BF_EXP,1},{"log",BF_LOG,1},{"exp2",BF_EXP2,1},{"log2",BF_LOG2,1},
     {"sqrt",BF_SQRT,1},{"inversesqrt",BF_INVSQRT,1},{"abs",BF_ABS,1},{"sign",BF_SIGN,1},
     {"floor",BF_FLOOR,1},{"ceil",BF_CEIL,1},{"fract",BF_FRACT,1},{"mod",BF_MOD,2},
@@ -130,6 +131,8 @@ static int type_from_token(int k)
     case TK_BOOL: return T_BOOL; case TK_INT_T: return T_INT; case TK_FLOAT_T: return T_FLOAT;
     case TK_VEC2: return T_VEC2; case TK_VEC3: return T_VEC3; case TK_VEC4: return T_VEC4;
     case TK_IVEC2: return T_IVEC2; case TK_IVEC3: return T_IVEC3; case TK_IVEC4: return T_IVEC4;
+    case TK_UINT_T: return T_UINT;
+    case TK_UVEC2: return T_UVEC2; case TK_UVEC3: return T_UVEC3; case TK_UVEC4: return T_UVEC4;
     case TK_BVEC2: return T_BVEC2; case TK_BVEC3: return T_BVEC3; case TK_BVEC4: return T_BVEC4;
     case TK_MAT2: return T_MAT2; case TK_MAT3: return T_MAT3; case TK_MAT4: return T_MAT4;
     case TK_SAMPLER2D: return T_SAMPLER2D; case TK_SAMPLERCUBE: return T_SAMPLERCUBE;
@@ -185,6 +188,7 @@ static int parse_struct_def(parser *P, char *name_out)
                 P->st->structs[id].foffset[nf] = 0; /* computed at link */
             }
             nf++;
+            if (nf > 16) perr(P, "too many struct fields");
         } while (accept(P, TK_COMMA));
         expect(P, TK_SEMI, "';'");
     }
@@ -192,11 +196,10 @@ static int parse_struct_def(parser *P, char *name_out)
     P->st->structs[id].nfields = nf;
     /* compute float offsets + total */
     {
-        int i; float total = 0;
-        int comps[] = {0,1,1,1,1,1,1,1,1,1,2,3,4,2,3,4,2,3,4,4,9,16,1,1,0};
+        int i, total = 0;
         for (i = 0; i < nf; ++i) {
             int t = P->st->structs[id].ftype[i];
-            int sz = (t>=0 && t<=T_MAT4) ? comps[t] : 4;
+            int sz = glsl_type_cells(P->st, t, P->st->structs[id].fst_id[i]);
             int cnt = P->st->structs[id].farray[i];
             P->st->structs[id].foffset[i] = (int)total;
             total += sz * (cnt>0?cnt:1);
@@ -413,8 +416,9 @@ static glsl_expr *parse_primary(parser *P)
     if (t->kind == TK_FLOAT) {
         glsl_expr *e = new_expr(EX_FLOAT); e->lit_f = t->fval; adv(P); return e;
     }
-    if (t->kind == TK_INT) {
-        glsl_expr *e = new_expr(EX_INT); e->lit_i = t->ival; adv(P); return e;
+    if (t->kind == TK_INT || t->kind == TK_UINT) {
+        glsl_expr *e = new_expr(t->kind == TK_UINT ? EX_UINT : EX_INT);
+        e->lit_i = t->ival; adv(P); return e;
     }
     if (t->kind == TK_TRUE || t->kind == TK_FALSE) {
         glsl_expr *e = new_expr(EX_BOOL); e->lit_i = t->ival; adv(P); return e;

@@ -8,11 +8,11 @@
 static inline int glsl_base_comps(int type)
 {
     switch (type) {
-    case T_BOOL: case T_INT: case T_FLOAT: case T_SAMPLER2D: case T_SAMPLERCUBE:
+    case T_BOOL: case T_INT: case T_UINT: case T_FLOAT: case T_SAMPLER2D: case T_SAMPLERCUBE:
         return 1;
-    case T_BVEC2: case T_IVEC2: case T_VEC2: return 2;
-    case T_BVEC3: case T_IVEC3: case T_VEC3: return 3;
-    case T_BVEC4: case T_IVEC4: case T_VEC4: return 4;
+    case T_BVEC2: case T_IVEC2: case T_UVEC2: case T_VEC2: return 2;
+    case T_BVEC3: case T_IVEC3: case T_UVEC3: case T_VEC3: return 3;
+    case T_BVEC4: case T_IVEC4: case T_UVEC4: case T_VEC4: return 4;
     case T_MAT2: return 4;
     case T_MAT3: return 9;
     case T_MAT4: return 16;
@@ -41,11 +41,17 @@ static inline int glsl_is_int_family(int type)
     switch (type) {
     case T_BOOL: case T_BVEC2: case T_BVEC3: case T_BVEC4:
     case T_INT:  case T_IVEC2: case T_IVEC3: case T_IVEC4:
+    case T_UINT: case T_UVEC2: case T_UVEC3: case T_UVEC4:
     case T_SAMPLER2D: case T_SAMPLERCUBE:
         return 1;
     default:
         return 0;
     }
+}
+
+static inline int glsl_is_uint(int type)
+{
+    return type == T_UINT || type == T_UVEC2 || type == T_UVEC3 || type == T_UVEC4;
 }
 
 static inline int glsl_is_matrix(int type)
@@ -57,9 +63,9 @@ static inline int glsl_is_matrix(int type)
 static inline int glsl_vec_len(int type)
 {
     switch (type) {
-    case T_VEC2: case T_IVEC2: case T_BVEC2: return 2;
-    case T_VEC3: case T_IVEC3: case T_BVEC3: return 3;
-    case T_VEC4: case T_IVEC4: case T_BVEC4: return 4;
+    case T_VEC2: case T_IVEC2: case T_UVEC2: case T_BVEC2: return 2;
+    case T_VEC3: case T_IVEC3: case T_UVEC3: case T_BVEC3: return 3;
+    case T_VEC4: case T_IVEC4: case T_UVEC4: case T_BVEC4: return 4;
     default: return 1;
     }
 }
@@ -72,6 +78,10 @@ static inline int glsl_float_type_of_len(int n)
 static inline int glsl_int_type_of_len(int n)
 {
     switch (n) { case 1: return T_INT; case 2: return T_IVEC2; case 3: return T_IVEC3; default: return T_IVEC4; }
+}
+static inline int glsl_uint_type_of_len(int n)
+{
+    switch (n) { case 1: return T_UINT; case 2: return T_UVEC2; case 3: return T_UVEC3; default: return T_UVEC4; }
 }
 static inline int glsl_bool_type_of_len(int n)
 {

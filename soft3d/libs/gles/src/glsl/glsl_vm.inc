@@ -881,7 +881,11 @@ static int vm_ce(vmc *C, const glsl_expr *e)
     }
     case EX_CTOR: case EX_CALL: {
         int slots[32], nargs = e->nargs, ab, op, xid;
-        if (nargs > 32) { C->failed = 1; return -1; }
+        if (nargs > 32 || (e->kind == EX_CTOR && glsl_is_uint(e->ctor_type)) ||
+            (e->kind == EX_CALL && !e->is_user_fn &&
+             (e->op_builtin == BF_FLOAT_BITS_TO_UINT || e->op_builtin == BF_ROUND))) {
+            C->failed = 1; return -1;
+        }
         for (i = 0; i < nargs; ++i) {
             slots[i] = vm_ce(C, e->args[i]);
             if (slots[i] < 0) { C->failed = 1; return -1; }
@@ -1049,6 +1053,16 @@ static vmprog *vm_compile_stage(glsl_program *prog, glsl_stage *stage)
 {
     vmprog *vp; vmc C; int fi, frame_slots = 1;
     if (!stage || stage->nstructs > 0) return NULL;   /* structs unsupported */
+    /* Unsigned operations use the tree-walker's exact 32-bit cells. The VM
+     * still has signed-only conversion, swizzle, and constructor paths. */
+    for (fi = 0; fi < stage->nglobals; ++fi)
+        if (glsl_is_uint(stage->globals[fi].type)) return NULL;
+    for (fi = 0; fi < stage->nfuncs; ++fi) {
+        int k;
+        if (glsl_is_uint(stage->funcs[fi].ret_type)) return NULL;
+        for (k = 0; k < stage->funcs[fi].nlocals; ++k)
+            if (glsl_is_uint(stage->funcs[fi].local_type[k])) return NULL;
+    }
     vp = (vmprog *)calloc(1, sizeof(vmprog));
     if (!vp) return NULL;
     vp->stage = stage;

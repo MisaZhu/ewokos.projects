@@ -14,6 +14,7 @@ static const kw k_keywords[] = {
     {"bool", TK_BOOL}, {"int", TK_INT_T}, {"float", TK_FLOAT_T}, {"void", TK_VOID_T},
     {"vec2", TK_VEC2}, {"vec3", TK_VEC3}, {"vec4", TK_VEC4},
     {"ivec2", TK_IVEC2}, {"ivec3", TK_IVEC3}, {"ivec4", TK_IVEC4},
+    {"uint", TK_UINT_T}, {"uvec2", TK_UVEC2}, {"uvec3", TK_UVEC3}, {"uvec4", TK_UVEC4},
     {"bvec2", TK_BVEC2}, {"bvec3", TK_BVEC3}, {"bvec4", TK_BVEC4},
     {"mat2", TK_MAT2}, {"mat3", TK_MAT3}, {"mat4", TK_MAT4},
     {"sampler2D", TK_SAMPLER2D}, {"samplerCube", TK_SAMPLERCUBE},
@@ -110,8 +111,8 @@ glsl_token *glsl_lex(const char *src, int *count, char *err, int errsz)
                 while (isxdigit((unsigned char)*p) && k < 62) buf[k++] = *p++;
                 buf[k] = '\0';
                 toks[n].kind = TK_INT;
-                toks[n].ival = (int)strtol(buf, NULL, 16);
-                while (*p == 'u' || *p == 'U') p++;
+                toks[n].ival = (int)(uint32_t)strtoul(buf, NULL, 16);
+                if (*p == 'u' || *p == 'U') { toks[n].kind = TK_UINT; p++; }
                 n++; continue;
             }
             while (k < 62) {
@@ -128,14 +129,18 @@ glsl_token *glsl_lex(const char *src, int *count, char *err, int errsz)
             buf[k] = '\0';
             while (*p == 'f' || *p == 'F' || *p == 'h' || *p == 'H') { isfloat = 1; p++; }
             if (isfloat) { toks[n].kind = TK_FLOAT; toks[n].fval = (float)strtod(buf, NULL); }
-            else         { toks[n].kind = TK_INT;   toks[n].ival = (int)strtol(buf, NULL, 10); }
+            else {
+                toks[n].kind = TK_INT;
+                toks[n].ival = (int)(uint32_t)strtoul(buf, NULL, 10);
+                if (*p == 'u' || *p == 'U') { toks[n].kind = TK_UINT; p++; }
+            }
             n++; continue;
         }
 
         /* operators / punctuation (longest match first) */
         {
             int kind = -1, adv = 0;
-            char c0 = p[0], c1 = p[1], c2 = p[2];
+            char c0 = p[0], c1 = p[1], c2 = c1 ? p[2] : '\0';
             if (c0=='<' && c1=='<' && c2=='=') { kind=TK_SHL_ASSIGN; adv=3; }
             else if (c0=='>' && c1=='>' && c2=='=') { kind=TK_SHR_ASSIGN; adv=3; }
             else if (c0=='+' && c1=='+') { kind=TK_INC; adv=2; }

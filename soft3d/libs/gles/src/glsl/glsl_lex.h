@@ -31,7 +31,8 @@ typedef enum {
     TK_SHL_ASSIGN, TK_SHR_ASSIGN,
     TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT, TK_GE,
     TK_LOGAND, TK_LOGOR, TK_LOGXOR, TK_BANG,
-    TK_BAND, TK_BOR, TK_BXOR, TK_BNOT, TK_SHL, TK_SHR
+    TK_BAND, TK_BOR, TK_BXOR, TK_BNOT, TK_SHL, TK_SHR,
+    TK_UINT, TK_UINT_T, TK_UVEC2, TK_UVEC3, TK_UVEC4
 } glsl_tokkind;
 
 typedef struct {

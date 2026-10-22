@@ -1,0 +1,15 @@
+{
+  "url": "https://www.shadertoy.com/view/fctSzf",
+  "id": "fctSzf",
+  "name": "hello Mac paint",
+  "username": "erpprog",
+  "description": "creation of the macOS \"Macintosh\" screensaver\n(prev version https://www.shadertoy.com/view/fftSzl)",
+  "sha256": {
+    "common": "617ce10d3599e86b266022394751216efeb8fd726444010548c4d23e6fa8e62e",
+    "image": "88df4a5379ad9b2f3d0b4381a2cda60534a835dd8c8c3e8ad29b52fd87ce09de"
+  },
+  "inputs": [],
+  "assets": "Original Geneva 9 glyphs, MacWriteEmpty and MacPaintHello bitmaps, cursors and brush path are embedded in Common.",
+  "license": "No explicit license in retrieved source or metadata; no additional rights asserted.",
+  "adaptation": "GPU: original integer tables losslessly packed into an embedded 4x512 RGBA8 nearest-filtered data texture (LINEARTILE); fractional tables use exact constant lookups, eliminating V3D array scratch. CPU: original in-memory tables with explicit lengths and equivalent 2x2 inverse; reuse identical main/shadow cells and skip brush walks outside their conservative bounds. Original res/Common and Image bytes, scene math, artwork, camera, timing and resolution are preserved."
+}

@@ -624,7 +624,7 @@ static void draw_teapot(void)
      * scene program is re-bound here every frame before drawing the teapot. */
     glUseProgram(program);
 
-    glClearColor(0.05f, 0.06f, 0.09f, 1.0f);
+    glClearColor(0.05f, 0.06f, 0.09f, 0x88 / 255.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     /* Camera orbits the teapot at a fixed radius, looking at the origin. */
@@ -1027,6 +1027,7 @@ int main(int argc, char* argv[])
         return 1;
     }
     xwin->on_event = on_event;
+    xwin_set_alpha(xwin, true);
 
     /* libEGL owns on_repaint/on_resize once the window surface is created. */
     if (!init_egl(xwin)) {

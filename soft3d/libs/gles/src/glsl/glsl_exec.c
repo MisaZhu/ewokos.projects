@@ -65,11 +65,19 @@ static glsl_cell *stk(env *E, int n)
 }
 
 static inline float cf(const glsl_cell *c, int type, int i)
-{ return glsl_is_int_family(type) ? (float)c[i].i : c[i].f; }
+{ return glsl_is_uint(type) ? (float)c[i].u : glsl_is_int_family(type) ? (float)c[i].i : c[i].f; }
 static inline int ci(const glsl_cell *c, int type, int i)
 { return glsl_is_int_family(type) ? c[i].i : (int)c[i].f; }
-static inline void pi(glsl_cell *c, int type, int i, int v)
-{ if (glsl_is_int_family(type)) c[i].i = v; else c[i].f = (float)v; }
+static glsl_cell convert_cell(int target, const glsl_cell *src, int type, int i)
+{
+    glsl_cell out;
+    if (glsl_is_int_family(target)) {
+        if (glsl_is_int_family(type)) out.u = src[i].u;
+        else if (glsl_is_uint(target)) out.u = (uint32_t)src[i].f;
+        else out.i = (int32_t)src[i].f;
+    } else out.f = cf(src, type, i);
+    return out;
+}
 
 static void setval(glsl_val *v, int type, int stid, glsl_cell *data, int n,
                    int arr, int elem)
@@ -259,17 +267,18 @@ static void resolve_lv(env *E, const glsl_expr *e, lv *out)
         /* vector / scalar component */
         if (idx < 0 || idx >= base.ncomp) { E->err = 1; return; }
         out->mem = base.mem + idx;
-        out->type = glsl_is_int_family(base.type) ? T_INT : T_FLOAT;
+        out->type = glsl_is_uint(base.type) ? T_UINT : glsl_is_int_family(base.type) ? T_INT : T_FLOAT;
         out->stid = -1; out->ncomp = 1; out->elem_cells = 1; out->array_len = 0; out->valid = 1;
         return;
     }
     if (e->kind == EX_FIELD) {
         lv base;
         if (!resolve_base_lv(E, e->a, &base)) { E->err = 1; return; }
-        if (e->field_is_swizzle) {
+        if (e->field_is_swizzle && base.type != T_STRUCT) {
             *out = base; out->is_swizzle = 1; out->swz_n = e->swz_n;
             memcpy(out->swz, e->swz, 4); out->ncomp = e->swz_n;
-            out->type = glsl_is_int_family(base.type) ? glsl_int_type_of_len(e->swz_n)
+            out->type = glsl_is_uint(base.type) ? glsl_uint_type_of_len(e->swz_n)
+                      : glsl_is_int_family(base.type) ? glsl_int_type_of_len(e->swz_n)
                                                       : glsl_float_type_of_len(e->swz_n);
             out->valid = 1; return;
         }
@@ -314,23 +323,24 @@ static void write_lv(env *E, lv *L, const glsl_val *v)
         int i;
         for (i = 0; i < L->swz_n; ++i) {
             int c = L->swz[i];
-            if (glsl_is_int_family(L->type)) L->mem[c].i = ci(v->data, v->type, i < v->n ? i : 0);
-            else L->mem[c].f = cf(v->data, v->type, i < v->n ? i : 0);
+            L->mem[c] = convert_cell(L->type, v->data, v->type, i < v->n ? i : 0);
         }
         return;
     }
     {
         int i, n = L->ncomp < v->n ? L->ncomp : v->n;
+        if (L->type == T_STRUCT) {
+            memcpy(L->mem, v->data, n * sizeof(glsl_cell));
+            return;
+        }
         /* scalar RHS broadcasts to a vector/matrix LHS */
         if (v->n == 1 && L->ncomp > 1 && v->array_len == 0) {
             for (i = 0; i < L->ncomp; ++i)
-                if (glsl_is_int_family(L->type)) L->mem[i].i = ci(v->data, v->type, 0);
-                else L->mem[i].f = cf(v->data, v->type, 0);
+                L->mem[i] = convert_cell(L->type, v->data, v->type, 0);
             return;
         }
         for (i = 0; i < n; ++i)
-            if (glsl_is_int_family(L->type)) L->mem[i].i = ci(v->data, v->type, i);
-            else L->mem[i].f = cf(v->data, v->type, i);
+            L->mem[i] = convert_cell(L->type, v->data, v->type, i);
     }
 }
 
@@ -356,36 +366,49 @@ static glsl_val arith(env *E, int op, const glsl_val *a, const glsl_val *b)
 {
     int af = !glsl_is_int_family(a->type), bf = !glsl_is_int_family(b->type);
     int isfloat = af || bf;
+    int isuint = (op == EX_SHL || op == EX_SHR) ? glsl_is_uint(a->type)
+                  : glsl_is_uint(a->type) || glsl_is_uint(b->type);
     int al = comp_len(a), bl = comp_len(b);
     int n = al > bl ? al : bl;
     int i, rtype;
     glsl_cell *d;
     glsl_val v;
     if (al != 1 && bl != 1 && al != bl) { E->err = 1; return make_scalar_f(E, 0); }
-    rtype = isfloat ? glsl_float_type_of_len(n) : glsl_int_type_of_len(n);
+    rtype = isfloat ? glsl_float_type_of_len(n)
+                   : isuint ? glsl_uint_type_of_len(n) : glsl_int_type_of_len(n);
     d = sc(E, n);
     for (i = 0; i < n; ++i) {
         float fa = cf(a->data, a->type, al == 1 ? 0 : i);
         float fb = cf(b->data, b->type, bl == 1 ? 0 : i);
-        int ia = ci(a->data, a->type, al == 1 ? 0 : i);
-        int ib = ci(b->data, b->type, bl == 1 ? 0 : i);
+        int ia = isfloat ? 0 : ci(a->data, a->type, al == 1 ? 0 : i);
+        int ib = isfloat ? 0 : ci(b->data, b->type, bl == 1 ? 0 : i);
         switch (op) {
-        case EX_ADD: if (isfloat) d[i].f = fa + fb; else d[i].i = ia + ib; break;
-        case EX_SUB: if (isfloat) d[i].f = fa - fb; else d[i].i = ia - ib; break;
-        case EX_MUL: if (isfloat) d[i].f = fa * fb; else d[i].i = ia * ib; break;
-        case EX_DIV: if (isfloat) d[i].f = fb != 0 ? fa / fb : (fa > 0 ? INFINITY : (fa < 0 ? -INFINITY : 0)); else d[i].i = ib != 0 ? ia / ib : 0; break;
-        case EX_MOD: d[i].i = ib != 0 ? ia % ib : 0; break;
+        case EX_ADD: if (isfloat) d[i].f = fa + fb; else d[i].u = (uint32_t)ia + (uint32_t)ib; break;
+        case EX_SUB: if (isfloat) d[i].f = fa - fb; else d[i].u = (uint32_t)ia - (uint32_t)ib; break;
+        case EX_MUL: if (isfloat) d[i].f = fa * fb; else d[i].u = (uint32_t)ia * (uint32_t)ib; break;
+        case EX_DIV:
+            if (isfloat) d[i].f = fb != 0 ? fa / fb : (fa > 0 ? INFINITY : (fa < 0 ? -INFINITY : 0));
+            else if (isuint) d[i].u = ib ? (uint32_t)ia / (uint32_t)ib : 0;
+            else d[i].i = ib && !(ia == INT32_MIN && ib == -1) ? ia / ib : 0;
+            break;
+        case EX_MOD:
+            if (isuint) d[i].u = ib ? (uint32_t)ia % (uint32_t)ib : 0;
+            else d[i].i = ib && !(ia == INT32_MIN && ib == -1) ? ia % ib : 0;
+            break;
         case EX_BAND: d[i].i = ia & ib; break;
         case EX_BOR:  d[i].i = ia | ib; break;
         case EX_BXOR: d[i].i = ia ^ ib; break;
-        case EX_SHL:  d[i].i = ia << ib; break;
-        case EX_SHR:  d[i].i = ia >> ib; break;
+        case EX_SHL:  d[i].u = (uint32_t)ia << ((uint32_t)ib & 31u); break;
+        case EX_SHR:
+            if (isuint) d[i].u = (uint32_t)ia >> ((uint32_t)ib & 31u);
+            else d[i].i = ia >> ((uint32_t)ib & 31u);
+            break;
         default: E->err = 1; break;
         }
     }
     if (op == EX_MOD || op == EX_BAND || op == EX_BOR || op == EX_BXOR ||
         op == EX_SHL || op == EX_SHR)
-        rtype = glsl_int_type_of_len(n);
+        rtype = isuint ? glsl_uint_type_of_len(n) : glsl_int_type_of_len(n);
     setval(&v, rtype, -1, d, n, 0, 0);
     return v;
 }
@@ -395,19 +418,20 @@ static glsl_val compare(env *E, int op, const glsl_val *a, const glsl_val *b)
     int al = comp_len(a), bl = comp_len(b);
     int n = al > bl ? al : bl, i;
     int isfloat = !glsl_is_int_family(a->type) || !glsl_is_int_family(b->type);
+    int isuint = glsl_is_uint(a->type) || glsl_is_uint(b->type);
     glsl_cell *d = sc(E, n);
     glsl_val v;
     for (i = 0; i < n; ++i) {
         float fa = cf(a->data, a->type, al == 1 ? 0 : i);
         float fb = cf(b->data, b->type, bl == 1 ? 0 : i);
-        int ia = ci(a->data, a->type, al == 1 ? 0 : i);
-        int ib = ci(b->data, b->type, bl == 1 ? 0 : i);
+        int ia = isfloat ? 0 : ci(a->data, a->type, al == 1 ? 0 : i);
+        int ib = isfloat ? 0 : ci(b->data, b->type, bl == 1 ? 0 : i);
         int r = 0;
         switch (op) {
-        case EX_LT: r = isfloat ? fa <  fb : ia <  ib; break;
-        case EX_LE: r = isfloat ? fa <= fb : ia <= ib; break;
-        case EX_GT: r = isfloat ? fa >  fb : ia >  ib; break;
-        case EX_GE: r = isfloat ? fa >= fb : ia >= ib; break;
+        case EX_LT: r = isfloat ? fa <  fb : isuint ? (uint32_t)ia <  (uint32_t)ib : ia <  ib; break;
+        case EX_LE: r = isfloat ? fa <= fb : isuint ? (uint32_t)ia <= (uint32_t)ib : ia <= ib; break;
+        case EX_GT: r = isfloat ? fa >  fb : isuint ? (uint32_t)ia >  (uint32_t)ib : ia >  ib; break;
+        case EX_GE: r = isfloat ? fa >= fb : isuint ? (uint32_t)ia >= (uint32_t)ib : ia >= ib; break;
         case EX_EQ: r = isfloat ? fa == fb : ia == ib; break;
         case EX_NE: r = isfloat ? fa != fb : ia != ib; break;
         }
@@ -488,9 +512,7 @@ static glsl_val construct(env *E, int type, glsl_expr **args, int nargs)
     int total = glsl_base_comps(type);
     glsl_cell *d;
     glsl_val v;
-    float flat[64]; int nf = 0, i;
-    int isint = glsl_is_int_family(type);
-    (void)isint;
+    glsl_cell flat[64]; int nf = 0, i;
     d = sc(E, total > 0 ? total : 1);
 
     if (type == T_SAMPLER2D || type == T_SAMPLERCUBE) {
@@ -531,17 +553,11 @@ static glsl_val construct(env *E, int type, glsl_expr **args, int nargs)
     if (nargs == 1 && total > 1) {
         glsl_val a = eval(E, args[0]);
         if (a.n == 1) {
-            float s = cf(a.data, a.type, 0);
-            int isf = !glsl_is_int_family(a.type);
-            for (i = 0; i < total; ++i) { if (isf && !glsl_is_int_family(type)) d[i].f = s; else pi(d, type, i, (int)(isf? s : ci(a.data,a.type,0))); }
-            /* simpler: replicate respecting target family */
             for (i = 0; i < total; ++i)
-                if (glsl_is_int_family(type)) d[i].i = isf ? (int)s : ci(a.data, a.type, 0);
-                else d[i].f = isf ? s : (float)ci(a.data, a.type, 0);
+                d[i] = convert_cell(type, a.data, a.type, 0);
         } else {
             for (i = 0; i < total && i < a.n; ++i)
-                if (glsl_is_int_family(type)) d[i].i = ci(a.data, a.type, i);
-                else d[i].f = cf(a.data, a.type, i);
+                d[i] = convert_cell(type, a.data, a.type, i);
         }
         setval(&v, type, -1, d, total, 0, 0);
         return v;
@@ -549,11 +565,10 @@ static glsl_val construct(env *E, int type, glsl_expr **args, int nargs)
     for (i = 0; i < nargs && nf < 64; ++i) {
         glsl_val a = eval(E, args[i]);
         int k;
-        for (k = 0; k < a.n && nf < 64; ++k) flat[nf++] = cf(a.data, a.type, k);
+        for (k = 0; k < a.n && nf < 64; ++k) flat[nf++] = convert_cell(type, a.data, a.type, k);
     }
     for (i = 0; i < total; ++i) {
-        float f = i < nf ? flat[i] : 0;
-        if (glsl_is_int_family(type)) d[i].i = (int)f; else d[i].f = f;
+        if (i < nf) d[i] = flat[i]; else d[i].u = 0;
     }
     setval(&v, type, -1, d, total, 0, 0);
     return v;
@@ -570,21 +585,19 @@ static glsl_val construct_array(env *E, int elem_type, int arr_len,
                                 glsl_expr **args, int nargs)
 {
     int elem_cells = glsl_base_comps(elem_type);
-    int total, idx = 0, i, isint;
+    int total, idx = 0, i;
     glsl_cell *d;
     glsl_val v;
     if (elem_cells < 1) elem_cells = 1;
     if (arr_len < 1) arr_len = 1;
     total = elem_cells * arr_len;
-    isint = glsl_is_int_family(elem_type);
     d = sc(E, total);
     memset(d, 0, total * sizeof(glsl_cell));
     for (i = 0; i < nargs && idx < total; ++i) {
         glsl_val a = eval(E, args[i]);
         int k;
         for (k = 0; k < a.n && idx < total; ++k) {
-            if (isint) d[idx].i = ci(a.data, a.type, k);
-            else       d[idx].f = cf(a.data, a.type, k);
+            d[idx] = convert_cell(elem_type, a.data, a.type, k);
             idx++;
         }
     }
@@ -601,6 +614,7 @@ static float bfun1(int id, float x)
     case BF_DEGREES: return x * 57.29577951308232f;
     case BF_SIN: return sinf(x); case BF_COS: return cosf(x); case BF_TAN: return tanf(x);
     case BF_TANH: return tanhf(x);
+    case BF_ROUND: return roundf(x);
     case BF_ASIN: return asinf(x); case BF_ACOS: return acosf(x);
     case BF_EXP: return expf(x); case BF_LOG: return logf(x);
     case BF_EXP2: return exp2f(x); case BF_LOG2: return log2f(x);
@@ -635,7 +649,7 @@ static glsl_val gen_binary(env *E, int id, const glsl_val *a, const glsl_val *b)
         case BF_MOD: r = y != 0 ? x - y * floorf(x / y) : 0; break;
         case BF_MIN: r = x < y ? x : y; break;
         case BF_MAX: r = x > y ? x : y; break;
-        case BF_STEP: r = x < y ? 0 : 1; break;
+        case BF_STEP: r = y < x ? 0 : 1; break;
         default: break;
         }
         d[i].f = r;
@@ -668,8 +682,11 @@ static glsl_val builtin(env *E, int id, glsl_expr **args, int nargs)
     case BF_RADIANS: case BF_DEGREES: case BF_SIN: case BF_COS: case BF_TAN:
     case BF_ASIN: case BF_ACOS: case BF_EXP: case BF_LOG: case BF_EXP2:
     case BF_LOG2: case BF_SQRT: case BF_INVSQRT: case BF_ABS: case BF_SIGN:
-    case BF_FLOOR: case BF_CEIL: case BF_FRACT: case BF_TANH:
+    case BF_FLOOR: case BF_CEIL: case BF_FRACT: case BF_TANH: case BF_ROUND:
         a = eval(E, args[0]); return gen_unary(E, id, &a);
+    case BF_FLOAT_BITS_TO_UINT:
+        a = eval(E, args[0]);
+        return copy_val(E, glsl_uint_type_of_len(a.n), -1, a.data, a.n, 0, 0);
     case BF_ATAN:
         a = eval(E, args[0]);
         if (nargs >= 2) { b = eval(E, args[1]); return gen_binary(E, BF_ATAN2, &a, &b); }
@@ -922,6 +939,7 @@ glsl_val eval(env *E, const glsl_expr *e)
     switch (e->kind) {
     case EX_FLOAT: return make_scalar_f(E, e->lit_f);
     case EX_INT:   return make_scalar_i(E, e->lit_i);
+    case EX_UINT:  v = make_scalar_i(E, e->lit_i); v.type = T_UINT; return v;
     case EX_BOOL:  return make_bool(E, e->lit_i);
     case EX_VAR: { lv L; resolve_lv(E, e, &L); if(!L.valid) return make_scalar_f(E,0); return read_lv(E,&L); }
     case EX_INDEX: case EX_FIELD: { lv L; resolve_lv(E,e,&L); if(!L.valid) return make_scalar_f(E,0); return read_lv(E,&L); }
@@ -934,12 +952,12 @@ glsl_val eval(env *E, const glsl_expr *e)
         return builtin(E, e->op_builtin, e->args, e->nargs);
     case EX_NEG: a=eval(E,e->a);
         { int i; glsl_cell*d=sc(E,a.n);
-          for(i=0;i<a.n;++i) if(glsl_is_int_family(a.type)) d[i].i=-ci(a.data,a.type,i); else d[i].f=-cf(a.data,a.type,i);
+          for(i=0;i<a.n;++i) if(glsl_is_int_family(a.type)) d[i].u=0u-(uint32_t)ci(a.data,a.type,i); else d[i].f=-cf(a.data,a.type,i);
           setval(&v,a.type,-1,d,a.n,0,0); return v; }
     case EX_NOT: a=eval(E,e->a); return make_bool(E, !ci(a.data,a.type,0));
     case EX_BNOT: a=eval(E,e->a);
         { int i; glsl_cell*d=sc(E,a.n); for(i=0;i<a.n;++i)d[i].i=~ci(a.data,a.type,i);
-          setval(&v,glsl_int_type_of_len(a.n),-1,d,a.n,0,0); return v; }
+          setval(&v,glsl_is_uint(a.type)?glsl_uint_type_of_len(a.n):glsl_int_type_of_len(a.n),-1,d,a.n,0,0); return v; }
     case EX_PREINC: case EX_PREDEC: case EX_POSTINC: case EX_POSTDEC: {
         lv L; glsl_val cur, one, res; int delta = (e->kind==EX_PREINC||e->kind==EX_POSTINC)?1:-1;
         resolve_lv(E,e->a,&L); if(!L.valid) return make_scalar_f(E,0);
@@ -973,7 +991,13 @@ glsl_val eval(env *E, const glsl_expr *e)
     case EX_EQ: case EX_NE: {
         a=eval(E,e->a); b=eval(E,e->b);
         { int eq=1,i; int n=a.n>b.n?a.n:b.n;
-          for(i=0;i<n;++i) if(cf(a.data,a.type,i<a.n?i:0)!=cf(b.data,b.type,i<b.n?i:0)){eq=0;break;}
+          for(i=0;i<n;++i) {
+              int ai=i<a.n?i:0, bi=i<b.n?i:0;
+              int same = glsl_is_int_family(a.type) && glsl_is_int_family(b.type)
+                  ? a.data[ai].u == b.data[bi].u
+                  : cf(a.data,a.type,ai) == cf(b.data,b.type,bi);
+              if(!same){eq=0;break;}
+          }
           return make_bool(E, e->kind==EX_EQ? eq : !eq); }
     }
     case EX_LOGAND: a=eval(E,e->a); if(!ci(a.data,a.type,0)) return make_bool(E,0);

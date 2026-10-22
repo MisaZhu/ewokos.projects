@@ -1,0 +1,29 @@
+{
+  "url": "https://www.shadertoy.com/view/cs2GWD",
+  "title": "20221105_inercia intended one",
+  "author": "0b5vr",
+  "description": "OVERSLEPT + BUG PANIC\n\nIntended to be won the Inércia 2022 Shader Royale\nThe estimated time will be 120min\n\nhttps://2022.inercia.pt/",
+  "source_sha256": "7edb89ad32264834fdb6a955942902d71f9b33d08c9b4b908af8edc5fe4725e4",
+  "license": "No explicit license in the retrieved shader or metadata; no additional rights asserted.",
+  "original_inputs": [
+    {
+      "id": "llBXD1",
+      "filepath": "https://soundcloud.com/artbyform/dubstep-2-emotional-clap",
+      "previewfilepath": "https://soundcloud.com/artbyform/dubstep-2-emotional-clap",
+      "type": "musicstream",
+      "channel": 0,
+      "sampler": {
+        "filter": "linear",
+        "wrap": "clamp",
+        "vflip": "true",
+        "srgb": "false",
+        "internal": "byte"
+      },
+      "published": 0
+    }
+  ],
+  "audio_mode": "User-approved match of the current silent webpage: iChannel0 red is zero.",
+  "runtime_sampler": "512x2 zero RGBA8, linear, repeat. Repeat is required by the compiled 2D texture route and is identical to clamp for this constant-zero input.",
+  "visual_assets": "Procedural geometry and materials in the unmodified Image source; no image textures.",
+  "adaptation": "GPU: distance-only marching, per-grid displacement reuse, looped six-sample normals, zero-contribution light rejection, and conservative upward-shadow escape above the animated panel height bound. Native resolution, ray budgets, normal samples, and materials preserved. Original shader retained for A/B validation and CPU rendering. CPU syntax expands macros and disambiguates sdbox overloads. Output alpha forced to one, as in Shadertoy."
+}
