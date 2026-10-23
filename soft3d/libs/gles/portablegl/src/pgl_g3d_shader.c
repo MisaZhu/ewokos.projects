@@ -179,10 +179,13 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 		   programs on the compute wrap ALONE and keep an empty VS/FS pair (the
 		   fullscreen route consumes only stage[COMPUTE]; the CPU-interpreter
 		   fallback is a separate compiler over the GLSL source and is
-		   unaffected).  Non-fullscreen programs keep the strict ES 1.00 gate. */
+		   unaffected).  Non-fullscreen programs keep the ES 1.00 pair compile,
+		   but for the MESH shape it is best-effort (see below). */
 		int fullscreen = strstr(vert_glsl, "uMVP") == NULL &&
 		                 strstr(frag_glsl, "gl_FragCoord") != NULL;
+		int mesh = strstr(vert_glsl, "uMVP") != NULL;
 		int fs_done = 0;
+		int pair_ok = 0;
 		if (fullscreen) {
 			fs_done = pglc_compile_compute(frag_glsl, &res);
 			if (!fs_done) {
@@ -193,13 +196,30 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 				pglc_program_free(&res);
 				return PGL_G3D_PROG_INVALID;   /* per-shader: no GPU latch-off */
 			}
-		} else if (!pglc_compile_glsl(vert_glsl, frag_glsl, &res)) {
-			if (errlog && errsz > 0)
-				snprintf(errlog, (size_t)errsz, "%s",
-				         res.log[0] ? res.log
-				                    : "pglc_compile_glsl failed");
-			pglc_program_free(&res);
-			return PGL_G3D_PROG_INVALID;   /* per-shader: no GPU latch-off */
+		} else {
+			pair_ok = pglc_compile_glsl(vert_glsl, frag_glsl, &res);
+			if (!pair_ok) {
+				if (errlog && errsz > 0)
+					snprintf(errlog, (size_t)errsz, "%s",
+					         res.log[0] ? res.log
+					                    : "pglc_compile_glsl failed");
+				pglc_program_free(&res);
+				/* A MESH program's only GPU route is the fixed two-pass
+				   geometry kernel pair attached below, which never consumes
+				   the app's VS/FS (the binner cannot rasterise real
+				   primitives, and a backend without a graphics-pipeline port
+				   - Adreno - declines EVERY pair up front).  Treating the
+				   pair's decline as fatal here kept every mesh app
+				   (glmatrix/teapot/gears/3ddemo) on the CPU interpreter on
+				   q8b, silently and in 0 ms.  So for the mesh shape carry on
+				   with an empty VS/FS pair and let the kernel compile decide;
+				   errlog already holds the pair's text should that fail too.
+				   Any other non-fullscreen shape has no compute route and
+				   still needs the pair. */
+				if (!mesh)
+					return PGL_G3D_PROG_INVALID;   /* per-shader: no GPU latch-off */
+				memset(&res, 0, sizeof(res));
+			}
 		}
 		_progs[slot].prog = res;   /* take ownership of res.stage[].code */
 
@@ -298,6 +318,14 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			}
 			pglc_program_free(&gres);
 			pglc_program_free(&xres);
+			/* No VS/FS pair AND no kernels: nothing the GPU could run, so
+			   decline instead of caching an empty program (whose draws would
+			   only ever bounce off has_compute == 0 on the CPU path). */
+			if (!pair_ok && !_progs[slot].is_geom) {
+				pglc_program_free(&_progs[slot].prog);
+				memset(&_progs[slot].prog, 0, sizeof(_progs[slot].prog));
+				return PGL_G3D_PROG_INVALID;   /* errlog: the pair's decline text */
+			}
 		} else if (!fs_done) {
 			struct pglc_program cres;
 			memset(&cres, 0, sizeof(cres));

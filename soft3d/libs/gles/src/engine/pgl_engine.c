@@ -2864,11 +2864,21 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
          * merely read "Renderer: CPU" with no clue why.  Log the compiler's
          * error text once so a GPU platform never quietly drops to software. */
         static int fs_decline_logged = 0;
+        static int mesh_decline_logged = 0;
         if (!fs_decline_logged &&
             strstr(vs_src, "uMVP") == NULL &&
             strstr(fs_src, "gl_FragCoord") != NULL) {
             fs_decline_logged = 1;
             slog("PGLG3D: fullscreen FS rejected by GPU compiler -> CPU fallback: %s\n",
+                 err[0] ? err : "(no error text)");
+        }
+        /* Same visibility for the MESH shape (uMVP): its GPU route is the fixed
+         * geometry kernel pair, so a decline here means those kernels did not
+         * compile (or the backend's VS/FS pair gate fired on a backend with no
+         * compute kernels) - not an app-shader problem. */
+        if (!mesh_decline_logged && strstr(vs_src, "uMVP") != NULL) {
+            mesh_decline_logged = 1;
+            slog("PGLG3D: mesh program rejected by GPU compiler -> CPU fallback: %s\n",
                  err[0] ? err : "(no error text)");
         }
         return 0;   /* not GPU-viable: the CPU interpreter keeps this program */
