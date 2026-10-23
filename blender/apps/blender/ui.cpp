@@ -413,16 +413,22 @@ void Ui::draw_viewport_header()
         ImGui::EndPopup();
     }
 
-    // Right-aligned readout.
+    // Right-aligned readout.  On a narrow window the fixed-width buttons can
+    // already run past `avail`; SameLine(avail) would then move the cursor
+    // BACKWARDS and overprint the readout on top of the Snap/View/Shading
+    // buttons (the garbled header seen on small panels), so only place it when
+    // it genuinely fits to the right of everything drawn so far.
     const Object* sel = scene_.selected();
     char label[96];
     snprintf(label, sizeof(label), "%s  |  %s",
              sel ? sel->name : "(none)", Scene::mode_name(scene_.mode()));
     float tw = ImGui::CalcTextSize(label).x;
     float avail = (float)r_vpheader_.w - tw - 12.0f;
-    if (avail < 0) avail = 0;
-    ImGui::SameLine(avail);
-    ImGui::TextUnformatted(label);
+    float after_buttons = ImGui::GetCursorPosX();
+    if (avail >= after_buttons + 4.0f) {
+        ImGui::SameLine(avail);
+        ImGui::TextUnformatted(label);
+    }
 
     end_chrome();
 }

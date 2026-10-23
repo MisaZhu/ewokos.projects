@@ -509,14 +509,26 @@ void pgl_g3d_set_blend(int mode);
 /* Set the fullscreen-compute internal render-scale denominator.  1 (default) =
    native resolution, the historical full-res path.  N > 1 renders a non-geom
    fullscreen compute effect into a reduced (_w/N x _h/N) scratch target and
-   upscales it to the framebuffer with a nearest-neighbour g2d_scale_to, trading
-   image sharpness for throughput.  The shader math is UNCHANGED: the engine
+   upscales it to the framebuffer with a bilinear g2d_scale_to (the shared
+   4-tap scale kernel), trading image sharpness for throughput.  The shader
+   math is UNCHANGED: the engine
    patches the kernel's iResolution and pglc_cs_stride uniforms to the reduced
    geometry, so uv/clip mapping stays correct - this is for spill-bound raymarch
    kernels that cannot reach interactive FPS at native resolution on V3D CSD.
    Mesh/geom and fixed-function draws are never affected.  Call once at startup
    (before the first draw); a scratch allocation failure silently reverts to 1. */
 void pgl_g3d_set_render_scale(int scale);
+/* Fractional render-scale: internal compute target = fb * den / num.  Use when
+   an integer divisor aliases too coarsely but the next integer up costs too much
+   FPS (e.g. 3/2 sits between native and 1/2).  num/den <= 1 disables. */
+void pgl_g3d_set_render_scale_frac(int num, int den);
+
+/* Temporal AA for the render-scale upscale (DEFAULT OFF).  The low-res sampling
+   grid is cycled by +-1 px per frame and the upscaled frames are constant-alpha
+   accumulated into a full-res history.  Kept as an opt-in experiment: on-device
+   A/B showed the small grid nudge adds too little local sub-pixel phase
+   diversity to smooth edges, so it is off by default.  Set 1 to enable. */
+void pgl_g3d_set_render_taa(int on);
 
 /* Draw vertices [first, first+count) of an uploaded mesh with a compiled program
    as one GPU dispatch: the program's compiled VS/coord QPU runs the transform +

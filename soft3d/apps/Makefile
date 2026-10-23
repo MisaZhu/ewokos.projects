@@ -1,5 +1,5 @@
 
-DIRS := 3ddemo Fireworks matrix teapot imgui_demo glmatrix ocean grass rainwin colorglass pixar tuner macgl
+DIRS := 3ddemo Fireworks matrix teapot imgui_demo glmatrix ocean grass rainwin colorglass pixar tuner macgl bricks
 
 all: $(DIRS)
 

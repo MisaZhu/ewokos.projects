@@ -74,12 +74,38 @@ static ewokos_addr_t _fb_phy;
    rw x rh target and upscaled to _fb, trading sharpness for throughput on
    spill-heavy raymarch kernels that cannot reach interactive FPS at native res
    on V3D CSD.  Grow-only like _fb; 1 = off (the historical full-res path). */
-static int      _render_scale = 1;
+static int      _rs_num = 1;   /* render-scale as a rational num/den: the internal
+                                  compute target is fb * den / num, so num/den > 1
+                                  downsamples.  Fractional values (e.g. 3/2) sample
+                                  the source aliasing finer than an integer divisor. */
+static int      _rs_den = 1;
 static int      _rs_shm;
 static uint32_t* _rs;        /* reduced-res scratch target pixels (RGBA8) */
 static ewokos_addr_t _rs_phy;
 static uint32_t _rs_cap;     /* scratch capacity in pixels */
 static int      _rs_w, _rs_h; /* active reduced render dims (0 = full-res) */
+
+/* Temporal AA for the render-scale path (see pgl_g3d_set_render_taa).  The
+   low-res compute grid is cycled by +-1 px per frame so consecutive frames
+   sample the scene at different sub-pixel phases; each upscaled frame is then
+   constant-alpha accumulated into a persistent full-res history (_taa_hist)
+   via _taa_tmp, and the history is composited to the fb.  Averaging genuine
+   multi-phase scene samples is what melts the aliasing a single low-res pass
+   bakes in; a plain blur cannot.  Only meaningful while render-scale is on.
+   DEFAULT OFF: on-device A/B (freeze, scale2) showed the +-1 px grid nudge
+   yields too little LOCAL sub-pixel phase diversity to smooth edges (laplacian
+   unchanged vs TAA off), so it costs two full-res blits for no gain.  Kept as
+   an opt-in experiment via pgl_g3d_set_render_taa(). */
+static int      _taa = 0;
+static int      _taa_shm, _taat_shm;
+static uint32_t* _taa_hist;     /* accumulated full-res history (RGBA8) */
+static uint32_t* _taa_tmp;      /* this frame's upscaled sample (RGBA8) */
+static ewokos_addr_t _taa_hist_phy, _taa_tmp_phy;
+static uint32_t _taa_cap, _taat_cap;
+static int      _taa_valid;     /* history holds a real frame (else copy) */
+static int      _taa_phase;     /* grid-variation phase counter */
+static int      _taa_prog = -1; /* prog the history was built from */
+static uint32_t _taa_alpha = 96;/* new-sample weight (~0.375) */
 
 static int      _pos_shm;
 static float*   _pos;        /* float3 NDC per vertex */
@@ -382,9 +408,68 @@ static g2d_canvas_t rs_canvas(int rw, int rh)
 	return cv;
 }
 
+/* Full-res history / temp canvases for the temporal-AA accumulate.  Both are
+   _w x _h; grow-only like rs_ensure so a resize reuses the run. */
+static int taa_ensure(int w, int h)
+{
+	uint32_t need = (uint32_t)w * (uint32_t)h;
+	uint32_t* px = NULL;
+	ewokos_addr_t phy = 0;
+	int shm = 0;
+
+	if (w <= 0 || h <= 0)
+		return 0;
+	if (_taa_hist && _taa_tmp && need <= _taa_cap && need <= _taat_cap)
+		return 1;
+	if (_taa_hist) { g2d_shm_free(_taa_hist); _taa_hist = NULL; _taa_shm = 0; _taa_hist_phy = 0; _taa_cap = 0; }
+	if (_taa_tmp)  { g2d_shm_free(_taa_tmp);  _taa_tmp  = NULL; _taat_shm = 0; _taa_tmp_phy = 0; _taat_cap = 0; }
+	if (g2d_shm_alloc_phy(need * 4u, &shm, &px, &phy) != 0 || shm <= 0 || px == NULL)
+		return 0;
+	_taa_shm = shm; _taa_hist = px; _taa_hist_phy = phy; _taa_cap = need;
+	if (g2d_shm_alloc_phy(need * 4u, &shm, &px, &phy) != 0 || shm <= 0 || px == NULL) {
+		g2d_shm_free(_taa_hist); _taa_hist = NULL; _taa_shm = 0; _taa_hist_phy = 0; _taa_cap = 0;
+		return 0;
+	}
+	_taat_shm = shm; _taa_tmp = px; _taa_tmp_phy = phy; _taat_cap = need;
+	_taa_valid = 0;
+	return 1;
+}
+
+static g2d_canvas_t taa_hist_canvas(int w, int h)
+{
+	g2d_canvas_t cv = g2d_canvas(_taa_shm, (uint32_t)w * (uint32_t)h * 4u,
+	                             (uint32_t)w, (uint32_t)h, 1);
+	cv.phy = _taa_hist_phy;
+	return cv;
+}
+
+static g2d_canvas_t taa_tmp_canvas(int w, int h)
+{
+	g2d_canvas_t cv = g2d_canvas(_taat_shm, (uint32_t)w * (uint32_t)h * 4u,
+	                             (uint32_t)w, (uint32_t)h, 1);
+	cv.phy = _taa_tmp_phy;
+	return cv;
+}
+
 void pgl_g3d_set_render_scale(int scale)
 {
-	_render_scale = (scale > 1) ? scale : 1;
+	_rs_num = (scale > 1) ? scale : 1;
+	_rs_den = 1;
+}
+
+void pgl_g3d_set_render_scale_frac(int num, int den)
+{
+	if (num < 1) num = 1;
+	if (den < 1) den = 1;
+	if (num > den * 8) num = den * 8;   /* cap downscale at 8x */
+	_rs_num = num;
+	_rs_den = den;
+}
+
+void pgl_g3d_set_render_taa(int on)
+{
+	_taa = on ? 1 : 0;
+	_taa_valid = 0;
 }
 
 void pgl_g3d_flush(void)
@@ -441,7 +526,7 @@ void pgl_g3d_flush(void)
 	   scratch target instead of the fb; the upscale to the real fb runs right
 	   after the draw below.  _rs_w/_rs_h were latched by pgl_g3d_set_uniforms
 	   this frame so the target and the injected pglc_cs_stride/iResolution agree. */
-	rs_active = (compiled && _render_scale > 1 && _rs_w > 0 && _rs != NULL &&
+	rs_active = (compiled && _rs_num > _rs_den && _rs_w > 0 && _rs != NULL &&
 	             pgl_g3d_shader_has_compute(_batch_prog) &&
 	             !pgl_g3d_shader_is_geom(_batch_prog));
 	dstcv = rs_active ? rs_canvas(_rs_w, _rs_h) : fb_canvas();
@@ -521,13 +606,43 @@ void pgl_g3d_flush(void)
 	_nverts = 0;
 	res = g2d_pgl_draw(&req);
 	if (res == G2D_OK && rs_active) {
-		/* Upscale the reduced-res scratch to the real fb (nearest neighbour).
-		   The compute's post-job L2 writeback flushed the scratch to memory;
-		   this blit's src invalidate reads it back coherently.  A scale failure
-		   only leaves the fb stale for one frame - not worth latching off. */
+		/* Upscale the reduced-res scratch.  The scale op runs the shared
+		   single-pass 4-tap bilinear kernel (g2dd gpu_scale_op).  With temporal
+		   AA the upscaled frame lands in _taa_tmp and is accumulated into the
+		   persistent history, which is then composited to the fb; without it the
+		   scratch goes straight to the fb.  The compute's post-job L2 writeback
+		   flushed the scratch to memory; these blits' src invalidate reads it
+		   back coherently.  A failure only leaves the fb stale one frame. */
 		g2d_scale_to_req_t sreq;
-		g2d_scale_to_req_init(&sreq, rs_canvas(_rs_w, _rs_h), fb_canvas());
-		g2d_scale_to(&sreq);
+		g2d_blit_req_t breq;
+		g2d_rect_t fullr;
+		fullr.x = 0; fullr.y = 0; fullr.w = _w; fullr.h = _h;
+		if (_taa && taa_ensure(_w, _h)) {
+			g2d_scale_to_req_init(&sreq, rs_canvas(_rs_w, _rs_h),
+			                    taa_tmp_canvas(_w, _h));
+			g2d_scale_to(&sreq);
+			if (_batch_prog != _taa_prog || _first_frame) {
+				_taa_prog = _batch_prog;
+				_taa_valid = 0;
+			}
+			if (!_taa_valid) {
+				g2d_blit_req_init(&breq, taa_hist_canvas(_w, _h),
+				                taa_tmp_canvas(_w, _h), fullr, fullr, 255);
+				g2d_blit(&breq);
+				_taa_valid = 1;
+			} else {
+				g2d_blit_req_init(&breq, taa_hist_canvas(_w, _h),
+				                taa_tmp_canvas(_w, _h), fullr, fullr,
+				                (uint8_t)_taa_alpha);
+				g2d_blit_alpha(&breq);
+			}
+			g2d_blit_req_init(&breq, fb_canvas(), taa_hist_canvas(_w, _h),
+			                fullr, fullr, 255);
+			g2d_blit(&breq);
+		} else {
+			g2d_scale_to_req_init(&sreq, rs_canvas(_rs_w, _rs_h), fb_canvas());
+			g2d_scale_to(&sreq);
+		}
 	}
 	if (res != G2D_OK) {
 		/* NOT_SUPPORTED on a compiled batch is a PRE-submission decline by
@@ -808,15 +923,26 @@ void pgl_g3d_set_uniforms(const uint32_t* data, uint32_t count)
 		   the kernel derives uv/clip from iResolution and its fb row pitch from
 		   pglc_cs_stride, so both must move to the reduced geometry together or
 		   not at all.  Any miss falls back to the exact full-res path. */
-		if (_render_scale > 1 && !pgl_g3d_shader_is_geom(_active_prog)) {
-			rw = _w / _render_scale; if (rw < 1) rw = 1;
-			rh = _h / _render_scale; if (rh < 1) rh = 1;
+		if (_rs_num > _rs_den && !pgl_g3d_shader_is_geom(_active_prog)) {
+			rw = (int)((int64_t)_w * _rs_den / _rs_num); if (rw < 1) rw = 1;
+			rh = (int)((int64_t)_h * _rs_den / _rs_num); if (rh < 1) rh = 1;
+			/* Temporal AA: nudge the sampling grid by a pixel on a 3-phase
+			   cycle so each frame's scene samples fall on a different
+			   sub-pixel phase; flush() accumulates them.  uv still spans
+			   [0,1) so this changes sample spacing, not framing. */
+			if (_taa) {
+				switch (_taa_phase++ % 3) {
+				case 1:  rw += 1; break;
+				case 2:  rh += 1; break;
+				default: break;
+				}
+			}
 			ri = pgl_g3d_shader_uniform_dword(_active_prog, "iResolution", &rc);
 			if (rs_ensure(rw, rh) && ri >= 0 && rc >= 2u &&
 			    (uint32_t)ri + 1u < PGL_G3D_MAX_UNIF)
 				scaled = 1;
 			else {
-				_render_scale = 1;   /* disable for good: never leave partial state */
+				_rs_num = 1; _rs_den = 1;   /* disable for good: never leave partial state */
 				rw = _w; rh = _h;
 			}
 		}

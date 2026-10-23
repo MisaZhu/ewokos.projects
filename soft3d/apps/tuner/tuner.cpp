@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <string>
 #include <unistd.h>
 #include <ewoksys/kernel_tic.h>
 #include <x/x.h>
@@ -18,6 +19,24 @@
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_gles2.h"
 #include "gen/tuner_glsl.h"
+
+#ifdef PGL_G3D
+/* Engine knob: render the fullscreen faithful compute at 1/N resolution and
+ * upscale to the window (the lever grass/wave/ocean ship).  The raymarch is
+ * ALU-bound on V3D CSD and its cost scales with the shaded pixel count, so
+ * N=2 cuts that ~4x.  The shader needs no change to stay correct: every size
+ * it uses is iResolution-relative and the engine patches iResolution and
+ * pglc_cs_stride to the reduced geometry together.  Inert on CPU builds. */
+extern "C" void pgl_g3d_set_render_scale(int scale);
+extern "C" void pgl_g3d_set_render_scale_frac(int num, int den);
+extern "C" void pgl_g3d_set_render_taa(int on);
+static bool g_taa = false;     /* argv "taa": opt-in temporal-AA accumulate */
+/* pglcompiler knob: compute workgroup shape for the GPU path (A/B tuning).
+ * Must be set before the first glLinkProgram, which triggers the on-device
+ * compile.  Output is bit-identical across shapes; only occupancy/scheduling
+ * changes, so this is a quality-neutral throughput lever. */
+extern "C" void pglc_compile_set_cs_local_size(unsigned x, unsigned y);
+#endif
 
 static EGLDisplay display = EGL_NO_DISPLAY;
 static EGLSurface surface = EGL_NO_SURFACE;
@@ -27,7 +46,7 @@ static xwin_t *window;
 static GLuint program, quad, audio;
 static GLint time_loc, resolution_loc;
 static int width = 800, height = 450;
-static bool windowed, fpslog;
+static bool windowed, fpslog, cpu_raster;
 #ifdef TUNER_VALIDATE
 static bool reference_shader;
 static int bench_frames, bench_count;
@@ -42,6 +61,19 @@ static uint32_t usec_now()
 #endif
 static int dump_at, frames, result;
 static float freeze_time = -1.0f;
+/* Raymarch step budgets (see apply_march_budget).  argv "stepsN"/"shstepsN"
+ * override the primary/shadow march fidelity for throughput on the V3D compute
+ * path at native resolution; the default primary budget trades some fidelity
+ * for speed while shsteps keeps the reference shadow budget. */
+static int g_steps = 32;     /* primary march iterations (domarch(ro,rd,N)) */
+static int g_shsteps = 30;   /* per-light shadow march iterations           */
+#ifdef PGL_G3D
+static int g_scale = 1;      /* faithful-compute render-scale denominator; bare
+                             * launch stays native full-res; argv "scaleN"
+                             * (N=1..9) overrides, e.g. scale2 = 1/2 res */
+static int g_fsnum = 0, g_fsden = 1; /* fractional render-scale num/den via argv
+                             * "fscaleNxM" (e.g. fscale3x2 = 2/3 res); 0 = use g_scale */
+#endif
 static uint32_t start_time, fps_time;
 static int fps_frames;
 static float fps;
@@ -86,6 +118,10 @@ static void draw_stats(int gpu)
     ImGui::TextColored(gpu ? ImVec4(0.40f, 1.00f, 0.55f, 1.0f)
                            : ImVec4(1.00f, 0.70f, 0.30f, 1.0f),
                        "Renderer: %s", gpu ? "GPU" : "CPU");
+#ifdef PGL_G3D
+    if (gpu && g_fsnum > g_fsden) ImGui::Text("Scale: %d/%d res", g_fsden, g_fsnum);
+    else if (gpu && g_scale > 1) ImGui::Text("Scale: 1/%d res", g_scale);
+#endif
     ImGui::End();
     ImGui::Render();
     ImGui_ImplGLES2_RenderDrawData(ImGui::GetDrawData());
@@ -109,10 +145,46 @@ static GLuint compile_shader(GLenum type, const char *source)
     return shader;
 }
 
+/* Rewrite the raymarch loop-bound literals in a generated shader source.
+ * GLES ES 1.00 requires literal loop bounds and the V3D compute path gains
+ * nothing from uniform bounds, so the argv "stepsN"/"shstepsN" knobs patch the
+ * literal into the source before it is compiled (the grass/pixar idiom).  The
+ * prefixes match every generated variant -- optimized (",true"/",false") and
+ * the plain reference form -- because the budget number precedes any extra
+ * argument, and the trailing ')' or ',' is left untouched. */
+static std::string apply_march_budget(const char *src, int steps, int shsteps)
+{
+    std::string s(src);
+    const char *from[2] = { "domarch(ro,rd,100", "domarch(march.rp,l,30" };
+    const char *to[2]   = { "domarch(ro,rd,",    "domarch(march.rp,l,"   };
+    int val[2]          = { steps, shsteps };
+    for (int k = 0; k < 2; ++k) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s%d", to[k], val[k]);
+        std::string rep(buf);
+        size_t pos = 0;
+        while ((pos = s.find(from[k], pos)) != std::string::npos) {
+            s.replace(pos, strlen(from[k]), rep);
+            pos += rep.size();
+        }
+    }
+    return s;
+}
+
 static bool init_scene()
 {
+    /* Keep the full original interpreter path; the equivalent GPU variant uses
+     * the same uniforms and opaque Shadertoy output wrapper.  Both are run
+     * through apply_march_budget so the argv step knobs reach the CPU and GPU
+     * routes identically. */
+    const char *gpu_src = tuner_gpu_fs_glsl;
+#ifdef TUNER_VALIDATE
+    if (reference_shader) gpu_src = tuner_reference_gpu_fs_glsl;
+#endif
+    std::string cpu_fs = apply_march_budget(tuner_reference_fs_glsl, g_steps, g_shsteps);
+    std::string gpu_fs = apply_march_budget(gpu_src, g_steps, g_shsteps);
     GLuint vs = compile_shader(GL_VERTEX_SHADER, tuner_vs_glsl);
-    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, tuner_reference_fs_glsl);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, cpu_fs.c_str());
     if (!vs || !fs) {
         if (vs) glDeleteShader(vs);
         if (fs) glDeleteShader(fs);
@@ -123,13 +195,7 @@ static bool init_scene()
         glAttachShader(program, vs);
         glAttachShader(program, fs);
         glBindAttribLocation(program, 0, "aPosition");
-        /* Keep the full original interpreter path; the equivalent GPU variant
-         * uses the same uniforms and opaque Shadertoy output wrapper. */
-        const char *gpu_source = tuner_gpu_fs_glsl;
-#ifdef TUNER_VALIDATE
-        if (reference_shader) gpu_source = tuner_reference_gpu_fs_glsl;
-#endif
-        glSetGpuShaderSourceEWOK(tuner_vs_glsl, gpu_source);
+        glSetGpuShaderSourceEWOK(tuner_vs_glsl, gpu_fs.c_str());
         glLinkProgram(program);
         glSetGpuShaderSourceEWOK(NULL, NULL);
     }
@@ -377,11 +443,29 @@ static bool positive_option(const char *arg, const char *prefix, int *value)
 
 int main(int argc, char **argv)
 {
+    unsigned lx = 0, ly = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "fpslog")) fpslog = true;
 #ifdef TUNER_VALIDATE
         else if (!strcmp(argv[i], "reference")) reference_shader = true;
         else if (positive_option(argv[i], "bench", &bench_frames)) {}
+#endif
+        else if (positive_option(argv[i], "shsteps", &g_shsteps)) {}
+        else if (positive_option(argv[i], "steps", &g_steps)) {}
+        else if (!strcmp(argv[i], "cpuraster")) cpu_raster = true;
+#ifdef PGL_G3D
+        else if (!strncmp(argv[i], "fscale", 6)) {
+            int n = 0, d = 0;
+            if (sscanf(argv[i] + 6, "%dx%d", &n, &d) == 2 && n > 0 && d > 0) {
+                g_fsnum = n; g_fsden = d;
+            } else return 1;
+        }
+        else if (!strncmp(argv[i], "scale", 5) && argv[i][5] >= '1' &&
+                 argv[i][5] <= '9' && argv[i][6] == '\0')
+            g_scale = argv[i][5] - '0';
+        else if (!strcmp(argv[i], "taa")) g_taa = true;
+        else if (sscanf(argv[i], "%ux%u", &lx, &ly) == 2 && lx > 0 && ly > 0)
+            pglc_compile_set_cs_local_size(lx, ly);
 #endif
         else if (positive_option(argv[i], "dump", &dump_at)) {}
         else if (!strncmp(argv[i], "window", 6)) {
@@ -397,7 +481,7 @@ int main(int argc, char **argv)
             if (end == argv[i] + 6 || *end || !isfinite(time) || time < 0 || time > 1e9) return 1;
             freeze_time = (float)time;
         } else {
-            fprintf(stderr, "Usage: tuner [window320x180] [freeze0] [dump1] [fpslog]"
+            fprintf(stderr, "Usage: tuner [window320x180] [freeze0] [dump1] [fpslog] [steps32] [shsteps30] [cpuraster] [scale1] [WxH]"
 #ifdef TUNER_VALIDATE
                     " [reference] [bench30]"
 #endif
@@ -405,6 +489,22 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    if (g_steps < 8) g_steps = 8; else if (g_steps > 256) g_steps = 256;
+    if (g_shsteps < 1) g_shsteps = 1; else if (g_shsteps > 64) g_shsteps = 64;
+    /* Optional quality-neutral HUD routing (argv "cpuraster"): decline ONLY the
+     * ImGui mesh/texcol raster dispatches to the CPU interpreter so they
+     * composite into the same fb the GPU fullscreen scene wrote (the grass
+     * idiom), while gpu_try_fullscreen keeps the raymarch on the V3D GPU.  The
+     * scene pixels are untouched, so this is a pure overhead lever.  Must be
+     * set before the render loop. */
+    if (cpu_raster) glForceCpuRasterEWOK();
+#ifdef PGL_G3D
+    /* Apply the (possibly argv-overridden) scale unconditionally so the default
+     * takes effect on a bare launch.  Inert on the CPU interpreter. */
+    if (g_fsnum > 0) pgl_g3d_set_render_scale_frac(g_fsnum, g_fsden);
+    else pgl_g3d_set_render_scale(g_scale);
+    pgl_g3d_set_render_taa(g_taa ? 1 : 0);
+#endif
     x_t x;
     x_init(&x, NULL);
     x.on_loop = render;

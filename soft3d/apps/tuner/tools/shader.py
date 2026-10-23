@@ -102,6 +102,8 @@ def optimize(source):
                             '    if(abs(isect.x)<1E-4)')
     source = source.replace('domarch(ro,rd,100)', 'domarch(ro,rd,100,true)')
     source = source.replace('domarch(march.rp,l,30)', 'domarch(march.rp,l,30,false)')
+    # The adaptive-SSAA boundary probe marches without material channels.
+    source = source.replace('return domarch(ro,rd,40);', 'return domarch(ro,rd,40,false);')
     # A back-facing light contributes exactly zero; its shadow cannot affect RGB.
     source = source.replace('      float shadow=step(', '      if(dotnl>0.){\n      float shadow=step(')
     source = source.replace('*(diff+spec);', '*(diff+spec);\n      }')

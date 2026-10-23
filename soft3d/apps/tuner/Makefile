@@ -13,6 +13,19 @@ TASK_OBJS = $(ARCH)/tuner.$(HW).validate.o
 TASK_OUT = .build/$(ARCH)/$(HW)/tuner-validate
 CXXFLAGS += -DTUNER_VALIDATE
 endif
+# The app Makefile does NOT define -DPGL_G3D for the app translation unit even
+# when PGL_G3D=yes is passed on the make line; tuner has an #ifdef PGL_G3D block
+# (the pgl_g3d_set_render_scale resolution argv), so add it explicitly here or
+# the GPU branch is silently compiled out.  Guard on BOTH PGL_G3D=yes AND a
+# GPU-capable HW: virt is CPU-only and its merged libGLESv2.a omits the GPU
+# engine, so activating the knob there would leave pgl_g3d_set_render_scale
+# unresolved at link time.
+GPU_HWS := raspi5 raspix
+ifeq ($(PGL_G3D),yes)
+ifneq ($(filter $(HW),$(GPU_HWS)),)
+CXXFLAGS += -DPGL_G3D
+endif
+endif
 CXXFLAGS += -I$(SDK_DIR)/include -I$(SDK_DIR)/include/imgui -D__ewokos__ -fno-threadsafe-statics
 GLES_LIBS = $(SDK_DIR)/lib/libimgui.a $(SDK_DIR)/lib/libEGL.a $(SDK_DIR)/lib/libGLESv2.a
 SYSTEM_LIBS = $(foreach lib,ewoksys ewokstl x++ x font graph widget++ cxx,$(SDK_DIR)/lib/lib$(lib).a)

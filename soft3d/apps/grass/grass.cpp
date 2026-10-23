@@ -81,10 +81,10 @@ static int win_height = 600;
 
 /* Raymarch step budget.  The reference uses 450; with the hit polish
  * (bisect back onto the surface, near-surface exhaustion/cutoff shaded as
- * hits) 128 steps is pixel-similar to 256/450 on the host probe and halves
+ * hits) 96 steps is pixel-similar to 256/450 on the host probe and halves
  * the march cost toward the 20+ fps envelope at scale2.  argv "stepsN"
  * overrides up to the faithful 450. */
-static int g_steps = 128;
+static int g_steps = 96;
 
 #ifdef PGL_G3D
 static int g_scale = 2;   /* faithful-compute render-scale denominator; argv "scaleN"
