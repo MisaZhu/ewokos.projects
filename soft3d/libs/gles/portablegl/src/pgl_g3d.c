@@ -482,20 +482,23 @@ void pgl_g3d_flush(void)
 		                            _unif_shm, _unif_count, 1);
 		/* WS4 sampler bindings: stage each bound unit's texture image as a
 		   ctex canvas (contig-shm, phy pre-filled) so the daemon resolves its
-		   physical base and the back end builds a V3D71 texture-state record
-		   for the TMU_CONFIG slot the compiled FS references.  Unbound units
-		   keep size 0 (the daemon skips them).  Only tiled slots are bound: the
-		   TMU cannot sample a raster image, so a raster slot leaves the unit
-		   unbound and the back end declines the draw instead of sampling a
-		   scrambled picture.  ctex_stride is the padded pitch and the canvas
-		   size covers the whole padded (ub_pad included) tiled image. */
+		   physical base and the back end builds its texture-state record for
+		   the slot the compiled FS references.  Unbound units keep size 0 (the
+		   daemon skips them).  Whether a raster (untiled) slot may be bound is
+		   backend-defined: pglc_tex_sampler_reads_raster() is false on V3D (its
+		   TMU needs a tiled level 0, so a raster slot is left unbound and the
+		   back end declines the draw instead of sampling a scrambled picture)
+		   and true on Adreno (its a6xx CS sampler reads linear raster directly).
+		   ctex_stride is the padded pitch and the canvas size covers the whole
+		   padded (ub_pad included) image. */
 		for (u = 0; u < PGL_G3D_MAX_TEX_UNITS; u++) {
 			const pgl_g3d_tex_slot_t* t;
 			int s = _ctex_bind[u];
 			if (s < 0 || s >= PGL_G3D_MAX_TEX || _tex[s].pixels == NULL)
 				continue;
 			t = &_tex[s];
-			if (t->tiling == PGLC_TEX_TILING_RASTER)
+			if (t->tiling == PGLC_TEX_TILING_RASTER &&
+			    !pglc_tex_sampler_reads_raster())
 				continue;
 			req.ctex[u] = g2d_canvas(t->shm, t->size,
 			                         (uint32_t)t->w, (uint32_t)t->h, 1);
@@ -1454,7 +1457,8 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 			if (s < 0 || s >= PGL_G3D_MAX_TEX || _tex[s].pixels == NULL)
 				continue;
 			t = &_tex[s];
-			if (t->tiling == PGLC_TEX_TILING_RASTER)
+			if (t->tiling == PGLC_TEX_TILING_RASTER &&
+			    !pglc_tex_sampler_reads_raster())
 				continue;
 			req.ctex[u] = g2d_canvas(t->shm, t->size,
 			                         (uint32_t)t->w, (uint32_t)t->h, 1);

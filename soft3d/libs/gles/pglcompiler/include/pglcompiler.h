@@ -165,6 +165,15 @@ void pglc_tex_store_2d(void *dst, const void *src, uint32_t src_stride,
                        uint32_t w, uint32_t h, uint32_t cpp,
                        const struct pglc_tex_layout *l);
 
+/* Whether this backend's GPU texture sampler can read a PGLC_TEX_TILING_RASTER
+ * (plain linear row-major) image directly.  V3D's TMU requires a tiled level 0
+ * (LT / UBLINEAR / UIF), so it returns false and the client leaves a raster
+ * slot unbound (the draw then declines rather than samples a scrambled image);
+ * Adreno's a6xx compute sampler builds TILE6_LINEAR texture descriptors, so it
+ * returns true and the client binds raster slots for the daemon to sample.
+ * Implemented by every backend selected through PGL_G3D_COMPILER_DIR. */
+bool pglc_tex_sampler_reads_raster(void);
+
 #ifdef __cplusplus
 }
 #endif
