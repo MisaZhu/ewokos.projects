@@ -1,0 +1,34 @@
+{
+  "inspired_by": "https://www.shadertoy.com/view/Nfy3DW",
+  "original_title": "Handwritten Letter Recognizer",
+  "original_author": "rickyyy",
+  "implementation": "Original GLSL code inspired by CNN visualization architecture",
+  "note": "This is NOT a verbatim port. All shader code is original. Uses procedural weights instead of trained CNN weights, so letter recognition is not accurate but the architecture and visualization are functional.",
+  "architecture": {
+    "passes": 6,
+    "render_targets": 4,
+    "feedback_loops": [
+      "Buffer_A (self)",
+      "Buffer_D (self)"
+    ],
+    "cnn_layers": [
+      "conv1 (1->12)",
+      "conv2 (12->24)",
+      "fc (26 classes)"
+    ]
+  },
+  "license": "Shadertoy default license (CC BY-NC-SA 3.0 unless specified otherwise)",
+  "url": "https://www.shadertoy.com/view/Nfy3DW",
+  "title": "Handwritten Letter Recognizer",
+  "author": "rickyyy",
+  "description": "Draw an A-Z letter and watch a CNN recognize it in real time. Displays convolution, pooling, flattening and the final prediction entirely in GLSL.",
+  "attribution": "Ported to EwokOS opengl with attribution to original author",
+  "pass_hashes": {
+    "Common": "e9569b8c665de9e6f5d49bfb121afbd51360b8820e738d60aec64e0d19c721f8",
+    "Buffer_A": "deb2443ca00586bf1d79c073f3ddd48f201b4c2e4e9fff41a7bb783d7ab6b358",
+    "Buffer_B": "fcb40d75ebfb511596667a41eff0f3d6308bb1bcb9b6e47cbbea1bf50736494d",
+    "Buffer_C": "66ed9ff8fa55787c1a72ccdc305883a1d06672ca6c805c7157b456ec6b8e1026",
+    "Buffer_D": "aa74b3f6502894b99df5f84325e692941100cfffdad0f86543883a8ebd37307e",
+    "Image": "537e4dbc6f4cb87684232a9d031c87a8a8170299fb1a2a1311d3a29b66cc9cc5"
+  }
+}

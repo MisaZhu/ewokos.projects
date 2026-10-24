@@ -1,10 +1,10 @@
 PROJS_ROOT_DIR=../../..
 include $(PROJS_ROOT_DIR)/make.inc
 
-# soft3d supplies libGLESv2 / libEGL / libimgui under the shared build include
+# opengl supplies libGLESv2 / libEGL / libimgui under the shared build include
 # + lib dir for the current ARCH/HW.  Reuse it rather than duplicating the GL
 # front end.
-SOFT3D_DIR = $(PROJS_ROOT_DIR)/soft3d
+SOFT3D_DIR = $(PROJS_ROOT_DIR)/opengl
 
 TASK_SRCS = main.cpp theme.cpp scene.cpp viewport.cpp ui.cpp
 TASK_OBJS = $(patsubst %.cpp,$(ARCH)/%.o,$(TASK_SRCS))

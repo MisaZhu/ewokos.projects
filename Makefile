@@ -1,7 +1,8 @@
 
 DIRS = macemu \
 	nesemu \
-	soft3d \
+	opengl \
+	opencl \
 	blender \
 	doom \
 	cards \
@@ -15,13 +16,19 @@ DIRS = macemu \
 all: $(DIRS)
 
 # blender consumes the GLES/EGL/imgui headers and libEGL/libGLESv2/libimgui that
-# soft3d stages into the shared build_$(ARCH)/$(HW) include+lib dirs.  The DIRS
+# opengl stages into the shared build_$(ARCH)/$(HW) include+lib dirs.  The DIRS
 # below are independent .PHONY targets, so under the machine build's default
 # parallel make (-jN, jobserver shared with sub-makes) blender would otherwise
-# start compiling before soft3d finishes staging and die with
+# start compiling before opengl finishes staging and die with
 # "EGL/egl.h: No such file" / "imgui/imgui.h: No such file".  Order it after
-# soft3d (same idiom as soft3d/Makefile's "apps: libs").
-blender: soft3d
+# opengl (same idiom as opengl/Makefile's "apps: libs").
+blender: opengl
+
+# opencl's Phase-2 GPU front-end compiles kernels through the pglcompiler that
+# opengl stages into build_$(ARCH)/$(HW); the CPU-only Phase-1 build does not
+# need it, but order opencl after opengl anyway so the parallel machine build
+# always finds pglcompiler staged before opencl links (same idiom as blender).
+opencl: opengl
 
 $(DIRS):
 	@$(MAKE) -C $@
