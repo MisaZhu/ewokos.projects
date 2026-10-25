@@ -69,6 +69,78 @@ typedef struct spirv_glsl_info {
 char *spirv_to_glsl(spirv_module *m, const spirv_entry *e,
                     spirv_glsl_info *info, char *err, size_t errsz);
 
+/* ---- geometry-kernel generation mode (raspi5 V3D two-pass rasterizer) -----
+ * spirv_to_geom_kernels() turns a Vulkan vertex entry (and an optional
+ * fragment entry, possibly from a DIFFERENT spirv_module) into the two GLSL ES
+ * 3.10 compute kernels the raspi5 V3D geometry rasterizer dispatches through
+ * draw_compute_geom() (the same shape as the hand-written kernels in
+ * pglcompiler's geom_raster_cs.h, geom_kind 5):
+ *
+ *   pass 1 "xform"  - local_size 8x8x1, one invocation per vertex, grid =
+ *       ceil(nverts/64).  Reads the per-vertex attribute float stream from the
+ *       vattr SSBO (binding 1), runs the user VS body, applies the viewport
+ *       transform (uniform uVpOffsetScale/uVpDepth) and writes a packed record
+ *       into the vout SSBO (binding 0): [0]=screen_x [1]=screen_y [2]=z(0..1)
+ *       [3]=iw(1/w, 0 as the near-plane clip sentinel) [4..7]=reserved, then
+ *       every VS output location flattened in the order recorded in
+ *       spirv_geom_layout.varyings (offset >= 8).  Record stride (floats) is
+ *       vout_stride = 8 + 4*ceil(nvarfloats/4); the per-vertex attribute stride
+ *       (floats) is attr_stride.
+ *
+ *   pass 2 "raster" - local_size 8x8x1, one workgroup per triangle
+ *       (cs_geom_tpw = 0), sweeping the triangle's screen bbox as an 8x8 lane
+ *       tile.  Bindings: 0 fb(uint[]) 1 vout(float[]) 2 depth(uint[]); fragment
+ *       textures stay TMU sampler2D uniforms (they do NOT take an SSBO slot).
+ *       The harness reproduces cpu_raster.c pixel-exactly (same edge/barycentric
+ *       sign convention, front = area < 0, Vulkan viewport y-down, perspective-
+ *       correct interpolation on vout.iw, 24-bit unorm atomicMin depth), injects
+ *       the interpolated varyings + gl_FragCoord/gl_FrontFacing into the user FS
+ *       body, and packs the FS colour into the fb word.  discard lowers to a
+ *       per-pixel skip.
+ *
+ * ALL render state is uniform-driven (viewport, depth func/write, cull mode +
+ * winding, scissor, blend mode, fb component swizzle), so one compiled kernel
+ * pair serves any pipeline state inside the supported subset; the GPU backend
+ * patches the uniforms per draw.  Everything outside the subset (non-float
+ * interface, gl_InstanceID, multiple colour targets, UBO/push-constant, storage
+ * buffers in a graphics stage, >4 samplers, a vec3 colour output) DECLINES, so
+ * the draw safely stays on the software rasterizer.
+ *
+ * Returns 0 on success (out->xform and out->raster are malloc()ed source the
+ * caller frees, out->layout describes the wire/stream layout); -1 on decline
+ * with a short reason in err and out->xform/out->raster left NULL. */
+#define SPIRV_GEOM_MAX_SAMPLERS 4
+
+typedef struct spirv_geom_slot {
+    uint32_t location;   /* SPIR-V location                                   */
+    uint32_t offset;     /* float offset within the per-vertex record         */
+    uint32_t comps;      /* component count (1..4)                            */
+} spirv_geom_slot;
+
+typedef struct spirv_geom_layout {
+    uint32_t attr_stride;        /* floats per vertex in the vattr stream     */
+    uint32_t vout_stride;        /* floats per vertex in the vout record      */
+    int      num_attrs;          /* VS inputs, in stream order                */
+    spirv_geom_slot attrs[SPIRV_MAX_LOCATIONS];
+    int      num_varyings;       /* VS outputs (excl. Position), record order  */
+    spirv_geom_slot varyings[SPIRV_MAX_LOCATIONS];
+    int      num_samplers;       /* FS combined-image samplers (TMU)          */
+    uint32_t sampler_set[SPIRV_GEOM_MAX_SAMPLERS];
+    uint32_t sampler_binding[SPIRV_GEOM_MAX_SAMPLERS];
+    int      uses_vertex_id;     /* VS reads gl_VertexID (gate indexed draws) */
+    int      fs_present;         /* 0 => colour = interpolated varying loc 0   */
+} spirv_geom_layout;
+
+typedef struct spirv_geom_kernels {
+    char             *xform;     /* pass 1 GLSL source (malloc'd) or NULL      */
+    char             *raster;    /* pass 2 GLSL source (malloc'd) or NULL      */
+    spirv_geom_layout layout;
+} spirv_geom_kernels;
+
+int spirv_to_geom_kernels(spirv_module *vmod, const spirv_entry *vs,
+                          spirv_module *fmod, const spirv_entry *fs,
+                          spirv_geom_kernels *out, char *err, size_t errsz);
+
 #ifdef __cplusplus
 }
 #endif

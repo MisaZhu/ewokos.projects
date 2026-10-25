@@ -39,18 +39,6 @@
 #include <string.h>
 #include <stdio.h>
 
-/* --- temporary diagnostics -------------------------------------------------
- * The GPU device registers from a transport probe alone, so a 1.0x benchmark
- * means every kernel quietly took the CPU fallback somewhere in
- * prepare/upload/dispatch.  These prints name the exact stage and reason; they
- * are debug scaffolding to remove once the fallback cause is fixed. */
-static int g_gpu_diag_dispatched;
-static void gpu_diag_decline(const char *kname, const char *why)
-{
-    fprintf(stderr, "opencl-gpu: kernel '%s' -> CPU fallback (%s)\n",
-            kname ? kname : "?", why ? why : "?");
-}
-
 /* Per-kernel GPU state, hung off kernel->exec_kernel.  `fn` is the parsed
  * kernel so a declined launch can hand the very same AST to the CPU backend. */
 typedef struct gpu_kernel {
@@ -61,7 +49,6 @@ typedef struct gpu_kernel {
     uint32_t      unif_dwords;    /* span of the per-dispatch uniform blob    */
     struct pglc_uniform_binding *bindings;  /* copied uniform reflection      */
     uint32_t      nbindings;
-    int           diag_done;      /* one-shot SEND dump emitted for this kernel */
 } gpu_kernel;
 
 /* ---- device probe + descriptor ------------------------------------------- */
@@ -284,7 +271,6 @@ static int gpu_prepare_kernel(struct _cl_kernel *kernel)
     /* 1. transpile to GLSL ES 3.10 compute (NULL => outside the GPU subset). */
     glsl = clc_to_glsl(cp, fn, &gk->info, err, sizeof(err));
     if (!glsl) {
-        gpu_diag_decline(kernel->name, err[0] ? err : "clc_to_glsl declined");
         gk->cpu_fallback = 1;
         return CL_SUCCESS;
     }
@@ -311,9 +297,6 @@ static int gpu_prepare_kernel(struct _cl_kernel *kernel)
         gk->cpu_fallback = 1;
         return CL_SUCCESS;
     }
-    /* --- temporary diagnostics: the exact GLSL fed to the compiler --- */
-    fprintf(stderr, "---- GLSL '%s' ----\n%s---- end GLSL '%s' ----\n",
-            kernel->name, glsl, kernel->name);
     free(glsl);
 
     /* copy the uniform reflection (name -> blob dword offset) for dispatch. */
@@ -325,28 +308,12 @@ static int gpu_prepare_kernel(struct _cl_kernel *kernel)
             size_t nb = (size_t)gk->nbindings * sizeof(struct pglc_uniform_binding);
             gk->bindings = (struct pglc_uniform_binding *)malloc(nb);
             if (!gk->bindings) {
-                gpu_diag_decline(kernel->name, "oom copying uniform bindings");
                 pglc_program_free(&res);
                 gk->nbindings = 0;
                 gk->cpu_fallback = 1;
                 return CL_SUCCESS;
             }
             memcpy(gk->bindings, cs->uniform_bindings, nb);
-        }
-        /* --- temporary diagnostics: reflected uniform layout + arg map --- */
-        {
-            uint32_t bi;
-            fprintf(stderr, "opencl-gpu: '%s' blob=%u dwords nbind=%u lsx=%d nargs=%d\n",
-                    kernel->name, gk->unif_dwords, gk->nbindings,
-                    gk->info.local_size_x, (int)gk->info.nargs);
-            for (bi = 0; bi < gk->nbindings; bi++)
-                fprintf(stderr, "  bind[%u] '%s' off=%u ncomp=%u\n", bi,
-                        gk->bindings[bi].name, gk->bindings[bi].dword_offset,
-                        gk->bindings[bi].num_components);
-            for (bi = 0; bi < (uint32_t)gk->info.nargs && bi < CL_MAX_KERNEL_ARGS; bi++)
-                fprintf(stderr, "  arg[%u] kind=%d binding=%d base=%d vec=%d\n", bi,
-                        (int)gk->info.args[bi].kind, (int)gk->info.args[bi].binding,
-                        (int)gk->info.args[bi].type.base, (int)gk->info.args[bi].type.vec);
         }
     }
 
@@ -357,20 +324,23 @@ static int gpu_prepare_kernel(struct _cl_kernel *kernel)
     opts.geom_tpw  = 0;
     blobsz = pglc_program_serialize(&res, NULL, &opts, NULL, 0);
     if (blobsz == 0) {
-        gpu_diag_decline(kernel->name, "pglc_program_serialize size query returned 0");
+        fprintf(stderr, "opencl-gpu: kernel '%s' serialize size query returned 0\n",
+                kernel->name);
         pglc_program_free(&res);
         gk->cpu_fallback = 1;
         return CL_SUCCESS;
     }
     blob = malloc(blobsz);
     if (!blob) {
-        gpu_diag_decline(kernel->name, "oom allocating program blob");
+        fprintf(stderr, "opencl-gpu: kernel '%s' oom allocating %u byte blob\n",
+                kernel->name, blobsz);
         pglc_program_free(&res);
         gk->cpu_fallback = 1;
         return CL_SUCCESS;
     }
     if (pglc_program_serialize(&res, NULL, &opts, blob, blobsz) == 0) {
-        gpu_diag_decline(kernel->name, "pglc_program_serialize fill failed");
+        fprintf(stderr, "opencl-gpu: kernel '%s' serialize fill failed\n",
+                kernel->name);
         free(blob);
         pglc_program_free(&res);
         gk->cpu_fallback = 1;
@@ -388,8 +358,6 @@ static int gpu_prepare_kernel(struct _cl_kernel *kernel)
         return CL_SUCCESS;
     }
 
-    fprintf(stderr, "opencl-gpu: kernel '%s' uploaded handle=%d (blob %u bytes, %u unif dwords)\n",
-            kernel->name, (int)handle, blobsz, gk->unif_dwords);
     gk->handle = handle;
     return CL_SUCCESS;
 }
@@ -515,33 +483,9 @@ static int gpu_ndrange(struct _cl_command_queue *queue, struct _cl_kernel *kerne
             nargs = (uint32_t)binding + 1u;
     }
 
-    /* --- temporary diagnostics: what the client actually sends to the CSD --- */
-    if (!gk->diag_done) {
-        uint32_t ui;
-        gk->diag_done = 1;
-        fprintf(stderr, "opencl-gpu: '%s' SEND wg=(%u,%u,%u)x%u num_unif=%u nargs=%u\n",
-                kernel->name, wg[0], wg[1], wg[2], wg_size, num_unif, nargs);
-        for (ui = 0; ui < num_unif && unif; ui++) {
-            float fv = 0.0f; int32_t iv = 0;
-            memcpy(&fv, &unif[ui], sizeof(fv));
-            memcpy(&iv, &unif[ui], sizeof(iv));
-            fprintf(stderr, "  unif[%u]=0x%08x f=%g i=%d\n", ui, unif[ui], fv, iv);
-        }
-        for (ui = 0; ui < nargs; ui++)
-            fprintf(stderr, "  ssbo[%u] host=%p size=%u\n", ui,
-                    arg_host[ui], arg_size[ui]);
-    }
-
     rc = cl_kernel_dispatch(gk->handle, wg, wg_size,
                             arg_host, arg_size, nargs, unif, num_unif);
     free(unif);
-
-    if (!g_gpu_diag_dispatched) {
-        g_gpu_diag_dispatched = 1;
-        fprintf(stderr, "opencl-gpu: first dispatch rc=%d wg=(%u,%u,%u)x%u nargs=%u num_unif=%u -> %s\n",
-                (int)rc, wg[0], wg[1], wg[2], wg_size, nargs, num_unif,
-                rc == CLCLIENT_OK ? "GPU" : "CPU fallback");
-    }
 
     if (rc == CLCLIENT_OK)
         return CL_SUCCESS;

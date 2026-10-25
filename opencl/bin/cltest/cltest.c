@@ -681,7 +681,6 @@ static void cov_kernel_program(struct cov *c, cl_context ctx, cl_device_id dev,
             COV_OK(clEnqueueTask(q, k, 0, NULL, NULL));
             COV_OK(clFinish(q));
             COV_OK(clEnqueueReadBuffer(q, b, CL_TRUE, 0, sizeof(float), &got, 0, NULL, NULL));
-            printf("  task readback got=%g expected=7.0\n", got);
             COV_TRUE(fabsf(got - 7.0f) < 1e-6f);
             /* single-item NDRange through the same kernel */
             got = 0.0f;
@@ -690,7 +689,6 @@ static void cov_kernel_program(struct cov *c, cl_context ctx, cl_device_id dev,
             COV_OK(clEnqueueNDRangeKernel(q, k, 1, NULL, &one, &one, 0, NULL, NULL));
             COV_OK(clFinish(q));
             COV_OK(clEnqueueReadBuffer(q, b, CL_TRUE, 0, sizeof(float), &got, 0, NULL, NULL));
-            printf("  task readback got=%g expected=3.0\n", got);
             COV_TRUE(fabsf(got - 3.0f) < 1e-6f);
             clReleaseMemObject(b);
         }

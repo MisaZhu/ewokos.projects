@@ -27,6 +27,20 @@
 #define MAX_BARRIERS 32
 #define MAX_REGION_DEPTH 64
 
+/* Kernel-generation modes (see spirv_to_geom_kernels).  GM_NONE is the plain
+ * single-entry spirv_to_glsl() path; GM_XFORM/GM_RASTER redirect the interface
+ * variables onto generated harness parameters instead of GLSL in/out. */
+enum { GM_NONE = 0, GM_XFORM = 1, GM_RASTER = 2 };
+
+/* One recorded graphics-stage interface variable (location in/out). */
+typedef struct {
+    uint32_t id;
+    int      loc;
+    uint32_t comps;
+    char     tn[12];     /* GLSL value type ("float"/"vec2"/..)              */
+    char     pname[24];  /* generated harness parameter / local name          */
+} kern_iface;
+
 typedef struct {
     char     *buf;
     size_t    len, cap;
@@ -45,6 +59,19 @@ typedef struct {
     int       nbar;
     int       depth;
     int       nssbo;
+
+    /* ---- kernel-generation state (GM_XFORM / GM_RASTER only) ---- */
+    int        mode;
+    kern_iface kin[SPIRV_MAX_LOCATIONS];  int nkin;   /* inputs / varyings    */
+    kern_iface kout[SPIRV_MAX_LOCATIONS]; int nkout;  /* VS outputs (varyings)*/
+    int        has_position;               /* VS wrote gl_Position            */
+    int        has_vertexid;               /* VS reads gl_VertexID            */
+    int        has_fragcoord;              /* FS reads gl_FragCoord           */
+    int        has_frontfacing;            /* FS reads gl_FrontFacing         */
+    int        has_color;                  /* FS wrote a vec4 colour output   */
+    int        nsampler;
+    uint32_t   sampler_set[SPIRV_GEOM_MAX_SAMPLERS];
+    uint32_t   sampler_binding[SPIRV_GEOM_MAX_SAMPLERS];
 } gctx;
 
 static int decl(gctx *c, const char *why)
@@ -1048,6 +1075,12 @@ static void emit_region(gctx *c, uint32_t label, uint32_t follow, int ind)
     case OpUnreachable:
         break;
     case OpKill: case OpTerminateInvocation:
+        if (c->mode == GM_RASTER) {
+            /* the FS body runs inside vk_fs(); discard becomes "flag + return"
+             * so the harness skips this pixel but keeps sweeping the tile. */
+            indent(c, ind); gf(c, "vkKilled = true; return;\n");
+            break;
+        }
         if (c->ep->exec_model != SPIRV_EXEC_FRAGMENT) { decl(c, "discard outside a fragment shader"); break; }
         indent(c, ind); gf(c, "discard;\n");
         break;
@@ -1188,4 +1221,607 @@ done:
     }
     free(c.is_ptr);
     return out;
+}
+
+/* ==========================================================================
+ * Geometry-kernel generation mode (see spirv_to_glsl.h / spirv_to_geom_kernels)
+ * ========================================================================== */
+
+/* Verify an interface variable is a 32-bit float scalar or 2/3/4-vector and
+ * report its component count; anything else declines (the attribute/varying
+ * streams are plain float[]). */
+static int iface_float_comps(gctx *c, uint32_t tid, uint32_t *comps)
+{
+    spirv_type *t = spirv_type_find(c->m, tid);
+    if (!t) return decl(c, "bad interface type");
+    if (t->op == OpTypeFloat && t->width == 32) { *comps = 1; return 0; }
+    if (t->op == OpTypeVector) {
+        spirv_type *e = spirv_type_find(c->m, t->elem);
+        if (e && e->op == OpTypeFloat && e->width == 32 &&
+            t->comps >= 1 && t->comps <= 4) { *comps = t->comps; return 0; }
+    }
+    return decl(c, "kernel interface must be a float scalar/vector");
+}
+
+/* The ".xyzw" selector for component k, or "" for a scalar. */
+static const char *comp_sel(uint32_t comps, uint32_t k, char *buf, size_t n)
+{
+    if (comps == 1) { buf[0] = '\0'; return buf; }
+    snprintf(buf, n, ".%c", "xyzw"[k]);
+    return buf;
+}
+
+/* Declare one module-scope OpVariable for a generated kernel.  Interface
+ * variables are RECORDED (not emitted as GLSL in/out) and bound to harness
+ * parameter names; samplers are emitted as TMU uniforms (raster pass only);
+ * everything else on the graphics path declines. */
+static int declare_global_var_kernel(gctx *c, const spirv_insn *in)
+{
+    uint32_t ptrtype = in->w[1], id = in->w[2];
+    uint32_t storage = (in->wc >= 4) ? in->w[3] : 0;
+    spirv_type *pt = spirv_type_find(c->m, ptrtype);
+    uint32_t pointee = pt ? pt->elem : 0;
+    spirv_type *bt = spirv_type_find(c->m, pointee);
+    int set     = spirv_deco_int(c->m, id, 0xffffffffu, DecoDescriptorSet, 0);
+    int binding = spirv_deco_int(c->m, id, 0xffffffffu, DecoBinding, -1);
+    int loc     = spirv_deco_int(c->m, id, 0xffffffffu, DecoLocation, -1);
+    int builtin = spirv_deco_int(c->m, id, 0xffffffffu, DecoBuiltIn, -1);
+    char nm[32], tn[12];
+    uint32_t comps;
+    int j;
+
+    if (!pt) return decl(c, "bad variable pointer type");
+
+    switch (storage) {
+    case SC_Input:
+    case SC_Output: {
+        int is_out = (storage == SC_Output);
+        if (builtin >= 0) {
+            if (c->mode == GM_XFORM) {
+                if (!is_out && builtin == BiVertexIndex) {
+                    c->has_vertexid = 1; set_name(c, id, "vkVertexIndex");
+                    c->is_ptr[id] = 1; return 0;
+                }
+                if (is_out && builtin == BiPosition) {
+                    c->has_position = 1; set_name(c, id, "vkPosition");
+                    c->is_ptr[id] = 1; return 0;
+                }
+                return decl(c, "unsupported vertex built-in");
+            } else { /* GM_RASTER */
+                if (!is_out && builtin == BiFragCoord) {
+                    c->has_fragcoord = 1; set_name(c, id, "vkFragCoord");
+                    c->is_ptr[id] = 1; return 0;
+                }
+                if (!is_out && builtin == BiFrontFacing) {
+                    c->has_frontfacing = 1; set_name(c, id, "vkFrontFacing");
+                    c->is_ptr[id] = 1; return 0;
+                }
+                return decl(c, "unsupported fragment built-in");
+            }
+        }
+        if (loc < 0) return decl(c, "interface variable without a location");
+        if (iface_float_comps(c, pointee, &comps) != 0) return -1;
+        if (type_name(c, pointee, tn, sizeof tn) != 0) return -1;
+        if (is_out && c->mode == GM_RASTER) {
+            /* the single fragment colour attachment */
+            if (c->has_color) return decl(c, "multiple fragment outputs unsupported");
+            if (comps != 4) return decl(c, "fragment output must be a vec4");
+            c->has_color = 1; set_name(c, id, "vkColor"); c->is_ptr[id] = 1;
+            return 0;
+        }
+        snprintf(nm, sizeof nm, is_out ? "ko%d" : "ki%d", loc);
+        set_name(c, id, nm);
+        c->is_ptr[id] = 1;
+        if (is_out) {
+            if (c->nkout >= SPIRV_MAX_LOCATIONS) return decl(c, "too many vertex outputs");
+            j = c->nkout++;
+            c->kout[j].id = id; c->kout[j].loc = loc; c->kout[j].comps = comps;
+            snprintf(c->kout[j].tn, sizeof c->kout[j].tn, "%s", tn);
+            snprintf(c->kout[j].pname, sizeof c->kout[j].pname, "%s", nm);
+        } else {
+            if (c->nkin >= SPIRV_MAX_LOCATIONS) return decl(c, "too many inputs");
+            j = c->nkin++;
+            c->kin[j].id = id; c->kin[j].loc = loc; c->kin[j].comps = comps;
+            snprintf(c->kin[j].tn, sizeof c->kin[j].tn, "%s", tn);
+            snprintf(c->kin[j].pname, sizeof c->kin[j].pname, "%s", nm);
+        }
+        return 0;
+    }
+    case SC_UniformConstant: {
+        if (c->mode != GM_RASTER)
+            return decl(c, "sampler/image in a vertex kernel unsupported");
+        if (set != 0) return decl(c, "descriptor set != 0 unsupported on GPU path");
+        if (binding < 0) return decl(c, "sampler without a binding");
+        if (!bt || (bt->op != OpTypeSampledImage && bt->op != OpTypeImage))
+            return decl(c, "unsupported uniform-constant on GPU geom path");
+        if (c->nsampler >= SPIRV_GEOM_MAX_SAMPLERS)
+            return decl(c, "more than 4 fragment samplers");
+        snprintf(nm, sizeof nm, "v%u", id);
+        gf(c, "layout(binding = %d) uniform sampler2D %s;\n", binding, nm);
+        set_name(c, id, nm);
+        c->is_ptr[id] = 1;
+        c->sampler_set[c->nsampler] = (uint32_t)set;
+        c->sampler_binding[c->nsampler] = (uint32_t)binding;
+        c->nsampler++;
+        return 0;
+    }
+    case SC_Uniform:
+    case SC_PushConstant:
+        return decl(c, "uniform buffer / push constants unsupported on GPU geom path");
+    case SC_StorageBuffer:
+        return decl(c, "storage buffer unsupported on GPU geom path");
+    default:
+        return decl(c, "unsupported storage class on GPU geom path");
+    }
+}
+
+/* Set up a kernel-mode gctx for one module + entry.  Returns 0 on success. */
+static int kern_init(gctx *c, spirv_module *m, const spirv_entry *e, int mode,
+                     spirv_glsl_info *scratch)
+{
+    spirv_func *f;
+    memset(c, 0, sizeof(*c));
+    c->m = m; c->ep = (const spirv_ep *)e; c->mode = mode; c->info = scratch;
+    f = spirv_func_find(m, c->ep->id);
+    if (!f || f->first_block == 0xffffffffu) return -1;
+    c->f = f;
+    c->name = (char **)calloc(m->bound ? m->bound : 1, sizeof(char *));
+    c->is_ptr = (uint8_t *)calloc(m->bound ? m->bound : 1, 1);
+    if (!c->name || !c->is_ptr) { decl(c, "out of memory"); return -1; }
+    return 0;
+}
+
+static void kern_free(gctx *c)
+{
+    if (c->name) {
+        uint32_t k;
+        for (k = 0; k < c->m->bound; k++) free(c->name[k]);
+        free(c->name);
+    }
+    free(c->is_ptr);
+}
+
+/* Scan the module-scope OpVariables before the first function body. */
+static int kern_scan_globals(gctx *c)
+{
+    spirv_module *m = c->m;
+    uint32_t i, first_func = m->nfuncs ? m->funcs[0].start : m->ninsns;
+    for (i = 0; i < m->ninsns && i < first_func && !c->declined; i++)
+        if (m->insns[i].op == OpVariable)
+            if (declare_global_var_kernel(c, &m->insns[i]) != 0) return -1;
+    return c->declined ? -1 : 0;
+}
+
+/* ---- pass 1: per-vertex transform kernel -------------------------------- */
+static char *gen_xform_kernel(spirv_module *m, const spirv_entry *e,
+                              spirv_geom_layout *L, char *err, size_t errsz)
+{
+    gctx c;
+    spirv_glsl_info scratch;
+    uint32_t first_label, aoff = 0, voff = 8, nvar = 0;
+    char *out = NULL, sel[8];
+    int j, k;
+    const char *sep;
+
+    if (err && errsz) err[0] = '\0';
+    memset(&scratch, 0, sizeof(scratch));
+    if (kern_init(&c, m, e, GM_XFORM, &scratch) != 0) {
+        if (err && errsz) snprintf(err, errsz, "vertex entry not found");
+        return NULL;
+    }
+
+    gf(&c, "#version 310 es\n");
+    gf(&c, "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\n\n");
+    gf(&c, "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n\n");
+
+    if (kern_scan_globals(&c) != 0) goto done;
+    if (!c.has_position) { decl(&c, "vertex shader does not write gl_Position"); goto done; }
+
+    /* attribute / vout layout */
+    L->num_attrs = c.nkin;
+    for (j = 0; j < c.nkin; j++) {
+        L->attrs[j].location = (uint32_t)c.kin[j].loc;
+        L->attrs[j].offset = aoff;
+        L->attrs[j].comps = c.kin[j].comps;
+        aoff += c.kin[j].comps;
+    }
+    L->attr_stride = aoff;
+    L->num_varyings = c.nkout;
+    for (j = 0; j < c.nkout; j++) {
+        L->varyings[j].location = (uint32_t)c.kout[j].loc;
+        L->varyings[j].offset = voff;
+        L->varyings[j].comps = c.kout[j].comps;
+        voff += c.kout[j].comps;
+        nvar += c.kout[j].comps;
+    }
+    L->vout_stride = 8 + 4 * ((nvar + 3) / 4);
+    L->uses_vertex_id = c.has_vertexid;
+
+    gf(&c, "layout(std430, binding = 0) buffer PglCsVout { float vout[]; };\n");
+    gf(&c, "layout(std430, binding = 1) buffer PglCsAttr { float vattr[]; };\n\n");
+    gf(&c, "uniform vec4 uVpOffsetScale;\n");   /* (vp.x, vp.y, vp.w*0.5, vp.h*0.5) */
+    gf(&c, "uniform vec2 uVpDepth;\n");         /* (minDepth, maxDepth-minDepth)    */
+    gf(&c, "uniform int  uVertCount;\n");
+    gf(&c, "uniform int  uVertexBase;\n\n");
+
+    /* the user VS body, interface redirected onto parameters */
+    sep = "";
+    gf(&c, "void vk_vs(");
+    for (j = 0; j < c.nkin; j++) { gf(&c, "%sin %s %s", sep, c.kin[j].tn, c.kin[j].pname); sep = ", "; }
+    if (c.has_vertexid) { gf(&c, "%sin int vkVertexIndex", sep); sep = ", "; }
+    gf(&c, "%sinout vec4 vkPosition", sep); sep = ", ";
+    for (j = 0; j < c.nkout; j++) { gf(&c, "%sinout %s %s", sep, c.kout[j].tn, c.kout[j].pname); sep = ", "; }
+    gf(&c, ") {\n");
+    declare_phis(&c, 1);
+    first_label = m->insns[c.f->first_block].w[1];
+    emit_region(&c, first_label, 0, 1);
+    if (c.declined) goto done;
+    gf(&c, "}\n\n");
+
+    /* main(): one invocation per vertex */
+    gf(&c, "void main() {\n");
+    gf(&c, "    int vkVid = int(gl_WorkGroupID.x) * 64 + int(gl_LocalInvocationID.y) * 8 + int(gl_LocalInvocationID.x);\n");
+    gf(&c, "    if (vkVid >= uVertCount) return;\n");
+    if (L->attr_stride) gf(&c, "    int abase = vkVid * %u;\n", L->attr_stride);
+    for (j = 0; j < c.nkin; j++) {
+        uint32_t off = L->attrs[j].offset, comps = c.kin[j].comps;
+        if (comps == 1) {
+            gf(&c, "    %s %s = vattr[abase + %u];\n", c.kin[j].tn, c.kin[j].pname, off);
+        } else {
+            gf(&c, "    %s %s = %s(", c.kin[j].tn, c.kin[j].pname, c.kin[j].tn);
+            for (k = 0; k < (int)comps; k++)
+                gf(&c, "%svattr[abase + %u]", k ? ", " : "", off + (uint32_t)k);
+            gf(&c, ");\n");
+        }
+    }
+    gf(&c, "    vec4 vkPosition = vec4(0.0);\n");
+    for (j = 0; j < c.nkout; j++)
+        gf(&c, "    %s %s = %s(0.0);\n", c.kout[j].tn, c.kout[j].pname, c.kout[j].tn);
+    sep = "";
+    gf(&c, "    vk_vs(");
+    for (j = 0; j < c.nkin; j++) { gf(&c, "%s%s", sep, c.kin[j].pname); sep = ", "; }
+    if (c.has_vertexid) { gf(&c, "%svkVid + uVertexBase", sep); sep = ", "; }
+    gf(&c, "%svkPosition", sep); sep = ", ";
+    for (j = 0; j < c.nkout; j++) { gf(&c, "%s%s", sep, c.kout[j].pname); sep = ", "; }
+    gf(&c, ");\n");
+    /* viewport transform + pack (Vulkan conventions, matching transform_vertex) */
+    gf(&c, "    float w = vkPosition.w;\n");
+    gf(&c, "    float iw = (w > 0.0) ? (1.0 / w) : 0.0;\n");
+    gf(&c, "    float ndcx = vkPosition.x * iw;\n");
+    gf(&c, "    float ndcy = vkPosition.y * iw;\n");
+    gf(&c, "    float ndcz = vkPosition.z * iw;\n");
+    gf(&c, "    float sx = uVpOffsetScale.x + uVpOffsetScale.z * (ndcx + 1.0);\n");
+    gf(&c, "    float sy = uVpOffsetScale.y + uVpOffsetScale.w * (ndcy + 1.0);\n");
+    gf(&c, "    float sz = uVpDepth.x + ndcz * uVpDepth.y;\n");
+    gf(&c, "    int vbase = vkVid * %u;\n", L->vout_stride);
+    gf(&c, "    vout[vbase + 0] = sx;\n");
+    gf(&c, "    vout[vbase + 1] = sy;\n");
+    gf(&c, "    vout[vbase + 2] = sz;\n");
+    gf(&c, "    vout[vbase + 3] = iw;\n");
+    gf(&c, "    vout[vbase + 4] = 0.0;\n");
+    gf(&c, "    vout[vbase + 5] = 0.0;\n");
+    gf(&c, "    vout[vbase + 6] = 0.0;\n");
+    gf(&c, "    vout[vbase + 7] = 0.0;\n");
+    for (j = 0; j < c.nkout; j++) {
+        uint32_t off = L->varyings[j].offset, comps = c.kout[j].comps;
+        for (k = 0; k < (int)comps; k++) {
+            comp_sel(comps, (uint32_t)k, sel, sizeof sel);
+            gf(&c, "    vout[vbase + %u] = %s%s;\n", off + (uint32_t)k, c.kout[j].pname, sel);
+        }
+    }
+    gf(&c, "}\n");
+
+done:
+    if (c.declined) {
+        if (err && errsz) snprintf(err, errsz, "%s", c.err[0] ? c.err : "declined");
+        free(c.buf);
+        out = NULL;
+    } else {
+        out = c.buf;
+    }
+    kern_free(&c);
+    return out;
+}
+
+/* Find the vout float offset of the VS varying at `loc`, or -1. */
+static int find_varying_off(const spirv_geom_layout *L, int loc, uint32_t *comps)
+{
+    int j;
+    for (j = 0; j < L->num_varyings; j++)
+        if ((int)L->varyings[j].location == loc) {
+            *comps = L->varyings[j].comps;
+            return (int)L->varyings[j].offset;
+        }
+    return -1;
+}
+
+/* Emit the per-vertex hoisted vout loads for one interpolated varying.  off is
+ * the vout float offset, comps the component count, tag a unique local suffix. */
+static void emit_vary_loads(gctx *c, uint32_t vstride, int off, uint32_t comps,
+                            const char *tag)
+{
+    uint32_t k;
+    for (k = 0; k < comps; k++) {
+        gf(c, "    float h%s%u_0 = vout[i0 * %u + %d];\n", tag, k, vstride, off + (int)k);
+        gf(c, "    float h%s%u_1 = vout[i1 * %u + %d];\n", tag, k, vstride, off + (int)k);
+        gf(c, "    float h%s%u_2 = vout[i2 * %u + %d];\n", tag, k, vstride, off + (int)k);
+    }
+}
+
+/* Emit the perspective-correct interpolation of one hoisted varying into the
+ * local `dst` (type tn, comps components), inside the pixel loop. */
+static void emit_vary_interp(gctx *c, const char *tn, uint32_t comps,
+                             const char *tag, const char *dst, int ind)
+{
+    uint32_t k;
+    char sel[8];
+    indent(c, ind);
+    if (comps == 1) {
+        gf(c, "%s %s = (b0 * h%s0_0 * iw0 + b1 * h%s0_1 * iw1 + b2 * h%s0_2 * iw2) * rw;\n",
+           tn, dst, tag, tag, tag);
+        return;
+    }
+    gf(c, "%s %s = %s(", tn, dst, tn);
+    for (k = 0; k < comps; k++) {
+        gf(c, "%s(b0 * h%s%u_0 * iw0 + b1 * h%s%u_1 * iw1 + b2 * h%s%u_2 * iw2) * rw",
+           k ? ", " : "", tag, k, tag, k, tag, k);
+    }
+    gf(c, ");\n");
+    (void)sel;
+}
+
+/* ---- pass 2: per-triangle raster kernel --------------------------------- */
+static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
+                               const spirv_geom_layout *L, spirv_geom_layout *Lout,
+                               char *err, size_t errsz)
+{
+    gctx c;
+    spirv_glsl_info scratch;
+    uint32_t first_label, vstride = L->vout_stride;
+    char *out = NULL, tag[16];
+    int j, fs = (e != NULL), off;
+    int *voff = NULL;      /* per-FS-input vout offset (-1 = zero-fill) */
+    const char *sep;
+
+    if (err && errsz) err[0] = '\0';
+    memset(&scratch, 0, sizeof(scratch));
+
+    if (fs) {
+        if (kern_init(&c, m, e, GM_RASTER, &scratch) != 0) {
+            if (err && errsz) snprintf(err, errsz, "fragment entry not found");
+            return NULL;
+        }
+    } else {
+        /* no fragment shader: colour = interpolated varying at location 0.  Use
+         * a throwaway gctx with no module walk (nothing to emit for a body). */
+        memset(&c, 0, sizeof(c));
+        c.mode = GM_RASTER; c.info = &scratch;
+        c.m = NULL;   /* nothing dereferences it: no body is emitted */
+    }
+
+    gf(&c, "#version 310 es\n");
+    gf(&c, "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\n\n");
+    gf(&c, "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n\n");
+
+    if (fs) {
+        if (kern_scan_globals(&c) != 0) goto done;
+        if (!c.has_color) { decl(&c, "fragment shader writes no vec4 colour output"); goto done; }
+        /* resolve each FS input varying against the VS vout layout */
+        voff = (int *)malloc((size_t)(c.nkin ? c.nkin : 1) * sizeof(int));
+        if (!voff) { decl(&c, "out of memory"); goto done; }
+        for (j = 0; j < c.nkin; j++) {
+            uint32_t vc = 0;
+            off = find_varying_off(L, c.kin[j].loc, &vc);
+            if (off >= 0 && c.kin[j].comps > vc) {
+                decl(&c, "fragment input wider than the vertex output");
+                goto done;
+            }
+            voff[j] = off;
+        }
+        Lout->num_samplers = c.nsampler;
+        for (j = 0; j < c.nsampler; j++) {
+            Lout->sampler_set[j] = c.sampler_set[j];
+            Lout->sampler_binding[j] = c.sampler_binding[j];
+        }
+        Lout->fs_present = 1;
+    } else {
+        /* the location-0 varying must exist as a vec4 to serve as the colour */
+        uint32_t vc = 0;
+        off = find_varying_off(L, 0, &vc);
+        if (off < 0 || vc != 4) {
+            decl(&c, "no fragment shader and location 0 is not a vec4 varying");
+            goto done;
+        }
+        voff = (int *)malloc(sizeof(int));
+        if (!voff) { decl(&c, "out of memory"); goto done; }
+        voff[0] = off;
+        Lout->fs_present = 0;
+    }
+
+    gf(&c, "layout(std430, binding = 0) buffer PglCsFb    { uint  fb[];    };\n");
+    gf(&c, "layout(std430, binding = 1) buffer PglCsVout  { float vout[];  };\n");
+    gf(&c, "layout(std430, binding = 2) buffer PglCsDepth { uint  depth[]; };\n\n");
+    gf(&c, "uniform vec2  uViewportWH;\n");
+    gf(&c, "uniform int   uFbStride;\n");
+    gf(&c, "uniform int   uTriFirst;\n");
+    gf(&c, "uniform int   uTriCount;\n");
+    gf(&c, "uniform ivec4 uScissor;\n");
+    gf(&c, "uniform int   uDepthFunc;\n");
+    gf(&c, "uniform int   uDepthWrite;\n");
+    gf(&c, "uniform int   uCullMode;\n");
+    gf(&c, "uniform int   uFrontCW;\n");
+    gf(&c, "uniform int   uBlendMode;\n");
+    gf(&c, "uniform int   uFbSwizzle;\n\n");
+    /* edge() in the cpu_raster.c convention: edge(a,b,p) = (b-a)x(p-a). */
+    gf(&c, "float edgef(vec2 a, vec2 b, vec2 p)\n{\n");
+    gf(&c, "    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);\n}\n\n");
+
+    /* the user FS body as a function (colour + killed via out params) */
+    if (fs) {
+        sep = "";
+        gf(&c, "void vk_fs(");
+        for (j = 0; j < c.nkin; j++) { gf(&c, "%sin %s %s", sep, c.kin[j].tn, c.kin[j].pname); sep = ", "; }
+        gf(&c, "%sin vec4 vkFragCoord", sep); sep = ", ";
+        gf(&c, "%sin bool vkFrontFacing", sep); sep = ", ";
+        gf(&c, "%sout vec4 vkColor", sep); sep = ", ";
+        gf(&c, "%sout bool vkKilled", sep);
+        gf(&c, ") {\n");
+        gf(&c, "    vkColor = vec4(0.0);\n");
+        gf(&c, "    vkKilled = false;\n");
+        declare_phis(&c, 1);
+        first_label = m->insns[c.f->first_block].w[1];
+        emit_region(&c, first_label, 0, 1);
+        if (c.declined) goto done;
+        gf(&c, "}\n\n");
+    }
+
+    /* main(): one 8x8 workgroup per triangle, sweeping its bbox as a lane tile */
+    gf(&c, "void main() {\n");
+    gf(&c, "    int tri = int(gl_WorkGroupID.x) + uTriFirst;\n");
+    gf(&c, "    if (tri >= uTriFirst + uTriCount) return;\n");
+    gf(&c, "    int i0 = tri * 3;\n");
+    gf(&c, "    int i1 = i0 + 1;\n");
+    gf(&c, "    int i2 = i0 + 2;\n");
+    gf(&c, "    float iw0 = vout[i0 * %u + 3], iw1 = vout[i1 * %u + 3], iw2 = vout[i2 * %u + 3];\n",
+       vstride, vstride, vstride);
+    gf(&c, "    if (iw0 <= 0.0 || iw1 <= 0.0 || iw2 <= 0.0) return;\n");
+    gf(&c, "    vec2 s0 = vec2(vout[i0 * %u + 0], vout[i0 * %u + 1]);\n", vstride, vstride);
+    gf(&c, "    vec2 s1 = vec2(vout[i1 * %u + 0], vout[i1 * %u + 1]);\n", vstride, vstride);
+    gf(&c, "    vec2 s2 = vec2(vout[i2 * %u + 0], vout[i2 * %u + 1]);\n", vstride, vstride);
+    gf(&c, "    float z0 = vout[i0 * %u + 2], z1 = vout[i1 * %u + 2], z2 = vout[i2 * %u + 2];\n",
+       vstride, vstride, vstride);
+    /* hoist every interpolated varying's three per-vertex component loads */
+    if (fs) {
+        for (j = 0; j < c.nkin; j++) {
+            if (voff[j] < 0) continue;
+            snprintf(tag, sizeof tag, "%d_", j);
+            emit_vary_loads(&c, vstride, voff[j], c.kin[j].comps, tag);
+        }
+    } else {
+        emit_vary_loads(&c, vstride, voff[0], 4, "0_");
+    }
+    gf(&c, "    float area = edgef(s0, s1, s2);\n");
+    gf(&c, "    if (area == 0.0) return;\n");
+    gf(&c, "    int front = (area < 0.0) ? 1 : 0;\n");
+    gf(&c, "    if (uCullMode == 3) return;\n");
+    gf(&c, "    if (uCullMode == 2) { if ((uFrontCW == 1) ? (front == 1) : (front == 0)) return; }\n");
+    gf(&c, "    else if (uCullMode == 1) { if ((uFrontCW == 1) ? (front == 0) : (front == 1)) return; }\n");
+    gf(&c, "    float inv_area = 1.0 / area;\n");
+    gf(&c, "    vec2 W = uViewportWH;\n");
+    gf(&c, "    int minx = int(floor(min(s0.x, min(s1.x, s2.x))));\n");
+    gf(&c, "    int maxx = int(ceil (max(s0.x, max(s1.x, s2.x))));\n");
+    gf(&c, "    int miny = int(floor(min(s0.y, min(s1.y, s2.y))));\n");
+    gf(&c, "    int maxy = int(ceil (max(s0.y, max(s1.y, s2.y))));\n");
+    gf(&c, "    if (minx < 0) minx = 0;\n");
+    gf(&c, "    if (miny < 0) miny = 0;\n");
+    gf(&c, "    if (maxx > int(W.x) - 1) maxx = int(W.x) - 1;\n");
+    gf(&c, "    if (maxy > int(W.y) - 1) maxy = int(W.y) - 1;\n");
+    gf(&c, "    if (uScissor.z > 0 && uScissor.w > 0) {\n");
+    gf(&c, "        if (minx < uScissor.x) minx = uScissor.x;\n");
+    gf(&c, "        if (miny < uScissor.y) miny = uScissor.y;\n");
+    gf(&c, "        if (maxx > uScissor.x + uScissor.z - 1) maxx = uScissor.x + uScissor.z - 1;\n");
+    gf(&c, "        if (maxy > uScissor.y + uScissor.w - 1) maxy = uScissor.y + uScissor.w - 1;\n");
+    gf(&c, "    }\n");
+    gf(&c, "    if (minx > maxx || miny > maxy) return;\n");
+    gf(&c, "    int lx = int(gl_LocalInvocationID.x);\n");
+    gf(&c, "    int ly = int(gl_LocalInvocationID.y);\n");
+    gf(&c, "    for (int py = miny + ly; py <= maxy; py += 8) {\n");
+    gf(&c, "    for (int px = minx + lx; px <= maxx; px += 8) {\n");
+    gf(&c, "        vec2 P = vec2(float(px) + 0.5, float(py) + 0.5);\n");
+    gf(&c, "        float w0 = edgef(s1, s2, P);\n");
+    gf(&c, "        float w1 = edgef(s2, s0, P);\n");
+    gf(&c, "        float w2 = edgef(s0, s1, P);\n");
+    gf(&c, "        if (area > 0.0) { if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) continue; }\n");
+    gf(&c, "        else            { if (w0 > 0.0 || w1 > 0.0 || w2 > 0.0) continue; }\n");
+    gf(&c, "        float b0 = w0 * inv_area, b1 = w1 * inv_area, b2 = w2 * inv_area;\n");
+    gf(&c, "        float iw = b0 * iw0 + b1 * iw1 + b2 * iw2;\n");
+    gf(&c, "        if (iw <= 0.0) continue;\n");
+    gf(&c, "        float rw = 1.0 / iw;\n");
+    gf(&c, "        float z = b0 * z0 + b1 * z1 + b2 * z2;\n");   /* window-linear, matches cpu */
+    gf(&c, "        int idx = py * uFbStride + px;\n");
+    if (fs) {
+        for (j = 0; j < c.nkin; j++) {
+            if (voff[j] < 0) {
+                gf(&c, "        %s %s = %s(0.0);\n", c.kin[j].tn, c.kin[j].pname, c.kin[j].tn);
+            } else {
+                snprintf(tag, sizeof tag, "%d_", j);
+                emit_vary_interp(&c, c.kin[j].tn, c.kin[j].comps, tag, c.kin[j].pname, 2);
+            }
+        }
+        gf(&c, "        vec4 vkFragCoord = vec4(float(px) + 0.5, float(py) + 0.5, z, iw);\n");
+        gf(&c, "        bool vkFrontFacing = (front != 0);\n");
+        gf(&c, "        vec4 vkColor;\n");
+        gf(&c, "        bool vkKilled;\n");
+        sep = "";
+        gf(&c, "        vk_fs(");
+        for (j = 0; j < c.nkin; j++) { gf(&c, "%s%s", sep, c.kin[j].pname); sep = ", "; }
+        gf(&c, "%svkFragCoord, vkFrontFacing, vkColor, vkKilled);\n", sep);
+        gf(&c, "        if (vkKilled) continue;\n");
+    } else {
+        emit_vary_interp(&c, "vec4", 4, "0_", "vkColor", 2);
+    }
+    /* depth test (24-bit unorm, atomicMin => LESS; matches cpu write_fragment) */
+    gf(&c, "        if (uDepthFunc > 0) {\n");
+    gf(&c, "            uint d = uint(clamp(z, 0.0, 1.0) * 16777215.0);\n");
+    gf(&c, "            if (uDepthWrite != 0) {\n");
+    gf(&c, "                if (d >= depth[idx]) continue;\n");
+    gf(&c, "                uint old = atomicMin(depth[idx], d);\n");
+    gf(&c, "                if (d >= old) continue;\n");
+    gf(&c, "            } else {\n");
+    gf(&c, "                if (d >= depth[idx]) continue;\n");
+    gf(&c, "            }\n");
+    gf(&c, "        }\n");
+    /* pack the colour into the fb word (RGBA8 or BGRA8 memory order) */
+    gf(&c, "        vec4 cc = clamp(vkColor, 0.0, 1.0);\n");
+    gf(&c, "        uint r8 = uint(cc.r * 255.0 + 0.5);\n");
+    gf(&c, "        uint g8 = uint(cc.g * 255.0 + 0.5);\n");
+    gf(&c, "        uint b8 = uint(cc.b * 255.0 + 0.5);\n");
+    gf(&c, "        uint a8 = uint(cc.a * 255.0 + 0.5);\n");
+    gf(&c, "        if (uFbSwizzle == 0) fb[idx] = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;\n");
+    gf(&c, "        else                 fb[idx] = (a8 << 24) | (r8 << 16) | (g8 << 8) | b8;\n");
+    gf(&c, "    }\n");
+    gf(&c, "    }\n");
+    gf(&c, "}\n");
+
+done:
+    free(voff);
+    if (c.declined) {
+        if (err && errsz) snprintf(err, errsz, "%s", c.err[0] ? c.err : "declined");
+        free(c.buf);
+        out = NULL;
+    } else {
+        out = c.buf;
+    }
+    kern_free(&c);   /* name/is_ptr are NULL on the no-FS path: a safe no-op */
+    return out;
+}
+
+int spirv_to_geom_kernels(spirv_module *vmod, const spirv_entry *vs,
+                          spirv_module *fmod, const spirv_entry *fs,
+                          spirv_geom_kernels *out, char *err, size_t errsz)
+{
+    char ebuf[192];
+
+    if (err && errsz) err[0] = '\0';
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    if (!vmod || !vs) {
+        if (err && errsz) snprintf(err, errsz, "missing vertex entry");
+        return -1;
+    }
+
+    out->xform = gen_xform_kernel(vmod, vs, &out->layout, ebuf, sizeof ebuf);
+    if (!out->xform) {
+        if (err && errsz) snprintf(err, errsz, "xform: %s", ebuf);
+        return -1;
+    }
+    out->raster = gen_raster_kernel(fmod, fs, &out->layout, &out->layout,
+                                    ebuf, sizeof ebuf);
+    if (!out->raster) {
+        if (err && errsz) snprintf(err, errsz, "raster: %s", ebuf);
+        free(out->xform);
+        out->xform = NULL;
+        return -1;
+    }
+    return 0;
 }

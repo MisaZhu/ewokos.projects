@@ -120,11 +120,16 @@ bool pglc_version_supported(uint32_t ver);
 /* Options for serializing a program into the daemon's wire blob.  geom_kind
  * is the geometry-rasterizer dispatch kind the daemon switches on (0 = plain
  * fullscreen/binner program, 1 = gouraud, 2 = textured, 3 = instanced,
- * 4 = colour-modulated textured); geom_tpw is the raster pass's
- * triangles-per-workgroup (0 = one workgroup per triangle). */
+ * 4 = colour-modulated textured, 5 = Vulkan user shader); geom_tpw is the
+ * raster pass's triangles-per-workgroup (0 = one workgroup per triangle).
+ * vout_stride / attr_stride are the geom_kind == 5 per-vertex stream strides
+ * in FLOATS (the pass-1 vout record stride and the attribute stream stride);
+ * they are copied into the VERSION-6 blob header and ignored for other kinds. */
 struct pglc_blob_opts {
    uint8_t  geom_kind;
    uint32_t geom_tpw;
+   uint32_t vout_stride;
+   uint32_t attr_stride;
 };
 
 /* Serialize `main` (VS/FS/COORD/CS stages) plus the optional `xform`
