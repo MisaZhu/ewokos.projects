@@ -29,6 +29,15 @@
 #define MATH_INNER  32
 #define BENCH_ITERS 2
 
+/* SPIR-V local_size per kernel (baked into vktest_spirv.h).  saxpy/math use the
+ * widest 1-D group the GPU offload path accepts (256 lanes) so the fixed
+ * per-workgroup CSD overhead is amortized over 4x more lanes; matmul stays at
+ * 64 because its dispatch is 2-D (one row per group) and widening 1-D would only
+ * add guarded-off lanes without cutting the workgroup count. */
+#define SAXPY_LSZ   256
+#define MATMUL_LSZ  64
+#define MATH_LSZ    256
+
 struct test_ctx {
     VkInstance instance;
     VkPhysicalDevice phys;
@@ -852,16 +861,17 @@ int main(void)
         inputs[0] = sx; inputs[1] = sy0; inputs[2] = NULL;
         times[pass][0] = run_bench(&ctx, "saxpy", kSpirvSaxpy,
                          sizeof(kSpirvSaxpy), 2, inputs, 1, SAXPY_N,
-                         SAXPY_N / 64, 1, sy_ref, 1e-2f);
+                         SAXPY_N / 4 / SAXPY_LSZ, 1, sy_ref, 1e-2f);
         inputs[0] = ma; inputs[1] = mb; inputs[2] = NULL;
         times[pass][1] = run_bench(&ctx, "matmul", kSpirvMatmul,
                          sizeof(kSpirvMatmul), 3, inputs, 2,
-                         MATMUL_N * MATMUL_N, MATMUL_N / 8, MATMUL_N,
+                         MATMUL_N * MATMUL_N,
+                         (MATMUL_N + MATMUL_LSZ - 1) / MATMUL_LSZ, MATMUL_N,
                          mc, 1e-2f);
         inputs[0] = tin; inputs[1] = NULL;
         times[pass][2] = run_bench(&ctx, "math", kSpirvMath,
                          sizeof(kSpirvMath), 2, inputs, 1, MATH_N,
-                         MATH_N / 64, 1, tout, 1e-2f);
+                         MATH_N / MATH_LSZ, 1, tout, 1e-2f);
         for (i = 0; i < 3; i++) if (times[pass][i] < 0) fails++;
         if (pass == 0) fails += run_coverage(&ctx);
         vkDestroyDevice(ctx.device, NULL);

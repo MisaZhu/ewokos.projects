@@ -297,6 +297,7 @@ int32_t vk_gfx_program_upload(const void *blob, uint32_t size)
 
 int32_t vk_gfx_draw(int32_t prog_handle,
                     void *fb_host, uint32_t fb_w, uint32_t fb_h, uint32_t fb_stride,
+                    int fb_shm,
                     const void *attr_host, uint32_t nverts, uint32_t attr_stride,
                     const uint32_t *unif, uint32_t num_unif,
                     int first_frame, uint32_t clear_rgba, float clear_z,
@@ -306,6 +307,7 @@ int32_t vk_gfx_draw(int32_t prog_handle,
     uint32_t host_pitch, fb_bytes, attr_bytes, unif_bytes;
     uint32_t i, ntex_bound;
     int32_t  rc;
+    int direct_fb;
 
     if (prog_handle < 0 || fb_host == NULL || fb_w == 0 || fb_h == 0)
         return G2D_ERR_FAILED;
@@ -320,9 +322,11 @@ int32_t vk_gfx_draw(int32_t prog_handle,
     fb_bytes   = fb_w * fb_h * 4u;          /* tight GPU framebuffer canvas */
     attr_bytes = nverts * attr_stride * 4u;
     unif_bytes = num_unif * 4u;
+    direct_fb = (fb_shm > 0 && host_pitch == fb_w * 4u);
 
-    /* grow the persistent staging canvases (fb, z, attr, and unif when present) */
-    if (!gfx_ensure_stage(&_fb, fb_bytes) ||
+    /* A shared swapchain image is itself the GPU destination.  Other images
+     * retain the persistent staging framebuffer and its host readback. */
+    if ((!direct_fb && !gfx_ensure_stage(&_fb, fb_bytes)) ||
         !gfx_ensure_stage(&_z,  fb_bytes) ||
         !gfx_ensure_stage(&_attr, attr_bytes))
         return G2D_ERR_FAILED;
@@ -335,7 +339,7 @@ int32_t vk_gfx_draw(int32_t prog_handle,
      * GPU-clears fb + depth to clear_rgba/clear_z, so the host pixels are not
      * needed; otherwise stage the current attachment contents (a continuing draw
      * within a render pass) and let the depth surface persist untouched. */
-    if (!first_frame)
+    if (!first_frame && !direct_fb)
         gfx_copy_rows(_fb.px, fb_w * 4u, fb_host, host_pitch,
                       fb_w * 4u, fb_h);
     memcpy(_attr.px, attr_host, attr_bytes);
@@ -373,7 +377,9 @@ int32_t vk_gfx_draw(int32_t prog_handle,
      * in the kernel uniforms (uDepthFunc / uCullSign / uBlendMode), and these
      * zero values keep vc_pgl3d's fixed-function eligibility gates satisfied. */
     {
-        g2d_canvas_t dst  = g2d_canvas(_fb.shm,   fb_bytes,   fb_w, fb_h, 1);
+        g2d_canvas_t dst  = direct_fb
+            ? g2d_canvas(fb_shm,  fb_bytes, fb_w, fb_h, 1)
+            : g2d_canvas(_fb.shm, fb_bytes, fb_w, fb_h, 1);
         g2d_canvas_t pos  = g2d_canvas(_attr.shm, attr_bytes, nverts, attr_stride, 1);
         g2d_canvas_t col  = g2d_canvas(0, 0, 0, 0, 0);
         g2d_canvas_t zc   = g2d_canvas(_z.shm,    fb_bytes,   fb_w, fb_h, 1);
@@ -410,10 +416,10 @@ int32_t vk_gfx_draw(int32_t prog_handle,
     rc = g2d_pgl_draw(&req);
     vkclient_quiesce(rc);
     if (rc == G2D_OK) {
-        /* the GPU wrote the framebuffer canvas by physical base; copy it back
-         * into the caller's colour attachment (row-wise for a pitched host). */
-        gfx_copy_rows(fb_host, host_pitch, _fb.px, fb_w * 4u,
-                      fb_w * 4u, fb_h);
+        /* A direct swapchain target already holds the finished pixels. */
+        if (!direct_fb)
+            gfx_copy_rows(fb_host, host_pitch, _fb.px, fb_w * 4u,
+                          fb_w * 4u, fb_h);
     } else if (rc == G2D_ERR_TIMEOUT || rc == G2D_ERR_MMU_FAULT) {
         gfx_abandon_staging();
     }

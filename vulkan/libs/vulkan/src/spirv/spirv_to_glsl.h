@@ -120,9 +120,10 @@ char *spirv_to_glsl(spirv_module *m, const spirv_entry *e,
  *       vout_stride = 8 + 4*ceil(nvarfloats/4); the per-vertex attribute stride
  *       (floats) is attr_stride.
  *
- *   pass 2 "raster" - local_size 8x8x1, one workgroup per triangle
- *       (cs_geom_tpw = 0), sweeping the triangle's screen bbox as an 8x8 lane
- *       tile.  Bindings: 0 fb(uint[]) 1 vout(float[]) 2 depth(uint[]); fragment
+ *   pass 2 "raster" - local_size 16x16x1, ONE LANE PER TRIANGLE: lane L of
+ *       workgroup W owns triangle W*256+L and sweeps its screen bbox serially
+ *       (cs_geom_tpw = 256, so the daemon dispatches ceil(ntris/256) workgroups).
+ *       Bindings: 0 fb(uint[]) 1 vout(float[]) 2 depth(uint[]); fragment
  *       textures stay TMU sampler2D uniforms (they do NOT take an SSBO slot).
  *       The harness reproduces cpu_raster.c pixel-exactly (same edge/barycentric
  *       sign convention, front = area < 0, Vulkan viewport y-down, perspective-

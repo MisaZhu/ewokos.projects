@@ -8,6 +8,22 @@
 #include "internal.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef VULKAN_GPU_BACKEND
+#include <g2dclient/g2dclient.h>
+#include <sys/shm.h>
+#endif
+
+static void release_sc_storage(vk_device_memory *mem)
+{
+#ifdef VULKAN_GPU_BACKEND
+    if (mem->gfx_shm > 0) {
+        g2d_shm_free((uint32_t *)mem->host);
+        shmctl(mem->gfx_shm, IPC_RMID, NULL);
+        return;
+    }
+#endif
+    free(mem->host);
+}
 
 /* ---- surface ------------------------------------------------------------- */
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateEwokOSSurfaceVK(
@@ -125,13 +141,26 @@ static int create_sc_image(vk_swapchain *sc, uint32_t i)
     mem->device = sc->device;
     mem->size = size;
     mem->type_index = 0;
-    mem->host = calloc(1, (size_t)size);
+#ifdef VULKAN_GPU_BACKEND
+    {
+        uint32_t *px = NULL;
+        if (g2d_shm_alloc((uint32_t)size, &mem->gfx_shm, &px) == 0 &&
+            mem->gfx_shm > 0 && px != NULL) {
+            mem->host = px;
+            memset(mem->host, 0, (size_t)size);
+        }
+    }
+#endif
+    if (!mem->host) {
+        mem->gfx_shm = 0;
+        mem->host = calloc(1, (size_t)size);
+    }
     if (!mem->host) { vk_obj_free(mem); vk_obj_free(im); return -1; }
     im->mem = mem;
     im->offset = 0;
 
     view = (vk_image_view *)vk_obj_alloc(sizeof(vk_image_view), VK_OBJ_IMAGE_VIEW);
-    if (!view) { free(mem->host); vk_obj_free(mem); vk_obj_free(im); return -1; }
+    if (!view) { release_sc_storage(mem); vk_obj_free(mem); vk_obj_free(im); return -1; }
     view->image = im;
     view->view_type = VK_IMAGE_VIEW_TYPE_2D;
     view->format = sc->format;
@@ -175,7 +204,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(
             uint32_t j;
             for (j = 0; j < i; j++) {
                 vk_obj_free(sc->views[j]);
-                free(sc->mems[j]->host); vk_obj_free(sc->mems[j]);
+                release_sc_storage(sc->mems[j]); vk_obj_free(sc->mems[j]);
                 vk_obj_free(sc->images[j]);
             }
             vk_obj_free(sc);
@@ -195,7 +224,7 @@ VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(
     if (!sc) return;
     for (i = 0; i < sc->count; i++) {
         vk_obj_free(sc->views[i]);
-        if (sc->mems[i]) { free(sc->mems[i]->host); vk_obj_free(sc->mems[i]); }
+        if (sc->mems[i]) { release_sc_storage(sc->mems[i]); vk_obj_free(sc->mems[i]); }
         vk_obj_free(sc->images[i]);
     }
     vk_obj_free(sc);
@@ -260,7 +289,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(
         if (surf && surf->present && sc->images[idx]) {
             vk_image *im = sc->images[idx];
             surf->present(surf->user, vk_image_ptr(im), sc->width, sc->height,
-                          im->row_pitch, sc->format);
+                          im->row_pitch, sc->format,
+                          (im->mem && im->mem->gfx_shm > 0) ? im->mem->gfx_shm : 0);
         }
         if (pPresentInfo->pResults)
             pPresentInfo->pResults[i] = VK_SUCCESS;

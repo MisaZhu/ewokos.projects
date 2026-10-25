@@ -54,6 +54,7 @@
 #include <pglcompiler.h>
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -160,17 +161,25 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
 #define GPU_DECLINE() do { gp->cpu_fallback = 1; gp->prepared = 1; return gp; } while (0)
 
     e = cpu_find_compute(p, &mod);
-    if (!e || !mod)
+    if (!e || !mod) {
+        fprintf(stderr, "vulkan-gpu: prepare decline: no GLCompute entry/module\n");
         GPU_DECLINE();
+    }
 
     /* 1. transpile to GLSL ES 3.10 compute (NULL => outside the GPU subset). */
     glsl = spirv_to_glsl((spirv_module *)mod, e, &gp->info, err, sizeof(err));
-    if (!glsl)
+    if (!glsl) {
+        fprintf(stderr, "vulkan-gpu: '%s' transpile DECLINED: %.200s\n",
+                e->name, err[0] ? err : "(no reason)");
         GPU_DECLINE();
+    }
 
     /* only a 1-D local shape maps onto the V3D CSD workgroup dispatch exactly. */
     if (gp->info.local_size[1] != 1u || gp->info.local_size[2] != 1u ||
         gp->info.local_size[0] == 0u || gp->info.local_size[0] > 256u) {
+        fprintf(stderr, "vulkan-gpu: '%s' local shape (%u,%u,%u) not 1-D offloadable\n",
+                e->name, gp->info.local_size[0], gp->info.local_size[1],
+                gp->info.local_size[2]);
         free(glsl);
         GPU_DECLINE();
     }
@@ -181,6 +190,21 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
         bool ok = pglc_compile_compute_raw(glsl, &res);
         if (!ok || !res.success ||
             res.stage[PGLC_STAGE_COMPUTE].code_words == 0) {
+            const char *gs = glsl;
+            int gln = 1;
+            fprintf(stderr, "vulkan-gpu: '%s' pglc compile FAILED (ok=%d success=%d words=%u): %.400s\n",
+                    e->name, (int)ok, (int)res.success,
+                    res.stage[PGLC_STAGE_COMPUTE].code_words,
+                    res.log[0] ? res.log : "(no log)");
+            fprintf(stderr, "---- generated GLSL for '%s' ----\n", e->name);
+            while (gs && *gs) {
+                const char *nl = strchr(gs, '\n');
+                fprintf(stderr, "%3d: %.*s\n", gln++,
+                        nl ? (int)(nl - gs) : (int)strlen(gs), gs);
+                if (!nl) break;
+                gs = nl + 1;
+            }
+            fprintf(stderr, "---- end GLSL ----\n");
             free(glsl);
             pglc_program_free(&res);
             GPU_DECLINE();
@@ -210,15 +234,18 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
     opts.geom_tpw  = 0;
     blobsz = pglc_program_serialize(&res, NULL, &opts, NULL, 0);
     if (blobsz == 0) {
+        fprintf(stderr, "vulkan-gpu: '%s' serialize size query returned 0\n", e->name);
         pglc_program_free(&res);
         GPU_DECLINE();
     }
     blob = malloc(blobsz);
     if (!blob) {
+        fprintf(stderr, "vulkan-gpu: '%s' oom allocating %u byte blob\n", e->name, blobsz);
         pglc_program_free(&res);
         GPU_DECLINE();
     }
     if (pglc_program_serialize(&res, NULL, &opts, blob, blobsz) == 0) {
+        fprintf(stderr, "vulkan-gpu: '%s' serialize fill failed\n", e->name);
         free(blob);
         pglc_program_free(&res);
         GPU_DECLINE();
@@ -228,8 +255,11 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
     free(blob);
     pglc_program_free(&res);
 
-    if (handle < 0)
+    if (handle < 0) {
+        fprintf(stderr, "vulkan-gpu: '%s' UPLOAD failed (handle=%d blobsz=%u)\n",
+                e->name, (int)handle, blobsz);
         GPU_DECLINE();
+    }
 
     gp->handle = handle;
     gp->prepared = 1;
@@ -480,14 +510,18 @@ static gpu_pipeline *gpu_prepare_gfx(vk_pipeline *p)
         GFX_DECLINE();
     }
 
-    /* 3. serialize (main = raster/cs, xform = cs2) with geom_kind 5, one
-     *    workgroup per triangle (geom_tpw 0), and the VERSION-6 stream strides.
+    /* 3. serialize (main = raster/cs, xform = cs2) with geom_kind 5, the
+     *    ONE-LANE-PER-TRIANGLE raster grid (geom_tpw 256 = the raster kernel's
+     *    16x16 lane count, so the daemon dispatches ceil(ntris/256) workgroups),
+     *    and the VERSION-6 stream strides.  The wide grid is the whole perf point
+     *    (the CSD charges ~3us of fixed overhead per workgroup); geom_tpw MUST
+     *    equal the raster local_size product or the daemon declines the program.
      *    A VS with no inputs reports attr_stride 0; the blob field must be >= 1
      *    (the daemon validates [1,64]), and the generated kernel reads no vattr
      *    in that case, so a 1-float dummy stride is staged. */
     memset(&opts, 0, sizeof(opts));
     opts.geom_kind   = 5;
-    opts.geom_tpw    = 0;
+    opts.geom_tpw    = 256;
     opts.vout_stride = kern.layout.vout_stride;
     opts.attr_stride = kern.layout.attr_stride ? kern.layout.attr_stride : 1u;
     blobsz = pglc_program_serialize(&res_r, &res_x, &opts, NULL, 0);
@@ -553,10 +587,14 @@ static VkResult gpu_dispatch(vk_command_buffer *cb, vk_draw_ctx *dc,
         size_t sz = 0;
         if (b->kind != SPIRV_RES_STORAGE_BUFFER)
             continue;
-        if (b->binding >= VKCLIENT_MAX_ARGS)
+        if (b->binding >= VKCLIENT_MAX_ARGS) {
+            fprintf(stderr, "vulkan-gpu: dispatch fallback: binding %u >= VKCLIENT_MAX_ARGS\n", b->binding);
             return cpu_dispatch(cb, dc, gx, gy, gz);
-        if (gpu_find_ssbo(dc, b->set, b->binding_src, &host, &sz) != 0)
+        }
+        if (gpu_find_ssbo(dc, b->set, b->binding_src, &host, &sz) != 0) {
+            fprintf(stderr, "vulkan-gpu: dispatch fallback: SSBO (set=%u binding=%u) unresolvable\n", b->set, b->binding_src);
             return cpu_dispatch(cb, dc, gx, gy, gz);   /* unresolvable: CPU replay */
+        }
         arg_host[b->binding] = host;
         arg_size[b->binding] = (uint32_t)sz;
         if (b->binding + 1u > nargs)
@@ -582,6 +620,8 @@ static VkResult gpu_dispatch(vk_command_buffer *cb, vk_draw_ctx *dc,
         return VK_SUCCESS;
     /* No device-wide failure latch: a later dispatch must be able to retry the
      * GPU.  Terminal staging is retained by vkclient until process exit. */
+    fprintf(stderr, "vulkan-gpu: dispatch fallback: vk_kernel_dispatch rc=%d (handle=%d nargs=%u wg=%u,%u,%u ls=%u)\n",
+            (int)rc, (int)gp->handle, nargs, wg[0], wg[1], wg[2], gp->info.local_size[0]);
     return cpu_dispatch(cb, dc, gx, gy, gz);
 }
 
@@ -753,48 +793,125 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
     }
 
     /* ---- gather the per-vertex attribute float stream ----
-     * One vertex's attributes are contiguous (layout.attrs[].offset floats in),
-     * nverts * attr_stride floats total.  Each VS input location is sourced from
-     * the pipeline attribute feeding it (decoded to float, matching the CPU); an
-     * unwritten / unbound location stays zero (the CPU interpreter's memset). */
+     * Resolve each VS input's pipeline binding once, not once per vertex.  The
+     * old inner loop repeated the location/binding searches for every vertex;
+     * at 19200 vertices that CPU gather dominated the whole Vulkan frame. */
     astride = gp->glayout.attr_stride ? gp->glayout.attr_stride : 1u;
-    attr = (float *)calloc((size_t)nverts * astride, sizeof(float));
+    attr = (float *)malloc((size_t)nverts * astride * sizeof(float));
     if (!attr)
         GFX_CPU();
-    for (k = 0; k < nverts; k++) {
-        uint32_t vidx = index_data ? index_data[k] : (firstVertex + k);
-        for (j = 0; j < (uint32_t)gp->glayout.num_attrs; j++) {
+    {
+        typedef struct {
+            const uint8_t *base;
+            uint32_t stride, offset, comps;
+            VkFormat format;
+        } gfx_attr_plan;
+        uint32_t nattrs = (uint32_t)gp->glayout.num_attrs;
+        gfx_attr_plan plans[nattrs ? nattrs : 1u];
+
+        for (j = 0; j < nattrs; j++) {
             const spirv_geom_slot *sl = &gp->glayout.attrs[j];
             const vk_vertex_attr *va = NULL;
-            const uint8_t *src;
-            uint32_t a, bb, stride = 0, comps;
-            float v[4];
+            uint32_t a, bb;
+            memset(&plans[j], 0, sizeof(plans[j]));
+            plans[j].offset = sl->offset;
+            plans[j].comps = sl->comps > 4u ? 4u : sl->comps;
             for (a = 0; a < p->num_vtx_attrs; a++)
-                if (p->vtx_attrs[a].location == sl->location) { va = &p->vtx_attrs[a]; break; }
-            if (!va)
-                continue;   /* unwritten input: leave zero (matches the CPU) */
-            if (va->binding >= VK_MAX_VERTEX_BINDINGS || !dc->vb[va->binding])
-                continue;   /* unbound: leave zero (matches the CPU) */
-            for (bb = 0; bb < p->num_vtx_bindings; bb++)
-                if (p->vtx_bindings[bb].binding == va->binding) {
-                    if (p->vtx_bindings[bb].rate != VK_VERTEX_INPUT_RATE_VERTEX) {
-                        /* per-instance attributes need gl_InstanceID: decline */
-                        GFX_CPU();
-                    }
-                    stride = p->vtx_bindings[bb].stride;
+                if (p->vtx_attrs[a].location == sl->location) {
+                    va = &p->vtx_attrs[a];
                     break;
                 }
-            src = (const uint8_t *)vk_buffer_ptr(dc->vb[va->binding]);
-            if (!src)
+            if (!va || va->binding >= VK_MAX_VERTEX_BINDINGS ||
+                !dc->vb[va->binding])
+                continue;   /* unwritten/unbound input stays zero */
+            for (bb = 0; bb < p->num_vtx_bindings; bb++) {
+                if (p->vtx_bindings[bb].binding != va->binding)
+                    continue;
+                if (p->vtx_bindings[bb].rate != VK_VERTEX_INPUT_RATE_VERTEX)
+                    GFX_CPU();   /* per-instance needs gl_InstanceID */
+                plans[j].stride = p->vtx_bindings[bb].stride;
+                break;
+            }
+            plans[j].base = (const uint8_t *)vk_buffer_ptr(dc->vb[va->binding]);
+            if (!plans[j].base)
                 continue;
-            src += dc->vb_off[va->binding] + (size_t)vidx * stride + va->offset;
-            gfx_decode_attr(va->format, src, v);
-            comps = sl->comps > 4u ? 4u : sl->comps;
-            for (a = 0; a < comps; a++)
-                attr[(size_t)k * astride + sl->offset + a] = v[a];
+            plans[j].base += dc->vb_off[va->binding] + va->offset;
+            plans[j].format = va->format;
+        }
+
+        /* calloc used to clear the whole stream even when every float is about
+         * to be overwritten.  Retain zeroes only for genuinely unwritten/gapped
+         * locations; a fully covered draw (including vkteapot) skips the extra
+         * nverts*astride memset entirely. */
+        {
+            uint32_t off;
+            int need_zero = 0;
+            for (off = 0; off < astride && !need_zero; off++) {
+                uint32_t covered = 0;
+                for (j = 0; j < nattrs; j++) {
+                    if (plans[j].base && off >= plans[j].offset &&
+                        off < plans[j].offset + plans[j].comps) {
+                        covered = 1;
+                        break;
+                    }
+                }
+                if (!covered)
+                    need_zero = 1;
+            }
+            if (need_zero)
+                memset(attr, 0, (size_t)nverts * astride * sizeof(float));
+        }
+
+        for (j = 0; j < nattrs; j++) {
+            const gfx_attr_plan *pl = &plans[j];
+            float *dst = attr + pl->offset;
+            const uint8_t *src;
+            if (!pl->base)
+                continue;
+            if (!index_data) {
+                src = pl->base + (size_t)firstVertex * pl->stride;
+                if (pl->format == VK_FORMAT_R32G32B32A32_SFLOAT &&
+                    pl->comps == 4u) {
+                    for (k = 0; k < nverts; k++) {
+                        const float *f = (const float *)src;
+                        dst[0] = f[0]; dst[1] = f[1];
+                        dst[2] = f[2]; dst[3] = f[3];
+                        src += pl->stride;
+                        dst += astride;
+                    }
+                } else {
+                    for (k = 0; k < nverts; k++) {
+                        float v[4];
+                        uint32_t a;
+                        gfx_decode_attr(pl->format, src, v);
+                        for (a = 0; a < pl->comps; a++)
+                            dst[a] = v[a];
+                        src += pl->stride;
+                        dst += astride;
+                    }
+                }
+            } else if (pl->format == VK_FORMAT_R32G32B32A32_SFLOAT &&
+                       pl->comps == 4u) {
+                for (k = 0; k < nverts; k++) {
+                    const float *f = (const float *)(pl->base +
+                        (size_t)index_data[k] * pl->stride);
+                    dst[0] = f[0]; dst[1] = f[1];
+                    dst[2] = f[2]; dst[3] = f[3];
+                    dst += astride;
+                }
+            } else {
+                for (k = 0; k < nverts; k++) {
+                    float v[4];
+                    uint32_t a;
+                    src = pl->base + (size_t)index_data[k] * pl->stride;
+                    gfx_decode_attr(pl->format, src, v);
+                    for (a = 0; a < pl->comps; a++)
+                        dst[a] = v[a];
+                    dst += astride;
+                }
+            }
         }
     }
-
     /* ---- resolve the FS combined-image samplers into TMU textures ---- */
     memset(tex, 0, sizeof(tex));
     for (j = 0; j < (uint32_t)gp->glayout.num_samplers; j++) {
@@ -907,6 +1024,7 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
 
     /* ---- dispatch the two passes over the g2dd PGL verbs ---- */
     rc = vk_gfx_draw(gp->handle, fb_host, rt_w, rt_h, fb_stride,
+                     (cim->mem && cim->mem->gfx_shm > 0) ? cim->mem->gfx_shm : 0,
                      attr, nverts, astride, unif, num_unif,
                      first_frame, clear_rgba, clear_z,
                      ntex ? tex : NULL, ntex);

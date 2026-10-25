@@ -113,7 +113,9 @@ typedef struct vk_gfx_tex {
 } vk_gfx_tex;
 
 /* Upload a serialized two-pass geom blob (pglc_program_serialize output with
- * opts.geom_kind == 5, opts.geom_tpw == 0, opts.vout_stride / attr_stride set).
+ * opts.geom_kind == 5, opts.geom_tpw == 256 (the raster kernel's 16x16 lane
+ * count, so the daemon dispatches ceil(ntris/256) workgroups), opts.vout_stride
+ * / attr_stride set).
  * Returns a non-negative program handle, or a negative G2D_ERR_* code
  * (G2D_ERR_NOT_SUPPORTED == -2 when the platform declines, which latches
  * libvulkan's GPU graphics path off). */
@@ -154,6 +156,7 @@ int32_t vk_gfx_program_upload(const void *blob, uint32_t size);
  * staging (it may still be GPU-owned) exactly like vk_kernel_dispatch. */
 int32_t vk_gfx_draw(int32_t prog_handle,
                     void *fb_host, uint32_t fb_w, uint32_t fb_h, uint32_t fb_stride,
+                    int fb_shm,
                     const void *attr_host, uint32_t nverts, uint32_t attr_stride,
                     const uint32_t *unif, uint32_t num_unif,
                     int first_frame, uint32_t clear_rgba, float clear_z,

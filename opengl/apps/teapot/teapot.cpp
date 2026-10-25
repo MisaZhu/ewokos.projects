@@ -749,6 +749,10 @@ static int fps = 0;
 static int count = 0;
 static uint32_t last_tic = 0;
 static uint32_t last_frame_tic = 0;
+/* Optional FPS log path from argv[1]: the EwokOS ssh exec channel does not
+ * forward stdout, so on-device FPS is measured by having the app write it to a
+ * file itself (fetched back separately).  NULL on a normal desktop launch. */
+static const char* g_fpslog = NULL;
 
 static void update_fps(void)
 {
@@ -758,6 +762,10 @@ static void update_fps(void)
         last_tic = low;
         fps = count;
         count = 0;
+        if (g_fpslog) {
+            FILE* fp = fopen(g_fpslog, "w");
+            if (fp) { fprintf(fp, "%d\n", fps); fclose(fp); }
+        }
     }
     count++;
 }
@@ -1016,7 +1024,7 @@ int main(int argc, char* argv[])
     xwin_t* xwin;
 
     (void)argc;
-    (void)argv;
+    if (argc > 1) g_fpslog = argv[1];   /* optional FPS log path (see g_fpslog) */
 
     x_init(&x, NULL);
     x.on_loop = loop;

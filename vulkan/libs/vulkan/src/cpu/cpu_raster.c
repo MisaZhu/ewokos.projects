@@ -567,6 +567,7 @@ VkResult cpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
 #define VIDX(k) (index_data ? index_data[(k)] : (firstVertex + (k)))
 
     (void)cb; (void)index_type;
+    vk_clear_deferred(dc);
     if (!p) return VK_ERROR_INITIALIZATION_FAILED;
 
     /* locate shader stages */

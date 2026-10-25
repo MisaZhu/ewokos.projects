@@ -95,55 +95,81 @@ static void encode_clear(VkFormat f, uint8_t *p, const VkClearColorValue *c)
 static void clear_color_image(vk_image *im, const VkClearColorValue *c)
 {
     uint8_t *base = (uint8_t *)vk_image_ptr(im);
-    uint32_t bpp, pitch, x, y, layer;
+    uint32_t bpp, pitch, rowbytes, x, y, layer;
     uint8_t texel[16];
     if (!base) return;
     bpp = im->bpp ? im->bpp : vk_format_bpp(im->format);
     if (!bpp || bpp > 16) return;
     pitch = im->row_pitch ? im->row_pitch : bpp * im->extent.width;
+    rowbytes = bpp * im->extent.width;
+    if (rowbytes == 0) return;
     encode_clear(im->format, texel, c);
     for (layer = 0; layer < im->array_layers; layer++) {
         uint8_t *lb = base + (size_t)layer * pitch * im->extent.height;
-        for (y = 0; y < im->extent.height; y++)
-            for (x = 0; x < im->extent.width; x++)
-                memcpy(lb + (size_t)y * pitch + (size_t)x * bpp, texel, bpp);
+        /* A full-attachment clear is width*height copies of ONE texel.  Fill
+         * scanline 0 texel-by-texel, then memcpy it down the remaining rows:
+         * ~width+height calls instead of width*height.  The executor clears on
+         * every begin_render_pass, so the old per-pixel loop cost several ms per
+         * frame at 640x480 (the GPU back-end then re-clears via its first_frame
+         * fill, so this host clear only matters for the CPU-raster fallback).
+         * Row padding [rowbytes,pitch) is left untouched, exactly as before. */
+        for (x = 0; x < im->extent.width; x++)
+            memcpy(lb + (size_t)x * bpp, texel, bpp);
+        for (y = 1; y < im->extent.height; y++)
+            memcpy(lb + (size_t)y * pitch, lb, rowbytes);
     }
 }
 
 static void clear_depth_image(vk_image *im, const VkClearDepthStencilValue *ds)
 {
     uint8_t *base = (uint8_t *)vk_image_ptr(im);
-    uint32_t bpp, pitch, x, y;
+    uint32_t bpp, pitch, rowbytes, x, y;
+    uint8_t texel[8];
     if (!base) return;
     bpp = im->bpp ? im->bpp : vk_format_bpp(im->format);
+    if (!bpp || bpp > 8) return;
     pitch = im->row_pitch ? im->row_pitch : bpp * im->extent.width;
-    for (y = 0; y < im->extent.height; y++) {
-        for (x = 0; x < im->extent.width; x++) {
-            uint8_t *p = base + (size_t)y * pitch + (size_t)x * bpp;
-            switch (im->format) {
-            case VK_FORMAT_D32_SFLOAT: *(float *)p = ds->depth; break;
-            case VK_FORMAT_D16_UNORM: {
-                float z = ds->depth < 0 ? 0 : (ds->depth > 1 ? 1 : ds->depth);
-                *(uint16_t *)p = (uint16_t)(z * 65535.0f + 0.5f); break;
-            }
-            case VK_FORMAT_D24_UNORM_S8_UINT:
-            case VK_FORMAT_X8_D24_UNORM_PACK32:
-            case VK_FORMAT_D32_SFLOAT_S8_UINT: {
-                float z = ds->depth < 0 ? 0 : (ds->depth > 1 ? 1 : ds->depth);
-                uint32_t d = (uint32_t)(z * 16777215.0f + 0.5f);
-                uint32_t v = ((uint32_t)(ds->stencil & 0xff) << 24) | (d & 0x00ffffffu);
-                if (im->format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
-                    *(float *)p = ds->depth;
-                    p[4] = (uint8_t)(ds->stencil & 0xff);
-                } else {
-                    *(uint32_t *)p = v;
-                }
-                break;
-            }
-            default: break;
-            }
-        }
+    rowbytes = bpp * im->extent.width;
+    if (rowbytes == 0) return;
+    /* The depth/stencil clear value is a single scalar, so every pixel of the
+     * attachment encodes to the SAME bpp-byte word.  Encode it once into texel,
+     * fill scanline 0, then memcpy it down the rest: ~width+height calls instead
+     * of a per-pixel switch over the whole attachment every frame (the old loop
+     * cost several ms per frame at 640x480).  The GPU back-end keeps its own
+     * private z canvas and never reads this host copy, so it only matters for
+     * the CPU-raster fallback.  Row padding is left untouched, as before. */
+    memset(texel, 0, sizeof(texel));
+    switch (im->format) {
+    case VK_FORMAT_D32_SFLOAT: {
+        float f = ds->depth;
+        memcpy(texel, &f, 4); break;
     }
+    case VK_FORMAT_D16_UNORM: {
+        float z = ds->depth < 0 ? 0 : (ds->depth > 1 ? 1 : ds->depth);
+        uint16_t h = (uint16_t)(z * 65535.0f + 0.5f);
+        memcpy(texel, &h, 2); break;
+    }
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: {
+        float z = ds->depth < 0 ? 0 : (ds->depth > 1 ? 1 : ds->depth);
+        uint32_t d = (uint32_t)(z * 16777215.0f + 0.5f);
+        uint32_t v = ((uint32_t)(ds->stencil & 0xff) << 24) | (d & 0x00ffffffu);
+        if (im->format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+            float f = ds->depth;
+            memcpy(texel, &f, 4);
+            texel[4] = (uint8_t)(ds->stencil & 0xff);
+        } else {
+            memcpy(texel, &v, 4);
+        }
+        break;
+    }
+    default: return;   /* not a depth/stencil format this encoder knows */
+    }
+    for (x = 0; x < im->extent.width; x++)
+        memcpy(base + (size_t)x * bpp, texel, bpp);
+    for (y = 1; y < im->extent.height; y++)
+        memcpy(base + (size_t)y * pitch, base, rowbytes);
 }
 
 static void clear_view(vk_image_view *iv, const VkClearValue *val, int is_depth)
@@ -154,7 +180,7 @@ static void clear_view(vk_image_view *iv, const VkClearValue *val, int is_depth)
 }
 
 /* apply the load ops of a render pass against its framebuffer */
-static void exec_begin_render_pass(const vk_cmd *c)
+static void exec_begin_render_pass(const vk_cmd *c, int defer_gpu_clear)
 {
     const vk_render_pass *rp = c->u.begin_rp.rp;
     const vk_framebuffer *fb = c->u.begin_rp.fb;
@@ -168,23 +194,29 @@ static void exec_begin_render_pass(const vk_cmd *c)
                         a->format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
                         a->format == VK_FORMAT_X8_D24_UNORM_PACK32);
         VkAttachmentLoadOp op = is_depth ? a->stencil_load : a->load;
+        if (defer_gpu_clear &&
+            ((rp->num_color_refs > 0 && i == rp->color_refs[0].attachment) ||
+             (rp->has_depth && i == rp->depth_ref.attachment)))
+            continue;
         if (op == VK_ATTACHMENT_LOAD_OP_CLEAR && i < c->u.begin_rp.num_clears)
             clear_view(fb->views[i], &c->u.begin_rp.clears[i], is_depth);
     }
 }
 
-static void exec_begin_rendering(const vk_cmd *c)
+static void exec_begin_rendering(const vk_cmd *c, int defer_gpu_clear)
 {
     /* The recorder flags a loadOp==CLEAR attachment by storing the sentinel
      * VK_LAYOUT_CLEAR_EWOK in its color_layout / depth_layout slot. */
     uint32_t i;
     for (i = 0; i < c->u.begin_rendering.num_color; i++) {
         vk_image_view *iv = c->u.begin_rendering.color[i];
-        if (iv && c->u.begin_rendering.color_layout[i] == VK_LAYOUT_CLEAR_EWOK)
+        if (iv && c->u.begin_rendering.color_layout[i] == VK_LAYOUT_CLEAR_EWOK &&
+            !(defer_gpu_clear && i == 0))
             clear_view(iv, &c->u.begin_rendering.color_clear[i], 0);
     }
     if (c->u.begin_rendering.depth &&
-        c->u.begin_rendering.depth_layout == VK_LAYOUT_CLEAR_EWOK)
+        c->u.begin_rendering.depth_layout == VK_LAYOUT_CLEAR_EWOK &&
+        !defer_gpu_clear)
         clear_view(c->u.begin_rendering.depth, &c->u.begin_rendering.depth_clear, 1);
 }
 
@@ -255,6 +287,24 @@ static void gfx_clear_from_rendering(const vk_cmd *c, gfx_clear_state *cs)
         cs->depth_clear = 1;
         cs->clear_depth = c->u.begin_rendering.depth_clear.depthStencil.depth;
     }
+}
+
+static int gfx_can_defer_clear(const gfx_clear_state *cs)
+{
+    return cs->color_clear && cs->depth_clear && cs->clear_depth >= 1.0f;
+}
+
+void vk_clear_deferred(vk_draw_ctx *dc)
+{
+    VkClearValue cv;
+    if (!dc->gfx_first_draw || dc->gfx_color_clear == 0 ||
+        dc->gfx_depth_clear == 0 || dc->gfx_clear_depth < 1.0f)
+        return;
+    memcpy(cv.color.float32, dc->gfx_clear_color, sizeof(cv.color.float32));
+    clear_view(dc->color[0], &cv, 0);
+    memset(&cv, 0, sizeof(cv));
+    cv.depthStencil.depth = dc->gfx_clear_depth;
+    clear_view(dc->depth, &cv, 1);
 }
 
 /* ---- memory transfer ops ------------------------------------------------- */
@@ -517,12 +567,14 @@ VkResult vk_execute_command_buffer(vk_command_buffer *cb)
         case VK_CMD_CLEAR_COLOR_IMAGE: exec_clear_color_image(c); break;
         case VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE: exec_clear_depth_image(c); break;
         case VK_CMD_BEGIN_RENDER_PASS:
-            exec_begin_render_pass(c);
             gfx_clear_from_render_pass(c, &cs);
+            exec_begin_render_pass(c, cb->device &&
+                cb->device->backend == &vk_backend_gpu && gfx_can_defer_clear(&cs));
             break;
         case VK_CMD_BEGIN_RENDERING:
-            exec_begin_rendering(c);
             gfx_clear_from_rendering(c, &cs);
+            exec_begin_rendering(c, cb->device &&
+                cb->device->backend == &vk_backend_gpu && gfx_can_defer_clear(&cs));
             break;
         case VK_CMD_WRITE_TIMESTAMP:   exec_write_timestamp(c); break;
         case VK_CMD_SET_EVENT:

@@ -1725,7 +1725,15 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
 
     gf(&c, "#version 310 es\n");
     gf(&c, "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\n\n");
-    gf(&c, "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n\n");
+    /* ONE LANE PER TRIANGLE: a 16x16 workgroup (256 lanes) covers 256 triangles
+     * (lane L of workgroup W owns triangle W*256+L).  The daemon dispatches
+     * ceil(ntris/256) workgroups (cs_geom_tpw = 256) instead of one per triangle.
+     * This is the whole performance point: the V3D 7.1 CSD charges ~3us of FIXED
+     * dispatch overhead PER WORKGROUP, so the legacy one-workgroup-per-triangle
+     * shape (6400 workgroups for the teapot) cost ~19ms in the raster pass alone
+     * while 25 wide workgroups cost well under 1ms.  Per-pixel math is unchanged;
+     * this mirrors pglcompiler's geom_raster_cs_glsl (gouraud V5) exactly. */
+    gf(&c, "layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;\n\n");
 
     if (fs) {
         if (kern_scan_globals(&c) != 0) goto done;
@@ -1810,9 +1818,12 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
         gf(&c, "}\n\n");
     }
 
-    /* main(): one 8x8 workgroup per triangle, sweeping its bbox as a lane tile */
+    /* main(): one 16x16 workgroup covers 256 triangles; lane L of workgroup W
+     * owns triangle W*256+L outright and sweeps its screen bbox serially.  The
+     * uTriCount guard exits any over-dispatched lane BEFORE it touches an SSBO. */
     gf(&c, "void main() {\n");
-    gf(&c, "    int tri = int(gl_WorkGroupID.x) + uTriFirst;\n");
+    gf(&c, "    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);\n");
+    gf(&c, "    int tri = int(gl_WorkGroupID.x) * 256 + lane + uTriFirst;\n");
     gf(&c, "    if (tri >= uTriFirst + uTriCount) return;\n");
     gf(&c, "    int i0 = tri * 3;\n");
     gf(&c, "    int i1 = i0 + 1;\n");
@@ -1858,10 +1869,8 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
     gf(&c, "        if (maxy > uScissor.y + uScissor.w - 1) maxy = uScissor.y + uScissor.w - 1;\n");
     gf(&c, "    }\n");
     gf(&c, "    if (minx > maxx || miny > maxy) return;\n");
-    gf(&c, "    int lx = int(gl_LocalInvocationID.x);\n");
-    gf(&c, "    int ly = int(gl_LocalInvocationID.y);\n");
-    gf(&c, "    for (int py = miny + ly; py <= maxy; py += 8) {\n");
-    gf(&c, "    for (int px = minx + lx; px <= maxx; px += 8) {\n");
+    gf(&c, "    for (int py = miny; py <= maxy; py++) {\n");
+    gf(&c, "    for (int px = minx; px <= maxx; px++) {\n");
     gf(&c, "        vec2 P = vec2(float(px) + 0.5, float(py) + 0.5);\n");
     gf(&c, "        float w0 = edgef(s1, s2, P);\n");
     gf(&c, "        float w1 = edgef(s2, s0, P);\n");

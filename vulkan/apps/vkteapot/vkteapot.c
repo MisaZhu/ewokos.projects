@@ -120,11 +120,17 @@ typedef struct {
 static vk_teapot T;
 static graph_t *g_cur;     /* window graph for the frame being presented */
 static int  g_frames = 0;
+/* Optional FPS log path taken from argv[1].  The EwokOS ssh exec channel does
+ * not forward an app's stdout, so on-device FPS is measured by having the app
+ * write it to a file itself (fetched back separately).  NULL on a normal
+ * desktop launch, which leaves behaviour unchanged. */
+static const char *g_fpslog = NULL;
 
 /* present callback: blit the rendered swapchain image into the window graph. */
 static void VKAPI_CALL teapot_present(void *user, const void *pixels,
                                       uint32_t width, uint32_t height,
-                                      uint32_t stride_bytes, VkFormat format)
+                                      uint32_t stride_bytes, VkFormat format,
+                                      int shm_id)
 {
     graph_t *g = g_cur;
     const uint8_t *src = (const uint8_t *)pixels;
@@ -134,6 +140,14 @@ static void VKAPI_CALL teapot_present(void *user, const void *pixels,
     /* only the byte-identical B8G8R8A8 path is copied straight through */
     if (format != VK_FORMAT_B8G8R8A8_UNORM) return;
     if (!g || !g->buffer) return;
+    if (shm_id > 0) {
+        graph_t sg;
+        graph_init(&sg, (const uint32_t *)src, width, height);
+        sg.shm_id = shm_id;
+        sg.shm_contig = 1;
+        graph_blt(&sg, 0, 0, width, height, g, 0, 0, g->w, g->h);
+        return;
+    }
     cw = width  < (uint32_t)g->w ? width  : (uint32_t)g->w;
     ch = height < (uint32_t)g->h ? height : (uint32_t)g->h;
     for (y = 0; y < ch; y++) {
@@ -1175,6 +1189,10 @@ static void update_fps(void)
         fps = fps_count;
         fps_count = 0;
         printf("vkteapot: %d fps\n", fps);
+        if (g_fpslog) {           /* app-written file: the only ssh-readable FPS */
+            FILE *fp = fopen(g_fpslog, "w");
+            if (fp) { fprintf(fp, "%d\n", fps); fclose(fp); }
+        }
     }
     fps_count++;
 }
@@ -1199,7 +1217,13 @@ static void on_repaint(xwin_t *xwin, graph_t *g)
 static void loop(void *p)
 {
     xwin_repaint((xwin_t *)p);
-    usleep(16000);   /* ~60fps */
+    /* xwin_repaint already blocks on the server present handshake, so the loop
+     * needs no frame-rate sleep of its own.  16ms here throttled vkteapot to
+     * ~30fps while the GL twin (teapot.cpp loop: render_frame + usleep(1000))
+     * free-runs at ~79fps through the very same xwin_repaint present path.
+     * Match the GL demo: a 1ms yield keeps the CPU off a busy spin without
+     * capping the frame rate below what the GPU + compositor can deliver. */
+    usleep(1000);
 }
 
 static void cleanup_vulkan(void)
@@ -1235,8 +1259,9 @@ int main(int argc, char *argv[])
 {
     x_t x;
     xwin_t *xwin;
-    (void)argc; (void)argv;
+    (void)argc;
 
+    if (argc > 1) g_fpslog = argv[1];   /* optional FPS log path (see g_fpslog) */
     setbuf(stdout, NULL);   /* unbuffered so ssh sees prints immediately */
 
     if (build_teapot_geometry() != 0)
@@ -1257,6 +1282,12 @@ int main(int argc, char *argv[])
     }
     xwin->on_event = on_event;
     xwin->on_repaint = on_repaint;
+    /* The scene clears to a translucent background (alpha 0x88), exactly like the
+     * GL teapot twin. Without alpha mode the compositor re-blends those
+     * translucent pixels over the previous frame every repaint (alpha stacked on
+     * alpha), which makes the background flicker; enabling it makes draw_win
+     * restore the backdrop and blend each pixel exactly once. */
+    xwin_set_alpha(xwin, true);
     xwin_set_visible(xwin, true);
 
     x_run(&x, xwin);
