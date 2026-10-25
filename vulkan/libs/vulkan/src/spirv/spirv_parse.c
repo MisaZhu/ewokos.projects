@@ -215,6 +215,21 @@ spirv_module *spirv_parse(const uint32_t *words, size_t nwords,
             case OpExtInstImport:
                 if (wc >= 2 && w[1] < m->bound) m->def_at[w[1]] = (int32_t)(idx - 1);
                 break;
+            /* Ops with NO result id: word2 is an operand (a store's value, a
+             * decoration number, a branch target), never a definition.  Recording
+             * def_at[w[2]] for these would clobber the real definition of that id
+             * -- e.g. OpStore %var %const0 overwrites the constant's def_at with
+             * the store, so a later idname(const0) can no longer resolve it to its
+             * literal and emits an undeclared "v<id>".  Skip them. */
+            case OpStore: case OpCopyMemory: case OpImageWrite:
+            case OpAtomicStore: case OpMemoryBarrier: case OpControlBarrier:
+            case OpDecorate: case OpMemberDecorate:
+            case OpGroupDecorate: case OpGroupMemberDecorate:
+            case OpFunctionEnd: case OpLoopMerge: case OpSelectionMerge:
+            case OpBranch: case OpBranchConditional: case OpSwitch:
+            case OpKill: case OpReturn: case OpReturnValue:
+            case OpUnreachable: case OpTerminateInvocation:
+                break;
             default:
                 /* value/variable/constant/function ops: word2 is the result id */
                 if (wc >= 3 && w[2] < m->bound) m->def_at[w[2]] = (int32_t)(idx - 1);

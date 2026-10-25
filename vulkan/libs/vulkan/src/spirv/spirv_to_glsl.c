@@ -54,6 +54,13 @@ typedef struct {
 
     char    **name;      /* id -> malloc'd GLSL read-name / lvalue (NULL lazy) */
     uint8_t  *is_ptr;    /* id -> 1 when name[] is a pointer lvalue            */
+    uint8_t  *flat_var;  /* id -> 1 when it is a flattened UBO/push block      */
+
+    /* Flattened UBO / push-constant members (kernel mode; see spirv_glsl_flat).
+     * Accumulated during declaration, consulted by the access-chain resolver,
+     * then copied into the caller's spirv_geom_layout. */
+    spirv_glsl_flat flat[SPIRV_MAX_FLAT];
+    int             nflat;
 
     uint32_t  barriers[MAX_BARRIERS];
     int       nbar;
@@ -617,13 +624,20 @@ static int emit_extinst(gctx *c, const spirv_insn *in, int ind)
             gf(c, "%s(%s, %s);\n", fn, idname(c, a[0]), idname(c, a[1]));
         }
         return 0;
-    case G_FClamp: case G_NClamp: case G_UClamp: case G_SClamp: case G_SmoothStep:
     case G_Fma:
+        /* The on-device mesa frontend has no fma() builtin; expand to a*b+c,
+         * which is what the CPU interpreter computes for GLSL.std.450 Fma and
+         * which mesa folds into a V3D FFMA anyway (same single-rounding result). */
+        if (na != 3) return decl(c, "bad extinst arity");
+        if (assign_start(c, in, ind) != 0) return -1;
+        gf(c, "(%s * %s + %s);\n",
+           idname(c, a[0]), idname(c, a[1]), idname(c, a[2]));
+        return 0;
+    case G_FClamp: case G_NClamp: case G_UClamp: case G_SClamp: case G_SmoothStep:
         if (na != 3) return decl(c, "bad extinst arity");
         if (assign_start(c, in, ind) != 0) return -1;
         {
-            const char *fn = (eop == G_SmoothStep) ? "smoothstep" :
-                             (eop == G_Fma) ? "fma" : "clamp";
+            const char *fn = (eop == G_SmoothStep) ? "smoothstep" : "clamp";
             gf(c, "%s(%s, %s, %s);\n", fn, idname(c, a[0]), idname(c, a[1]), idname(c, a[2]));
         }
         return 0;
@@ -708,7 +722,31 @@ static int emit_stmt(gctx *c, const spirv_insn *in, int ind)
     case OpAccessChain: case OpInBoundsAccessChain: {
         spirv_type *bt = spirv_type_find(c->m, id_type(c, w[3]));
         uint32_t pointee = bt ? bt->elem : 0;
-        char *lv = build_access_chain(c, idname(c, w[3]), pointee, w + 4, in->wc - 4);
+        uint32_t nidx = in->wc - 4;
+        char *lv;
+        /* A flattened UBO/push block: the first index selects one of the emitted
+         * member uniforms (a direct identifier); any remaining indices index into
+         * that member's value (a vector component / matrix column). */
+        if (c->flat_var && w[3] < c->m->bound && c->flat_var[w[3]] && nidx >= 1) {
+            int32_t d0 = (w[4] < c->m->bound) ? c->m->def_at[w[4]] : -1;
+            const spirv_glsl_flat *fl = NULL;
+            uint32_t mk, fi;
+            if (d0 < 0 || c->m->insns[d0].op != OpConstant)
+                return decl(c, "non-constant UBO/push member index");
+            mk = c->m->insns[d0].w[3];
+            for (fi = 0; fi < (uint32_t)c->nflat; fi++)
+                if (c->flat[fi].var == w[3] && c->flat[fi].member == mk)
+                    { fl = &c->flat[fi]; break; }
+            if (!fl) return decl(c, "UBO/push member not flattened");
+            if (nidx == 1)
+                lv = strdup(fl->name);
+            else
+                lv = build_access_chain(c, fl->name,
+                                        struct_member_type(c, pointee, mk),
+                                        w + 5, nidx - 1);
+        } else {
+            lv = build_access_chain(c, idname(c, w[3]), pointee, w + 4, nidx);
+        }
         if (!lv) return -1;
         set_name(c, w[2], lv);
         free(lv);
@@ -1251,6 +1289,79 @@ static const char *comp_sel(uint32_t comps, uint32_t k, char *buf, size_t n)
     return buf;
 }
 
+/* Flatten a Uniform-buffer or push-constant block into standalone default-block
+ * uniforms, one per struct member, recording each in c->flat so the backend can
+ * fill it from the bound host buffer / push snapshot.  Only scalar, 2/3/4-vector
+ * and CONTIGUOUS square-matrix members are supported (a matrix whose columns are
+ * padded, i.e. MatrixStride != rows*4, is declined); a nested struct or array
+ * member is declined.  Member byte offsets come straight from the SPIR-V Offset
+ * decoration, matching what the software interpreter reads exactly. */
+static int flatten_block(gctx *c, uint32_t id, uint32_t struct_tid,
+                         int set, int binding, int is_push)
+{
+    spirv_type *st = spirv_type_find(c->m, struct_tid);
+    int32_t di = (struct_tid < c->m->bound) ? c->m->def_at[struct_tid] : -1;
+    spirv_insn *in;
+    uint32_t k, nm;
+
+    if (!st || st->op != OpTypeStruct || di < 0)
+        return decl(c, "UBO/push block is not a struct");
+    in = &c->m->insns[di];
+    nm = in->wc - 2;
+
+    for (k = 0; k < nm; k++) {
+        uint32_t mt = in->w[2 + k];
+        spirv_type *t = spirv_type_find(c->m, mt);
+        char tn[32], un[32];
+        uint32_t comps, off;
+        spirv_glsl_flat *fl;
+
+        if (!t) return decl(c, "bad UBO/push member type");
+        if (t->op == OpTypeFloat || t->op == OpTypeInt || t->op == OpTypeBool) {
+            if (t->op != OpTypeBool && t->width != 32)
+                return decl(c, "only 32-bit UBO/push scalars supported");
+            comps = 1;
+        } else if (t->op == OpTypeVector) {
+            spirv_type *e = spirv_type_find(c->m, t->elem);
+            if (t->comps < 2 || t->comps > 4 || !e || e->width != 32)
+                return decl(c, "unsupported UBO/push vector member");
+            comps = t->comps;
+        } else if (t->op == OpTypeMatrix) {
+            spirv_type *colv = spirv_type_find(c->m, t->elem);
+            uint32_t rows, stride;
+            if (!colv || colv->op != OpTypeVector)
+                return decl(c, "bad UBO/push matrix member");
+            rows = colv->comps;
+            stride = (uint32_t)spirv_deco_int(c->m, mt, 0xffffffffu, DecoMatrixStride, 0);
+            if (!stride) stride = rows * 4u;
+            if (stride != rows * 4u)
+                return decl(c, "non-contiguous UBO/push matrix member");
+            comps = t->comps * rows;   /* mat4 -> 16 */
+        } else {
+            return decl(c, "nested struct / array UBO/push member unsupported");
+        }
+        if (type_name(c, mt, tn, sizeof tn) != 0) return -1;
+
+        off = (uint32_t)spirv_deco_int(c->m, struct_tid, k, DecoOffset, 0);
+        if (is_push) snprintf(un, sizeof un, "pc%u_m%u", off, k);
+        else         snprintf(un, sizeof un, "u%d_%d_m%u", set, binding, k);
+        gf(c, "uniform %s %s;\n", tn, un);
+
+        if (c->nflat >= SPIRV_MAX_FLAT) return decl(c, "too many UBO/push members");
+        fl = &c->flat[c->nflat++];
+        snprintf(fl->name, sizeof fl->name, "%s", un);
+        fl->set = (uint32_t)set; fl->binding = (uint32_t)binding;
+        fl->offset = off; fl->comps = comps;
+        fl->is_push = (uint8_t)(is_push ? 1 : 0);
+        fl->var = id; fl->member = k;
+    }
+
+    set_name(c, id, "");      /* sentinel: only ever used as an access-chain base */
+    if (c->flat_var) c->flat_var[id] = 1;
+    c->is_ptr[id] = 1;
+    return 0;
+}
+
 /* Declare one module-scope OpVariable for a generated kernel.  Interface
  * variables are RECORDED (not emitted as GLSL in/out) and bound to harness
  * parameter names; samplers are emitted as TMU uniforms (raster pass only);
@@ -1346,8 +1457,14 @@ static int declare_global_var_kernel(gctx *c, const spirv_insn *in)
         return 0;
     }
     case SC_Uniform:
-    case SC_PushConstant:
-        return decl(c, "uniform buffer / push constants unsupported on GPU geom path");
+    case SC_PushConstant: {
+        int is_push = (storage == SC_PushConstant);
+        if (!is_push) {
+            if (set != 0) return decl(c, "descriptor set != 0 unsupported on GPU path");
+            if (binding < 0) return decl(c, "uniform buffer without a binding");
+        }
+        return flatten_block(c, id, pointee, set, binding, is_push);
+    }
     case SC_StorageBuffer:
         return decl(c, "storage buffer unsupported on GPU geom path");
     default:
@@ -1367,7 +1484,8 @@ static int kern_init(gctx *c, spirv_module *m, const spirv_entry *e, int mode,
     c->f = f;
     c->name = (char **)calloc(m->bound ? m->bound : 1, sizeof(char *));
     c->is_ptr = (uint8_t *)calloc(m->bound ? m->bound : 1, 1);
-    if (!c->name || !c->is_ptr) { decl(c, "out of memory"); return -1; }
+    c->flat_var = (uint8_t *)calloc(m->bound ? m->bound : 1, 1);
+    if (!c->name || !c->is_ptr || !c->flat_var) { decl(c, "out of memory"); return -1; }
     return 0;
 }
 
@@ -1379,6 +1497,7 @@ static void kern_free(gctx *c)
         free(c->name);
     }
     free(c->is_ptr);
+    free(c->flat_var);
 }
 
 /* Scan the module-scope OpVariables before the first function body. */
@@ -1416,6 +1535,11 @@ static char *gen_xform_kernel(spirv_module *m, const spirv_entry *e,
 
     if (kern_scan_globals(&c) != 0) goto done;
     if (!c.has_position) { decl(&c, "vertex shader does not write gl_Position"); goto done; }
+
+    /* carry this stage's flattened UBO/push members into the layout (the raster
+     * stage merges its own on top, de-duplicated by name) */
+    L->num_flat = c.nflat;
+    memcpy(L->flat, c.flat, sizeof(c.flat[0]) * (size_t)c.nflat);
 
     /* attribute / vout layout */
     L->num_attrs = c.nkin;
@@ -1624,6 +1748,17 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
             Lout->sampler_binding[j] = c.sampler_binding[j];
         }
         Lout->fs_present = 1;
+        /* merge this stage's flattened UBO/push members on top of the xform
+         * stage's, de-duplicated by name (a uniform both stages read is emitted
+         * once; the backend writes it into each stage's reflected blob region). */
+        for (j = 0; j < c.nflat; j++) {
+            int dup = 0, t;
+            for (t = 0; t < Lout->num_flat; t++)
+                if (strcmp(Lout->flat[t].name, c.flat[j].name) == 0) { dup = 1; break; }
+            if (dup) continue;
+            if (Lout->num_flat >= SPIRV_MAX_FLAT) { decl(&c, "too many UBO/push members"); goto done; }
+            Lout->flat[Lout->num_flat++] = c.flat[j];
+        }
     } else {
         /* the location-0 varying must exist as a vec4 to serve as the colour */
         uint32_t vc = 0;

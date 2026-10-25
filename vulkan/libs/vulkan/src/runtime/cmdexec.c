@@ -188,6 +188,75 @@ static void exec_begin_rendering(const vk_cmd *c)
         clear_view(c->u.begin_rendering.depth, &c->u.begin_rendering.depth_clear, 1);
 }
 
+/* ---- GPU clear handoff ---------------------------------------------------
+ * The GPU graphics back-end reproduces a render pass's loadOp==CLEAR on the
+ * device (its first_frame fill) and needs the clear values plus a "this is the
+ * pass's first draw" flag.  The executor carries that state from the begin
+ * command to the draws that follow it; the values mirror what clear_view()
+ * just applied to host memory, so the GPU fill and the CPU/host clear agree. */
+typedef struct {
+    int   first_draw;         /* the next draw is the pass's first            */
+    int   color_clear;        /* colour attachment[0] loadOp was CLEAR        */
+    float clear_color[4];     /* RGBA float clear value                       */
+    int   depth_clear;        /* the depth attachment loadOp was CLEAR        */
+    float clear_depth;        /* depth clear value                            */
+} gfx_clear_state;
+
+static void gfx_clear_from_render_pass(const vk_cmd *c, gfx_clear_state *cs)
+{
+    const vk_render_pass *rp = c->u.begin_rp.rp;
+    uint32_t idx;
+
+    cs->first_draw = 1;
+    cs->color_clear = 0;
+    cs->depth_clear = 0;
+    cs->clear_depth = 1.0f;
+    if (!rp)
+        return;
+    if (rp->num_color_refs > 0) {
+        idx = rp->color_refs[0].attachment;
+        if (idx < rp->num_attachments && idx < c->u.begin_rp.num_clears &&
+            rp->attachments[idx].load == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            const VkClearValue *cv = &c->u.begin_rp.clears[idx];
+            cs->color_clear = 1;
+            cs->clear_color[0] = cv->color.float32[0];
+            cs->clear_color[1] = cv->color.float32[1];
+            cs->clear_color[2] = cv->color.float32[2];
+            cs->clear_color[3] = cv->color.float32[3];
+        }
+    }
+    if (rp->has_depth) {
+        idx = rp->depth_ref.attachment;
+        if (idx < rp->num_attachments && idx < c->u.begin_rp.num_clears &&
+            rp->attachments[idx].load == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            cs->depth_clear = 1;
+            cs->clear_depth = c->u.begin_rp.clears[idx].depthStencil.depth;
+        }
+    }
+}
+
+static void gfx_clear_from_rendering(const vk_cmd *c, gfx_clear_state *cs)
+{
+    cs->first_draw = 1;
+    cs->color_clear = 0;
+    cs->depth_clear = 0;
+    cs->clear_depth = 1.0f;
+    if (c->u.begin_rendering.num_color > 0 &&
+        c->u.begin_rendering.color_layout[0] == VK_LAYOUT_CLEAR_EWOK) {
+        const VkClearValue *cv = &c->u.begin_rendering.color_clear[0];
+        cs->color_clear = 1;
+        cs->clear_color[0] = cv->color.float32[0];
+        cs->clear_color[1] = cv->color.float32[1];
+        cs->clear_color[2] = cv->color.float32[2];
+        cs->clear_color[3] = cv->color.float32[3];
+    }
+    if (c->u.begin_rendering.depth &&
+        c->u.begin_rendering.depth_layout == VK_LAYOUT_CLEAR_EWOK) {
+        cs->depth_clear = 1;
+        cs->clear_depth = c->u.begin_rendering.depth_clear.depthStencil.depth;
+    }
+}
+
 /* ---- memory transfer ops ------------------------------------------------- */
 static void exec_copy_buffer(const vk_cmd *c)
 {
@@ -339,7 +408,7 @@ static void exec_clear_depth_image(const vk_cmd *c)
 }
 
 /* ---- draw / dispatch delegation ------------------------------------------ */
-static void exec_draw(vk_command_buffer *cb, const vk_cmd *c)
+static void exec_draw(vk_command_buffer *cb, const vk_cmd *c, gfx_clear_state *cs)
 {
     const vk_device_backend *be = cb->device ? cb->device->backend : NULL;
     vk_draw_ctx dc;
@@ -361,6 +430,18 @@ static void exec_draw(vk_command_buffer *cb, const vk_cmd *c)
     memcpy(dc.vb, c->u.draw.vb, sizeof(dc.vb));
     memcpy(dc.vb_off, c->u.draw.vb_off, sizeof(dc.vb_off));
     dc.ib = c->u.draw.ib; dc.ib_off = c->u.draw.ib_off; dc.ib_type = c->u.draw.ib_type;
+
+    /* GPU clear handoff: flag the pass's first draw and carry the loadOp==CLEAR
+     * values the begin command recorded (a no-op for the CPU back-end). */
+    dc.gfx_first_draw = cs->first_draw;
+    dc.gfx_color_clear = cs->color_clear;
+    dc.gfx_clear_color[0] = cs->clear_color[0];
+    dc.gfx_clear_color[1] = cs->clear_color[1];
+    dc.gfx_clear_color[2] = cs->clear_color[2];
+    dc.gfx_clear_color[3] = cs->clear_color[3];
+    dc.gfx_depth_clear = cs->depth_clear;
+    dc.gfx_clear_depth = cs->clear_depth;
+    cs->first_draw = 0;   /* only the pass's first draw may GPU-clear */
 
     if (c->op == VK_CMD_DRAW_INDEXED && c->u.draw.ib) {
         vk_buffer *ib = c->u.draw.ib;
@@ -415,13 +496,16 @@ static void exec_write_timestamp(const vk_cmd *c)
 /* ---- the executor -------------------------------------------------------- */
 VkResult vk_execute_command_buffer(vk_command_buffer *cb)
 {
+    gfx_clear_state cs;
     uint32_t i;
     if (!cb) return VK_ERROR_INITIALIZATION_FAILED;
+    memset(&cs, 0, sizeof(cs));
+    cs.clear_depth = 1.0f;
     for (i = 0; i < cb->num_cmds; i++) {
         const vk_cmd *c = &cb->cmds[i];
         switch (c->op) {
         case VK_CMD_DRAW:
-        case VK_CMD_DRAW_INDEXED:      exec_draw(cb, c); break;
+        case VK_CMD_DRAW_INDEXED:      exec_draw(cb, c, &cs); break;
         case VK_CMD_DISPATCH:          exec_dispatch(cb, c); break;
         case VK_CMD_COPY_BUFFER:       exec_copy_buffer(c); break;
         case VK_CMD_FILL_BUFFER:       exec_fill_buffer(c); break;
@@ -432,8 +516,14 @@ VkResult vk_execute_command_buffer(vk_command_buffer *cb)
         case VK_CMD_BLIT_IMAGE:        exec_blit_image(c); break;
         case VK_CMD_CLEAR_COLOR_IMAGE: exec_clear_color_image(c); break;
         case VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE: exec_clear_depth_image(c); break;
-        case VK_CMD_BEGIN_RENDER_PASS: exec_begin_render_pass(c); break;
-        case VK_CMD_BEGIN_RENDERING:   exec_begin_rendering(c); break;
+        case VK_CMD_BEGIN_RENDER_PASS:
+            exec_begin_render_pass(c);
+            gfx_clear_from_render_pass(c, &cs);
+            break;
+        case VK_CMD_BEGIN_RENDERING:
+            exec_begin_rendering(c);
+            gfx_clear_from_rendering(c, &cs);
+            break;
         case VK_CMD_WRITE_TIMESTAMP:   exec_write_timestamp(c); break;
         case VK_CMD_SET_EVENT:
             if (c->u.event_op.event) c->u.event_op.event->set = VK_TRUE;

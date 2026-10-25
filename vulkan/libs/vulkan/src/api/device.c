@@ -2,7 +2,9 @@
  * device.c - VkDevice lifecycle, queue retrieval, and the queue submit/wait
  * path.  Device creation fixes the execution back-end for the whole device:
  * always the software CPU back-end, plus the GPU back-end on raspi5 when the
- * probe found usable silicon.  Queue submission runs recorded command buffers
+ * probe found usable silicon.  EWOK_VULKAN_CPU=1 forces the CPU back-end for
+ * this logical device, allowing software/hardware comparisons in one process.
+ * Queue submission runs recorded command buffers
  * immediately (in order) then signals the submit's semaphores and fence, which
  * is the CPU analog of OpenCL's in-order queue.
  */
@@ -42,8 +44,11 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
     dev->instance = pd->instance;
     dev->backend = &vk_backend_cpu;
 #ifdef VULKAN_GPU_BACKEND
-    if (pd->gpu_available)
-        dev->backend = &vk_backend_gpu;
+    {
+        const char *force_cpu = getenv("EWOK_VULKAN_CPU");
+        if (pd->gpu_available && (!force_cpu || strcmp(force_cpu, "1") != 0))
+            dev->backend = &vk_backend_gpu;
+    }
 #endif
     if (pCreateInfo->pEnabledFeatures)
         dev->features = *pCreateInfo->pEnabledFeatures;

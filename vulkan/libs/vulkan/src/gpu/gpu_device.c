@@ -23,12 +23,21 @@
  * binding, or a negative daemon result) runs transparently on the CPU back-end,
  * so registering the GPU device can only ever add speed, never change results.
  *
- * Graphics draws are ALWAYS declined to the software rasterizer: the V3D
- * compiled geom-raster path executes fixed vendored kernels parameterised by
- * uniforms (see geom_raster_cs.h), not arbitrary user vertex/fragment shaders,
- * so a general Vulkan graphics pipeline cannot be mapped onto it faithfully.
- * Declining is the safe choice the "GPU can only add speed, never change
- * results" rule prescribes; the CPU rasterizer already produces correct pixels.
+ * Graphics draws take the same route through a generated two-pass geometry
+ * rasterizer: on the first draw gpu_prepare_gfx() feeds the pipeline's VS (+FS)
+ * to spirv_to_geom_kernels(), which emits TWO GLSL ES 3.10 compute kernels (pass
+ * 1 vertex-transform -> vout, pass 2 raster -> fb) that reproduce cpu_raster.c
+ * pixel-exactly, compiles both on-device, serializes them into one geom blob
+ * (geom_kind 5) and uploads it.  gpu_draw() then gates the draw against the
+ * supported subset, gathers the vertex-attribute float stream + FS samplers,
+ * packs the per-draw uniform blob and dispatches through vk_gfx_draw.
+ *
+ * Everything outside that subset is DECLINED, never mis-rendered: a construct
+ * the transpiler cannot express, an unsupported pipeline/draw state (non
+ * TRIANGLE_LIST, blend, a depth func other than LESS+write, a non-float vertex
+ * format, an indexed draw whose VS reads gl_VertexID, ...), an unresolvable
+ * binding, or a negative daemon result all fall back to cpu_draw.  Registering
+ * the GPU device therefore can only ever add speed, never change pixels.
  *
  * Workgroup model: the transpiler bakes the shader's LocalSize into the GLSL and
  * this file dispatches gx x gy x gz work-groups of local_size[0] items.  Only a
@@ -44,6 +53,7 @@
 
 #include <pglcompiler.h>
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -58,6 +68,21 @@ typedef struct gpu_pipeline {
     uint32_t unif_dwords;    /* span of the per-dispatch uniform blob         */
     struct pglc_uniform_binding *bindings;  /* copied uniform reflection      */
     uint32_t nbindings;
+
+    /* ---- graphics (two-pass geom rasterizer, geom_kind 5) ----
+     * A graphics pipeline compiles TWO compute kernels (pass 1 xform -> vout,
+     * pass 2 raster -> fb) generated from its VS/FS by spirv_to_geom_kernels(),
+     * serialized into ONE blob whose per-draw uniform region is the concatenation
+     * [xform | raster] split at xf_dwords.  glayout carries the attribute/varying
+     * stream layout and the FS sampler (set,binding) list the draw resolves. */
+    int                 gfx;          /* 1: prepared as a graphics pipeline    */
+    spirv_geom_layout   glayout;
+    uint32_t            xf_dwords;    /* xform (cs2) uniform region = split     */
+    uint32_t            rs_dwords;    /* raster (cs) uniform region             */
+    struct pglc_uniform_binding *xf_bindings;   /* xform uniform reflection     */
+    uint32_t            nxf_bindings;
+    struct pglc_uniform_binding *rs_bindings;   /* raster uniform reflection    */
+    uint32_t            nrs_bindings;
 } gpu_pipeline;
 
 /* ---- device probe -------------------------------------------------------- */
@@ -152,11 +177,14 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
 
     /* 2. compile + link with the on-device mesa backend. */
     memset(&res, 0, sizeof(res));
-    if (!pglc_compile_compute_raw(glsl, &res) || !res.success ||
-        res.stage[PGLC_STAGE_COMPUTE].code_words == 0) {
-        free(glsl);
-        pglc_program_free(&res);
-        GPU_DECLINE();
+    {
+        bool ok = pglc_compile_compute_raw(glsl, &res);
+        if (!ok || !res.success ||
+            res.stage[PGLC_STAGE_COMPUTE].code_words == 0) {
+            free(glsl);
+            pglc_program_free(&res);
+            GPU_DECLINE();
+        }
     }
     free(glsl);
 
@@ -208,6 +236,288 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
     return gp;
 
 #undef GPU_DECLINE
+}
+
+/* ---- graphics helpers ---------------------------------------------------- */
+
+/* Bit-pattern of a float, for packing into the u32 uniform blob (a float
+ * uniform is stored as its IEEE bits, an int as its two's-complement value). */
+static uint32_t gfx_f2u(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return u;
+}
+
+/* Clamp a [0,1] float to a UNORM byte, matching cpu_raster.c's f2u8 / cmdexec's
+ * cc_u8 so the GPU-side clear colour equals the host clear the executor wrote. */
+static uint8_t gfx_u8(float v)
+{
+    if (v <= 0.0f) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+/* Write nvals dwords into the packed per-draw uniform blob at the reflected
+ * offset of `name` within one stage's region (base = that region's start in the
+ * concatenated [xform | raster] blob).  A uniform the linker dead-stripped (the
+ * kernel never reads it) is simply absent from the reflection table, which is
+ * not an error: the value is unused, so skipping it is correct. */
+static void gfx_pack(const struct pglc_uniform_binding *bs, uint32_t n,
+                     uint32_t base, uint32_t *blob, const char *name,
+                     const uint32_t *vals, uint32_t nvals)
+{
+    uint32_t i, k, span;
+    for (i = 0; i < n; i++) {
+        if (strcmp(bs[i].name, name) != 0)
+            continue;
+        span = bs[i].num_components < nvals ? bs[i].num_components : nvals;
+        for (k = 0; k < span; k++)
+            blob[base + bs[i].dword_offset + k] = vals[k];
+        return;
+    }
+}
+
+/* Deep-copy one compiled stage's uniform reflection table (name -> blob offset). */
+static int gfx_copy_bindings(struct pglc_uniform_binding **dst, uint32_t *n,
+                             const struct pglc_stage *st)
+{
+    *dst = NULL;
+    *n = 0;
+    if (st->num_uniform_bindings && st->uniform_bindings) {
+        size_t nb = (size_t)st->num_uniform_bindings * sizeof(struct pglc_uniform_binding);
+        *dst = (struct pglc_uniform_binding *)malloc(nb);
+        if (!*dst)
+            return -1;
+        memcpy(*dst, st->uniform_bindings, nb);
+        *n = st->num_uniform_bindings;
+    }
+    return 0;
+}
+
+/* Resolve one combined-image-sampler descriptor write to its image view + sampler
+ * (the graphics twin of gpu_find_ssbo).  Returns 0 on success, -1 when the
+ * (set,binding) is not written as a sampled image (which declines the draw rather
+ * than sampling an unbound unit). */
+static int gpu_find_sampler(const vk_draw_ctx *dc, uint32_t set, uint32_t binding,
+                            vk_image_view **view, vk_sampler **smp)
+{
+    uint32_t s, i;
+    for (s = 0; s < dc->set_count; s++) {
+        const vk_descriptor_set *ds = dc->sets[s];
+        uint32_t set_index = dc->first_set + s;
+        if (!ds || set_index != set)
+            continue;
+        for (i = 0; i < ds->num_bindings; i++) {
+            const vk_descriptor_binding *b = &ds->bindings[i];
+            if (b->binding != binding)
+                continue;
+            if (b->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || !b->view)
+                return -1;
+            *view = b->view;
+            *smp = b->sampler;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Resolve one uniform-buffer descriptor write to its host store (the UBO twin of
+ * gpu_find_ssbo, used to source a flattened UBO member).  Returns 0 on success,
+ * -1 when the (set,binding) is not written as a UNIFORM_BUFFER. */
+static int gpu_find_ubo(const vk_draw_ctx *dc, uint32_t set, uint32_t binding,
+                        void **host, size_t *size)
+{
+    uint32_t s, i;
+    for (s = 0; s < dc->set_count; s++) {
+        const vk_descriptor_set *ds = dc->sets[s];
+        uint32_t set_index = dc->first_set + s;
+        if (!ds || set_index != set)
+            continue;
+        for (i = 0; i < ds->num_bindings; i++) {
+            const vk_descriptor_binding *b = &ds->bindings[i];
+            void *base;
+            if (b->binding != binding)
+                continue;
+            if (b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || !b->buffer)
+                return -1;
+            base = vk_buffer_ptr(b->buffer);
+            if (!base)
+                return -1;
+            *host = (char *)base + b->offset;
+            *size = (size_t)(b->range == VK_WHOLE_SIZE
+                                 ? (b->buffer->size - b->offset) : b->range);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Non-zero when a stage's reflected uniform table contains `name` (the linker
+ * kept it).  A flattened UBO/push member that was dead-stripped from BOTH stages
+ * needs no host value, so the draw does not decline when its buffer is unbound. */
+static int gfx_reflected(const struct pglc_uniform_binding *bs, uint32_t n,
+                         const char *name)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++)
+        if (strcmp(bs[i].name, name) == 0)
+            return 1;
+    return 0;
+}
+
+/* Decode one vertex attribute component set to floats.  The GPU attribute stream
+ * is plain float[], so only 32-bit float formats are staged; anything else falls
+ * back to the {0,0,0,1} default exactly like cpu_raster.c's decode_attr (which
+ * leaves the default for an unsupported format rather than declining). */
+static void gfx_decode_attr(VkFormat f, const uint8_t *p, float *out)
+{
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    switch (f) {
+    case VK_FORMAT_R32_SFLOAT:
+        out[0] = *(const float *)p; break;
+    case VK_FORMAT_R32G32_SFLOAT:
+        out[0] = ((const float *)p)[0]; out[1] = ((const float *)p)[1]; break;
+    case VK_FORMAT_R32G32B32_SFLOAT:
+        out[0] = ((const float *)p)[0]; out[1] = ((const float *)p)[1];
+        out[2] = ((const float *)p)[2]; break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        out[0] = ((const float *)p)[0]; out[1] = ((const float *)p)[1];
+        out[2] = ((const float *)p)[2]; out[3] = ((const float *)p)[3]; break;
+    default:
+        break;   /* unsupported: leave the {0,0,0,1} default (matches the CPU) */
+    }
+}
+
+/* ---- lazy per-pipeline graphics prepare ---------------------------------- */
+
+/* Generate + compile + serialize + upload the pipeline's two-pass geom kernels
+ * once (the graphics twin of gpu_prepare).  Any decline sets cpu_fallback and
+ * STILL returns a valid gpu_pipeline, so gpu_draw transparently replays on the
+ * CPU rasterizer. */
+static gpu_pipeline *gpu_prepare_gfx(vk_pipeline *p)
+{
+    gpu_pipeline *gp;
+    const spirv_module *vmod = NULL, *fmod = NULL;
+    const spirv_entry *ve = NULL, *fe = NULL;
+    spirv_geom_kernels kern;
+    struct pglc_program res_x, res_r;
+    struct pglc_blob_opts opts;
+    struct pglc_stage *sx, *sr;
+    char err[256];
+    uint32_t i, blobsz;
+    void *blob = NULL;
+    int32_t handle;
+
+    if (p->backend_data)
+        return (gpu_pipeline *)p->backend_data;
+
+    gp = (gpu_pipeline *)calloc(1, sizeof(*gp));
+    if (!gp)
+        return NULL;
+    gp->handle = -1;
+    p->backend_data = gp;
+
+#define GFX_DECLINE() do { gp->cpu_fallback = 1; gp->prepared = 1; return gp; } while (0)
+#define GFX_CLEANUP() do { \
+        free(kern.xform); free(kern.raster); \
+        pglc_program_free(&res_x); pglc_program_free(&res_r); \
+        free(blob); \
+    } while (0)
+
+    memset(&kern, 0, sizeof(kern));
+    memset(&res_x, 0, sizeof(res_x));
+    memset(&res_r, 0, sizeof(res_r));
+
+    /* locate the VS/FS entries exactly like cpu_draw does */
+    for (i = 0; i < p->num_stages; i++) {
+        if (p->stages[i].stage == VK_SHADER_STAGE_VERTEX_BIT) {
+            if (p->stages[i].module && p->stages[i].module->module) {
+                vmod = p->stages[i].module->module;
+                ve = spirv_find_entry(vmod,
+                        p->stages[i].entry[0] ? p->stages[i].entry : NULL,
+                        SPIRV_EXEC_VERTEX);
+            }
+        } else if (p->stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+            if (p->stages[i].module && p->stages[i].module->module) {
+                fmod = p->stages[i].module->module;
+                fe = spirv_find_entry(fmod,
+                        p->stages[i].entry[0] ? p->stages[i].entry : NULL,
+                        SPIRV_EXEC_FRAGMENT);
+            }
+        }
+    }
+    if (!vmod || !ve)
+        GFX_DECLINE();   /* no vertex shader: nothing to offload */
+
+    /* 1. generate the two GLSL ES 3.10 compute kernels from VS (+ optional FS). */
+    if (spirv_to_geom_kernels((spirv_module *)vmod, ve, (spirv_module *)fmod, fe,
+                              &kern, err, sizeof(err)) != 0)
+        GFX_DECLINE();
+
+    /* 2. compile both with the on-device mesa backend (pass 1 = xform, pass 2 =
+     *    raster).  Each lands in its own pglc_program's COMPUTE stage. */
+    if (!pglc_compile_compute_raw(kern.xform, &res_x) || !res_x.success ||
+        res_x.stage[PGLC_STAGE_COMPUTE].code_words == 0) {
+        GFX_CLEANUP();
+        GFX_DECLINE();
+    }
+    if (!pglc_compile_compute_raw(kern.raster, &res_r) || !res_r.success ||
+        res_r.stage[PGLC_STAGE_COMPUTE].code_words == 0) {
+        GFX_CLEANUP();
+        GFX_DECLINE();
+    }
+
+    sx = &res_x.stage[PGLC_STAGE_COMPUTE];
+    sr = &res_r.stage[PGLC_STAGE_COMPUTE];
+    gp->glayout   = kern.layout;
+    gp->xf_dwords = sx->uniform_blob_dwords;   /* the daemon's blob split point */
+    gp->rs_dwords = sr->uniform_blob_dwords;
+    if (gfx_copy_bindings(&gp->xf_bindings, &gp->nxf_bindings, sx) != 0 ||
+        gfx_copy_bindings(&gp->rs_bindings, &gp->nrs_bindings, sr) != 0) {
+        GFX_CLEANUP();
+        GFX_DECLINE();
+    }
+
+    /* 3. serialize (main = raster/cs, xform = cs2) with geom_kind 5, one
+     *    workgroup per triangle (geom_tpw 0), and the VERSION-6 stream strides.
+     *    A VS with no inputs reports attr_stride 0; the blob field must be >= 1
+     *    (the daemon validates [1,64]), and the generated kernel reads no vattr
+     *    in that case, so a 1-float dummy stride is staged. */
+    memset(&opts, 0, sizeof(opts));
+    opts.geom_kind   = 5;
+    opts.geom_tpw    = 0;
+    opts.vout_stride = kern.layout.vout_stride;
+    opts.attr_stride = kern.layout.attr_stride ? kern.layout.attr_stride : 1u;
+    blobsz = pglc_program_serialize(&res_r, &res_x, &opts, NULL, 0);
+    if (blobsz == 0) {
+        GFX_CLEANUP();
+        GFX_DECLINE();
+    }
+    blob = malloc(blobsz);
+    if (!blob) {
+        GFX_CLEANUP();
+        GFX_DECLINE();
+    }
+    if (pglc_program_serialize(&res_r, &res_x, &opts, blob, blobsz) == 0) {
+        GFX_CLEANUP();
+        GFX_DECLINE();
+    }
+
+    handle = vk_gfx_program_upload(blob, blobsz);
+    GFX_CLEANUP();
+
+    if (handle < 0)
+        GFX_DECLINE();
+
+    gp->gfx      = 1;
+    gp->handle   = handle;
+    gp->prepared = 1;
+    return gp;
+
+#undef GFX_CLEANUP
+#undef GFX_DECLINE
 }
 
 /* ---- backend: compute dispatch ------------------------------------------- */
@@ -275,16 +585,340 @@ static VkResult gpu_dispatch(vk_command_buffer *cb, vk_draw_ctx *dc,
     return cpu_dispatch(cb, dc, gx, gy, gz);
 }
 
-/* ---- backend: graphics draw (always declined to the software rasterizer) -- */
+/* ---- backend: graphics draw (two-pass geom rasterizer, geom_kind 5) ------- */
 
+/* Offload a graphics draw to the V3D two-pass geometry rasterizer when the
+ * pipeline + draw state fall inside the supported subset; otherwise decline to
+ * the (always-correct) CPU rasterizer.  The subset mirrors the feature face the
+ * generated kernels reproduce pixel-exactly (see spirv_to_glsl.h): TRIANGLE_LIST,
+ * a single RGBA8/BGRA8 colour attachment, <= 1 instance, no blend, depth off or
+ * LESS+write, any viewport/scissor, <= 4 set-0 combined-image samplers.
+ *
+ * Everything the kernels cannot reproduce faithfully is DECLINED, never
+ * mis-rendered: an unsupported construct (the transpiler declines it), an
+ * unresolvable binding, an indexed draw whose VS reads gl_VertexID, a non-float
+ * vertex format the stream cannot carry, or a negative daemon result all fall
+ * back to cpu_draw, so enabling the GPU can only add speed, never change pixels.
+ *
+ * Depth model (v1): the raster kernel arbitrates depth on vkclient's PRIVATE
+ * z canvas (24-bit unorm atomicMin, nearest-wins), NOT the host depth
+ * attachment, and that canvas is neither seeded from nor written back to the
+ * attachment.  A depth-enabled draw therefore requires the render pass to have
+ * cleared colour and depth-to-1.0 (so the frame's first GPU draw's first_frame
+ * fill reproduces both), and assumes the whole pass runs on the GPU; reading the
+ * depth attachment after the pass, or interleaving a CPU draw in a depth pass,
+ * are documented v1 boundaries that decline or stay consistent per-pass. */
 static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
                          uint32_t vertexCount, uint32_t firstVertex,
                          uint32_t instanceCount, uint32_t firstInstance,
                          const uint32_t *index_data, VkIndexType index_type)
 {
-    /* See the file header: the V3D compiled geom-raster path runs fixed vendored
-     * kernels, not arbitrary user VS/FS, so a general Vulkan graphics pipeline
-     * cannot be offloaded faithfully.  Decline to the (correct) CPU rasterizer. */
+    vk_pipeline *p = dc->pipeline;
+    gpu_pipeline *gp;
+    vk_image *cim;
+    void *fb_host;
+    float *attr = NULL;
+    uint32_t *unif = NULL;
+    vk_gfx_tex tex[VKCLIENT_MAX_TEX];
+    VkViewport vp;
+    uint32_t cbpp, rt_w, rt_h, fb_stride, ntris, nverts, astride;
+    uint32_t num_unif, ntex = 0, k, j, cull, frontcw, fbswz, clear_rgba = 0;
+    int bgra, depth_on, have_depth, first_frame = 0;
+    float lox, loy, hix, hiy;
+    int cx0, cy0, cx1, cy1, scx, scy, scw, sch;
+    float clear_z = 1.0f;
+    int32_t rc;
+
+#define GFX_CPU() do { free(attr); free(unif); \
+        return cpu_draw(cb, dc, vertexCount, firstVertex, instanceCount, \
+                        firstInstance, index_data, index_type); } while (0)
+
+    if (!p)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    /* ---- static eligibility gate (pipeline + draw state) ---- */
+    if (p->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS)  GFX_CPU();
+    if (p->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) GFX_CPU();
+    if (instanceCount != 1u)                               GFX_CPU();
+    if (p->rasterizer_discard)                             GFX_CPU();
+    if (p->blend_enable)                                   GFX_CPU();   /* opaque only */
+
+    /* single RGBA8/BGRA8 colour attachment (the only formats the kernel packs) */
+    if (dc->num_color != 1u || !dc->color[0] || !dc->color[0]->image)
+        GFX_CPU();
+    cim = dc->color[0]->image;
+    if (cim->format != VK_FORMAT_R8G8B8A8_UNORM && cim->format != VK_FORMAT_R8G8B8A8_SRGB &&
+        cim->format != VK_FORMAT_B8G8R8A8_UNORM && cim->format != VK_FORMAT_B8G8R8A8_SRGB)
+        GFX_CPU();
+    bgra = (cim->format == VK_FORMAT_B8G8R8A8_UNORM ||
+            cim->format == VK_FORMAT_B8G8R8A8_SRGB) ? 1 : 0;
+    fbswz = bgra ? 1u : 0u;   /* kernel fb byte order selector */
+
+    cbpp = cim->bpp ? cim->bpp : vk_format_bpp(cim->format);
+    if (cbpp != 4u)            GFX_CPU();
+    fb_host = vk_image_ptr(cim);
+    if (!fb_host)              GFX_CPU();
+
+    /* render-target size (setup_rt semantics: image extent, overridden by the
+     * recorded rt size); host row pitch is cbpp * image width, matching the CPU
+     * rasterizer's cpitch so both address the attachment identically. */
+    rt_w = cim->extent.width;
+    rt_h = cim->extent.height;
+    if (dc->rt_width)  rt_w = dc->rt_width;
+    if (dc->rt_height) rt_h = dc->rt_height;
+    if (!rt_w || !rt_h)        GFX_CPU();
+    fb_stride = cbpp * cim->extent.width;
+    if (fb_stride < rt_w * 4u) GFX_CPU();
+
+    /* depth: the kernel arbitrates strict LESS + write, or is off.  A depth
+     * attachment the CPU would actually test against (depth_test_enable && a
+     * resident depth image) must be LESS + write to offload; anything else
+     * declines.  depth_test_enable with NO attachment is a no-op on the CPU too,
+     * so it maps to the kernel's depth-off path. */
+    have_depth = (dc->depth && dc->depth->image &&
+                  vk_image_ptr(dc->depth->image)) ? 1 : 0;
+    depth_on = (p->depth_test_enable && have_depth) ? 1 : 0;
+    if (depth_on && (p->depth_compare != VK_COMPARE_OP_LESS || !p->depth_write_enable))
+        GFX_CPU();
+
+    /* triangle count: the CPU draws floor(vertexCount/3) triangles, ignoring a
+     * trailing partial, so stage exactly ntris*3 vertices. */
+    ntris = vertexCount / 3u;
+    if (ntris == 0u)           GFX_CPU();   /* nothing to draw (CPU is a no-op) */
+    nverts = ntris * 3u;
+    if (nverts > VKCLIENT_MAX_VERTS) GFX_CPU();
+
+    /* ---- lazily generate + compile + upload the two kernels ---- */
+    gp = gpu_prepare_gfx(p);
+    if (!gp || !gp->gfx || gp->cpu_fallback || gp->handle < 0)
+        GFX_CPU();
+
+    /* an indexed draw re-bases vertices to 0..n-1 in the staged stream, so a VS
+     * that reads gl_VertexID would see the wrong index; decline it (the CPU path
+     * resolves index_data faithfully). */
+    if (index_data && gp->glayout.uses_vertex_id)
+        GFX_CPU();
+
+    /* ---- viewport + scissor -> the kernel's integer clip rect ----
+     * The kernel clamps its bbox to the render target and (when enabled) to
+     * uScissor, but NOT to a viewport sub-rect, so uScissor carries the
+     * intersection of the viewport and the user scissor to reproduce the CPU's
+     * clamp.  A full-target rect disables the kernel scissor (fast path). */
+    vp = dc->has_vp ? dc->vp
+                    : (VkViewport){ 0.0f, 0.0f, (float)rt_w, (float)rt_h, 0.0f, 1.0f };
+    lox = vp.x;               loy = vp.y;
+    hix = vp.x + vp.width;    hiy = vp.y + vp.height;
+    if (dc->has_sc) {
+        float sx0 = (float)dc->sc.offset.x, sy0 = (float)dc->sc.offset.y;
+        float sx1 = sx0 + (float)dc->sc.extent.width;
+        float sy1 = sy0 + (float)dc->sc.extent.height;
+        if (sx0 > lox) lox = sx0;
+        if (sy0 > loy) loy = sy0;
+        if (sx1 < hix) hix = sx1;
+        if (sy1 < hiy) hiy = sy1;
+    }
+    cx0 = (int)floorf(lox); if (cx0 < 0) cx0 = 0;
+    cy0 = (int)floorf(loy); if (cy0 < 0) cy0 = 0;
+    cx1 = (int)ceilf(hix);  if (cx1 > (int)rt_w) cx1 = (int)rt_w;
+    cy1 = (int)ceilf(hiy);  if (cy1 > (int)rt_h) cy1 = (int)rt_h;
+    if (cx1 <= cx0 || cy1 <= cy0)
+        return VK_SUCCESS;   /* empty clip rect: the CPU also draws nothing */
+    if (cx0 <= 0 && cy0 <= 0 && cx1 >= (int)rt_w && cy1 >= (int)rt_h) {
+        scx = scy = scw = sch = 0;   /* covers the target: disable kernel scissor */
+    } else {
+        scx = cx0; scy = cy0; scw = cx1 - cx0; sch = cy1 - cy0;
+    }
+
+    /* ---- clear / first_frame decision ---- */
+    if (depth_on) {
+        uint8_t r8, g8, b8, a8;
+        /* the private z canvas is only cleared by the frame's first GPU draw
+         * (first_frame fill -> depth max), so the pass must have cleared colour
+         * (reproduced by the same fill) and depth to 1.0; otherwise decline. */
+        if (!dc->gfx_color_clear || !dc->gfx_depth_clear ||
+            !(dc->gfx_clear_depth >= 1.0f))
+            GFX_CPU();
+        first_frame = dc->gfx_first_draw ? 1 : 0;
+        /* Encode the clear colour for the daemon's fb fill: it writes
+         * swap_RB(clear_rgba), which must equal the kernel's fb word for the
+         * clear colour, i.e. clear_rgba is the OPPOSITE swizzle of the fb. */
+        r8 = gfx_u8(dc->gfx_clear_color[0]);
+        g8 = gfx_u8(dc->gfx_clear_color[1]);
+        b8 = gfx_u8(dc->gfx_clear_color[2]);
+        a8 = gfx_u8(dc->gfx_clear_color[3]);
+        clear_rgba = bgra ? (((uint32_t)a8 << 24) | ((uint32_t)b8 << 16) |
+                             ((uint32_t)g8 << 8)  |  (uint32_t)r8)
+                          : (((uint32_t)a8 << 24) | ((uint32_t)r8 << 16) |
+                             ((uint32_t)g8 << 8)  |  (uint32_t)b8);
+    }
+
+    /* ---- gather the per-vertex attribute float stream ----
+     * One vertex's attributes are contiguous (layout.attrs[].offset floats in),
+     * nverts * attr_stride floats total.  Each VS input location is sourced from
+     * the pipeline attribute feeding it (decoded to float, matching the CPU); an
+     * unwritten / unbound location stays zero (the CPU interpreter's memset). */
+    astride = gp->glayout.attr_stride ? gp->glayout.attr_stride : 1u;
+    attr = (float *)calloc((size_t)nverts * astride, sizeof(float));
+    if (!attr)
+        GFX_CPU();
+    for (k = 0; k < nverts; k++) {
+        uint32_t vidx = index_data ? index_data[k] : (firstVertex + k);
+        for (j = 0; j < (uint32_t)gp->glayout.num_attrs; j++) {
+            const spirv_geom_slot *sl = &gp->glayout.attrs[j];
+            const vk_vertex_attr *va = NULL;
+            const uint8_t *src;
+            uint32_t a, bb, stride = 0, comps;
+            float v[4];
+            for (a = 0; a < p->num_vtx_attrs; a++)
+                if (p->vtx_attrs[a].location == sl->location) { va = &p->vtx_attrs[a]; break; }
+            if (!va)
+                continue;   /* unwritten input: leave zero (matches the CPU) */
+            if (va->binding >= VK_MAX_VERTEX_BINDINGS || !dc->vb[va->binding])
+                continue;   /* unbound: leave zero (matches the CPU) */
+            for (bb = 0; bb < p->num_vtx_bindings; bb++)
+                if (p->vtx_bindings[bb].binding == va->binding) {
+                    if (p->vtx_bindings[bb].rate != VK_VERTEX_INPUT_RATE_VERTEX) {
+                        /* per-instance attributes need gl_InstanceID: decline */
+                        GFX_CPU();
+                    }
+                    stride = p->vtx_bindings[bb].stride;
+                    break;
+                }
+            src = (const uint8_t *)vk_buffer_ptr(dc->vb[va->binding]);
+            if (!src)
+                continue;
+            src += dc->vb_off[va->binding] + (size_t)vidx * stride + va->offset;
+            gfx_decode_attr(va->format, src, v);
+            comps = sl->comps > 4u ? 4u : sl->comps;
+            for (a = 0; a < comps; a++)
+                attr[(size_t)k * astride + sl->offset + a] = v[a];
+        }
+    }
+
+    /* ---- resolve the FS combined-image samplers into TMU textures ---- */
+    memset(tex, 0, sizeof(tex));
+    for (j = 0; j < (uint32_t)gp->glayout.num_samplers; j++) {
+        uint32_t bset = gp->glayout.sampler_set[j];
+        uint32_t bbind = gp->glayout.sampler_binding[j];
+        vk_image_view *iv = NULL;
+        vk_sampler *smp = NULL;
+        vk_image *tim;
+        void *th;
+        uint32_t tbpp, tpitch;
+        if (bbind >= VKCLIENT_MAX_TEX)
+            GFX_CPU();
+        /* the FS samples this unit, so it MUST be bound: decline rather than let
+         * the kernel read an unbound TMU (the daemon declines that too). */
+        if (gpu_find_sampler(dc, bset, bbind, &iv, &smp) != 0 || !iv || !iv->image)
+            GFX_CPU();
+        tim = iv->image;
+        if (tim->format != VK_FORMAT_R8G8B8A8_UNORM &&
+            tim->format != VK_FORMAT_R8G8B8A8_SRGB)
+            GFX_CPU();   /* only tightly packed RGBA8 tiles into the TMU layout */
+        th = vk_image_ptr(tim);
+        tbpp = tim->bpp ? tim->bpp : vk_format_bpp(tim->format);
+        tpitch = tim->row_pitch ? tim->row_pitch : tbpp * tim->extent.width;
+        if (!th || tbpp != 4u || tpitch != tim->extent.width * 4u ||
+            tim->extent.width == 0 || tim->extent.height == 0)
+            GFX_CPU();
+        tex[bbind].host   = th;
+        tex[bbind].w      = tim->extent.width;
+        tex[bbind].h      = tim->extent.height;
+        tex[bbind].linear = (smp && (smp->mag == VK_FILTER_LINEAR ||
+                                     smp->min_f == VK_FILTER_LINEAR)) ? 1 : 0;
+        if (bbind + 1u > ntex)
+            ntex = bbind + 1u;
+    }
+
+    /* ---- pack the per-draw uniform blob [xform | raster] ---- */
+    num_unif = gp->xf_dwords + gp->rs_dwords;
+    if (num_unif > 0u) {
+        uint32_t v4[4], rb = gp->xf_dwords;
+        unif = (uint32_t *)calloc(num_unif, sizeof(uint32_t));
+        if (!unif)
+            GFX_CPU();
+        /* pass 1 xform uniforms */
+        v4[0] = gfx_f2u(vp.x); v4[1] = gfx_f2u(vp.y);
+        v4[2] = gfx_f2u(vp.width * 0.5f); v4[3] = gfx_f2u(vp.height * 0.5f);
+        gfx_pack(gp->xf_bindings, gp->nxf_bindings, 0, unif, "uVpOffsetScale", v4, 4);
+        v4[0] = gfx_f2u(vp.minDepth); v4[1] = gfx_f2u(vp.maxDepth - vp.minDepth);
+        gfx_pack(gp->xf_bindings, gp->nxf_bindings, 0, unif, "uVpDepth", v4, 2);
+        v4[0] = nverts;
+        gfx_pack(gp->xf_bindings, gp->nxf_bindings, 0, unif, "uVertCount", v4, 1);
+        v4[0] = index_data ? 0u : firstVertex;   /* gl_VertexID base */
+        gfx_pack(gp->xf_bindings, gp->nxf_bindings, 0, unif, "uVertexBase", v4, 1);
+        /* pass 2 raster uniforms (offset by the xform region) */
+        v4[0] = gfx_f2u((float)rt_w); v4[1] = gfx_f2u((float)rt_h);
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uViewportWH", v4, 2);
+        v4[0] = rt_w;
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uFbStride", v4, 1);
+        v4[0] = 0u;
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uTriFirst", v4, 1);
+        v4[0] = ntris;
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uTriCount", v4, 1);
+        v4[0] = (uint32_t)scx; v4[1] = (uint32_t)scy;
+        v4[2] = (uint32_t)scw; v4[3] = (uint32_t)sch;
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uScissor", v4, 4);
+        v4[0] = depth_on ? 1u : 0u;
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uDepthFunc", v4, 1);
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uDepthWrite", v4, 1);
+        cull = (uint32_t)p->cull_mode & 3u;   /* NONE/FRONT/BACK/BOTH == 0/1/2/3 */
+        v4[0] = cull;
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uCullMode", v4, 1);
+        frontcw = (p->front_face == VK_FRONT_FACE_CLOCKWISE) ? 1u : 0u;
+        v4[0] = frontcw;
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uFrontCW", v4, 1);
+        v4[0] = 0u;   /* opaque only (blend gated off above) */
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uBlendMode", v4, 1);
+        v4[0] = fbswz;
+        gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uFbSwizzle", v4, 1);
+        /* user UBO / push-constant members (flattened by the transpiler): read
+         * each from its bound host buffer / the push snapshot and write it into
+         * BOTH stage regions by name (a name only one stage reflects lands there;
+         * the other region's gfx_pack is a no-op).  A member dead-stripped from
+         * both stages needs no value; a reflected one whose source is missing
+         * declines to the CPU rather than feeding the kernel garbage. */
+        for (j = 0; j < (uint32_t)gp->glayout.num_flat; j++) {
+            const spirv_glsl_flat *fl = &gp->glayout.flat[j];
+            const uint8_t *src = NULL;
+            uint32_t vals[16];
+            if (fl->comps > 16u)
+                GFX_CPU();
+            if (!gfx_reflected(gp->xf_bindings, gp->nxf_bindings, fl->name) &&
+                !gfx_reflected(gp->rs_bindings, gp->nrs_bindings, fl->name))
+                continue;   /* dead-stripped everywhere: no value required */
+            if (fl->is_push) {
+                if (dc->push && fl->offset + fl->comps * 4u <= dc->push_size)
+                    src = dc->push + fl->offset;
+            } else {
+                void *uh = NULL;
+                size_t usz = 0;
+                if (gpu_find_ubo(dc, fl->set, fl->binding, &uh, &usz) == 0 &&
+                    fl->offset + fl->comps * 4u <= usz)
+                    src = (const uint8_t *)uh + fl->offset;
+            }
+            if (!src)
+                GFX_CPU();   /* reflected but unresolvable: the CPU replay is correct */
+            memcpy(vals, src, (size_t)fl->comps * 4u);
+            gfx_pack(gp->xf_bindings, gp->nxf_bindings, 0, unif, fl->name, vals, fl->comps);
+            gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, fl->name, vals, fl->comps);
+        }
+    }
+
+    /* ---- dispatch the two passes over the g2dd PGL verbs ---- */
+    rc = vk_gfx_draw(gp->handle, fb_host, rt_w, rt_h, fb_stride,
+                     attr, nverts, astride, unif, num_unif,
+                     first_frame, clear_rgba, clear_z,
+                     ntex ? tex : NULL, ntex);
+    free(attr);
+    free(unif);
+#undef GFX_CPU
+
+    if (rc == VKCLIENT_OK)
+        return VK_SUCCESS;
+    /* No device-wide failure latch: a declined/failed GPU draw replays on the
+     * CPU rasterizer (correct pixels); a later draw may retry the GPU.  Terminal
+     * staging was abandoned inside vkclient exactly like vk_kernel_dispatch. */
     return cpu_draw(cb, dc, vertexCount, firstVertex,
                     instanceCount, firstInstance, index_data, index_type);
 }
@@ -302,6 +936,8 @@ static void gpu_pipeline_free(vk_pipeline *p)
         if (gp->handle >= 0)
             vk_program_free(gp->handle);
         free(gp->bindings);
+        free(gp->xf_bindings);
+        free(gp->rs_bindings);
         free(gp);
     }
     p->backend_data = NULL;

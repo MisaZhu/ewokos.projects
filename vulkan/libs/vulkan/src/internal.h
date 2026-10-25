@@ -642,6 +642,21 @@ typedef struct vk_draw_ctx {
     /* vertex/index */
     vk_buffer         *vb[VK_MAX_VERTEX_BINDINGS]; VkDeviceSize vb_off[VK_MAX_VERTEX_BINDINGS];
     vk_buffer         *ib; VkDeviceSize ib_off; VkIndexType ib_type;
+
+    /* GPU graphics clear handoff.  The executor already applied every
+     * loadOp==CLEAR to host memory before the draws run; these fields carry
+     * that clear state to the GPU back-end so its first draw of a render pass
+     * can reproduce the colour clear on the device (first_frame fill) and
+     * initialise the rasterizer's PRIVATE depth surface (the two-pass geom
+     * kernel arbitrates depth on an internal canvas cleared to max, never the
+     * host depth attachment).  All default to 0 (memset), which selects the
+     * host-copy path, so the CPU back-end and any non-clearing pass are
+     * unaffected. */
+    int      gfx_first_draw;      /* 1 = first draw since begin_render_pass/rendering */
+    int      gfx_color_clear;     /* 1 = colour attachment[0] loadOp was CLEAR */
+    float    gfx_clear_color[4];  /* RGBA float clear value (attachment[0]) */
+    int      gfx_depth_clear;     /* 1 = the depth attachment loadOp was CLEAR */
+    float    gfx_clear_depth;     /* depth clear value */
 } vk_draw_ctx;
 
 /* ---- shared runtime helpers (src/runtime) -------------------------------- */

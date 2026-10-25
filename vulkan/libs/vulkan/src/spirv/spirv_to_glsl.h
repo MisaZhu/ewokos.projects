@@ -19,9 +19,17 @@
  *     composite construct/extract/insert/shuffle, load/store through simple
  *     access chains, structured if/else and while control flow (out-of-SSA phi
  *     lowering), and the common GLSL.std.450 extended instructions.
- * It DECLINES: Uniform (UBO) and PushConstant resources, function calls, switch,
- * atomics, barriers, workgroup shared memory, irregular control flow, and any
- * opcode/type outside the list above.
+ * It DECLINES: function calls, switch, atomics, barriers, workgroup shared
+ * memory, irregular control flow, and any opcode/type outside the list above.
+ *
+ * Uniform (UBO) and PushConstant resources are handled per mode.  The
+ * single-entry spirv_to_glsl() path (a raw compute / VS / FS shader) still
+ * declines them.  The two-pass kernel generator spirv_to_geom_kernels() instead
+ * FLATTENS each scalar/vector/contiguous-matrix member of a set-0 UBO or of the
+ * push-constant block into a standalone default-block uniform, recording it in
+ * spirv_glsl_flat so the GPU backend can fill the reflected blob slot per draw;
+ * nested structs, arrays, non-set-0 UBOs and non-contiguous matrices are
+ * declined.
  */
 #ifndef VULKAN_SPIRV_TO_GLSL_H
 #define VULKAN_SPIRV_TO_GLSL_H
@@ -38,6 +46,31 @@ extern "C" {
  * clc_to_glsl documents).  A compute entry referencing more storage buffers is
  * declined so it stays on the software device. */
 #define SPIRV_GLSL_MAX_SSBO 4
+
+/* Maximum number of UBO / push-constant members one entry flattens into
+ * default-block uniforms (see spirv_glsl_flat). */
+#define SPIRV_MAX_FLAT 32
+
+/* One Uniform-buffer (UBO) or push-constant struct member that the transpiler
+ * FLATTENED into a standalone default-block uniform, because the V3D uniform
+ * blob reflects loose uniforms by name (a mat4 member is one 16-component slot).
+ * The GPU backend fills it per draw: it reads `comps` 32-bit words from the
+ * bound buffer (a UBO, at descriptor set/binding) or from the push-constant
+ * snapshot at byte `offset`, and writes them into the reflected blob slot named
+ * `name`.  The byte offset is taken verbatim from the SPIR-V Offset decoration,
+ * so it matches exactly what the software interpreter reads.  `var`/`member`
+ * are transient (the transpiler's access-chain resolver keys on them); the
+ * backend uses only name/set/binding/offset/comps/is_push. */
+typedef struct spirv_glsl_flat {
+    char     name[32];   /* emitted default-block uniform name                */
+    uint32_t set;        /* UBO descriptor set (ignored when is_push)         */
+    uint32_t binding;    /* UBO descriptor binding                            */
+    uint32_t offset;     /* member byte offset within the block               */
+    uint32_t comps;      /* 32-bit components in the blob (mat4 = 16)         */
+    uint8_t  is_push;    /* 1 = push-constant block, 0 = uniform buffer       */
+    uint32_t var;        /* OpVariable id of the block (access-chain resolve) */
+    uint32_t member;     /* struct member index                               */
+} spirv_glsl_flat;
 
 /* One descriptor resource as realised in the emitted GLSL.  The GPU backend
  * uses `binding` (the flattened GLSL binding point) plus `set`/`binding_src`
@@ -129,6 +162,11 @@ typedef struct spirv_geom_layout {
     uint32_t sampler_binding[SPIRV_GEOM_MAX_SAMPLERS];
     int      uses_vertex_id;     /* VS reads gl_VertexID (gate indexed draws) */
     int      fs_present;         /* 0 => colour = interpolated varying loc 0   */
+    /* UBO / push-constant members flattened into default-block uniforms across
+     * BOTH stages, de-duplicated by name (a uniform both stages read appears
+     * once; the backend writes it into each stage's reflected blob region). */
+    int      num_flat;
+    spirv_glsl_flat flat[SPIRV_MAX_FLAT];
 } spirv_geom_layout;
 
 typedef struct spirv_geom_kernels {

@@ -12,10 +12,14 @@
  * byte order (B,G,R,A) is bit-identical to the window graph's ARGB pixels on
  * little-endian, so present is a straight row copy.
  *
- * On every machine the triangle is rasterised by the software device.  On raspi5
- * the GPU back-end is offered for compute but graphics draws stay on the software
- * rasteriser (the V3D compiled geom-raster path runs fixed kernels, not arbitrary
- * user VS/FS), so the pixels here are identical everywhere.
+ * On every machine the software device can rasterise the triangle.  On raspi5
+ * (PGL_G3D) this draw also qualifies for the GPU back-end: it is a plain
+ * TRIANGLE_LIST into a single B8G8R8A8_UNORM attachment with no depth/blend and
+ * a trivial VS/FS, so the runtime transpiles the two SPIR-V stages into a
+ * geom-raster kernel pair (geom_kind 5) and dispatches them on the V3D CSD.  Any
+ * step that falls outside the GPU subset -- or a kernel-compile/dispatch failure
+ * -- transparently declines to the software rasteriser, so the presented pixels
+ * are identical whether the GPU path runs or not.
  */
 #include <vulkan/vulkan.h>
 #include <x/x.h>
@@ -116,6 +120,32 @@ typedef struct {
 static vk_tri T;
 static graph_t *g_cur;     /* window graph for the frame being presented */
 
+/* One-shot framebuffer dump: the present callback receives the final rendered
+ * pixels whether the GPU (geom_kind 5) or the CPU rasteriser produced them, so
+ * dumping here lets a GPU build and a CPU-only build be compared byte-for-byte
+ * off-device.  Path overridable via argv[1]; written on the first present. */
+static char g_dump_path[128] = "/home/root/tri.ppm";
+static int  g_dumped = 0;
+
+static void dump_ppm(const uint8_t *src, uint32_t w, uint32_t h,
+                     uint32_t stride, const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    uint32_t x, y;
+    if (!f) { printf("triangle: dump open failed: %s\n", path); return; }
+    fprintf(f, "P6\n%u %u\n255\n", w, h);
+    for (y = 0; y < h; y++) {
+        const uint8_t *row = src + (size_t)y * stride;
+        for (x = 0; x < w; x++) {
+            fputc(row[(size_t)x * 4u + 2u], f);   /* R (src is B8G8R8A8) */
+            fputc(row[(size_t)x * 4u + 1u], f);   /* G */
+            fputc(row[(size_t)x * 4u + 0u], f);   /* B */
+        }
+    }
+    fclose(f);
+    printf("triangle: dumped %ux%u to %s\n", w, h, path);
+}
+
 /* present callback: blit the rendered swapchain image into the window graph. */
 static void VKAPI_CALL tri_present(void *user, const void *pixels,
                                    uint32_t width, uint32_t height,
@@ -125,9 +155,11 @@ static void VKAPI_CALL tri_present(void *user, const void *pixels,
     const uint8_t *src = (const uint8_t *)pixels;
     uint32_t cw, ch, y;
     (void)user;
-    if (!g || !g->buffer || !src) return;
+    if (!src) return;
     /* only the byte-identical B8G8R8A8 path is copied straight through */
     if (format != VK_FORMAT_B8G8R8A8_UNORM) return;
+    if (!g_dumped) { g_dumped = 1; dump_ppm(src, width, height, stride_bytes, g_dump_path); }
+    if (!g || !g->buffer) return;
     cw = width  < (uint32_t)g->w ? width  : (uint32_t)g->w;
     ch = height < (uint32_t)g->h ? height : (uint32_t)g->h;
     for (y = 0; y < ch; y++) {
@@ -542,7 +574,10 @@ int main(int argc, char *argv[])
 {
     x_t x;
     xwin_t *xwin;
-    (void)argc; (void)argv;
+    if (argc > 1 && argv[1][0]) {
+        strncpy(g_dump_path, argv[1], sizeof(g_dump_path) - 1);
+        g_dump_path[sizeof(g_dump_path) - 1] = '\0';
+    }
 
     if (init_vulkan(TRI_W, TRI_H) != 0) {
         printf("triangle: Vulkan init failed\n");

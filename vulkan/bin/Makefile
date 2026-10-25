@@ -4,8 +4,9 @@
 # libvulkan.a and invisible here.
 #   vkinfo    - query the instance / physical-device / device registry (console)
 #   compute   - vkCmdDispatch a SPIR-V compute shader, verify results (console)
+#   vktest    - compute correctness/performance + Vulkan API coverage (console)
 #   triangle  - graphics pipeline -> swapchain image -> present (GUI app)
-DIRS := vkinfo compute triangle
+DIRS := vkinfo compute vktest triangle
 
 all: $(DIRS)
 

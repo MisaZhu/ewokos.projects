@@ -15,8 +15,18 @@
  * the same dispatch is transparently offloaded to the V3D CSD by the GPU back-end
  * when the shader is inside the GPU subset -- the results are identical either
  * way, only the timing differs, so the printed ms/launch reports whichever path
- * the runtime selected.  N is a multiple of the local size so one dispatch of
- * (N,1,1) work-groups covers the whole array.
+ * the runtime selected.
+ *
+ * Usage: vkcompute [N] [iters]
+ *   N      item count / dispatch grid X (default 256, capped to 65535 by
+ *          maxComputeWorkGroupCount[0] since LocalSize is 1x1x1);
+ *   iters  timed re-dispatch count (default 1).
+ * Two timings are reported: the COLD first dispatch (which on the GPU path also
+ * pays the one-time on-device mesa compile + program upload) and the STEADY
+ * per-dispatch average over `iters` re-submits of the same command buffer (the
+ * program is already uploaded, so this isolates attach + IPC + CSD exec).  A
+ * large N with several iters is what lets the GPU's throughput overcome its
+ * fixed per-launch overhead; at the default tiny N the CPU software device wins.
  */
 #include <vulkan/vulkan.h>
 #include <ewoksys/kernel_tic.h>
@@ -58,7 +68,11 @@ static const uint32_t kSpirvSaxpy[168] = {
     0x0000002b, 0x0003003e, 0x00000031, 0x00000030, 0x000100fd, 0x00010038
 };
 
-#define NUM_ITEMS 256u
+#define DEFAULT_ITEMS 256u
+/* One dispatch grid is capped by maxComputeWorkGroupCount[0] (65535); the
+ * kernel uses only GlobalInvocationId.x with LocalSize 1x1x1, so N cannot
+ * exceed the X work-group count in a single dispatch. */
+#define MAX_ITEMS     65535u
 
 static uint64_t now_ns(void)
 {
@@ -153,7 +167,7 @@ static void sb_destroy(VkDevice dev, sb_t *sb)
     if (sb->mem) vkFreeMemory(dev, sb->mem, NULL);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
@@ -180,9 +194,17 @@ int main(void)
     VkFence fence = VK_NULL_HANDLE;
     int ret = 1;
     uint64_t t0, t1;
-    double ms;
+    double ms, cold_ms;
+    uint32_t n = DEFAULT_ITEMS;   /* item count (argv[1]), capped to one grid */
+    uint32_t iters = 1;           /* timed re-dispatch count (argv[2]) */
+    uint32_t it;
 
-    printf("vkcompute: %u-item saxpy (out[i] = x[i]*y[i])\n", NUM_ITEMS);
+    if (argc > 1) { long v = strtol(argv[1], NULL, 10); if (v > 0) n = (uint32_t)v; }
+    if (argc > 2) { long v = strtol(argv[2], NULL, 10); if (v > 0) iters = (uint32_t)v; }
+    if (n > MAX_ITEMS) n = MAX_ITEMS;
+
+    printf("vkcompute: %u-item saxpy (out[i] = x[i]*y[i]), %u timed dispatch(es)\n",
+           n, iters);
 
     memset(&app, 0, sizeof(app));
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -226,14 +248,14 @@ int main(void)
     vkGetDeviceQueue(device, qfi, 0, &queue);
 
     /* ---- storage buffers -------------------------------------------------- */
-    if (sb_create(device, phys, &xs, NUM_ITEMS * sizeof(float)) != 0 ||
-        sb_create(device, phys, &ys, NUM_ITEMS * sizeof(float)) != 0 ||
-        sb_create(device, phys, &os, NUM_ITEMS * sizeof(float)) != 0)
+    if (sb_create(device, phys, &xs, n * sizeof(float)) != 0 ||
+        sb_create(device, phys, &ys, n * sizeof(float)) != 0 ||
+        sb_create(device, phys, &os, n * sizeof(float)) != 0)
         goto cleanup;
 
     {
         float *x = (float *)xs.map, *y = (float *)ys.map, *o = (float *)os.map;
-        for (i = 0; i < NUM_ITEMS; i++) {
+        for (i = 0; i < n; i++) {
             x[i] = (float)(i + 1);
             y[i] = (float)(i + 1) * 0.5f;
             o[i] = -1.0f;
@@ -384,7 +406,7 @@ int main(void)
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, NULL);
-        vkCmdDispatch(cmd, NUM_ITEMS, 1, 1);   /* LocalSize 1x1x1 -> NUM_ITEMS groups */
+        vkCmdDispatch(cmd, n, 1, 1);   /* LocalSize 1x1x1 -> n groups */
         if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
             printf("vkcompute: vkEndCommandBuffer failed\n");
             goto cleanup;
@@ -406,6 +428,9 @@ int main(void)
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmd;
 
+        /* Cold dispatch: the first submit triggers the backend's lazy
+         * compile+upload (on the GPU path), so it is timed separately from the
+         * steady state below. */
         t0 = now_ns();
         if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) {
             printf("vkcompute: vkQueueSubmit failed\n");
@@ -416,7 +441,28 @@ int main(void)
             goto cleanup;
         }
         t1 = now_ns();
+        cold_ms = (double)(t1 - t0) / 1.0e6;
+
+        /* Steady state: re-submit the SAME command buffer `iters` times.  The
+         * GPU program is already compiled+uploaded after the cold dispatch, so
+         * this isolates the raw per-dispatch cost (attach + IPC + CSD exec)
+         * from the one-time compile.  Each dispatch is idempotent
+         * (out = x*y), so the verification below stays valid. */
+        t0 = now_ns();
+        for (it = 0; it < iters; it++) {
+            vkResetFences(device, 1, &fence);
+            if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) {
+                printf("vkcompute: vkQueueSubmit (iter %u) failed\n", it);
+                goto cleanup;
+            }
+            if (vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull) != VK_SUCCESS) {
+                printf("vkcompute: vkWaitForFences (iter %u) failed/timeout\n", it);
+                goto cleanup;
+            }
+        }
+        t1 = now_ns();
         ms = (double)(t1 - t0) / 1.0e6;
+        if (iters) ms /= (double)iters;   /* per-dispatch average */
     }
 
     /* ---- verify ------------------------------------------------------------ */
@@ -425,7 +471,7 @@ int main(void)
         const float *y = (const float *)ys.map;
         const float *o = (const float *)os.map;
         uint32_t bad = 0;
-        for (i = 0; i < NUM_ITEMS; i++) {
+        for (i = 0; i < n; i++) {
             float want = x[i] * y[i];
             if (o[i] != want) {
                 if (bad < 8)
@@ -433,13 +479,16 @@ int main(void)
                 bad++;
             }
         }
-        printf("  dispatch: %.3f ms  (%u items)\n", ms, NUM_ITEMS);
+        printf("  cold dispatch:   %.3f ms  (first submit, incl. lazy compile/upload)\n",
+               cold_ms);
+        printf("  steady dispatch: %.3f ms avg  (%u items x %u dispatch(es))\n",
+               ms, n, iters);
         printf("  out[0..3] = %.1f %.1f %.1f %.1f\n", o[0], o[1], o[2], o[3]);
         if (bad) {
-            printf("vkcompute: FAIL (%u/%u mismatches)\n", bad, NUM_ITEMS);
+            printf("vkcompute: FAIL (%u/%u mismatches)\n", bad, n);
             goto cleanup;
         }
-        printf("vkcompute: PASS (all %u correct)\n", NUM_ITEMS);
+        printf("vkcompute: PASS (all %u correct)\n", n);
         ret = 0;
     }
 
