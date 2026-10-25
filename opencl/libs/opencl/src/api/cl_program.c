@@ -234,7 +234,9 @@ cl_int clGetProgramInfo(cl_program program, cl_program_info param_name,
             n = 1;
             for (; *s; s++) if (*s == ';') n++;
         }
-        INFO_P_SCALAR(size_t, n);
+        /* the spec types this cl_uint; returning size_t made every
+         * cl_uint-sized query fail with CL_INVALID_VALUE */
+        INFO_P_SCALAR(cl_uint, n);
     }
     default:
         return CL_INVALID_VALUE;

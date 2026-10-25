@@ -48,7 +48,7 @@
  * data-abort is in the pair or compute compile, and which step.  Remove once
  * the offending NIR pass is fixed. */
 #include <ewoksys/klog.h>
-#define FEDBG(fmt, ...) slog("fedbg: " fmt "\r\n", ##__VA_ARGS__)
+#define FEDBG(fmt, ...) ((void)0)
 
 /* TEMPORARY compile-phase wall-clock probe, twin of vir.c/nir_to_vir.c: same
  * /tmp/v3dc.log so the frontend steps (builtin init / parse / link / lower)

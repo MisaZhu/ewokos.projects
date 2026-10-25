@@ -1,0 +1,461 @@
+/*
+ * cmdexec.c - command recording primitives and the immediate-mode executor.
+ * Command buffers record into a growable command list (vk_cmd_push); the bound
+ * pipeline/descriptor/vertex/viewport state is snapshotted into each draw and
+ * dispatch at record time (vk_snapshot_state).  vkQueueSubmit runs the recorded
+ * list in order: memory-transfer / clear / query / event commands execute here
+ * directly (they are back-end agnostic host memory operations), while draw and
+ * dispatch are delegated to the device's vk_device_backend (cpu or gpu).  This
+ * is the CPU analog of OpenCL's queue enqueue-and-execute model.
+ */
+#include "internal.h"
+#include <stdlib.h>
+#include <string.h>
+
+/* ---- recording primitives ------------------------------------------------ */
+vk_cmd *vk_cmd_push(vk_command_buffer *cb, vk_cmd_op op)
+{
+    vk_cmd *c;
+    if (!cb)
+        return NULL;
+    if (cb->num_cmds >= cb->cap_cmds) {
+        uint32_t ncap = cb->cap_cmds ? cb->cap_cmds * 2 : 64;
+        vk_cmd *nc = (vk_cmd *)realloc(cb->cmds, (size_t)ncap * sizeof(vk_cmd));
+        if (!nc)
+            return NULL;
+        cb->cmds = nc;
+        cb->cap_cmds = ncap;
+    }
+    c = &cb->cmds[cb->num_cmds++];
+    memset(c, 0, sizeof(*c));
+    c->op = op;
+    return c;
+}
+
+void vk_snapshot_state(vk_command_buffer *cb, vk_cmd *c)
+{
+    /* fill the draw command's execution-time snapshot from the bound state */
+    memcpy(c->u.draw.sets, cb->sets, sizeof(cb->sets));
+    c->u.draw.first_set = cb->first_set;
+    c->u.draw.set_count = cb->set_count;
+    memcpy(c->u.draw.push, cb->push, sizeof(cb->push));
+    c->u.draw.push_size = cb->push_size;
+    memcpy(c->u.draw.vb, cb->vb, sizeof(cb->vb));
+    memcpy(c->u.draw.vb_off, cb->vb_off, sizeof(cb->vb_off));
+    c->u.draw.ib = cb->ib;
+    c->u.draw.ib_off = cb->ib_off;
+    c->u.draw.ib_type = cb->ib_type;
+    c->u.draw.vp = cb->vp;
+    c->u.draw.sc = cb->sc;
+    c->u.draw.has_vp = cb->has_vp;
+    c->u.draw.has_sc = cb->has_sc;
+    memcpy(c->u.draw.color, cb->color, sizeof(cb->color));
+    c->u.draw.num_color = cb->num_color;
+    c->u.draw.depth = cb->depth;
+    c->u.draw.rt_width = cb->rt_width;
+    c->u.draw.rt_height = cb->rt_height;
+}
+
+/* ---- image / attachment clear helpers ------------------------------------ */
+static uint8_t cc_u8(float v)
+{
+    if (v <= 0.0f) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+static void encode_clear(VkFormat f, uint8_t *p, const VkClearColorValue *c)
+{
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
+        p[0]=cc_u8(c->float32[0]); p[1]=cc_u8(c->float32[1]);
+        p[2]=cc_u8(c->float32[2]); p[3]=cc_u8(c->float32[3]); break;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+        p[0]=cc_u8(c->float32[2]); p[1]=cc_u8(c->float32[1]);
+        p[2]=cc_u8(c->float32[0]); p[3]=cc_u8(c->float32[3]); break;
+    case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R32G32B32A32_UINT:
+        if (f == VK_FORMAT_R8G8B8A8_UINT) {
+            p[0]=(uint8_t)c->uint32[0]; p[1]=(uint8_t)c->uint32[1];
+            p[2]=(uint8_t)c->uint32[2]; p[3]=(uint8_t)c->uint32[3];
+        } else {
+            memcpy(p, c->uint32, 16);
+        }
+        break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        memcpy(p, c->float32, 16); break;
+    case VK_FORMAT_R32G32B32_SFLOAT:
+        memcpy(p, c->float32, 12); break;
+    case VK_FORMAT_R8_UNORM:
+        p[0]=cc_u8(c->float32[0]); break;
+    default: break;
+    }
+}
+
+/* clear the base mip/layer of an image to a color value */
+static void clear_color_image(vk_image *im, const VkClearColorValue *c)
+{
+    uint8_t *base = (uint8_t *)vk_image_ptr(im);
+    uint32_t bpp, pitch, x, y, layer;
+    uint8_t texel[16];
+    if (!base) return;
+    bpp = im->bpp ? im->bpp : vk_format_bpp(im->format);
+    if (!bpp || bpp > 16) return;
+    pitch = im->row_pitch ? im->row_pitch : bpp * im->extent.width;
+    encode_clear(im->format, texel, c);
+    for (layer = 0; layer < im->array_layers; layer++) {
+        uint8_t *lb = base + (size_t)layer * pitch * im->extent.height;
+        for (y = 0; y < im->extent.height; y++)
+            for (x = 0; x < im->extent.width; x++)
+                memcpy(lb + (size_t)y * pitch + (size_t)x * bpp, texel, bpp);
+    }
+}
+
+static void clear_depth_image(vk_image *im, const VkClearDepthStencilValue *ds)
+{
+    uint8_t *base = (uint8_t *)vk_image_ptr(im);
+    uint32_t bpp, pitch, x, y;
+    if (!base) return;
+    bpp = im->bpp ? im->bpp : vk_format_bpp(im->format);
+    pitch = im->row_pitch ? im->row_pitch : bpp * im->extent.width;
+    for (y = 0; y < im->extent.height; y++) {
+        for (x = 0; x < im->extent.width; x++) {
+            uint8_t *p = base + (size_t)y * pitch + (size_t)x * bpp;
+            switch (im->format) {
+            case VK_FORMAT_D32_SFLOAT: *(float *)p = ds->depth; break;
+            case VK_FORMAT_D16_UNORM: {
+                float z = ds->depth < 0 ? 0 : (ds->depth > 1 ? 1 : ds->depth);
+                *(uint16_t *)p = (uint16_t)(z * 65535.0f + 0.5f); break;
+            }
+            case VK_FORMAT_D24_UNORM_S8_UINT:
+            case VK_FORMAT_X8_D24_UNORM_PACK32:
+            case VK_FORMAT_D32_SFLOAT_S8_UINT: {
+                float z = ds->depth < 0 ? 0 : (ds->depth > 1 ? 1 : ds->depth);
+                uint32_t d = (uint32_t)(z * 16777215.0f + 0.5f);
+                uint32_t v = ((uint32_t)(ds->stencil & 0xff) << 24) | (d & 0x00ffffffu);
+                if (im->format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+                    *(float *)p = ds->depth;
+                    p[4] = (uint8_t)(ds->stencil & 0xff);
+                } else {
+                    *(uint32_t *)p = v;
+                }
+                break;
+            }
+            default: break;
+            }
+        }
+    }
+}
+
+static void clear_view(vk_image_view *iv, const VkClearValue *val, int is_depth)
+{
+    if (!iv || !iv->image) return;
+    if (is_depth) clear_depth_image(iv->image, &val->depthStencil);
+    else          clear_color_image(iv->image, &val->color);
+}
+
+/* apply the load ops of a render pass against its framebuffer */
+static void exec_begin_render_pass(const vk_cmd *c)
+{
+    const vk_render_pass *rp = c->u.begin_rp.rp;
+    const vk_framebuffer *fb = c->u.begin_rp.fb;
+    uint32_t i;
+    if (!rp || !fb) return;
+    for (i = 0; i < rp->num_attachments && i < fb->num_views; i++) {
+        const vk_attachment_desc *a = &rp->attachments[i];
+        int is_depth = (a->format == VK_FORMAT_D16_UNORM ||
+                        a->format == VK_FORMAT_D24_UNORM_S8_UINT ||
+                        a->format == VK_FORMAT_D32_SFLOAT ||
+                        a->format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                        a->format == VK_FORMAT_X8_D24_UNORM_PACK32);
+        VkAttachmentLoadOp op = is_depth ? a->stencil_load : a->load;
+        if (op == VK_ATTACHMENT_LOAD_OP_CLEAR && i < c->u.begin_rp.num_clears)
+            clear_view(fb->views[i], &c->u.begin_rp.clears[i], is_depth);
+    }
+}
+
+static void exec_begin_rendering(const vk_cmd *c)
+{
+    /* The recorder flags a loadOp==CLEAR attachment by storing the sentinel
+     * VK_LAYOUT_CLEAR_EWOK in its color_layout / depth_layout slot. */
+    uint32_t i;
+    for (i = 0; i < c->u.begin_rendering.num_color; i++) {
+        vk_image_view *iv = c->u.begin_rendering.color[i];
+        if (iv && c->u.begin_rendering.color_layout[i] == VK_LAYOUT_CLEAR_EWOK)
+            clear_view(iv, &c->u.begin_rendering.color_clear[i], 0);
+    }
+    if (c->u.begin_rendering.depth &&
+        c->u.begin_rendering.depth_layout == VK_LAYOUT_CLEAR_EWOK)
+        clear_view(c->u.begin_rendering.depth, &c->u.begin_rendering.depth_clear, 1);
+}
+
+/* ---- memory transfer ops ------------------------------------------------- */
+static void exec_copy_buffer(const vk_cmd *c)
+{
+    const uint8_t *src = (const uint8_t *)vk_buffer_ptr(c->u.copy_buf.src);
+    uint8_t *dst = (uint8_t *)vk_buffer_ptr(c->u.copy_buf.dst);
+    uint32_t i;
+    if (!src || !dst) return;
+    for (i = 0; i < c->u.copy_buf.n; i++) {
+        const VkBufferCopy *r = &c->u.copy_buf.regions[i];
+        memmove(dst + r->dstOffset, src + r->srcOffset, (size_t)r->size);
+    }
+}
+
+static void exec_fill_buffer(const vk_cmd *c)
+{
+    uint8_t *dst = (uint8_t *)vk_buffer_ptr(c->u.fill.dst);
+    VkDeviceSize off = c->u.fill.offset, size = c->u.fill.size, i;
+    uint32_t data = c->u.fill.data;
+    if (!dst) return;
+    if (size == VK_WHOLE_SIZE && c->u.fill.dst->mem)
+        size = c->u.fill.dst->size - off;
+    for (i = 0; i + 4 <= size; i += 4)
+        memcpy(dst + off + i, &data, 4);
+}
+
+static void exec_update_buffer(const vk_cmd *c)
+{
+    uint8_t *dst = (uint8_t *)vk_buffer_ptr(c->u.update.dst);
+    if (!dst) return;
+    memcpy(dst + c->u.update.offset, c->u.update.data, (size_t)c->u.update.size);
+}
+
+static void exec_copy_buffer_to_image(const vk_cmd *c)
+{
+    const uint8_t *src = (const uint8_t *)vk_buffer_ptr(c->u.copy_b2i.src);
+    vk_image *im = c->u.copy_b2i.dst;
+    uint8_t *dbase = (uint8_t *)vk_image_ptr(im);
+    uint32_t r, y, z;
+    if (!src || !dbase || !im->bpp) return;
+    for (r = 0; r < c->u.copy_b2i.n; r++) {
+        const VkBufferImageCopy *rg = &c->u.copy_b2i.regions[r];
+        uint32_t w = rg->imageExtent.width ? rg->imageExtent.width : 1;
+        uint32_t h = rg->imageExtent.height ? rg->imageExtent.height : 1;
+        uint32_t d = rg->imageExtent.depth ? rg->imageExtent.depth : 1;
+        uint32_t rowbytes = w * im->bpp;
+        const uint8_t *sp = src + rg->bufferOffset;
+        for (z = 0; z < d; z++)
+            for (y = 0; y < h; y++) {
+                uint8_t *dp = dbase +
+                    (size_t)(rg->imageOffset.z + z) * im->row_pitch * im->extent.height +
+                    (size_t)(rg->imageOffset.y + y) * im->row_pitch +
+                    (size_t)(rg->imageOffset.x) * im->bpp;
+                memcpy(dp, sp, rowbytes);
+                sp += rowbytes;
+            }
+    }
+}
+
+static void exec_copy_image_to_buffer(const vk_cmd *c)
+{
+    vk_image *im = c->u.copy_i2b.src;
+    const uint8_t *sbase = (const uint8_t *)vk_image_ptr(im);
+    uint8_t *dst = (uint8_t *)vk_buffer_ptr(c->u.copy_i2b.dst);
+    uint32_t r, y, z;
+    if (!dst || !sbase || !im->bpp) return;
+    for (r = 0; r < c->u.copy_i2b.n; r++) {
+        const VkBufferImageCopy *rg = &c->u.copy_i2b.regions[r];
+        uint32_t w = rg->imageExtent.width ? rg->imageExtent.width : 1;
+        uint32_t h = rg->imageExtent.height ? rg->imageExtent.height : 1;
+        uint32_t d = rg->imageExtent.depth ? rg->imageExtent.depth : 1;
+        uint32_t rowbytes = w * im->bpp;
+        uint8_t *dp = dst + rg->bufferOffset;
+        for (z = 0; z < d; z++)
+            for (y = 0; y < h; y++) {
+                const uint8_t *sp = sbase +
+                    (size_t)(rg->imageOffset.z + z) * im->row_pitch * im->extent.height +
+                    (size_t)(rg->imageOffset.y + y) * im->row_pitch +
+                    (size_t)(rg->imageOffset.x) * im->bpp;
+                memcpy(dp, sp, rowbytes);
+                dp += rowbytes;
+            }
+    }
+}
+
+static void exec_copy_image(const vk_cmd *c)
+{
+    vk_image *s = c->u.copy_img.src, *d = c->u.copy_img.dst;
+    const uint8_t *sb = (const uint8_t *)vk_image_ptr(s);
+    uint8_t *db = (uint8_t *)vk_image_ptr(d);
+    uint32_t r, y, z;
+    if (!sb || !db || !s->bpp || s->bpp != d->bpp) return;
+    for (r = 0; r < c->u.copy_img.n; r++) {
+        const VkImageCopy *rg = &c->u.copy_img.regions[r];
+        uint32_t w = rg->extent.width, h = rg->extent.height, dep = rg->extent.depth;
+        uint32_t rowbytes = w * s->bpp;
+        for (z = 0; z < dep; z++)
+            for (y = 0; y < h; y++) {
+                const uint8_t *sp = sb +
+                    (size_t)(rg->srcOffset.z + z) * s->row_pitch * s->extent.height +
+                    (size_t)(rg->srcOffset.y + y) * s->row_pitch +
+                    (size_t)rg->srcOffset.x * s->bpp;
+                uint8_t *dp = db +
+                    (size_t)(rg->dstOffset.z + z) * d->row_pitch * d->extent.height +
+                    (size_t)(rg->dstOffset.y + y) * d->row_pitch +
+                    (size_t)rg->dstOffset.x * d->bpp;
+                memcpy(dp, sp, rowbytes);
+            }
+    }
+}
+
+static void exec_blit_image(const vk_cmd *c)
+{
+    /* nearest-neighbour blit of each region (software path) */
+    vk_image *s = c->u.blit.src, *d = c->u.blit.dst;
+    const uint8_t *sb = (const uint8_t *)vk_image_ptr(s);
+    uint8_t *db = (uint8_t *)vk_image_ptr(d);
+    uint32_t r;
+    if (!sb || !db || !s->bpp || s->bpp != d->bpp) return;
+    for (r = 0; r < c->u.blit.n; r++) {
+        const VkImageBlit *b = &c->u.blit.regions[r];
+        int32_t sx0 = b->srcOffsets[0].x, sy0 = b->srcOffsets[0].y;
+        int32_t sx1 = b->srcOffsets[1].x, sy1 = b->srcOffsets[1].y;
+        int32_t dx0 = b->dstOffsets[0].x, dy0 = b->dstOffsets[0].y;
+        int32_t dx1 = b->dstOffsets[1].x, dy1 = b->dstOffsets[1].y;
+        int32_t sw = sx1 - sx0, sh = sy1 - sy0;
+        int32_t dw = dx1 - dx0, dh = dy1 - dy0;
+        int32_t yy, xx;
+        if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) continue;
+        for (yy = 0; yy < dh; yy++) {
+            int32_t sy = sy0 + (int32_t)((int64_t)yy * sh / dh);
+            for (xx = 0; xx < dw; xx++) {
+                int32_t sx = sx0 + (int32_t)((int64_t)xx * sw / dw);
+                const uint8_t *sp = sb + (size_t)sy * s->row_pitch + (size_t)sx * s->bpp;
+                uint8_t *dp = db + (size_t)(dy0 + yy) * d->row_pitch + (size_t)(dx0 + xx) * d->bpp;
+                memcpy(dp, sp, d->bpp);
+            }
+        }
+    }
+}
+
+static void exec_clear_color_image(const vk_cmd *c)
+{
+    clear_color_image(c->u.clear_color.img, &c->u.clear_color.color);
+}
+
+static void exec_clear_depth_image(const vk_cmd *c)
+{
+    clear_depth_image(c->u.clear_ds.img, &c->u.clear_ds.ds);
+}
+
+/* ---- draw / dispatch delegation ------------------------------------------ */
+static void exec_draw(vk_command_buffer *cb, const vk_cmd *c)
+{
+    const vk_device_backend *be = cb->device ? cb->device->backend : NULL;
+    vk_draw_ctx dc;
+    if (!be || !be->draw) return;
+    memset(&dc, 0, sizeof(dc));
+    dc.pipeline = c->u.draw.pipeline;
+    memcpy(dc.sets, c->u.draw.sets, sizeof(dc.sets));
+    dc.first_set = c->u.draw.first_set;
+    dc.set_count = c->u.draw.set_count;
+    dc.push = c->u.draw.push;
+    dc.push_size = c->u.draw.push_size;
+    memcpy(dc.color, c->u.draw.color, sizeof(dc.color));
+    dc.num_color = c->u.draw.num_color;
+    dc.depth = c->u.draw.depth;
+    dc.rt_width = c->u.draw.rt_width;
+    dc.rt_height = c->u.draw.rt_height;
+    dc.vp = c->u.draw.vp; dc.sc = c->u.draw.sc;
+    dc.has_vp = c->u.draw.has_vp; dc.has_sc = c->u.draw.has_sc;
+    memcpy(dc.vb, c->u.draw.vb, sizeof(dc.vb));
+    memcpy(dc.vb_off, c->u.draw.vb_off, sizeof(dc.vb_off));
+    dc.ib = c->u.draw.ib; dc.ib_off = c->u.draw.ib_off; dc.ib_type = c->u.draw.ib_type;
+
+    if (c->op == VK_CMD_DRAW_INDEXED && c->u.draw.ib) {
+        vk_buffer *ib = c->u.draw.ib;
+        const uint8_t *base = (const uint8_t *)vk_buffer_ptr(ib);
+        uint32_t cnt = c->u.draw.vertexCount;
+        uint32_t isz = (c->u.draw.ib_type == VK_INDEX_TYPE_UINT16) ? 2 : 4;
+        uint32_t voff = c->u.draw.firstVertex;
+        uint32_t *idx = NULL, k;
+        if (!base) return;
+        base += c->u.draw.ib_off;
+        idx = (uint32_t *)malloc((size_t)cnt * sizeof(uint32_t));
+        if (!idx) return;
+        for (k = 0; k < cnt; k++) {
+            uint32_t v;
+            if (isz == 2) v = ((const uint16_t *)base)[k];
+            else          v = ((const uint32_t *)base)[k];
+            idx[k] = v + voff;
+        }
+        be->draw(cb, &dc, cnt, 0, c->u.draw.instanceCount, c->u.draw.firstInstance,
+                 idx, c->u.draw.ib_type);
+        free(idx);
+    } else {
+        be->draw(cb, &dc, c->u.draw.vertexCount, c->u.draw.firstVertex,
+                 c->u.draw.instanceCount, c->u.draw.firstInstance,
+                 NULL, c->u.draw.ib_type);
+    }
+}
+
+static void exec_dispatch(vk_command_buffer *cb, const vk_cmd *c)
+{
+    const vk_device_backend *be = cb->device ? cb->device->backend : NULL;
+    vk_draw_ctx dc;
+    if (!be || !be->dispatch) return;
+    memset(&dc, 0, sizeof(dc));
+    dc.pipeline = c->u.dispatch.pipeline;
+    memcpy(dc.sets, c->u.dispatch.sets, sizeof(dc.sets));
+    dc.first_set = c->u.dispatch.first_set;
+    dc.set_count = c->u.dispatch.set_count;
+    dc.push = c->u.dispatch.push;
+    dc.push_size = c->u.dispatch.push_size;
+    be->dispatch(cb, &dc, c->u.dispatch.gx, c->u.dispatch.gy, c->u.dispatch.gz);
+}
+
+/* ---- query / timestamp --------------------------------------------------- */
+static void exec_write_timestamp(const vk_cmd *c)
+{
+    vk_query_pool *qp = c->u.query_op.pool;
+    if (qp && qp->results && c->u.query_op.query < qp->count)
+        qp->results[c->u.query_op.query] = vk_now_ns();
+}
+
+/* ---- the executor -------------------------------------------------------- */
+VkResult vk_execute_command_buffer(vk_command_buffer *cb)
+{
+    uint32_t i;
+    if (!cb) return VK_ERROR_INITIALIZATION_FAILED;
+    for (i = 0; i < cb->num_cmds; i++) {
+        const vk_cmd *c = &cb->cmds[i];
+        switch (c->op) {
+        case VK_CMD_DRAW:
+        case VK_CMD_DRAW_INDEXED:      exec_draw(cb, c); break;
+        case VK_CMD_DISPATCH:          exec_dispatch(cb, c); break;
+        case VK_CMD_COPY_BUFFER:       exec_copy_buffer(c); break;
+        case VK_CMD_FILL_BUFFER:       exec_fill_buffer(c); break;
+        case VK_CMD_UPDATE_BUFFER:     exec_update_buffer(c); break;
+        case VK_CMD_COPY_BUFFER_TO_IMAGE: exec_copy_buffer_to_image(c); break;
+        case VK_CMD_COPY_IMAGE_TO_BUFFER: exec_copy_image_to_buffer(c); break;
+        case VK_CMD_COPY_IMAGE:        exec_copy_image(c); break;
+        case VK_CMD_BLIT_IMAGE:        exec_blit_image(c); break;
+        case VK_CMD_CLEAR_COLOR_IMAGE: exec_clear_color_image(c); break;
+        case VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE: exec_clear_depth_image(c); break;
+        case VK_CMD_BEGIN_RENDER_PASS: exec_begin_render_pass(c); break;
+        case VK_CMD_BEGIN_RENDERING:   exec_begin_rendering(c); break;
+        case VK_CMD_WRITE_TIMESTAMP:   exec_write_timestamp(c); break;
+        case VK_CMD_SET_EVENT:
+            if (c->u.event_op.event) c->u.event_op.event->set = VK_TRUE;
+            break;
+        case VK_CMD_RESET_EVENT:
+            if (c->u.event_op.event) c->u.event_op.event->set = VK_FALSE;
+            break;
+        case VK_CMD_RESET_QUERY_POOL:
+            if (c->u.query_op.pool && c->u.query_op.pool->results)
+                memset(c->u.query_op.pool->results, 0,
+                       (size_t)c->u.query_op.pool->count * sizeof(uint64_t));
+            break;
+        case VK_CMD_EXECUTE_COMMANDS: {
+            uint32_t k;
+            for (k = 0; k < c->u.exec.n; k++)
+                if (c->u.exec.cmds[k]) vk_execute_command_buffer(c->u.exec.cmds[k]);
+            break;
+        }
+        /* bind / state / barrier / subpass commands are captured at record time
+         * (into the draw/dispatch snapshots) or are no-ops in immediate mode. */
+        default: break;
+        }
+    }
+    return VK_SUCCESS;
+}

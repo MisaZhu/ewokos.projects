@@ -1,9 +1,12 @@
 
-# opencl builds libOpenCL.a and stages the public CL/*.h headers + archive into
-# the shared build_$(ARCH)/$(HW) tree.  (Phase 2 adds clclient as a private
-# intermediate folded into libOpenCL.a, exactly as opengl folds portablegl into
-# libGLESv2.a; for now the single CPU-complete library is the only member.)
-DIRS = opencl
+# clclient builds the private GPU IPC transport (libclclient.a) and opencl builds
+# libOpenCL.a + stages the public CL/*.h headers and archive into the shared
+# build_$(ARCH)/$(HW) tree.  clclient is listed FIRST because opencl's GPU build
+# ADDLIB-merges libclclient.a (plus the on-device mesa compiler archives opengl
+# stages) into libOpenCL.a -- exactly as opengl folds portablegl + pglcompiler
+# into libGLESv2.a.  On a CPU-only target clclient is a no-op and libOpenCL.a is
+# the Phase-1 CPU library, so an app still links only -lOpenCL either way.
+DIRS = clclient opencl
 
 .PHONY: all clean
 

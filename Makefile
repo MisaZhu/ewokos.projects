@@ -6,7 +6,8 @@ DIRS = macemu \
 	blender \
 	doom \
 	cards \
-	mine
+	mine \
+	vulkan
 #	previous video saver minivmac nx11
 
 # qt needs the Qt tree that projects/qt/build.sh produces; if it is missing for
@@ -29,6 +30,12 @@ blender: opengl
 # need it, but order opencl after opengl anyway so the parallel machine build
 # always finds pglcompiler staged before opencl links (same idiom as blender).
 opencl: opengl
+
+# vulkan's GPU front-end compiles SPIR-V->GLSL through the pglcompiler that
+# opengl stages into build_$(ARCH)/$(HW); the software-device build does not need
+# it, but order vulkan after opengl anyway so the parallel machine build always
+# finds pglcompiler staged before vulkan links (same idiom as opencl).
+vulkan: opengl
 
 $(DIRS):
 	@$(MAKE) -C $@

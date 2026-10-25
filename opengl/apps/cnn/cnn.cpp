@@ -38,7 +38,7 @@ static GLuint texid[4];     /* A, B, C, D staged as CPU-uploaded ctex slots */
 static GLuint progImage;
 static GLuint quad;
 static int width = 800, height = 450;
-static bool windowed, fpslog;
+static bool fpslog;
 static uint32_t start_time, fps_time;
 static int frames, fps_frames, result;
 static float fps;
@@ -540,14 +540,7 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "scale", 5) && argv[i][5] >= '1' && argv[i][5] <= '9')
             pgl_g3d_set_render_scale(argv[i][5] - '0');
 #endif
-        else if (!strncmp(argv[i], "window", 6)) {
-            char *middle, *end;
-            long w = strtol(argv[i] + 6, &middle, 10);
-            if (middle == argv[i] + 6 || *middle != 'x') return 1;
-            long h = strtol(middle + 1, &end, 10);
-            if (end == middle + 1 || *end || w <= 0 || h <= 0 || w > 8192 || h > 8192) return 1;
-            windowed = true; width = (int)w; height = (int)h;
-        } else {
+        else {
             fprintf(stderr, "Usage: cnn [window320x180] [fpslog] [scale1]\n");
             return 1;
         }
@@ -561,7 +554,7 @@ int main(int argc, char **argv)
     window->on_close = on_close;
     window->on_event = on_event;
     xwin_set_alpha(window, false);
-    if (!windowed) xwin_fullscreen(window);
+    xwin_max(window);
 
     if (!init_egl() || !init_scene()) {
         fprintf(stderr, "cnn: initialization failed (EGL 0x%x)\n", (unsigned)eglGetError());

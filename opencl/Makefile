@@ -1,12 +1,12 @@
 
-DIRS = libs apps
+DIRS = libs bin
 
 all: $(DIRS)
 
-# apps link libOpenCL.a and include <CL/cl.h>, both staged into the shared
-# build_$(ARCH)/$(HW) tree by libs; order apps after libs (same idiom as
+# the /bin commands link libOpenCL.a and include <CL/cl.h>, both staged into the
+# shared build_$(ARCH)/$(HW) tree by libs; order bin after libs (same idiom as
 # projects/opengl/Makefile).
-apps: libs
+bin: libs
 
 $(DIRS):
 	@$(MAKE) -C $@
