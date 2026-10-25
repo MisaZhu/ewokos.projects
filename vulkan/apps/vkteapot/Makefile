@@ -11,7 +11,7 @@ TASK_OBJS = $(ARCH)/vkteapot.o
 TASK_DIR = $(BUILD_DIR)/rootfs/apps/$(TASK)
 VULKAN_LIB = $(BUILD_DIR)/lib/libvulkan.a
 
-VK_GPU_HWS := raspi5
+VK_GPU_HWS := raspi5 q8b
 VK_GPU_LIBS :=
 VK_GPU_CXX :=
 ifeq ($(PGL_G3D),yes)
@@ -26,8 +26,10 @@ all: $(TASK)
 # vkteapot presents through an EwokOS xwin surface (like bin/triangle): the app
 # owns the libx window and registers a present callback, so libvulkan.a itself
 # stays free of any libx/libgraph dependency.  The app links the windowing libs,
-# not the runtime.  On raspi5 (PGL_G3D) the draw qualifies for the GPU back-end
-# and the g2dclient/ewokstl/cxx libs are pulled in; elsewhere it is CPU-only.
+# not the runtime.  On the GPU targets (PGL_G3D: raspi5, q8b) the draw qualifies
+# for the GPU back-end and the g2dclient/ewokstl/cxx libs are pulled in;
+# elsewhere it is CPU-only.  On q8b the same geom_kind-5 pipeline is compiled
+# to Adreno compute kernels and dispatched through the machine's PGL backend.
 $(TASK): $(TASK_OBJS) $(VULKAN_LIB) \
          $(SDK_DIR)/lib/libewoksys.a $(SDK_DIR)/lib/libx.a \
          $(SDK_DIR)/lib/libgraph.a $(SDK_DIR)/lib/libfont.a \

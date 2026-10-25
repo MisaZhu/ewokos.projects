@@ -11,11 +11,12 @@ TASK_OBJS = $(ARCH)/$(TASK).o
 TASK_DIR = $(BUILD_DIR)/rootfs/bin
 VULKAN_LIB = $(BUILD_DIR)/lib/libvulkan.a
 
-# GPU target (raspi5): libvulkan.a additionally folds in vkclient + the on-device
-# mesa compiler, so the command must also link the g2d transport and the C++
-# runtime mesa needs.  Gated on the same PGL_G3D=yes + raspi5-class HW condition
-# libs/vulkan uses, so a CPU-only target keeps its exact link line.
-VK_GPU_HWS := raspi5
+# GPU targets (raspi5 V3D CSD, q8b Adreno 690 CS): libvulkan.a additionally
+# folds in vkclient + the on-device mesa compiler, so the command must also link
+# the g2d transport and the C++ runtime mesa needs.  Gated on the same
+# PGL_G3D=yes + VK-GPU-HW condition libs/vulkan uses, so a CPU-only target keeps
+# its exact link line.
+VK_GPU_HWS := raspi5 q8b
 VK_GPU_LIBS :=
 VK_GPU_CXX :=
 ifeq ($(PGL_G3D),yes)

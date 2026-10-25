@@ -97,6 +97,14 @@ int vk_gpu_probe(void)
     return vkclient_gpu_version() != 0u;
 }
 
+/* Physical-device identification for vkinfo.  The transport is shared, but the
+ * compiler/backend and silicon are machine-specific; do not label Adreno as V3D. */
+const char *vk_gpu_name(void)
+{
+    return vkclient_gpu_version() == 690u ?
+           "EwokOS GPU (Adreno 690)" : "EwokOS GPU (V3D)";
+}
+
 /* ---- SSBO resolution ----------------------------------------------------- */
 
 /* Resolve one storage-buffer descriptor write to its host store.  Mirrors the

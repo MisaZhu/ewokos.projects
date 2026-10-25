@@ -6,9 +6,10 @@
  * There is exactly one instance and one physical device (the EwokOS software
  * device).  The physical device always advertises a coherent Vulkan 1.3 profile
  * with one GRAPHICS|COMPUTE queue family and a host-visible + device-local
- * memory model; whether a VkDevice executes on the software back-end or, on
- * raspi5, offloads to the V3D GPU is decided per device at vkCreateDevice by the
- * back-end probe, with no divergence in the advertised surface.
+ * memory model; whether a VkDevice executes on the software back-end or, on a
+ * supported GPU machine, offloads to its compute back end is decided per device
+ * at vkCreateDevice by the back-end probe, with no divergence in the advertised
+ * surface.
  */
 #include "internal.h"
 #include <stdlib.h>
@@ -19,9 +20,10 @@
 /* GPU device selection is compiled in only when the machine exports the
  * 3D/compute path (Makefile defines VULKAN_GPU_BACKEND under PGL_G3D=yes).
  * vk_gpu_probe() lives in src/gpu/gpu_device.c and returns non-zero when a
- * usable V3D device is present. */
+ * supported compute GPU is present. */
 #ifdef VULKAN_GPU_BACKEND
 extern int vk_gpu_probe(void);
+extern const char *vk_gpu_name(void);
 #endif
 
 /* the dispatch tag stored as the first member of every dispatchable object */
@@ -175,7 +177,7 @@ static void runtime_init(void)
     if (g_phys.gpu_available) {
         g_phys.props.deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
         snprintf(g_phys.props.deviceName, sizeof(g_phys.props.deviceName),
-                 "EwokOS GPU (V3D)");
+                 "%s", vk_gpu_name());
     }
 #else
     g_phys.gpu_available = 0;

@@ -33,10 +33,36 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* Fixed compiled-program cache depth.  shadertoy ships 11 effects; 16 leaves
    room for a couple of extra variants before an eviction-free compile fails. */
 #define PGL_G3D_MAX_PROGS 16
+
+/* ---------------------------------------------------------------------------
+ * PERSISTENT DISK CACHE for compiled shader programs.
+ *
+ * The vendored mesa V3D register-allocation ladder recompiles from scratch on
+ * EVERY process launch (costing ~10-18s per strategy attempt, minutes total
+ * for a heavy raymarch shader).  This cache stores the serialized daemon blob
+ * plus the uniform-binding reflection table so subsequent launches skip the
+ * compile entirely and upload the cached blob in <100ms.
+ *
+ * Cache location: /data/pgl_shader_cache/<gpu_ver>_<hash>.bin
+ * Format (all little-endian):
+ *   [magic "PGLC" 4B][version 4B][gpu_ver 4B][source_hash 8B]
+ *   [blob_size 4B][blob_data blob_size B]
+ *   [cs_num_bindings 4B][cs_bindings cs_num_bindings * 72B]
+ *   [cs_uniform_blob_dwords 4B][cs_local_size 12B]
+ *   [xs_num_bindings 4B][xs_bindings ...]
+ *   [xs_uniform_blob_dwords 4B][xs_local_size 12B]
+ *   [flags: is_geom geom_model geom_tex geom_texcol geom_inst geom_inst_lit
+ *           geom_tpw  -- 7 * 4B]
+ * ------------------------------------------------------------------------- */
+#define PGL_DISK_CACHE_DIR   "/tmp/pgl_shader_cache"
+#define PGL_DISK_CACHE_MAGIC 0x434C4750u  /* 'P','G','L','C' */
+#define PGL_DISK_CACHE_VER   1u
 
 typedef struct {
 	int      used;
@@ -81,6 +107,12 @@ typedef struct {
 	   always has both stages.  uniform_blob_dwords of this stage's COMPUTE
 	   slot is the split point of the concatenated per-draw blob. */
 	struct pglc_program xform_prog;
+	/* Disk-cache: the serialized daemon blob loaded from / saved to disk.
+	   When non-NULL, program_upload() uses this directly instead of calling
+	   pglc_program_serialize(), and the compile step is skipped entirely on
+	   a cache hit. */
+	uint8_t* cached_blob;
+	uint32_t cached_blob_size;
 } prog_entry_t;
 
 static prog_entry_t _progs[PGL_G3D_MAX_PROGS];
@@ -98,10 +130,194 @@ static uint32_t hash_sources(const char* v, const char* f)
 	return h;
 }
 
+/* 64-bit FNV-1a for the disk-cache key (wider than the in-memory pre-filter
+   so cache filenames are effectively collision-free across apps). */
+static uint64_t hash_sources_64(const char* v, const char* f)
+{
+	uint64_t h = 14695981039346656037ULL;
+	const unsigned char* p;
+	for (p = (const unsigned char*)v; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+	h ^= 0x1Fu; h *= 1099511628211ULL;
+	for (p = (const unsigned char*)f; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+	return h;
+}
+
+/* Build the cache file path: /data/pgl_shader_cache/<gpu_ver>_<hash64>.bin */
+static void cache_path(char* buf, size_t bufsz, uint32_t gpu_ver, uint64_t h64)
+{
+	snprintf(buf, bufsz, "%s/%u_%016llx.bin",
+	         PGL_DISK_CACHE_DIR, gpu_ver, (unsigned long long)h64);
+}
+
+static void cache_ensure_dir(void)
+{
+	static int tried = 0;
+	if (tried) return;
+	tried = 1;
+	mkdir(PGL_DISK_CACHE_DIR, 0755);
+}
+
+/* Read a cached program from disk.  Returns 1 on success (entry populated),
+   0 on miss/corruption.  On success, e->cached_blob is malloc'd and the
+   uniform_bindings for the COMPUTE stage(s) are restored. */
+static int cache_load(prog_entry_t* e, uint32_t gpu_ver, uint64_t h64)
+{
+	char path[256];
+	FILE* fp;
+	uint32_t magic, ver, gver, blob_size;
+	uint64_t stored_hash;
+	uint8_t* blob = NULL;
+	struct pglc_uniform_binding* cs_b = NULL;
+	struct pglc_uniform_binding* xs_b = NULL;
+	uint32_t cs_ubd, xs_ubd;
+	uint32_t cs_ls[3], xs_ls[3];
+	uint32_t cs_nb, xs_nb;
+	uint32_t flags[7];
+
+	cache_path(path, sizeof(path), gpu_ver, h64);
+	fp = fopen(path, "rb");
+	if (!fp) return 0;
+
+	/* header */
+	if (fread(&magic, 4, 1, fp) != 1 || magic != PGL_DISK_CACHE_MAGIC) goto fail;
+	if (fread(&ver, 4, 1, fp) != 1 || ver != PGL_DISK_CACHE_VER) goto fail;
+	if (fread(&gver, 4, 1, fp) != 1 || gver != gpu_ver) goto fail;
+	if (fread(&stored_hash, 8, 1, fp) != 1 || stored_hash != h64) goto fail;
+
+	/* blob */
+	if (fread(&blob_size, 4, 1, fp) != 1 || blob_size == 0 || blob_size > 32u*1024u*1024u)
+		goto fail;
+	blob = (uint8_t*)malloc(blob_size);
+	if (!blob) goto fail;
+	if (fread(blob, 1, blob_size, fp) != blob_size) goto fail;
+
+	/* cs uniform bindings */
+	if (fread(&cs_nb, 4, 1, fp) != 1) goto fail;
+	if (cs_nb > 4096) goto fail;
+	if (cs_nb > 0) {
+		cs_b = (struct pglc_uniform_binding*)calloc(cs_nb, sizeof(*cs_b));
+		if (!cs_b) goto fail;
+		if (fread(cs_b, sizeof(*cs_b), cs_nb, fp) != cs_nb) goto fail;
+	}
+	if (fread(&cs_ubd, 4, 1, fp) != 1) goto fail;
+	if (fread(cs_ls, 4, 3, fp) != 3) goto fail;
+
+	/* xs (xform) uniform bindings */
+	if (fread(&xs_nb, 4, 1, fp) != 1) goto fail;
+	if (xs_nb > 4096) goto fail;
+	if (xs_nb > 0) {
+		xs_b = (struct pglc_uniform_binding*)calloc(xs_nb, sizeof(*xs_b));
+		if (!xs_b) goto fail;
+		if (fread(xs_b, sizeof(*xs_b), xs_nb, fp) != xs_nb) goto fail;
+	}
+	if (fread(&xs_ubd, 4, 1, fp) != 1) goto fail;
+	if (fread(xs_ls, 4, 3, fp) != 3) goto fail;
+
+	/* flags */
+	if (fread(flags, 4, 7, fp) != 7) goto fail;
+	fclose(fp);
+
+	/* Populate the entry.  The pglc_program stages get their uniform
+	   bindings restored but code=NULL (the blob IS the code, already
+	   serialized for the daemon).  program_upload() will use cached_blob
+	   directly. */
+	e->cached_blob = blob;
+	e->cached_blob_size = blob_size;
+
+	e->prog.stage[PGLC_STAGE_COMPUTE].uniform_bindings = cs_b;
+	e->prog.stage[PGLC_STAGE_COMPUTE].num_uniform_bindings = cs_nb;
+	e->prog.stage[PGLC_STAGE_COMPUTE].uniform_blob_dwords = cs_ubd;
+	e->prog.stage[PGLC_STAGE_COMPUTE].local_size[0] = cs_ls[0];
+	e->prog.stage[PGLC_STAGE_COMPUTE].local_size[1] = cs_ls[1];
+	e->prog.stage[PGLC_STAGE_COMPUTE].local_size[2] = cs_ls[2];
+	/* Mark code_words non-zero so has_compute() passes; the actual code
+	   pointer stays NULL because upload uses cached_blob. */
+	e->prog.stage[PGLC_STAGE_COMPUTE].code_words = 1;
+
+	e->xform_prog.stage[PGLC_STAGE_COMPUTE].uniform_bindings = xs_b;
+	e->xform_prog.stage[PGLC_STAGE_COMPUTE].num_uniform_bindings = xs_nb;
+	e->xform_prog.stage[PGLC_STAGE_COMPUTE].uniform_blob_dwords = xs_ubd;
+	e->xform_prog.stage[PGLC_STAGE_COMPUTE].local_size[0] = xs_ls[0];
+	e->xform_prog.stage[PGLC_STAGE_COMPUTE].local_size[1] = xs_ls[1];
+	e->xform_prog.stage[PGLC_STAGE_COMPUTE].local_size[2] = xs_ls[2];
+	if (xs_nb > 0 || xs_ubd > 0)
+		e->xform_prog.stage[PGLC_STAGE_COMPUTE].code_words = 1;
+
+	e->is_geom       = flags[0];
+	e->geom_model    = flags[1];
+	e->geom_tex      = flags[2];
+	e->geom_texcol   = flags[3];
+	e->geom_inst     = flags[4];
+	e->geom_inst_lit = flags[5];
+	e->geom_tpw      = flags[6];
+	return 1;
+
+fail:
+	if (fp) fclose(fp);
+	free(blob);
+	free(cs_b);
+	free(xs_b);
+	return 0;
+}
+
+/* Write a compiled program to the disk cache.  Best-effort: failures are
+   silently ignored (the app still works, it just recompiles next launch). */
+static void cache_store(const prog_entry_t* e, uint32_t gpu_ver, uint64_t h64,
+                        const uint8_t* blob, uint32_t blob_size)
+{
+	char path[256];
+	FILE* fp;
+	uint32_t magic = PGL_DISK_CACHE_MAGIC, ver = PGL_DISK_CACHE_VER;
+	uint32_t cs_nb, xs_nb, cs_ubd, xs_ubd;
+	uint32_t flags[7];
+	const struct pglc_stage* cs = &e->prog.stage[PGLC_STAGE_COMPUTE];
+	const struct pglc_stage* xs = &e->xform_prog.stage[PGLC_STAGE_COMPUTE];
+
+	cache_ensure_dir();
+	cache_path(path, sizeof(path), gpu_ver, h64);
+	fp = fopen(path, "wb");
+	if (!fp) return;
+
+	fwrite(&magic, 4, 1, fp);
+	fwrite(&ver, 4, 1, fp);
+	fwrite(&gpu_ver, 4, 1, fp);
+	fwrite(&h64, 8, 1, fp);
+	fwrite(&blob_size, 4, 1, fp);
+	fwrite(blob, 1, blob_size, fp);
+
+	cs_nb = cs->num_uniform_bindings;
+	fwrite(&cs_nb, 4, 1, fp);
+	if (cs_nb && cs->uniform_bindings)
+		fwrite(cs->uniform_bindings, sizeof(struct pglc_uniform_binding), cs_nb, fp);
+	cs_ubd = cs->uniform_blob_dwords;
+	fwrite(&cs_ubd, 4, 1, fp);
+	fwrite(cs->local_size, 4, 3, fp);
+
+	xs_nb = xs->num_uniform_bindings;
+	fwrite(&xs_nb, 4, 1, fp);
+	if (xs_nb && xs->uniform_bindings)
+		fwrite(xs->uniform_bindings, sizeof(struct pglc_uniform_binding), xs_nb, fp);
+	xs_ubd = xs->uniform_blob_dwords;
+	fwrite(&xs_ubd, 4, 1, fp);
+	fwrite(xs->local_size, 4, 3, fp);
+
+	flags[0] = (uint32_t)e->is_geom;
+	flags[1] = (uint32_t)e->geom_model;
+	flags[2] = (uint32_t)e->geom_tex;
+	flags[3] = (uint32_t)e->geom_texcol;
+	flags[4] = (uint32_t)e->geom_inst;
+	flags[5] = (uint32_t)e->geom_inst_lit;
+	flags[6] = (uint32_t)e->geom_tpw;
+	fwrite(flags, 4, 7, fp);
+	fclose(fp);
+}
+
 static void entry_clear(prog_entry_t* e)
 {
 	if (e->vert) { free(e->vert); e->vert = NULL; }
 	if (e->frag) { free(e->frag); e->frag = NULL; }
+	if (e->cached_blob) { free(e->cached_blob); e->cached_blob = NULL; }
+	e->cached_blob_size = 0;
 	pglc_program_free(&e->prog);   /* frees each stage[].code */
 	memset(&e->prog, 0, sizeof(e->prog));
 	pglc_program_free(&e->xform_prog);
@@ -112,7 +328,7 @@ static void entry_clear(prog_entry_t* e)
 	e->upload_declined = 0;
 	e->is_geom = 0;
 	e->geom_model = 0;
-		e->geom_tex = 0;
+	e->geom_tex = 0;
 	e->geom_texcol = 0;
 	e->geom_inst = 0;
 	e->geom_inst_lit = 0;
@@ -163,6 +379,26 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 			         "pgl_g3d: shader program cache full (%d entries)",
 			         PGL_G3D_MAX_PROGS);
 		return PGL_G3D_PROG_INVALID;
+	}
+
+	/* --- DISK CACHE LOOKUP: skip the entire mesa compile when a previous
+	   launch already serialized this program.  This is the single biggest
+	   startup optimization: a heavy raymarch shader costs 10-18s PER RA
+	   strategy attempt (minutes total) on every cold launch; a cache hit
+	   loads the pre-compiled blob in <10ms. --- */
+	{
+		uint32_t gpu_ver = pgl_g3d_ensure_version();
+		uint64_t h64 = hash_sources_64(vert_glsl, frag_glsl);
+		if (gpu_ver != 0 && cache_load(&_progs[slot], gpu_ver, h64)) {
+			_progs[slot].vert = strdup(vert_glsl);
+			_progs[slot].frag = strdup(frag_glsl);
+			_progs[slot].hash = h;
+			_progs[slot].daemon_handle = -1;
+			_progs[slot].uploaded = 0;
+			_progs[slot].upload_declined = 0;
+			_progs[slot].used = 1;
+			return (pgl_g3d_prog)slot;
+		}
 	}
 
 	{
@@ -359,6 +595,43 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 	_progs[slot].uploaded = 0;
 	_progs[slot].upload_declined = 0;
 	_progs[slot].used = 1;
+
+	/* --- DISK CACHE STORE: serialize the freshly compiled program and persist
+	   it so the next launch skips the multi-minute mesa compile entirely. --- */
+	{
+		uint32_t gpu_ver = pgl_g3d_ensure_version();
+		uint64_t h64 = hash_sources_64(vert_glsl, frag_glsl);
+		if (gpu_ver != 0) {
+			struct pglc_blob_opts copts;
+			uint32_t total;
+			uint8_t* blob = NULL;
+			memset(&copts, 0, sizeof(copts));
+			copts.geom_kind = _progs[slot].is_geom
+				? (_progs[slot].geom_texcol ? 4
+				   : (_progs[slot].geom_tex ? 2
+				      : (_progs[slot].geom_inst ? 3 : 1)))
+				: 0;
+			copts.geom_tpw = (uint32_t)_progs[slot].geom_tpw;
+			total = pglc_program_serialize(&_progs[slot].prog,
+			                               &_progs[slot].xform_prog,
+			                               &copts, NULL, 0);
+			if (total > 0 && (total & 3u) == 0) {
+				blob = (uint8_t*)malloc(total);
+				if (blob) {
+					if (pglc_program_serialize(&_progs[slot].prog,
+					                           &_progs[slot].xform_prog,
+					                           &copts, blob, total) == total) {
+						_progs[slot].cached_blob = blob;
+						_progs[slot].cached_blob_size = total;
+						cache_store(&_progs[slot], gpu_ver, h64, blob, total);
+						blob = NULL;  /* ownership moved to entry */
+					}
+					free(blob);
+				}
+			}
+		}
+	}
+
 	return (pgl_g3d_prog)slot;
 }
 
@@ -589,45 +862,52 @@ uint32_t pgl_g3d_shader_patch_uniform(pgl_g3d_prog p, uint32_t* blob,
    pglc_program_serialize(): this client never looks inside a stage's
    backend-private state.  Returns the daemon's non-negative program handle,
    or a negative G2D_ERR_* code.  The canvas is modelled w=total/4 h=1 so
-   g2d_attach's size >= w*h*4 check holds with size == the blob length. */
+   g2d_attach's size >= w*h*4 check holds with size == the blob length.
+
+   FAST PATH: when the entry carries a cached_blob (loaded from the persistent
+   disk cache or stored after a fresh compile), the serialization is skipped
+   entirely and the pre-built blob is shipped directly. */
 static int program_upload(const prog_entry_t* e)
 {
-	struct pglc_blob_opts opts;
 	g2d_pgl_program_req_t req;
 	uint32_t total;
 	uint32_t* px = NULL;
 	int shm = 0, handle;
 
-	memset(&opts, 0, sizeof(opts));
-	/* the geometry rasterizer rides the same compute wire stage; the daemon
-	   switches its dispatch shape (per-triangle grid + SSBO layout) on this
-	   byte: 1 = gouraud (fb/pos/nrm/depth), 2 = textured (fb/interleaved
-	   pos+uv/depth/tex), 3 = instanced (fb/pos+idx/nrm/depth/matrices),
-	   4 = colour-modulated textured (fb/interleaved pos+uv+colour/
-	   depth(unused)/tex, bilinear + blend + scissor). */
-	opts.geom_kind = e->is_geom ? (e->geom_texcol ? 4 : (e->geom_tex ? 2 : (e->geom_inst ? 3 : 1))) : 0;
-	/* raster-pass workgroup geometry: 0 = one workgroup per triangle; 64/256
-	   = the one-lane-per-triangle kernels, so the daemon dispatches
-	   ceil(ntris/tpw) workgroups instead. */
-	opts.geom_tpw  = (uint32_t)e->geom_tpw;
-
-	/* size query, then a contig segment big enough for the whole blob; the
-	   daemon reads it as a raw byte buffer, so no physical base is needed
-	   client-side. */
-	total = pglc_program_serialize(&e->prog, &e->xform_prog, &opts, NULL, 0);
-	if (total == 0 || (total & 3u) != 0)
-		return G2D_ERR_FAILED;
-	if (g2d_shm_alloc(total, &shm, &px) != 0 || shm <= 0 || px == NULL)
-		return G2D_ERR_FAILED;
-	if (pglc_program_serialize(&e->prog, &e->xform_prog, &opts, px, total) != total) {
+	/* Fast path: use the pre-serialized blob from the disk cache. */
+	if (e->cached_blob && e->cached_blob_size > 0) {
+		total = e->cached_blob_size;
+		if (g2d_shm_alloc(total, &shm, &px) != 0 || shm <= 0 || px == NULL)
+			return G2D_ERR_FAILED;
+		memcpy(px, e->cached_blob, total);
+		g2d_pgl_program_req_init(&req, g2d_canvas(shm, total, total / 4u, 1u, 1));
+		handle = g2d_pgl_program(&req);
 		g2d_shm_free(px);
-		return G2D_ERR_FAILED;
+		return handle;
 	}
 
-	g2d_pgl_program_req_init(&req, g2d_canvas(shm, total, total / 4u, 1u, 1));
-	handle = g2d_pgl_program(&req);
-	g2d_shm_free(px);
-	return handle;
+	/* Slow path: serialize from the live compiled program. */
+	{
+		struct pglc_blob_opts opts;
+		memset(&opts, 0, sizeof(opts));
+		opts.geom_kind = e->is_geom ? (e->geom_texcol ? 4 : (e->geom_tex ? 2 : (e->geom_inst ? 3 : 1))) : 0;
+		opts.geom_tpw  = (uint32_t)e->geom_tpw;
+
+		total = pglc_program_serialize(&e->prog, &e->xform_prog, &opts, NULL, 0);
+		if (total == 0 || (total & 3u) != 0)
+			return G2D_ERR_FAILED;
+		if (g2d_shm_alloc(total, &shm, &px) != 0 || shm <= 0 || px == NULL)
+			return G2D_ERR_FAILED;
+		if (pglc_program_serialize(&e->prog, &e->xform_prog, &opts, px, total) != total) {
+			g2d_shm_free(px);
+			return G2D_ERR_FAILED;
+		}
+
+		g2d_pgl_program_req_init(&req, g2d_canvas(shm, total, total / 4u, 1u, 1));
+		handle = g2d_pgl_program(&req);
+		g2d_shm_free(px);
+		return handle;
+	}
 }
 
 int pgl_g3d_shader_upload(pgl_g3d_prog p)

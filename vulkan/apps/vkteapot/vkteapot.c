@@ -674,6 +674,73 @@ static int create_swapchain_views_fbs(void)
     return 0;
 }
 
+/* Create the colour swapchain at T.width x T.height with the already-selected
+ * T.format.  The render pass and graphics pipeline are extent-independent, so a
+ * resize only has to rebuild the swapchain, its image views/framebuffers and the
+ * depth attachment -- never the pipeline or the vertex/UBO buffers. */
+static int create_swapchain(void)
+{
+    VkSwapchainCreateInfoKHR sci;
+    memset(&sci, 0, sizeof(sci));
+    sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    sci.surface = T.surface;
+    sci.minImageCount = 1;
+    sci.imageFormat = T.format;
+    sci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    sci.imageExtent.width = T.width;
+    sci.imageExtent.height = T.height;
+    sci.imageArrayLayers = 1;
+    sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    sci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    sci.clipped = VK_TRUE;
+    if (vkCreateSwapchainKHR(T.device, &sci, NULL, &T.swapchain) != VK_SUCCESS) {
+        printf("vkteapot: vkCreateSwapchainKHR failed\n"); return -1;
+    }
+    return 0;
+}
+
+/* Tear down everything sized to the window: the framebuffers, the swapchain
+ * image views, the swapchain itself and the depth attachment.  The surface,
+ * render pass, pipeline and vertex/UBO buffers survive a resize. */
+static void destroy_sc_objects(void)
+{
+    uint32_t i;
+    for (i = 0; i < T.sc_count; i++) {
+        if (T.sc_fbs[i])   { vkDestroyFramebuffer(T.device, T.sc_fbs[i], NULL); T.sc_fbs[i]   = VK_NULL_HANDLE; }
+        if (T.sc_views[i]) { vkDestroyImageView(T.device, T.sc_views[i], NULL); T.sc_views[i] = VK_NULL_HANDLE; }
+    }
+    T.sc_count = 0;
+    if (T.depth_view) { vkDestroyImageView(T.device, T.depth_view, NULL);   T.depth_view = VK_NULL_HANDLE; }
+    if (T.depth_img)  { vkDestroyImage(T.device, T.depth_img, NULL);        T.depth_img  = VK_NULL_HANDLE; }
+    if (T.depth_mem)  { vkFreeMemory(T.device, T.depth_mem, NULL);          T.depth_mem  = VK_NULL_HANDLE; }
+    if (T.swapchain)  { vkDestroySwapchainKHR(T.device, T.swapchain, NULL); T.swapchain  = VK_NULL_HANDLE; }
+}
+
+/* Rebuild the window-sized Vulkan objects for a new client extent and refresh the
+ * projection so the teapot keeps its aspect ratio instead of being stretched. */
+static void recreate_swapchain(uint32_t w, uint32_t h)
+{
+    if (!T.ready || w == 0 || h == 0) return;
+    if (w == T.width && h == T.height) return;
+
+    vkDeviceWaitIdle(T.device);
+    destroy_sc_objects();
+
+    T.width = w; T.height = h;
+    if (create_swapchain() != 0 ||
+        create_depth(w, h) != 0 ||
+        create_swapchain_views_fbs() != 0) {
+        T.ready = 0;   /* stop presenting: the window-sized objects are invalid */
+        printf("vkteapot: swapchain recreate failed at %ux%u\n", w, h);
+        return;
+    }
+    /* aspect must follow the new extent or the model is stretched */
+    perspective(projection_matrix, 45.0f, (float)w / (float)h, 0.5f, 100.0f);
+}
+
 static int init_vulkan(uint32_t width, uint32_t height)
 {
     PFN_vkCreateEwokOSSurfaceVK_t pfnCreateSurface;
@@ -684,7 +751,6 @@ static int init_vulkan(uint32_t width, uint32_t height)
     VkQueueFamilyProperties qfam[16];
     uint32_t nphys = 0, nq = 16, i;
     float prio = 1.0f;
-    VkSwapchainCreateInfoKHR sci;
     VkSurfaceFormatKHR sfmt;
     VkAttachmentDescription att[2];
     VkAttachmentReference colorRef;
@@ -776,24 +842,7 @@ static int init_vulkan(uint32_t width, uint32_t height)
             T.format = sfmt.format;
     }
 
-    memset(&sci, 0, sizeof(sci));
-    sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-    sci.surface = T.surface;
-    sci.minImageCount = 1;
-    sci.imageFormat = T.format;
-    sci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-    sci.imageExtent.width = width;
-    sci.imageExtent.height = height;
-    sci.imageArrayLayers = 1;
-    sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    sci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-    sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    sci.clipped = VK_TRUE;
-    if (vkCreateSwapchainKHR(T.device, &sci, NULL, &T.swapchain) != VK_SUCCESS) {
-        printf("vkteapot: vkCreateSwapchainKHR failed\n"); return -1;
-    }
+    if (create_swapchain() != 0) return -1;
 
     /* depth attachment must exist before the framebuffers reference its view */
     if (create_depth(width, height) != 0) return -1;
@@ -1031,7 +1080,8 @@ static int init_vulkan(uint32_t width, uint32_t height)
         printf("vkteapot: vkCreateSemaphore failed\n"); return -1;
     }
 
-    /* fixed projection for the (non-resizable) window */
+    /* initial projection for the launch extent; recreate_swapchain refreshes it
+     * (aspect included) whenever the window is resized */
     perspective(projection_matrix, 45.0f, (float)width / (float)height, 0.5f, 100.0f);
 
     T.ready = 1;
@@ -1202,6 +1252,15 @@ static void on_repaint(xwin_t *xwin, graph_t *g)
     uint32_t idx = 0;
     float dt;
     (void)xwin;
+    if (!T.ready) return;
+    /* Track the window's drawable size.  The swapchain, its framebuffers and the
+     * depth attachment are all sized to the window, and the projection's aspect
+     * ratio must match it too -- otherwise resizing stretches the teapot to the
+     * new aspect.  g is the exact buffer teapot_present blits into, so matching
+     * T.width/T.height to g->w/g->h also keeps that present a 1:1 copy. */
+    if (g && g->w > 0 && g->h > 0 &&
+        ((uint32_t)g->w != T.width || (uint32_t)g->h != T.height))
+        recreate_swapchain((uint32_t)g->w, (uint32_t)g->h);
     if (!T.ready) return;
     g_cur = g;
     if (vkAcquireNextImageKHR(T.device, T.swapchain, UINT64_MAX, T.acquired,

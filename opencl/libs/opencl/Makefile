@@ -16,16 +16,16 @@ OBJDIR = $(ARCH)/$(HW)
 CFLAGS += -I../../include -Isrc -Isrc/clc
 
 # Phase 2 GPU front-end gate.  The GPU device is compiled in ONLY on the OpenCL
-# GPU target: PGL_G3D=yes AND a raspi5-class HW.  raspix/q8b also export
-# PGL_G3D=yes but are not OpenCL GPU targets yet, so the HW filter keeps them --
-# and virt -- on the CPU-only Phase-1 build (matching the plan's "first hardware
-# target is raspi5 only" and libs/clclient's identical gate).  When gated on:
+# GPU targets: PGL_G3D=yes AND a machine with a real bsp_cl compute back end
+# (raspi5's V3D CSD, q8b's Adreno 690 CS).  raspix exports PGL_G3D=yes but is
+# not an OpenCL GPU target yet, so the HW filter keeps it -- and virt -- on the
+# CPU-only Phase-1 build (matching libs/clclient's identical gate).  When gated on:
 #   - src/gpu is added and OPENCL_GPU_BACKEND is defined, so runtime.c registers
 #     the GPU device (cl_gpu_probe/cl_gpu_device_init in src/gpu/gpu_device.c);
 #   - the private clclient transport + the on-device mesa compiler archives that
 #     projects/opengl stages under .gles_priv are ADDLIB-merged into libOpenCL.a,
 #     so an app still links only -lOpenCL (+ -lg2dclient -lewokstl -lcxx).
-CL_GPU_HWS := raspi5
+CL_GPU_HWS := raspi5 q8b
 OPENCL_GPU :=
 ifeq ($(PGL_G3D),yes)
 ifneq ($(filter $(HW),$(CL_GPU_HWS)),)

@@ -11,14 +11,15 @@ TASK_OBJS = $(ARCH)/$(TASK).o
 TASK_DIR = $(BUILD_DIR)/rootfs/bin
 OPENCL_LIB = $(BUILD_DIR)/lib/libOpenCL.a
 
-# Phase 2 GPU target (raspi5): libOpenCL.a additionally folds in clclient + the
-# on-device mesa compiler, so the command must also link the g2d transport and
-# the C++ runtime mesa needs (operator new[]/delete[] + the STL from libewokstl,
-# the cxa guards from libcxx).  Gated on the same PGL_G3D=yes + raspi5-class HW
-# condition libs/opencl uses, so a CPU-only target keeps its exact link line
-# (the extra archives would be unreferenced no-ops there anyway).  Order mirrors
-# the proven GLES app closure: transport/STL before $(EWOK_LIBC), -lcxx last.
-CL_GPU_HWS := raspi5
+# Phase 2 GPU targets (raspi5 V3D CSD, q8b Adreno 690 CS): libOpenCL.a
+# additionally folds in clclient + the on-device mesa compiler, so the command
+# must also link the g2d transport and the C++ runtime mesa needs (operator
+# new[]/delete[] + the STL from libewokstl, the cxa guards from libcxx).  Gated
+# on the same PGL_G3D=yes + CL-GPU-HW condition libs/opencl uses, so a CPU-only
+# target keeps its exact link line (the extra archives would be unreferenced
+# no-ops there anyway).  Order mirrors the proven GLES app closure:
+# transport/STL before $(EWOK_LIBC), -lcxx last.
+CL_GPU_HWS := raspi5 q8b
 OPENCL_GPU_LIBS :=
 OPENCL_GPU_CXX :=
 ifeq ($(PGL_G3D),yes)

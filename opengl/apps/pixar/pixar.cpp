@@ -68,10 +68,10 @@ static int win_width  = 800;
 static int win_height = 600;
 
 /* March / soft-shadow step budgets.  Defaults match the reference exactly
- * (DISTMARCH_STEPS=60, SOFTSHADOW_STEPS=90).  argv "stepsN" / "shstepsN"
+ * (DISTMARCH_STEPS=48, SOFTSHADOW_STEPS=8).  argv "stepsN" / "shstepsN"
  * override so slow targets can trade fidelity for throughput. */
-static int g_steps   = 60;
-static int g_shsteps = 90;
+static int g_steps   = 48;
+static int g_shsteps = 8;
 static float g_freeze = -1.0f; /* argv "freezeN": pin iGlobalTime at N seconds so
                                   A/B timing runs render the identical frame */
 static int g_dump = 0;     /* argv "dumpN": glReadPixels frame N to /tmp/pixar.ppm
@@ -79,7 +79,7 @@ static int g_dump = 0;     /* argv "dumpN": glReadPixels frame N to /tmp/pixar.p
 static int g_frames = 0;
 
 #ifdef PGL_G3D
-static int g_scale = 2;   /* faithful-compute render-scale denominator; argv
+static int g_scale = 1;   /* faithful-compute render-scale denominator; argv
                              "scaleN" (N=1..9) overrides, 1 = native */
 #endif
 
