@@ -62,16 +62,6 @@
 #include <string.h>
 #include <time.h>
 
-/* Wall-clock ms, for the prepare-cost lines below.  CLOCK_MONOTONIC is the same
- * source portablegl's v3ct probes read, so a Vulkan prepare and a GLES
- * glLinkProgram measured in the same boot are directly comparable. */
-static double gpu_now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
-}
-
 /* Per-pipeline GPU state, hung off pipeline->backend_data.  Lazily built on the
  * first dispatch; a declined pipeline keeps cpu_fallback set and the CPU back-end
  * runs every launch. */
@@ -177,7 +167,6 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
     vk_gpu_cache_rec *rec;
     uint32_t blobsz, gpu_ver;
     uint64_t key;
-    double t0 = gpu_now_ms();
     void *blob;
     int32_t handle;
 
@@ -236,8 +225,6 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
             gp->bindings    = rec->a_bindings;   /* stolen from the record */
             rec->a_bindings = NULL;
             gp->nbindings   = rec->a_nbindings;
-            fprintf(stderr, "vulkan-gpu: '%s' compute prepare CACHED %.0f ms (blob %u B)\n",
-                    e->name, gpu_now_ms() - t0, rec->blob_size);
             vk_gpu_cache_rec_free(rec);
             free(glsl);
             gp->handle   = handle;
@@ -331,8 +318,6 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
         GPU_DECLINE();
     }
 
-    fprintf(stderr, "vulkan-gpu: '%s' compute prepare COMPILED %.0f ms (blob %u B)\n",
-            e->name, gpu_now_ms() - t0, blobsz);
     gp->handle = handle;
     gp->prepared = 1;
     return gp;
@@ -550,7 +535,6 @@ static gpu_pipeline *gpu_prepare_gfx(vk_pipeline *p)
     char err[256];
     uint32_t i, blobsz, gpu_ver;
     uint64_t key;
-    double t0 = gpu_now_ms();
     void *blob = NULL;
     int32_t handle;
 
@@ -628,8 +612,6 @@ static gpu_pipeline *gpu_prepare_gfx(vk_pipeline *p)
             gp->rs_bindings  = rec->b_bindings;   /* stolen from the record */
             rec->b_bindings  = NULL;
             gp->nrs_bindings = rec->b_nbindings;
-            fprintf(stderr, "vulkan-gpu: gfx prepare CACHED %.0f ms (blob %u B)\n",
-                    gpu_now_ms() - t0, rec->blob_size);
             vk_gpu_cache_rec_free(rec);
             GFX_CLEANUP();   /* res_x/res_r are still zeroed, blob still NULL */
             gp->gfx      = 1;
@@ -670,18 +652,24 @@ static gpu_pipeline *gpu_prepare_gfx(vk_pipeline *p)
         GFX_DECLINE();
     }
 
-    /* 3. serialize (main = raster/cs, xform = cs2) with geom_kind 5, the
-     *    ONE-LANE-PER-TRIANGLE raster grid (geom_tpw 256 = the raster kernel's
-     *    16x16 lane count, so the daemon dispatches ceil(ntris/256) workgroups),
-     *    and the VERSION-6 stream strides.  The wide grid is the whole perf point
-     *    (the CSD charges ~3us of fixed overhead per workgroup); geom_tpw MUST
-     *    equal the raster local_size product or the daemon declines the program.
-     *    A VS with no inputs reports attr_stride 0; the blob field must be >= 1
-     *    (the daemon validates [1,64]), and the generated kernel reads no vattr
-     *    in that case, so a 1-float dummy stride is staged. */
+    /* 3. serialize (main = raster/cs, xform = cs2) with geom_kind 5, the raster
+     *    grid shape the transpiler chose, and the VERSION-6 stream strides.  The
+     *    raster kernel is emitted in one of two shapes (see spirv_to_glsl.h):
+     *    a NON-TEXTURED (gouraud) FS is ONE-LANE-PER-TRIANGLE, so geom_tpw = 256
+     *    (the 16x16 lane count) and the daemon dispatches ceil(ntris/256) wide
+     *    workgroups; a TEXTURED FS (imgui) is COOPERATIVE one-workgroup-per-
+     *    triangle, so geom_tpw = 0 and the daemon dispatches ntris 8x8 workgroups
+     *    whose 64 lanes tile each triangle's bbox.  The wide grid is the whole
+     *    perf point for a mesh (the CSD charges ~3us of fixed overhead PER
+     *    workgroup); the cooperative shape is the perf point for the few huge
+     *    triangles of a GUI overlay.  A nonzero geom_tpw MUST equal the raster
+     *    local_size product or the daemon declines the program -- the transpiler
+     *    guarantees both.  A VS with no inputs reports attr_stride 0; the blob
+     *    field must be >= 1 (the daemon validates [1,64]), and the generated
+     *    kernel reads no vattr in that case, so a 1-float dummy stride is staged. */
     memset(&opts, 0, sizeof(opts));
     opts.geom_kind   = 5;
-    opts.geom_tpw    = 256;
+    opts.geom_tpw    = kern.layout.geom_tpw;
     opts.vout_stride = kern.layout.vout_stride;
     opts.attr_stride = kern.layout.attr_stride ? kern.layout.attr_stride : 1u;
     blobsz = pglc_program_serialize(&res_r, &res_x, &opts, NULL, 0);
@@ -711,8 +699,6 @@ static gpu_pipeline *gpu_prepare_gfx(vk_pipeline *p)
     if (handle < 0)
         GFX_DECLINE();
 
-    fprintf(stderr, "vulkan-gpu: gfx prepare COMPILED %.0f ms (blob %u B)\n",
-            gpu_now_ms() - t0, blobsz);
     gp->gfx      = 1;
     gp->handle   = handle;
     gp->prepared = 1;
@@ -1210,26 +1196,11 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
     }
 
     /* ---- dispatch the two passes over the g2dd PGL verbs ---- */
-    {   /* TEMP-PERF */
-        struct timespec _g0, _g1;
-        static unsigned long long g_ns[2]; static unsigned long g_n[2];
-        int _cat = ntex ? 1 : 0;
-        clock_gettime(CLOCK_MONOTONIC, &_g0);
-        rc = vk_gfx_draw(gp->handle, fb_host, rt_w, rt_h, fb_stride,
-                         (cim->mem && cim->mem->gfx_shm > 0) ? cim->mem->gfx_shm : 0,
-                         attr, nverts, astride, unif, num_unif,
-                         first_frame, clear_rgba, clear_z,
-                         ntex ? tex : NULL, ntex);
-        clock_gettime(CLOCK_MONOTONIC, &_g1);
-        g_ns[_cat] += (unsigned long long)(_g1.tv_sec - _g0.tv_sec) * 1000000000ull
-                    + (unsigned long long)(_g1.tv_nsec - _g0.tv_nsec);
-        g_n[_cat]++;
-        if (g_n[0] >= 30 && g_n[1] >= 30) {
-            printf("[gpu] teapot=%llu us/draw  imgui=%llu us/draw  (nverts imgui=%u)\n",
-                   g_ns[0] / g_n[0] / 1000ull, g_ns[1] / g_n[1] / 1000ull, nverts);
-            g_ns[0] = g_ns[1] = 0; g_n[0] = g_n[1] = 0;
-        }
-    }
+    rc = vk_gfx_draw(gp->handle, fb_host, rt_w, rt_h, fb_stride,
+                     (cim->mem && cim->mem->gfx_shm > 0) ? cim->mem->gfx_shm : 0,
+                     attr, nverts, astride, unif, num_unif,
+                     first_frame, clear_rgba, clear_z,
+                     ntex ? tex : NULL, ntex);
     free(unif);
 #undef GFX_CPU
 

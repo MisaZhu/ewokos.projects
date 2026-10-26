@@ -120,9 +120,17 @@ char *spirv_to_glsl(spirv_module *m, const spirv_entry *e,
  *       vout_stride = 8 + 4*ceil(nvarfloats/4); the per-vertex attribute stride
  *       (floats) is attr_stride.
  *
- *   pass 2 "raster" - local_size 16x16x1, ONE LANE PER TRIANGLE: lane L of
- *       workgroup W owns triangle W*256+L and sweeps its screen bbox serially
- *       (cs_geom_tpw = 256, so the daemon dispatches ceil(ntris/256) workgroups).
+ *   pass 2 "raster" - the work distribution depends on the FS, mirroring the GL
+ *       path's v_tpw = v_tex ? 0 : 256 heuristic.  A NON-TEXTURED (gouraud) FS
+ *       uses local_size 16x16, ONE LANE PER TRIANGLE: lane L of workgroup W owns
+ *       triangle W*256+L and sweeps its bbox serially (cs_geom_tpw = 256, so the
+ *       daemon dispatches ceil(ntris/256) workgroups) -- best for meshes of many
+ *       tiny triangles.  A TEXTURED FS (an FS that samples a texture, e.g. imgui)
+ *       uses local_size 8x8, ONE WORKGROUP PER TRIANGLE: all 64 lanes cooperatively
+ *       tile a single triangle's bbox (cs_geom_tpw = 0, the daemon dispatches ntris
+ *       workgroups) -- best for the few huge triangles of a GUI overlay, which the
+ *       one-lane shape would serialise onto a single lane.  geom_tpw in the layout
+ *       reports which shape was generated so the backend patches cs_geom_tpw.
  *       Bindings: 0 fb(uint[]) 1 vout(float[]) 2 depth(uint[]); fragment
  *       textures stay TMU sampler2D uniforms (they do NOT take an SSBO slot).
  *       The harness reproduces cpu_raster.c pixel-exactly (same edge/barycentric
@@ -163,6 +171,13 @@ typedef struct spirv_geom_layout {
     uint32_t sampler_binding[SPIRV_GEOM_MAX_SAMPLERS];
     int      uses_vertex_id;     /* VS reads gl_VertexID (gate indexed draws) */
     int      fs_present;         /* 0 => colour = interpolated varying loc 0   */
+    /* Raster work distribution for the daemon's cs_geom_tpw: 256 = the
+     * ONE-LANE-PER-TRIANGLE shape (a textured-free gouraud mesh: ceil(ntris/256)
+     * 16x16 workgroups, one triangle per lane); 0 = the COOPERATIVE one-
+     * workgroup-per-triangle shape (a TEXTURED FS such as imgui's font atlas:
+     * ntris 8x8 workgroups, all 64 lanes tiling one triangle's bbox).  Mirrors
+     * the GL path's v_tpw = v_tex ? 0 : 256 heuristic (pgl_g3d_shader.c). */
+    uint32_t geom_tpw;
     /* UBO / push-constant members flattened into default-block uniforms across
      * BOTH stages, de-duplicated by name (a uniform both stages read appears
      * once; the backend writes it into each stage's reflected blob region). */

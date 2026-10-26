@@ -1891,6 +1891,7 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
     uint32_t first_label, vstride = L->vout_stride;
     char *out = NULL, tag[16];
     int j, fs = (e != NULL), off;
+    int cooperative = 0;   /* 1 => one-workgroup-per-triangle (textured FS) */
     int *voff = NULL;      /* per-FS-input vout offset (-1 = zero-fill) */
     const char *sep;
 
@@ -1912,15 +1913,8 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
 
     gf(&c, "#version 310 es\n");
     gf(&c, "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\n\n");
-    /* ONE LANE PER TRIANGLE: a 16x16 workgroup (256 lanes) covers 256 triangles
-     * (lane L of workgroup W owns triangle W*256+L).  The daemon dispatches
-     * ceil(ntris/256) workgroups (cs_geom_tpw = 256) instead of one per triangle.
-     * This is the whole performance point: the V3D 7.1 CSD charges ~3us of FIXED
-     * dispatch overhead PER WORKGROUP, so the legacy one-workgroup-per-triangle
-     * shape (6400 workgroups for the teapot) cost ~19ms in the raster pass alone
-     * while 25 wide workgroups cost well under 1ms.  Per-pixel math is unchanged;
-     * this mirrors pglcompiler's geom_raster_cs_glsl (gouraud V5) exactly. */
-    gf(&c, "layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;\n\n");
+    /* The local_size line is emitted AFTER the FS scan below, once c.nsampler
+     * tells us which raster shape to build (see the comment there). */
 
     if (fs) {
         if (kern_scan_globals(&c) != 0) goto done;
@@ -1982,6 +1976,24 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
         Lout->fs_present = 0;
     }
 
+    /* Raster work distribution mirrors the GL geom path's v_tpw heuristic
+     * (pgl_g3d_shader.c: v_tpw = v_tex ? 0 : 256).  A TEXTURED fragment shader
+     * (an FS that samples a texture -- imgui's font atlas) uses the COOPERATIVE
+     * one-workgroup-per-triangle shape: all 64 lanes of an 8x8 workgroup tile a
+     * single triangle's screen bbox, so a few huge GUI triangles stay parallel
+     * instead of each being serialised onto one lane (the ~3.8ms/draw that held
+     * vkteapot+imgui at 60fps).  A NON-TEXTURED (gouraud) shader keeps the
+     * ONE-LANE-PER-TRIANGLE shape (256 triangles per 16x16 workgroup), which wins
+     * for a mesh of thousands of tiny triangles where the CSD's ~3us fixed
+     * per-workgroup overhead would otherwise dominate.  geom_tpw is the daemon's
+     * cs_geom_tpw: 0 = one workgroup per triangle, 256 = ceil(ntris/256). */
+    cooperative = (fs && c.nsampler > 0);
+    Lout->geom_tpw = cooperative ? 0u : 256u;
+    if (cooperative)
+        gf(&c, "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n\n");
+    else
+        gf(&c, "layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;\n\n");
+
     gf(&c, "layout(std430, binding = 0) buffer PglCsFb    { uint  fb[];    };\n");
     gf(&c, "layout(std430, binding = 1) buffer PglCsVout  { float vout[];  };\n");
     gf(&c, "layout(std430, binding = 2) buffer PglCsDepth { uint  depth[]; };\n\n");
@@ -2019,12 +2031,21 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
         gf(&c, "}\n\n");
     }
 
-    /* main(): one 16x16 workgroup covers 256 triangles; lane L of workgroup W
-     * owns triangle W*256+L outright and sweeps its screen bbox serially.  The
-     * uTriCount guard exits any over-dispatched lane BEFORE it touches an SSBO. */
+    /* main(): two shapes, chosen above by `cooperative`.
+     *   cooperative (textured FS): one 8x8 workgroup per triangle -- tri =
+     *     gl_WorkGroupID.x + uTriFirst, and the 64 lanes tile that triangle's
+     *     bbox in an 8-strided sweep.
+     *   one-lane (gouraud): one 16x16 workgroup covers 256 triangles -- lane L of
+     *     workgroup W owns triangle W*256+L and sweeps its bbox serially.
+     * In both, the uTriCount guard exits any over-dispatched lane BEFORE it
+     * touches an SSBO, and the per-triangle setup + per-pixel math are identical. */
     gf(&c, "void main() {\n");
-    gf(&c, "    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);\n");
-    gf(&c, "    int tri = int(gl_WorkGroupID.x) * 256 + lane + uTriFirst;\n");
+    if (cooperative) {
+        gf(&c, "    int tri = int(gl_WorkGroupID.x) + uTriFirst;\n");
+    } else {
+        gf(&c, "    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);\n");
+        gf(&c, "    int tri = int(gl_WorkGroupID.x) * 256 + lane + uTriFirst;\n");
+    }
     gf(&c, "    if (tri >= uTriFirst + uTriCount) return;\n");
     gf(&c, "    int i0 = tri * 3;\n");
     gf(&c, "    int i1 = i0 + 1;\n");
@@ -2078,8 +2099,17 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
     gf(&c, "        if (maxy > uScissor.y + uScissor.w - 1) maxy = uScissor.y + uScissor.w - 1;\n");
     gf(&c, "    }\n");
     gf(&c, "    if (minx > maxx || miny > maxy) return;\n");
-    gf(&c, "    for (int py = miny; py <= maxy; py++) {\n");
-    gf(&c, "    for (int px = minx; px <= maxx; px++) {\n");
+    if (cooperative) {
+        /* All 64 lanes of this workgroup share the one triangle; stride the bbox
+         * by the 8x8 tile so a large triangle is rasterised in parallel. */
+        gf(&c, "    int lx = int(gl_LocalInvocationID.x);\n");
+        gf(&c, "    int ly = int(gl_LocalInvocationID.y);\n");
+        gf(&c, "    for (int py = miny + ly; py <= maxy; py += 8) {\n");
+        gf(&c, "    for (int px = minx + lx; px <= maxx; px += 8) {\n");
+    } else {
+        gf(&c, "    for (int py = miny; py <= maxy; py++) {\n");
+        gf(&c, "    for (int px = minx; px <= maxx; px++) {\n");
+    }
     gf(&c, "        vec2 P = vec2(float(px) + 0.5, float(py) + 0.5);\n");
     gf(&c, "        float w0 = edgef(s1, s2, P);\n");
     gf(&c, "        float w1 = edgef(s2, s0, P);\n");

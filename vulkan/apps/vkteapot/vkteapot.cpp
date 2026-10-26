@@ -122,12 +122,6 @@ typedef struct {
 
 static vk_teapot T;
 static graph_t *g_cur;     /* window graph for the frame being presented */
-static int  g_frames = 0;
-/* Optional FPS log path taken from argv[1].  The EwokOS ssh exec channel does
- * not forward an app's stdout, so on-device FPS is measured by having the app
- * write it to a file itself (fetched back separately).  NULL on a normal
- * desktop launch, which leaves behaviour unchanged. */
-static const char *g_fpslog = NULL;
 /* GPU-vs-CPU route indicator.  The Vulkan runtime exposes one physical device
  * whose deviceType is VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU only when the
  * start-up probe found usable silicon (V3D on raspi5); otherwise it reports a
@@ -1111,8 +1105,6 @@ static int init_vulkan(uint32_t width, uint32_t height)
     perspective(projection_matrix, 45.0f, (float)width / (float)height, 0.5f, 100.0f);
 
     T.ready = 1;
-    printf("vkteapot: vulkan ready (%ux%u, format=%d, %u swapchain images, %d vertices)\n",
-           T.width, T.height, (int)T.format, T.sc_count, teapot.nvertices);
     return 0;
 }
 
@@ -1302,13 +1294,8 @@ static void update_fps(void)
     kernel_tic32(NULL, NULL, &low);
     if (last_tic == 0 || (low - last_tic) >= 1000000) {
         last_tic = low;
-        fps = fps_count;
+        fps = fps_count;   /* consumed by the ImGui overlay readout */
         fps_count = 0;
-        printf("vkteapot: %d fps\n", fps);
-        if (g_fpslog) {           /* app-written file: the only ssh-readable FPS */
-            FILE *fp = fopen(g_fpslog, "w");
-            if (fp) { fprintf(fp, "%d\n", fps); fclose(fp); }
-        }
     }
     fps_count++;
 }
@@ -1499,7 +1486,6 @@ static void on_repaint(xwin_t *xwin, graph_t *g)
     process_imgui_frame();
     ImGui::Render();
     render_frame(idx, dt);
-    g_frames++;
     update_fps();
 }
 
@@ -1548,10 +1534,7 @@ int main(int argc, char *argv[])
 {
     x_t x;
     xwin_t *xwin;
-    (void)argc;
-
-    if (argc > 1) g_fpslog = argv[1];   /* optional FPS log path (see g_fpslog) */
-    setbuf(stdout, NULL);   /* unbuffered so ssh sees prints immediately */
+    (void)argc; (void)argv;
 
     if (build_teapot_geometry() != 0)
         return -1;
@@ -1593,6 +1576,5 @@ int main(int argc, char *argv[])
     cleanup_vulkan();
     if (teapot.vertices) free(teapot.vertices);
     if (teapot.colors)   free(teapot.colors);
-    printf("vkteapot: presented %d frames\n", g_frames);
     return 0;
 }
