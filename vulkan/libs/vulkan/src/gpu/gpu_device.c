@@ -687,7 +687,7 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
     float clear_z = 1.0f;
     int32_t rc;
 
-#define GFX_CPU() do { free(attr); free(unif); \
+#define GFX_CPU() do { free(unif); \
         return cpu_draw(cb, dc, vertexCount, firstVertex, instanceCount, \
                         firstInstance, index_data, index_type); } while (0)
 
@@ -810,12 +810,12 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
                              ((uint32_t)g8 << 8)  |  (uint32_t)b8);
     }
 
-    /* ---- gather the per-vertex attribute float stream ----
+    /* ---- gather directly into the persistent GPU attribute canvas ----
      * Resolve each VS input's pipeline binding once, not once per vertex.  The
-     * old inner loop repeated the location/binding searches for every vertex;
-     * at 19200 vertices that CPU gather dominated the whole Vulkan frame. */
+     * gathered stream is already the vkclient draw canvas, so there is no
+     * temporary heap allocation or second nverts*astride copy before dispatch. */
     astride = gp->glayout.attr_stride ? gp->glayout.attr_stride : 1u;
-    attr = (float *)malloc((size_t)nverts * astride * sizeof(float));
+    attr = (float *)vk_gfx_attr_stage(nverts, astride);
     if (!attr)
         GFX_CPU();
     {
@@ -857,10 +857,8 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
             plans[j].format = va->format;
         }
 
-        /* calloc used to clear the whole stream even when every float is about
-         * to be overwritten.  Retain zeroes only for genuinely unwritten/gapped
-         * locations; a fully covered draw (including vkteapot) skips the extra
-         * nverts*astride memset entirely. */
+        /* Clear only genuinely unwritten/gapped locations; a fully covered
+         * draw (including vkteapot) skips the nverts*astride memset entirely. */
         {
             uint32_t off;
             int need_zero = 0;
@@ -1046,7 +1044,6 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
                      attr, nverts, astride, unif, num_unif,
                      first_frame, clear_rgba, clear_z,
                      ntex ? tex : NULL, ntex);
-    free(attr);
     free(unif);
 #undef GFX_CPU
 

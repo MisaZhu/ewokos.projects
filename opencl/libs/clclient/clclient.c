@@ -1,10 +1,9 @@
 /*
  * clclient.c - libOpenCL's user-space IPC client to the g2dd daemon's OpenCL
  * compute offload path (see clclient.h).  A thin wrapper over the g2dclient
- * dev_cntl transport portablegl already uses: buffers are staged into
- * physically-contiguous shm canvases (g2d_shm_alloc hands out IPC_CONTIG, so the
- * V3D CSD addresses them by physical base with zero copy), the request structs
- * are marshalled, and results are copied back into the caller's host stores.
+ * dev_cntl transport portablegl already uses: contig-shm buffers dispatch
+ * directly, other buffers use persistent staging, and the request structs are
+ * marshalled for the daemon.
  *
  * Every function mirrors the proven portablegl pattern:
  *   clclient_gpu_version  <- pgl_g3d_ensure_version + pgl_g3d_init's gate
@@ -78,63 +77,100 @@ int32_t cl_program_upload(const void *blob, uint32_t size)
     return handle;
 }
 
+/* Staging canvases persist across launches.  Buffers already backed by contig
+ * shm bypass them entirely; other buffers keep host visibility through copies. */
+typedef struct {
+    int       shm;
+    uint32_t *px;
+    uint32_t  cap;
+} cl_stage_t;
+
+static cl_stage_t _compute_args[CLCLIENT_MAX_ARGS], _compute_unif;
+static int _compute_direct_blocked;
+
+static int ensure_stage(cl_stage_t *s, uint32_t need)
+{
+    if (s->px && s->cap >= need)
+        return 1;
+    if (s->px) {
+        g2d_shm_free(s->px);
+        s->px = NULL;
+        s->cap = 0;
+    }
+    if (g2d_shm_alloc(need, &s->shm, &s->px) != 0 ||
+        s->shm <= 0 || s->px == NULL) {
+        s->px = NULL;
+        s->cap = 0;
+        return 0;
+    }
+    s->cap = need;
+    return 1;
+}
+
+static void compute_abandon_staging(void)
+{
+    uint32_t i;
+
+    /* A terminal job may still own these mappings.  Leak this set deliberately
+     * and allocate fresh storage for any later launch. */
+    for (i = 0; i < CLCLIENT_MAX_ARGS; i++) {
+        _compute_args[i].shm = 0;
+        _compute_args[i].px = NULL;
+        _compute_args[i].cap = 0;
+    }
+    _compute_unif.shm = 0;
+    _compute_unif.px = NULL;
+    _compute_unif.cap = 0;
+}
+
 int32_t cl_kernel_dispatch(int32_t prog_handle,
                            const uint32_t wg[3], uint32_t wg_size,
                            void *const *arg_host, const uint32_t *arg_size,
-                           uint32_t num_args,
+                           const int *arg_shm, uint32_t num_args,
                            const uint32_t *unif, uint32_t num_unif)
 {
     g2d_cl_dispatch_req_t req;
-    int      shm[CLCLIENT_MAX_ARGS];
-    uint32_t *px[CLCLIENT_MAX_ARGS];
-    int      unshm = 0;
-    uint32_t *unpx = NULL;
     uint32_t n, i;
-    int32_t  rc = G2D_ERR_FAILED;
+    int direct_used = 0;
+    int32_t rc = G2D_ERR_FAILED;
 
     if (prog_handle < 0 || wg == NULL || wg_size == 0 || wg_size > 256u)
         return G2D_ERR_FAILED;
     n = num_args > CLCLIENT_MAX_ARGS ? CLCLIENT_MAX_ARGS : num_args;
 
-    memset(shm, 0, sizeof(shm));
-    memset(px, 0, sizeof(px));
-
     g2d_cl_dispatch_req_init(&req, prog_handle, wg[0], wg[1], wg[2], wg_size);
     req.num_args = n;
 
-    /* Stage each __global buffer host store into its own contig-shm canvas and
-     * copy the input in.  The canvas is modelled w = ceil(size/4), h = 1 so the
-     * driver's size >= w*h*4 attach check holds and the daemon resolves the
-     * physical base (contig=1, phy=0) for the CSD's SSBO offset. */
     for (i = 0; i < n; i++) {
         uint32_t sz = arg_size ? arg_size[i] : 0u;
         uint32_t alloc;
+        cl_stage_t *s = &_compute_args[i];
+
         if (sz == 0u || arg_host == NULL || arg_host[i] == NULL) {
-            req.args[i] = g2d_canvas(0, 0, 0, 0, 0);   /* unused slot */
+            req.args[i] = g2d_canvas(0, 0, 0, 0, 0);
             continue;
         }
         alloc = (sz + 3u) & ~3u;
-        if (g2d_shm_alloc(alloc, &shm[i], &px[i]) != 0 ||
-            shm[i] <= 0 || px[i] == NULL) {
-            px[i] = NULL;
-            goto done;
+        if (arg_shm && arg_shm[i] > 0) {
+            if (_compute_direct_blocked)
+                return rc;
+            req.args[i] = g2d_canvas(arg_shm[i], alloc, alloc / 4u, 1u, 1);
+            direct_used = 1;
+            continue;
         }
-        memcpy(px[i], arg_host[i], sz);
-        req.args[i] = g2d_canvas(shm[i], alloc, alloc / 4u, 1u, 1);
+        if (!ensure_stage(s, alloc))
+            return rc;
+        memcpy(s->px, arg_host[i], sz);
+        req.args[i] = g2d_canvas(s->shm, alloc, alloc / 4u, 1u, 1);
     }
 
-    /* The scalar + __constant uniform blob: num_unif u32 dwords modelled
-     * w = num_unif, h = 1 (matching the daemon's unif.size >= n*4 && unif.w == n
-     * check); the daemon reads it by vaddr for the QUNIFORM_UNIFORM slots. */
     if (num_unif > 0u && unif != NULL) {
         uint32_t ub = num_unif * 4u;
-        if (g2d_shm_alloc(ub, &unshm, &unpx) != 0 || unshm <= 0 || unpx == NULL) {
-            unpx = NULL;
-            goto done;
-        }
-        memcpy(unpx, unif, ub);
+        if (!ensure_stage(&_compute_unif, ub))
+            return rc;
+        memcpy(_compute_unif.px, unif, ub);
         req.num_uniforms = num_unif;
-        req.unif = g2d_canvas(unshm, ub, num_unif, 1u, 1);
+        req.unif = g2d_canvas(_compute_unif.shm, ub, num_unif, 1u, 1);
     } else {
         req.num_uniforms = 0;
         req.unif = g2d_canvas(0, 0, 0, 0, 0);
@@ -143,25 +179,16 @@ int32_t cl_kernel_dispatch(int32_t prog_handle,
     rc = g2d_cl_dispatch(&req);
     clclient_quiesce(rc);
     if (rc == G2D_OK) {
-        /* the GPU wrote the output buffers by physical base; copy each staged
-         * canvas back into the caller's host store so the writes land there. */
         for (i = 0; i < n; i++) {
             uint32_t sz = arg_size ? arg_size[i] : 0u;
-            if (sz != 0u && px[i] != NULL && arg_host && arg_host[i])
-                memcpy(arg_host[i], px[i], sz);
+            if (sz != 0u && (!arg_shm || arg_shm[i] <= 0) &&
+                _compute_args[i].px != NULL && arg_host && arg_host[i])
+                memcpy(arg_host[i], _compute_args[i].px, sz);
         }
-    }
-
-done:
-    /* A terminal job may still own its GPU-visible buffers.  Keep this one
-       staging set mapped until process exit; later submissions use new staging
-       and the CPU replay uses the caller's host buffers. */
-    if (rc != G2D_ERR_TIMEOUT && rc != G2D_ERR_MMU_FAULT) {
-        for (i = 0; i < n; i++)
-            if (px[i])
-                g2d_shm_free(px[i]);
-        if (unpx)
-            g2d_shm_free(unpx);
+    } else if (rc == G2D_ERR_TIMEOUT || rc == G2D_ERR_MMU_FAULT) {
+        compute_abandon_staging();
+        if (direct_used)
+            _compute_direct_blocked = 1;
     }
     return rc;
 }

@@ -1,11 +1,15 @@
 /*
  * cl_mem.c - buffer memory objects: create/sub-buffer, retain/release, info,
- * destructor callback.  Buffers own a host-resident store; CL_MEM_USE_HOST_PTR
- * adopts the caller's pointer instead.  Images are created in cl_image.c but
- * share this struct _cl_mem and its info/refcount paths.
+ * destructor callback.  GPU-context buffers prefer a shared contig backing;
+ * CL_MEM_USE_HOST_PTR adopts the caller's pointer instead.  Images are created
+ * in cl_image.c but share struct _cl_mem and its info/refcount paths.
  */
 #include "internal.h"
 #include <stdlib.h>
+#ifdef OPENCL_GPU_BACKEND
+#include <g2dclient/g2dclient.h>
+#include <sys/shm.h>
+#endif
 
 /* destructor callback list (small, per object) */
 typedef struct mem_dtor {
@@ -32,13 +36,32 @@ static void fire_dtors(struct _cl_mem *m)
     }
 }
 
+#ifdef OPENCL_GPU_BACKEND
+static int context_has_gpu(struct _cl_context *context)
+{
+    cl_uint i;
+
+    for (i = 0; context && i < context->num_devices; i++)
+        if (context->devices[i]->backend == &cl_backend_gpu)
+            return 1;
+    return 0;
+}
+#endif
+
 static void mem_free(struct _cl_mem *m)
 {
     fire_dtors(m);
-    if (m->parent)
+    if (m->parent) {
         clReleaseMemObject((cl_mem)m->parent);
-    else if (m->owns_ptr && m->host_ptr)
-        free(m->host_ptr);
+    } else if (m->owns_ptr && m->host_ptr) {
+#ifdef OPENCL_GPU_BACKEND
+        if (m->gfx_shm > 0) {
+            g2d_shm_free((uint32_t *)m->host_ptr);
+            shmctl(m->gfx_shm, IPC_RMID, NULL);
+        } else
+#endif
+            free(m->host_ptr);
+    }
     free(m);
 }
 
@@ -78,7 +101,20 @@ cl_mem clCreateBuffer(cl_context context, cl_mem_flags flags, size_t size,
         m->host_ptr = host_ptr;
         m->owns_ptr = 0;
     } else {
-        m->host_ptr = calloc(1, size);
+#ifdef OPENCL_GPU_BACKEND
+        if (context_has_gpu(context) && size <= UINT32_MAX) {
+            uint32_t *px = NULL;
+            if (g2d_shm_alloc((uint32_t)size, &m->gfx_shm, &px) == 0 &&
+                m->gfx_shm > 0 && px != NULL) {
+                m->host_ptr = px;
+                memset(m->host_ptr, 0, size);
+            }
+        }
+#endif
+        if (!m->host_ptr) {
+            m->gfx_shm = 0;
+            m->host_ptr = calloc(1, size);
+        }
         if (!m->host_ptr) { free(m); err = CL_MEM_OBJECT_ALLOCATION_FAILURE; goto done; }
         m->owns_ptr = 1;
         if ((flags & CL_MEM_COPY_HOST_PTR) && host_ptr)

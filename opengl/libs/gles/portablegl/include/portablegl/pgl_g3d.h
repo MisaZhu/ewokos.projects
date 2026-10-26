@@ -550,6 +550,22 @@ int  pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
                                 uint32_t depth_func, uint32_t depth_mask,
                                 uint32_t cull);
 
+/* Transient variant for a mesh that already exists as an interleaved staging
+   stream.  It performs the same synchronous draw and final GPU-staging pass as
+   pgl_g3d_draw_mesh_compiled(prog, mesh, 0, nverts, ...), but borrows the input
+   only for the call: no mesh slot, owning copy, allocation or free is needed.
+   The stream layout is selected by the compiled program:
+     gouraud/textured: pos.xyz at 0, normal.xyz or uv.xy at 3 (stride >= 6;
+                       textured element 5 is the zero pad);
+     instanced:        the same plus the instance index at 6 (stride >= 7);
+     texcol:           pos.xyz, uv.xy, colour rgba and pad at 0..9 (stride >= 10).
+   Extra trailing floats are ignored.  Return semantics match the mesh draw. */
+int  pgl_g3d_draw_interleaved_compiled(pgl_g3d_prog prog,
+                                       const float* interleaved,
+                                       uint32_t nverts, uint32_t stride_floats,
+                                       uint32_t depth_func, uint32_t depth_mask,
+                                       uint32_t cull);
+
 #ifdef __cplusplus
 }
 #endif

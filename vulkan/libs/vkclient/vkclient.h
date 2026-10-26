@@ -121,6 +121,13 @@ typedef struct vk_gfx_tex {
  * libvulkan's GPU graphics path off). */
 int32_t vk_gfx_program_upload(const void *blob, uint32_t size);
 
+/* Acquire the persistent attribute canvas for one draw.  The caller gathers
+ * directly into the returned float stream and passes it back as attr_host to
+ * vk_gfx_draw; this avoids a temporary heap stream and a second full copy.
+ * The pointer remains owned by vkclient and is valid until the next staging
+ * resize or terminal draw.  Returns NULL on invalid size/allocation failure. */
+void *vk_gfx_attr_stage(uint32_t nverts, uint32_t attr_stride);
+
 /* Run one two-pass geom draw of `nverts` vertices (a multiple of 3,
  * <= G2D_PGL_MAX_VERTS) into the caller's colour attachment.
  *
@@ -134,7 +141,8 @@ int32_t vk_gfx_program_upload(const void *blob, uint32_t size);
  *                  pitched host attachment is copied row by row.
  *   attr_host    - the gathered per-vertex attribute float stream, one vertex's
  *                  attributes contiguous, `attr_stride` FLOATS per vertex
- *                  (nverts * attr_stride * 4 bytes total).
+ *                  (nverts * attr_stride * 4 bytes total).  A pointer returned
+ *                  by vk_gfx_attr_stage is consumed in place without a copy.
  *   unif/num_unif- the packed per-draw uniform blob: the CONCATENATION
  *                  [cs2/xform uniforms | cs/raster uniforms] the daemon splits at
  *                  cs2_uniform_blob_dwords (num_unif u32 dwords; may be 0/NULL).

@@ -166,10 +166,11 @@ struct _cl_mem {
     struct _cl_context     *context;
     size_t                  size;
 
-    /* host-resident store (CPU device executes directly on it; the GPU
-     * backend stages to/from it).  owned unless CL_MEM_USE_HOST_PTR. */
+    /* CPU and GPU share this store.  GPU-context buffers prefer contig shm so
+     * dispatch can use them directly; other buffers retain staging fallback. */
     void                   *host_ptr;
     int                     owns_ptr;
+    int                     gfx_shm;       /* >0: GPU-addressable contig shm */
 
     /* sub-buffer linkage */
     struct _cl_mem         *parent;

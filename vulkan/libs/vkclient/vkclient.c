@@ -308,6 +308,19 @@ int32_t vk_gfx_program_upload(const void *blob, uint32_t size)
     return handle;
 }
 
+void *vk_gfx_attr_stage(uint32_t nverts, uint32_t attr_stride)
+{
+    uint32_t bytes;
+
+    if (nverts == 0 || nverts > G2D_PGL_MAX_VERTS || attr_stride == 0 ||
+        attr_stride > UINT32_MAX / (nverts * 4u))
+        return NULL;
+    bytes = nverts * attr_stride * 4u;
+    if (!ensure_stage(&_attr, bytes))
+        return NULL;
+    return _attr.px;
+}
+
 int32_t vk_gfx_draw(int32_t prog_handle,
                     void *fb_host, uint32_t fb_w, uint32_t fb_h, uint32_t fb_stride,
                     int fb_shm,
@@ -355,7 +368,8 @@ int32_t vk_gfx_draw(int32_t prog_handle,
     if (!first_frame && !direct_fb)
         gfx_copy_rows(_fb.px, fb_w * 4u, fb_host, host_pitch,
                       fb_w * 4u, fb_h);
-    memcpy(_attr.px, attr_host, attr_bytes);
+    if (attr_host != _attr.px)
+        memcpy(_attr.px, attr_host, attr_bytes);
     if (num_unif > 0u && unif != NULL)
         memcpy(_unif.px, unif, unif_bytes);
 

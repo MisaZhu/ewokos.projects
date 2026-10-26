@@ -157,6 +157,11 @@ typedef struct {
 	   staging per draw.  tcol_stride is 10. */
 	float*   tcol;
 	uint32_t tcol_stride;
+	/* Transient interleaved input used by pgl_g3d_draw_interleaved_compiled.
+	   Unlike the owning arrays above, this view is borrowed for one synchronous
+	   draw and is never present in a persistent mesh-table slot. */
+	const float* packed;
+	uint32_t packed_stride;
 	int      instanced;
 } pgl_g3d_mesh_slot_t;
 #define PGL_G3D_MAX_MESH 8
@@ -1248,14 +1253,13 @@ static uint32_t pgl_g3d_cull_sign(uint32_t cull)
 	}
 }
 
-int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
-                               uint32_t first, uint32_t count,
-                               uint32_t depth_func, uint32_t depth_mask,
-                               uint32_t cull)
+static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
+                                   uint32_t first, uint32_t count,
+                                   uint32_t depth_func, uint32_t depth_mask,
+                                   uint32_t cull)
 {
 	g2d_pgl_req_t req;
 	g2d_canvas_t pos, col, z;
-	pgl_g3d_mesh_slot_t* m;
 	uint32_t v;
 	uint32_t unif_n;
 	int dh, res;
@@ -1268,9 +1272,6 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		return 0;
 	if (!pgl_g3d_program_valid(prog))
 		return 0;
-	if (mesh < 0 || mesh >= PGL_G3D_MAX_MESH || !_mesh[mesh].used)
-		return 0;
-	m = &_mesh[mesh];
 	if (first >= m->nverts || count == 0)
 		return 0;
 	if (first + count > m->nverts)
@@ -1319,12 +1320,22 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		   stride 4) and nrm a float3 stream; the per-instance matrices ride the
 		   separate _inst buffer attached as ctex unit 0 below. */
 		for (v = 0; v < count; v++) {
-			const float* sp = m->pos + (size_t)(first + v) * 3u;
-			const float* sn = m->nrm + (size_t)(first + v) * 3u;
+			const float* sp;
+			const float* sn;
+			float idx;
+			if (m->packed != NULL) {
+				sp = m->packed + (size_t)(first + v) * m->packed_stride;
+				sn = sp + 3;
+				idx = sp[6];
+			} else {
+				sp = m->pos + (size_t)(first + v) * 3u;
+				sn = m->nrm + (size_t)(first + v) * 3u;
+				idx = m->idx ? m->idx[first + v] : 0.0f;
+			}
 			_pos[v*4u + 0u] = sp[0];
 			_pos[v*4u + 1u] = sp[1];
 			_pos[v*4u + 2u] = sp[2];
-			_pos[v*4u + 3u] = m->idx ? m->idx[first + v] : 0.0f;
+			_pos[v*4u + 3u] = idx;
 			_nrm[v*3u + 0u] = sn[0];
 			_nrm[v*3u + 1u] = sn[1];
 			_nrm[v*3u + 2u] = sn[2];
@@ -1334,30 +1345,63 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		   interleaved at a 10-float stride in the mesh's tcol stream (staged
 		   by pgl_g3d_upload_mesh_texcol), so a straight sub-range copy into
 		   the pos buffer re-bases it to vertex 0. */
-		if (m->tcol == NULL)
-			return 0;
-		memcpy(_pos, m->tcol + (size_t)first * 10u,
-		       (size_t)count * 10u * sizeof(float));
+		if (m->packed != NULL) {
+			const float* src = m->packed + (size_t)first * m->packed_stride;
+			if (m->packed_stride == 10u) {
+				memcpy(_pos, src, (size_t)count * 10u * sizeof(float));
+			} else {
+				for (v = 0; v < count; v++)
+					memcpy(_pos + (size_t)v * 10u,
+					       src + (size_t)v * m->packed_stride,
+					       10u * sizeof(float));
+			}
+		} else {
+			if (m->tcol == NULL)
+				return 0;
+			memcpy(_pos, m->tcol + (size_t)first * 10u,
+			       (size_t)count * 10u * sizeof(float));
+		}
 	} else if (geom_tex) {
 		/* Textured variant: V3D compute has only 4 SSBO bindings, so pos and
 		   uv SHARE the pos staging as one interleaved stream, stride 6 floats
 		   (pos.xyz, uv.xy, pad); the normal staging is unused. */
-		for (v = 0; v < count; v++) {
-			const float* sp = m->pos + (size_t)(first + v) * 3u;
-			const float* sn = m->nrm + (size_t)(first + v) * 3u;
-			_pos[v*6u + 0u] = sp[0];
-			_pos[v*6u + 1u] = sp[1];
-			_pos[v*6u + 2u] = sp[2];
-			_pos[v*6u + 3u] = sn[0];
-			_pos[v*6u + 4u] = sn[1];
-			_pos[v*6u + 5u] = 0.0f;
+		if (m->packed != NULL) {
+			const float* src = m->packed + (size_t)first * m->packed_stride;
+			if (m->packed_stride == 6u) {
+				memcpy(_pos, src, (size_t)count * 6u * sizeof(float));
+			} else {
+				for (v = 0; v < count; v++)
+					memcpy(_pos + (size_t)v * 6u,
+					       src + (size_t)v * m->packed_stride,
+					       6u * sizeof(float));
+			}
+		} else {
+			for (v = 0; v < count; v++) {
+				const float* sp = m->pos + (size_t)(first + v) * 3u;
+				const float* sn = m->nrm + (size_t)(first + v) * 3u;
+				_pos[v*6u + 0u] = sp[0];
+				_pos[v*6u + 1u] = sp[1];
+				_pos[v*6u + 2u] = sp[2];
+				_pos[v*6u + 3u] = sn[0];
+				_pos[v*6u + 4u] = sn[1];
+				_pos[v*6u + 5u] = 0.0f;
+			}
 		}
 	} else {
-		/* gouraud: both streams are already tight float3, so the sub-range is
-		   a straight copy (NEON memcpy, not a scalar per-float store loop into
-		   NOCACHE memory). */
-		memcpy(_pos, m->pos + (size_t)first * 3u, (size_t)count * 12u);
-		memcpy(_nrm, m->nrm + (size_t)first * 3u, (size_t)count * 12u);
+		if (m->packed != NULL) {
+			for (v = 0; v < count; v++) {
+				const float* src = m->packed +
+				                   (size_t)(first + v) * m->packed_stride;
+				memcpy(_pos + (size_t)v * 3u, src, 3u * sizeof(float));
+				memcpy(_nrm + (size_t)v * 3u, src + 3, 3u * sizeof(float));
+			}
+		} else {
+			/* gouraud: both streams are already tight float3, so the sub-range is
+			   a straight copy (NEON memcpy, not a scalar per-float store loop into
+			   NOCACHE memory). */
+			memcpy(_pos, m->pos + (size_t)first * 3u, (size_t)count * 12u);
+			memcpy(_nrm, m->nrm + (size_t)first * 3u, (size_t)count * 12u);
+		}
 	}
 
 	/* pos canvas (attribute 0) and col canvas (attribute 1 = normal) are both
@@ -1622,6 +1666,45 @@ int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
 		                          next frame on; the CPU clear is skipped. */
 	_first_frame = 0;   /* this frame's clear has been consumed */
 	return 1;
+}
+
+int pgl_g3d_draw_mesh_compiled(pgl_g3d_prog prog, pgl_g3d_mesh mesh,
+                               uint32_t first, uint32_t count,
+                               uint32_t depth_func, uint32_t depth_mask,
+                               uint32_t cull)
+{
+	if (mesh < 0 || mesh >= PGL_G3D_MAX_MESH || !_mesh[mesh].used)
+		return 0;
+	return draw_mesh_compiled_slot(prog, &_mesh[mesh], first, count,
+	                               depth_func, depth_mask, cull);
+}
+
+int pgl_g3d_draw_interleaved_compiled(pgl_g3d_prog prog,
+                                      const float* interleaved,
+                                      uint32_t nverts, uint32_t stride_floats,
+                                      uint32_t depth_func, uint32_t depth_mask,
+                                      uint32_t cull)
+{
+	pgl_g3d_mesh_slot_t m;
+	uint32_t min_stride = 6u;
+
+	if (interleaved == NULL || nverts == 0 || !pgl_g3d_program_valid(prog))
+		return 0;
+	if (pgl_g3d_shader_geom_texcol(prog))
+		min_stride = 10u;
+	else if (pgl_g3d_shader_geom_inst(prog))
+		min_stride = 7u;
+	if (stride_floats < min_stride)
+		return 0;
+
+	/* The synchronous draw consumes this borrowed view before returning; it
+	   never enters the owning mesh table and needs no allocation or free. */
+	memset(&m, 0, sizeof(m));
+	m.packed = interleaved;
+	m.packed_stride = stride_floats;
+	m.nverts = nverts;
+	return draw_mesh_compiled_slot(prog, &m, 0, nverts,
+	                               depth_func, depth_mask, cull);
 }
 
 /* Shared body of the raster / tiled texture uploads: (re)allocate the slot's

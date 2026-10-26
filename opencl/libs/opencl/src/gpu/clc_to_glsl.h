@@ -43,10 +43,12 @@ extern "C" {
  * binding points").  A kernel with more __global buffer args is declined. */
 #define CLC_GLSL_MAX_SSBO     4
 
-/* Baked work-group shape.  64 lanes keeps a tail group small while staying well
- * under the CSD's 256-item limit; only get_global_id() is exact under it, so a
- * kernel touching work-group builtins is declined to the CPU. */
-#define CLC_GLSL_LOCAL_SIZE_X 64
+/* Baked work-group shape.  Use the CSD's full 256-item group, matching the
+ * Vulkan compute path and avoiding four times as many work-groups for the same
+ * NDRange.  The emitted tail guard preserves arbitrary global sizes; only
+ * get_global_id() is exact under this shape, so a kernel touching work-group
+ * builtins is declined to the CPU. */
+#define CLC_GLSL_LOCAL_SIZE_X 256
 
 /* One kernel parameter's GPU realisation, filled by clc_to_glsl(). */
 typedef struct clc_glsl_arg {

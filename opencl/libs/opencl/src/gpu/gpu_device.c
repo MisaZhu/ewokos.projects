@@ -20,8 +20,8 @@
  * can only ever add speed, never change results.  Dispatch failures are local
  * to that launch: later kernels and launches continue to attempt the GPU.
  *
- * Global-id model (see clc_to_glsl.h): the shader bakes local_size = (64,1,1)
- * and this file dispatches ceil(gsz0/64) x gsz1 x gsz2 work-groups of 64 items,
+ * Global-id model (see clc_to_glsl.h): the shader bakes local_size = (256,1,1)
+ * and this file dispatches ceil(gsz0/256) x gsz1 x gsz2 groups of 256 items,
  * so gl_GlobalInvocationID.x sweeps dim0 (a partial tail group is clipped by the
  * emitted guard) and .y/.z map 1:1 onto dim1/dim2 -- get_global_id(d) is exact
  * for every d.  The host's own local_work_size only gates the runtime's
@@ -393,6 +393,7 @@ static int gpu_ndrange(struct _cl_command_queue *queue, struct _cl_kernel *kerne
     uint32_t  num_unif;
     void     *arg_host[CLCLIENT_MAX_ARGS];
     uint32_t  arg_size[CLCLIENT_MAX_ARGS];
+    int       arg_shm[CLCLIENT_MAX_ARGS];
     uint32_t  nargs = 0;
     int       lsx;
     cl_uint   d;
@@ -462,9 +463,11 @@ static int gpu_ndrange(struct _cl_command_queue *queue, struct _cl_kernel *kerne
         }
     }
 
-    /* gather the __global buffers as SSBO host stores in binding order. */
+    /* Gather __global buffers in binding order.  Only a zero-origin buffer can
+     * use its contig-shm id directly; sub-buffer offsets need staged storage. */
     memset(arg_host, 0, sizeof(arg_host));
     memset(arg_size, 0, sizeof(arg_size));
+    memset(arg_shm, 0, sizeof(arg_shm));
     for (i = 0; i < gk->info.nargs && i < CL_MAX_KERNEL_ARGS; i++) {
         clc_glsl_arg  *a   = &gk->info.args[i];
         cl_kernel_arg *arg = &kernel->args[i];
@@ -476,21 +479,26 @@ static int gpu_ndrange(struct _cl_command_queue *queue, struct _cl_kernel *kerne
         if (binding < 0 || binding >= (int)CLCLIENT_MAX_ARGS)
             continue;
         if (arg->set && arg->is_mem && arg->mem) {
-            arg_host[binding] = cl_mem_device_ptr(arg->mem);
-            arg_size[binding] = (uint32_t)arg->mem->size;
+            struct _cl_mem *mem = arg->mem;
+            struct _cl_mem *base = mem->parent ? mem->parent : mem;
+
+            arg_host[binding] = cl_mem_device_ptr(mem);
+            arg_size[binding] = (uint32_t)mem->size;
+            if (mem->origin == 0 && base->gfx_shm > 0)
+                arg_shm[binding] = base->gfx_shm;
         }
         if ((uint32_t)binding + 1u > nargs)
             nargs = (uint32_t)binding + 1u;
     }
 
     rc = cl_kernel_dispatch(gk->handle, wg, wg_size,
-                            arg_host, arg_size, nargs, unif, num_unif);
+                            arg_host, arg_size, arg_shm, nargs, unif, num_unif);
     free(unif);
 
     if (rc == CLCLIENT_OK)
         return CL_SUCCESS;
-    /* No device-wide failure latch: a later launch must be able to retry the
-     * GPU.  Terminal staging remains retained by clclient until process exit. */
+    /* Ordinary failures may retry the GPU later.  After a terminal direct-job
+     * fault clclient keeps subsequent direct launches on this safe CPU path. */
     return gpu_run_cpu(queue, kernel, gk, work_dim,
                        global_work_offset, global_work_size, local_work_size);
 }

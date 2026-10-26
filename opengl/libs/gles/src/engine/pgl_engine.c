@@ -2145,7 +2145,6 @@ static int gpu_tessellate_elements_mesh(gpu_stage *st, GLenum mode, GLsizei coun
  * batch is never silently retried-and-dropped every frame. */
 static void gpu_coalesce_flush(void)
 {
-    pgl_g3d_mesh mesh;
     int ok;
     if (!g_coalesce_active || g_coalesce_n < 3) {
         g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0;
@@ -2160,29 +2159,24 @@ static void gpu_coalesce_flush(void)
         /* INSTANCED-LIT batch: stage the per-draw 40-float records (binding 3 of
          * the xform kernel) then submit the whole accumulated vertex stream -
          * each vertex already stamped with its draw's instance index at element
-         * 6 - as ONE upload_mesh_instanced + draw_mesh_compiled dispatch. */
+         * 6 - as ONE transient interleaved dispatch. */
         if (!pgl_g3d_set_instances(g_inst_rec,
                                    (uint32_t)g_inst_rec_n * GPU_INST_REC)) {
             if (g_coalesce_entry) g_coalesce_entry->cpu_latched = 1;
             g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0;
             return;
         }
-        mesh = pgl_g3d_upload_mesh_instanced(g_gpu_istage,
-                                             (uint32_t)g_coalesce_n,
-                                             GPU_INST_STRIDE);
+        ok = pgl_g3d_draw_interleaved_compiled(
+                 g_coalesce_prog, g_gpu_istage, (uint32_t)g_coalesce_n,
+                 GPU_INST_STRIDE, g_coalesce_depth, g_coalesce_mask,
+                 g_coalesce_cull);
     } else {
-        mesh = pgl_g3d_upload_mesh(g_gpu_stage, (uint32_t)g_coalesce_n,
-                                   GPU_STAGING_STRIDE);
+        ok = pgl_g3d_draw_interleaved_compiled(
+                 g_coalesce_prog, g_gpu_stage, (uint32_t)g_coalesce_n,
+                 GPU_STAGING_STRIDE, g_coalesce_depth, g_coalesce_mask,
+                 g_coalesce_cull);
     }
-    if (mesh == PGL_G3D_MESH_INVALID) {
-        if (g_coalesce_entry) g_coalesce_entry->cpu_latched = 1;
-    } else {
-        ok = pgl_g3d_draw_mesh_compiled(g_coalesce_prog, mesh, 0,
-                                        (uint32_t)g_coalesce_n, g_coalesce_depth,
-                                        g_coalesce_mask, g_coalesce_cull);
-        pgl_g3d_free_mesh(mesh);
-        if (!ok && g_coalesce_entry) g_coalesce_entry->cpu_latched = 1;
-    }
+    if (!ok && g_coalesce_entry) g_coalesce_entry->cpu_latched = 1;
     g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0;
 }
 
@@ -2515,7 +2509,6 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
      * and raster-slot binding are not coalesced), but drains any pending
      * untextured batch first so painter's order holds. */
     if (e->textured) {
-        pgl_g3d_mesh mesh;
         int slot, ok;
         gpu_coalesce_flush();
         if (!gpu_stage_reserve(nout)) return 0;
@@ -2528,11 +2521,9 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
         slot = gpu_tex_slot(gles_engine_texture_for_unit(0), 0);
         if (slot < 0) return 0;   /* no raster texture staged: CPU this draw */
         pgl_g3d_bind_tex_unit(0, slot);
-        mesh = pgl_g3d_upload_mesh(g_gpu_stage, (uint32_t)nout, GPU_STAGING_STRIDE);
-        if (mesh == PGL_G3D_MESH_INVALID) return 0;   /* transient (OOM): CPU this draw */
-        ok = pgl_g3d_draw_mesh_compiled(e->prog, mesh, 0, (uint32_t)nout,
-                                        depth, mask, cull);
-        pgl_g3d_free_mesh(mesh);
+        ok = pgl_g3d_draw_interleaved_compiled(e->prog, g_gpu_stage,
+                                               (uint32_t)nout, GPU_STAGING_STRIDE,
+                                               depth, mask, cull);
         if (!ok) { e->cpu_latched = 1; return 0; }   /* declined: latch CPU + fall through */
         return 1;
     }
@@ -2654,7 +2645,6 @@ static int gpu_try_draw_elements_textured(gpu_entry *e, GLenum mode, GLsizei cou
     uint32_t blob[PGL_G3D_MAX_UNIF];
     uint32_t depth, mask, cull;
     GLsizei nout, i;
-    pgl_g3d_mesh mesh;
     const void *base;
     int slot, ok;
 
@@ -2696,11 +2686,9 @@ static int gpu_try_draw_elements_textured(gpu_entry *e, GLenum mode, GLsizei cou
     slot = gpu_tex_slot(gles_engine_texture_for_unit(0), 0);
     if (slot < 0) return 0;   /* no raster texture staged: CPU this draw */
     pgl_g3d_bind_tex_unit(0, slot);
-    mesh = pgl_g3d_upload_mesh(g_gpu_stage, (uint32_t)nout, GPU_STAGING_STRIDE);
-    if (mesh == PGL_G3D_MESH_INVALID) return 0;   /* transient (OOM): CPU this draw */
-    ok = pgl_g3d_draw_mesh_compiled(e->prog, mesh, 0, (uint32_t)nout,
-                                    depth, mask, cull);
-    pgl_g3d_free_mesh(mesh);
+    ok = pgl_g3d_draw_interleaved_compiled(e->prog, g_gpu_stage,
+                                           (uint32_t)nout, GPU_STAGING_STRIDE,
+                                           depth, mask, cull);
     if (!ok) { e->cpu_latched = 1; return 0; }   /* declined: latch CPU + fall through */
     return 1;
 }
@@ -2721,7 +2709,6 @@ static int gpu_try_draw_elements(GLenum mode, GLsizei count, GLenum type,
     uint32_t blob[PGL_G3D_MAX_UNIF];
     uint32_t depth, mask, cull;
     GLsizei nout, i;
-    pgl_g3d_mesh mesh;
     int slot, ok, sx, sy, sw, sh;
 
     gpu_bringup();
@@ -2819,11 +2806,9 @@ static int gpu_try_draw_elements(GLenum mode, GLsizei count, GLenum type,
     if (slot < 0) return 0;   /* font atlas not staged as a raster slot: CPU */
     pgl_g3d_bind_tex_unit(0, slot);
     pgl_g3d_set_scissor(sx, sy, sw, sh);
-    mesh = pgl_g3d_upload_mesh_texcol(g_gpu_tcol, (uint32_t)nout, GPU_TEXCOL_STRIDE);
-    if (mesh == PGL_G3D_MESH_INVALID) return 0;   /* transient (OOM): CPU this draw */
-    ok = pgl_g3d_draw_mesh_compiled(e->prog, mesh, 0, (uint32_t)nout,
-                                    depth, mask, cull);
-    pgl_g3d_free_mesh(mesh);
+    ok = pgl_g3d_draw_interleaved_compiled(e->prog, g_gpu_tcol,
+                                           (uint32_t)nout, GPU_TEXCOL_STRIDE,
+                                           depth, mask, cull);
     if (!ok) { e->cpu_latched = 1; return 0; }   /* declined: latch CPU + fall through */
     return 1;
 }
