@@ -195,7 +195,7 @@ typedef struct vk_device_memory {
     VkDeviceSize  size;
     uint32_t      type_index;
     void         *host;          /* always host-resident in the software model */
-    int32_t       gfx_shm;       /* >0: GPU-addressable swapchain backing */
+    int32_t       gfx_shm;       /* >0: GPU-addressable contiguous shm backing */
     void         *mapped;        /* non-NULL while mapped                      */
     VkDeviceSize  map_offset, map_size;
 } vk_device_memory;

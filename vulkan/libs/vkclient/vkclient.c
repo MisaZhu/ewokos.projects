@@ -79,26 +79,50 @@ int32_t vk_program_upload(const void *blob, uint32_t size)
     return handle;
 }
 
+/* Staged compute canvases persist across submissions.  Their contents are still
+ * copied in both directions on every dispatch, so host writes remain visible,
+ * but the steady-state path does not repeat allocation/map/free.  Zero-offset
+ * buffers already backed by contig shm bypass these canvases entirely. */
+typedef struct {
+    int       shm;
+    uint32_t *px;
+    uint32_t  cap;
+} vk_stage_t;
+
+static vk_stage_t _compute_args[VKCLIENT_MAX_ARGS], _compute_unif;
+static int _compute_direct_blocked;
+static int ensure_stage(vk_stage_t *s, uint32_t need);
+
+static void compute_abandon_staging(void)
+{
+    uint32_t i;
+
+    /* A terminal job may still own its GPU-visible buffers.  Leak this staging
+     * set until process exit and force later submissions onto fresh memory. */
+    for (i = 0; i < VKCLIENT_MAX_ARGS; i++) {
+        _compute_args[i].px = NULL;
+        _compute_args[i].shm = 0;
+        _compute_args[i].cap = 0;
+    }
+    _compute_unif.px = NULL;
+    _compute_unif.shm = 0;
+    _compute_unif.cap = 0;
+}
+
 int32_t vk_kernel_dispatch(int32_t prog_handle,
                            const uint32_t wg[3], uint32_t wg_size,
                            void *const *arg_host, const uint32_t *arg_size,
-                           uint32_t num_args,
+                           const int *arg_shm, uint32_t num_args,
                            const uint32_t *unif, uint32_t num_unif)
 {
     g2d_cl_dispatch_req_t req;
-    int      shm[VKCLIENT_MAX_ARGS];
-    uint32_t *px[VKCLIENT_MAX_ARGS];
-    int      unshm = 0;
-    uint32_t *unpx = NULL;
     uint32_t n, i;
+    int direct_used = 0;
     int32_t  rc = G2D_ERR_FAILED;
 
     if (prog_handle < 0 || wg == NULL || wg_size == 0 || wg_size > 256u)
         return G2D_ERR_FAILED;
     n = num_args > VKCLIENT_MAX_ARGS ? VKCLIENT_MAX_ARGS : num_args;
-
-    memset(shm, 0, sizeof(shm));
-    memset(px, 0, sizeof(px));
 
     g2d_cl_dispatch_req_init(&req, prog_handle, wg[0], wg[1], wg[2], wg_size);
     req.num_args = n;
@@ -110,18 +134,23 @@ int32_t vk_kernel_dispatch(int32_t prog_handle,
     for (i = 0; i < n; i++) {
         uint32_t sz = arg_size ? arg_size[i] : 0u;
         uint32_t alloc;
+        vk_stage_t *s = &_compute_args[i];
         if (sz == 0u || arg_host == NULL || arg_host[i] == NULL) {
             req.args[i] = g2d_canvas(0, 0, 0, 0, 0);   /* unused slot */
             continue;
         }
         alloc = (sz + 3u) & ~3u;
-        if (g2d_shm_alloc(alloc, &shm[i], &px[i]) != 0 ||
-            shm[i] <= 0 || px[i] == NULL) {
-            px[i] = NULL;
-            goto done;
+        if (arg_shm && arg_shm[i] > 0) {
+            if (_compute_direct_blocked)
+                return rc;
+            req.args[i] = g2d_canvas(arg_shm[i], alloc, alloc / 4u, 1u, 1);
+            direct_used = 1;
+            continue;
         }
-        memcpy(px[i], arg_host[i], sz);
-        req.args[i] = g2d_canvas(shm[i], alloc, alloc / 4u, 1u, 1);
+        if (!ensure_stage(s, alloc))
+            return rc;
+        memcpy(s->px, arg_host[i], sz);
+        req.args[i] = g2d_canvas(s->shm, alloc, alloc / 4u, 1u, 1);
     }
 
     /* The scalar uniform blob: num_unif u32 dwords modelled w = num_unif, h = 1
@@ -129,13 +158,11 @@ int32_t vk_kernel_dispatch(int32_t prog_handle,
      * reads it by vaddr for the QUNIFORM_UNIFORM slots. */
     if (num_unif > 0u && unif != NULL) {
         uint32_t ub = num_unif * 4u;
-        if (g2d_shm_alloc(ub, &unshm, &unpx) != 0 || unshm <= 0 || unpx == NULL) {
-            unpx = NULL;
-            goto done;
-        }
-        memcpy(unpx, unif, ub);
+        if (!ensure_stage(&_compute_unif, ub))
+            return rc;
+        memcpy(_compute_unif.px, unif, ub);
         req.num_uniforms = num_unif;
-        req.unif = g2d_canvas(unshm, ub, num_unif, 1u, 1);
+        req.unif = g2d_canvas(_compute_unif.shm, ub, num_unif, 1u, 1);
     } else {
         req.num_uniforms = 0;
         req.unif = g2d_canvas(0, 0, 0, 0, 0);
@@ -148,21 +175,14 @@ int32_t vk_kernel_dispatch(int32_t prog_handle,
          * canvas back into the caller's host store so the writes land there. */
         for (i = 0; i < n; i++) {
             uint32_t sz = arg_size ? arg_size[i] : 0u;
-            if (sz != 0u && px[i] != NULL && arg_host && arg_host[i])
-                memcpy(arg_host[i], px[i], sz);
+            if (sz != 0u && (!arg_shm || arg_shm[i] <= 0) &&
+                _compute_args[i].px != NULL && arg_host && arg_host[i])
+                memcpy(arg_host[i], _compute_args[i].px, sz);
         }
-    }
-
-done:
-    /* A terminal job may still own its GPU-visible buffers.  Keep this one
-       staging set mapped until process exit; later submissions use new staging
-       and the CPU replay uses the caller's host buffers. */
-    if (rc != G2D_ERR_TIMEOUT && rc != G2D_ERR_MMU_FAULT) {
-        for (i = 0; i < n; i++)
-            if (px[i])
-                g2d_shm_free(px[i]);
-        if (unpx)
-            g2d_shm_free(unpx);
+    } else if (rc == G2D_ERR_TIMEOUT || rc == G2D_ERR_MMU_FAULT) {
+        compute_abandon_staging();
+        if (direct_used)
+            _compute_direct_blocked = 1;
     }
     return rc;
 }
@@ -195,13 +215,6 @@ int32_t vk_program_free(int32_t prog_handle)
  * vk_kernel_dispatch - these canvases are allocated with g2d_shm_alloc (contig,
  * phy left 0) rather than g2d_shm_alloc_phy. */
 
-/* One persistent staging canvas: a contig shm segment grown on demand. */
-typedef struct {
-    int       shm;
-    uint32_t *px;
-    uint32_t  cap;   /* allocated bytes (>= the logical size it stages) */
-} vk_stage_t;
-
 static vk_stage_t _fb, _z, _attr, _unif;
 static vk_stage_t _tex[VKCLIENT_MAX_TEX];
 
@@ -209,7 +222,7 @@ static vk_stage_t _tex[VKCLIENT_MAX_TEX];
  * target that resizes by a few pixels does not realloc every frame.  Returns 1
  * on success (s->px valid, s->cap >= need) or 0 on allocation failure (s reset).
  * A segment already large enough is reused untouched. */
-static int gfx_ensure_stage(vk_stage_t *s, uint32_t need)
+static int ensure_stage(vk_stage_t *s, uint32_t need)
 {
     uint32_t alloc;
 
@@ -326,12 +339,12 @@ int32_t vk_gfx_draw(int32_t prog_handle,
 
     /* A shared swapchain image is itself the GPU destination.  Other images
      * retain the persistent staging framebuffer and its host readback. */
-    if ((!direct_fb && !gfx_ensure_stage(&_fb, fb_bytes)) ||
-        !gfx_ensure_stage(&_z,  fb_bytes) ||
-        !gfx_ensure_stage(&_attr, attr_bytes))
+    if ((!direct_fb && !ensure_stage(&_fb, fb_bytes)) ||
+        !ensure_stage(&_z,  fb_bytes) ||
+        !ensure_stage(&_attr, attr_bytes))
         return G2D_ERR_FAILED;
     if (num_unif > 0u && unif != NULL) {
-        if (!gfx_ensure_stage(&_unif, unif_bytes))
+        if (!ensure_stage(&_unif, unif_bytes))
             return G2D_ERR_FAILED;
     }
 
@@ -360,7 +373,7 @@ int32_t vk_gfx_draw(int32_t prog_handle,
             if (!pglc_tex_layout_2d(tex[i].w, tex[i].h, 4u, &layout) ||
                 layout.size == 0)
                 return G2D_ERR_FAILED;
-            if (!gfx_ensure_stage(&_tex[i], layout.size))
+            if (!ensure_stage(&_tex[i], layout.size))
                 return G2D_ERR_FAILED;
             pglc_tex_store_2d(_tex[i].px, tex[i].host, tex[i].w * 4u,
                               tex[i].w, tex[i].h, 4u, &layout);
@@ -398,7 +411,7 @@ int32_t vk_gfx_draw(int32_t prog_handle,
         for (i = 0; i < ntex_bound; i++) {
             struct pglc_tex_layout layout;
             /* recompute the layout for the canvas geometry (cheap, no re-alloc);
-             * gfx_ensure_stage above already sized _tex[i] to layout.size. */
+             * ensure_stage above already sized _tex[i] to layout.size. */
             if (!pglc_tex_layout_2d(tex[i].w, tex[i].h, 4u, &layout))
                 continue;
             req.ctex[i] = g2d_canvas(_tex[i].shm, layout.size,

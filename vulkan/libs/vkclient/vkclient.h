@@ -63,16 +63,16 @@ int32_t vk_program_upload(const void *blob, uint32_t size);
 
 /* Run prog_handle over a wg[0] x wg[1] x wg[2] grid of work-groups, each of
  * wg_size work-items (1..256).  arg_host[i]/arg_size[i] are the storage-buffer
- * host stores in SSBO binding order: each is staged into a contig-shm canvas for
- * the launch and copied back into arg_host[i] afterwards, so the GPU reads the
- * inputs and its writes land in the caller's host buffers.  A NULL arg_host[i]
- * (or arg_size[i] == 0) marks an unused trailing slot.  unif/num_unif is the
+ * host stores in SSBO binding order.  A positive arg_shm[i] identifies a
+ * zero-offset contig-shm backing and dispatches it in place; otherwise the host
+ * store is staged and copied back.  A NULL arg_host[i] (or arg_size[i] == 0)
+ * marks an unused trailing slot.  unif/num_unif is the
  * packed scalar uniform blob (num_unif u32 dwords; may be 0/NULL).  Returns
  * VKCLIENT_OK (0) or a negative code. */
 int32_t vk_kernel_dispatch(int32_t prog_handle,
                            const uint32_t wg[3], uint32_t wg_size,
                            void *const *arg_host, const uint32_t *arg_size,
-                           uint32_t num_args,
+                           const int *arg_shm, uint32_t num_args,
                            const uint32_t *unif, uint32_t num_unif);
 
 /* Release a program handle and the GPU dma it owns.  Returns VKCLIENT_OK (0) or

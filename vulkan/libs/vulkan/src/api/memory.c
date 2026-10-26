@@ -1,13 +1,18 @@
 /*
  * memory.c - VkDeviceMemory lifecycle and mapping, buffer/image memory binding,
  * memory-requirement queries, and the buffer-device-address / opaque-capture
- * surface.  In the software model every allocation is a plain host buffer that
- * is simultaneously device-local and host-visible, so map/bind/flush are direct
- * host operations and a device address is simply the host pointer.
+ * surface.  Every allocation is simultaneously device-local and host-visible.
+ * The software device uses plain host buffers; the GPU device prefers contig
+ * shm so compute buffers can be dispatched in place.  Map/bind/flush remain
+ * direct host operations and a device address is simply the host pointer.
  */
 #include "internal.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef VULKAN_GPU_BACKEND
+#include <g2dclient/g2dclient.h>
+#include <sys/shm.h>
+#endif
 
 /* ---- device memory ------------------------------------------------------- */
 VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(
@@ -26,7 +31,23 @@ VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(
     m->device = dev;
     m->size = pAllocateInfo->allocationSize;
     m->type_index = pAllocateInfo->memoryTypeIndex;
-    m->host = calloc(1, (size_t)pAllocateInfo->allocationSize);
+#ifdef VULKAN_GPU_BACKEND
+    /* Give GPU-device allocations a physically contiguous shared backing from
+     * the start.  Compute SSBOs can then be dispatched without an upload and
+     * readback through a second staging allocation. */
+    if (dev->backend == &vk_backend_gpu && m->size <= UINT32_MAX) {
+        uint32_t *px = NULL;
+        if (g2d_shm_alloc((uint32_t)m->size, &m->gfx_shm, &px) == 0 &&
+            m->gfx_shm > 0 && px != NULL) {
+            m->host = px;
+            memset(m->host, 0, (size_t)m->size);
+        }
+    }
+#endif
+    if (!m->host) {
+        m->gfx_shm = 0;
+        m->host = calloc(1, (size_t)pAllocateInfo->allocationSize);
+    }
     if (!m->host) { vk_obj_free(m); return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
     *pMemory = VK_P2H(VkDeviceMemory, m);
     return VK_SUCCESS;
@@ -38,6 +59,14 @@ VKAPI_ATTR void VKAPI_CALL vkFreeMemory(
     vk_device_memory *m = (vk_device_memory *)VK_H2P(memory);
     (void)device; (void)pAllocator;
     if (!m) return;
+#ifdef VULKAN_GPU_BACKEND
+    if (m->gfx_shm > 0) {
+        g2d_shm_free((uint32_t *)m->host);
+        shmctl(m->gfx_shm, IPC_RMID, NULL);
+        vk_obj_free(m);
+        return;
+    }
+#endif
     free(m->host);
     vk_obj_free(m);
 }

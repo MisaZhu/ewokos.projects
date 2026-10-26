@@ -112,9 +112,10 @@ const char *vk_gpu_name(void)
  * success, -1 when the (set,binding) is not written or cannot be resolved to a
  * host pointer (which declines the dispatch to the CPU rather than mis-binding). */
 static int gpu_find_ssbo(const vk_draw_ctx *dc, uint32_t set, uint32_t binding,
-                         void **host, size_t *size)
+                         void **host, size_t *size, int *shm)
 {
     uint32_t s, i;
+    *shm = 0;
     for (s = 0; s < dc->set_count; s++) {
         const vk_descriptor_set *ds = dc->sets[s];
         uint32_t set_index = dc->first_set + s;
@@ -133,6 +134,12 @@ static int gpu_find_ssbo(const vk_draw_ctx *dc, uint32_t set, uint32_t binding,
             *host = (char *)base + b->offset;
             *size = (size_t)(b->range == VK_WHOLE_SIZE
                                  ? (b->buffer->size - b->offset) : b->range);
+            /* The daemon's SSBO address is the segment base.  A zero-offset
+             * binding can use that segment directly; suballocations retain the
+             * staging path because g2d_canvas_t has no byte-offset field. */
+            if (b->buffer->mem->gfx_shm > 0 &&
+                b->buffer->offset == 0 && b->offset == 0)
+                *shm = b->buffer->mem->gfx_shm;
             return 0;
         }
     }
@@ -571,6 +578,7 @@ static VkResult gpu_dispatch(vk_command_buffer *cb, vk_draw_ctx *dc,
     gpu_pipeline *gp;
     void    *arg_host[VKCLIENT_MAX_ARGS];
     uint32_t arg_size[VKCLIENT_MAX_ARGS];
+    int      arg_shm[VKCLIENT_MAX_ARGS];
     uint32_t *unif = NULL;
     uint32_t  num_unif = 0;
     uint32_t  nargs = 0;
@@ -589,6 +597,7 @@ static VkResult gpu_dispatch(vk_command_buffer *cb, vk_draw_ctx *dc,
      * flattened GLSL binding slot the transpiler emitted (args[] is positional). */
     memset(arg_host, 0, sizeof(arg_host));
     memset(arg_size, 0, sizeof(arg_size));
+    memset(arg_shm, 0, sizeof(arg_shm));
     for (i = 0; i < gp->info.num_bindings; i++) {
         const spirv_glsl_binding *b = &gp->info.bindings[i];
         void *host = NULL;
@@ -599,7 +608,8 @@ static VkResult gpu_dispatch(vk_command_buffer *cb, vk_draw_ctx *dc,
             fprintf(stderr, "vulkan-gpu: dispatch fallback: binding %u >= VKCLIENT_MAX_ARGS\n", b->binding);
             return cpu_dispatch(cb, dc, gx, gy, gz);
         }
-        if (gpu_find_ssbo(dc, b->set, b->binding_src, &host, &sz) != 0) {
+        if (gpu_find_ssbo(dc, b->set, b->binding_src, &host, &sz,
+                          &arg_shm[b->binding]) != 0) {
             fprintf(stderr, "vulkan-gpu: dispatch fallback: SSBO (set=%u binding=%u) unresolvable\n", b->set, b->binding_src);
             return cpu_dispatch(cb, dc, gx, gy, gz);   /* unresolvable: CPU replay */
         }
@@ -621,7 +631,7 @@ static VkResult gpu_dispatch(vk_command_buffer *cb, vk_draw_ctx *dc,
 
     wg[0] = gx; wg[1] = gy; wg[2] = gz;
     rc = vk_kernel_dispatch(gp->handle, wg, gp->info.local_size[0],
-                            arg_host, arg_size, nargs, unif, num_unif);
+                            arg_host, arg_size, arg_shm, nargs, unif, num_unif);
     free(unif);
 
     if (rc == VKCLIENT_OK)
