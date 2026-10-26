@@ -7,7 +7,7 @@ EXTRA_LIBS_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 
 # <EGL/egl.h> + <GLES2/gl2.h> are installed into the shared build include dir by
 # libs/gles, glcommon's headers land there too, and the Dear ImGui headers land
-# under include/imgui (installed by libs/imgui).  matrix is C++ (ImGui is C++):
+# under include/imgui (installed by projects/imgui).  matrix is C++ (ImGui is C++):
 # -I.../include resolves <EGL/...>, <GLES2/...> and "imgui/...", and
 # -I.../include/imgui lets the backend header find its sibling "imgui.h".
 CXXFLAGS += -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/glcommon -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__ -fno-threadsafe-statics
@@ -19,7 +19,7 @@ LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib
 # libimgui + libEGL + libGLESv2 (imgui -> gl*, EGL -> engine) and never names
 # portablegl or pglcompiler.
 GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libglcommon.a \
-	$(EXTRA_LIBS_DIR)/lib/libimgui.a \
+	$(EXTRA_LIBS_DIR)/lib/libimgui_gles.a \
 	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
 

@@ -6,7 +6,7 @@ TASK = macgl
 TASK_DIR = $(SDK_DIR)/rootfs/apps/$(TASK)
 TASK_OBJS = $(ARCH)/macgl.$(HW).o
 CXXFLAGS += -I$(SDK_DIR)/include -I$(SDK_DIR)/include/imgui -fno-threadsafe-statics
-GLES_LIBS = $(SDK_DIR)/lib/libimgui.a $(SDK_DIR)/lib/libEGL.a $(SDK_DIR)/lib/libGLESv2.a
+GLES_LIBS = $(SDK_DIR)/lib/libimgui_gles.a $(SDK_DIR)/lib/libEGL.a $(SDK_DIR)/lib/libGLESv2.a
 SYSTEM_LIBS = $(foreach lib,ewoksys ewokstl x++ x font graph widget++ cxx,$(SDK_DIR)/lib/lib$(lib).a)
 GPU_HWS := raspi5 raspix
 ifeq ($(PGL_G3D),yes)

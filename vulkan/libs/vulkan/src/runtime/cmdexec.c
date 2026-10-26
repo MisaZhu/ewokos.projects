@@ -91,6 +91,17 @@ static void encode_clear(VkFormat f, uint8_t *p, const VkClearColorValue *c)
     }
 }
 
+/* Mark an image's backing memory as freshly written.  The GPU graphics path
+ * caches each sampled image's TMU tiling keyed on this version (see vkclient's
+ * _tex_key), so every host-side pixel write into an image funnels a bump here
+ * to guarantee the next draw that samples it re-tiles rather than reading a
+ * stale tile.  A no-op when the image has no backing. */
+static inline void image_content_touch(vk_image *im)
+{
+    if (im && im->mem)
+        im->mem->content_version++;
+}
+
 /* clear the base mip/layer of an image to a color value */
 static void clear_color_image(vk_image *im, const VkClearColorValue *c)
 {
@@ -118,6 +129,7 @@ static void clear_color_image(vk_image *im, const VkClearColorValue *c)
         for (y = 1; y < im->extent.height; y++)
             memcpy(lb + (size_t)y * pitch, lb, rowbytes);
     }
+    image_content_touch(im);
 }
 
 static void clear_depth_image(vk_image *im, const VkClearDepthStencilValue *ds)
@@ -170,6 +182,7 @@ static void clear_depth_image(vk_image *im, const VkClearDepthStencilValue *ds)
         memcpy(base + (size_t)x * bpp, texel, bpp);
     for (y = 1; y < im->extent.height; y++)
         memcpy(base + (size_t)y * pitch, base, rowbytes);
+    image_content_touch(im);
 }
 
 static void clear_view(vk_image_view *iv, const VkClearValue *val, int is_depth)
@@ -363,6 +376,7 @@ static void exec_copy_buffer_to_image(const vk_cmd *c)
                 sp += rowbytes;
             }
     }
+    image_content_touch(im);
 }
 
 static void exec_copy_image_to_buffer(const vk_cmd *c)
@@ -415,6 +429,7 @@ static void exec_copy_image(const vk_cmd *c)
                 memcpy(dp, sp, rowbytes);
             }
     }
+    image_content_touch(d);
 }
 
 static void exec_blit_image(const vk_cmd *c)
@@ -445,6 +460,7 @@ static void exec_blit_image(const vk_cmd *c)
             }
         }
     }
+    image_content_touch(d);
 }
 
 static void exec_clear_color_image(const vk_cmd *c)
@@ -517,6 +533,17 @@ static void exec_draw(vk_command_buffer *cb, const vk_cmd *c, gfx_clear_state *c
         be->draw(cb, &dc, c->u.draw.vertexCount, c->u.draw.firstVertex,
                  c->u.draw.instanceCount, c->u.draw.firstInstance,
                  NULL, c->u.draw.ib_type);
+    }
+
+    /* The draw wrote the colour/depth attachments: bump their backing versions
+     * so a render-to-texture target that is sampled later re-tiles. */
+    {
+        uint32_t ci;
+        for (ci = 0; ci < dc.num_color; ci++)
+            if (dc.color[ci])
+                image_content_touch(dc.color[ci]->image);
+        if (dc.depth)
+            image_content_touch(dc.depth->image);
     }
 }
 

@@ -32,6 +32,7 @@ spirv_type *spirv_type_find(spirv_module *m, uint32_t id)
 {
     uint32_t i;
     if (!m || !id) return NULL;
+    if (m->type_at) return (id < m->bound) ? m->type_at[id] : NULL;
     for (i = 0; i < m->ntypes; i++)
         if (m->types[i].id == id) return &m->types[i];
     return NULL;
@@ -41,6 +42,7 @@ spirv_const *spirv_const_find(spirv_module *m, uint32_t id)
 {
     uint32_t i;
     if (!m || !id) return NULL;
+    if (m->const_at) return (id < m->bound) ? m->const_at[id] : NULL;
     for (i = 0; i < m->nconsts; i++)
         if (m->consts[i].id == id) return &m->consts[i];
     return NULL;
@@ -51,6 +53,14 @@ spirv_deco *spirv_deco_find(spirv_module *m, uint32_t target, uint32_t member,
 {
     uint32_t i;
     if (!m) return NULL;
+    if (m->deco_order && target < m->bound) {
+        uint32_t s = m->deco_start[target], e = m->deco_start[target + 1];
+        for (i = s; i < e; i++) {
+            spirv_deco *d = &m->decos[m->deco_order[i]];
+            if (d->deco == deco && d->member == member) return d;
+        }
+        return NULL;
+    }
     for (i = 0; i < m->ndecos; i++)
         if (m->decos[i].target == target && m->decos[i].deco == deco &&
             m->decos[i].member == member)
@@ -134,6 +144,10 @@ void spirv_free(spirv_module *m)
     free(m->eps);
     free(m->funcs);
     free(m->def_at);
+    free(m->type_at);
+    free(m->const_at);
+    free(m->deco_start);
+    free(m->deco_order);
     free(m->label_at);
     free(m->scratch);
     free(m->scratch_valid);
@@ -451,6 +465,35 @@ spirv_module *spirv_parse(const uint32_t *words, size_t nwords,
             uint32_t lid = m->insns[i].w[1];
             if (lid < m->bound) m->label_at[lid] = (int32_t)i;
         }
+    }
+
+    /* O(1) id -> type / const indexes and a target-grouped decoration index
+     * (see spirv_priv.h).  Built once here so the interpreter's per-instruction
+     * describe() and per-fragment interface/descriptor setup stop linear-
+     * scanning m->types / m->consts / m->decos. */
+    m->type_at    = (spirv_type **)calloc(m->bound, sizeof(spirv_type *));
+    m->const_at   = (spirv_const **)calloc(m->bound, sizeof(spirv_const *));
+    m->deco_start = (uint32_t *)calloc(m->bound + 1, sizeof(uint32_t));
+    m->deco_order = (uint32_t *)malloc((m->ndecos ? m->ndecos : 1) * sizeof(uint32_t));
+    if (!m->type_at || !m->const_at || !m->deco_start || !m->deco_order) {
+        set_err(err, errsz, "oom id index"); spirv_free(m); return NULL;
+    }
+    for (i = 0; i < m->ntypes; i++)
+        if (m->types[i].id < m->bound) m->type_at[m->types[i].id] = &m->types[i];
+    for (i = 0; i < m->nconsts; i++)
+        if (m->consts[i].id < m->bound) m->const_at[m->consts[i].id] = &m->consts[i];
+    {
+        /* count-sort decorations by target id into deco_order/deco_start */
+        uint32_t *cursor = (uint32_t *)calloc(m->bound, sizeof(uint32_t));
+        if (!cursor) { set_err(err, errsz, "oom deco idx"); spirv_free(m); return NULL; }
+        for (i = 0; i < m->ndecos; i++)
+            if (m->decos[i].target < m->bound) m->deco_start[m->decos[i].target + 1]++;
+        for (i = 0; i < m->bound; i++) m->deco_start[i + 1] += m->deco_start[i];
+        for (i = 0; i < m->ndecos; i++) {
+            uint32_t t = m->decos[i].target;
+            if (t < m->bound) m->deco_order[m->deco_start[t] + cursor[t]++] = i;
+        }
+        free(cursor);
     }
 
     /* resolve entry-point function first-block indices */

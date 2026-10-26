@@ -49,7 +49,9 @@
  * plus the uniform-binding reflection table so subsequent launches skip the
  * compile entirely and upload the cached blob in <100ms.
  *
- * Cache location: /data/pgl_shader_cache/<gpu_ver>_<hash>.bin
+ * Cache location: PGL_DISK_CACHE_DIR/<gpu_ver>_<hash>.bin.  That directory is
+ * on the ramfs mount (/tmp), so the cache survives an app relaunch but NOT a
+ * reboot: the first launch of each program after boot still pays the compile.
  * Format (all little-endian):
  *   [magic "PGLC" 4B][version 4B][gpu_ver 4B][source_hash 8B]
  *   [blob_size 4B][blob_data blob_size B]
@@ -142,7 +144,32 @@ static uint64_t hash_sources_64(const char* v, const char* f)
 	return h;
 }
 
-/* Build the cache file path: /data/pgl_shader_cache/<gpu_ver>_<hash64>.bin */
+/* Disk-cache key for a MESH program.  A mesh program's blob is fully determined
+   by which fixed geometry kernels its sources select - nothing in it is derived
+   from the app's own VS/FS (see the pair-skip in pgl_g3d_program_compile) - so
+   the key covers the variant flags plus the two selected kernel texts rather
+   than the app sources, and every mesh app sharing a variant loads the same
+   file.  Hashing the kernel TEXT as well makes the key self-invalidating when
+   geom_raster_cs.h changes, which matters: stale QPU served for a new kernel
+   does not fail cleanly, it can wedge the V3D CSD dispatcher. */
+static uint64_t hash_mesh_variant(int tex, int texcol, int inst, int inst_lit,
+                                  int color, int model, int tpw,
+                                  const char* raster_src, const char* xform_src)
+{
+	uint64_t h = 14695981039346656037ULL;
+	const unsigned char* p;
+	int v[7], i;
+	v[0] = tex; v[1] = texcol; v[2] = inst; v[3] = inst_lit;
+	v[4] = color; v[5] = model; v[6] = tpw;
+	for (i = 0; i < 7; i++) { h ^= (unsigned char)v[i]; h *= 1099511628211ULL; }
+	h ^= 0x1Fu; h *= 1099511628211ULL;
+	for (p = (const unsigned char*)raster_src; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+	h ^= 0x1Fu; h *= 1099511628211ULL;
+	for (p = (const unsigned char*)xform_src; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+	return h;
+}
+
+/* Build the cache file path: PGL_DISK_CACHE_DIR/<gpu_ver>_<hash64>.bin */
 static void cache_path(char* buf, size_t bufsz, uint32_t gpu_ver, uint64_t h64)
 {
 	snprintf(buf, bufsz, "%s/%u_%016llx.bin",
@@ -340,6 +367,15 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 {
 	uint32_t h;
 	int i, slot = -1;
+	/* Shape + kernel-variant sniff, hoisted above the disk-cache lookup because
+	   the lookup's key depends on it (a mesh program is keyed by variant). */
+	int mesh = 0, fullscreen = 0, fs_done = 0, pair_ok = 0;
+	int v_tex = 0, v_texcol = 0, v_inst = 0, v_inst_lit = 0;
+	int v_color = 0, v_model = 0, v_tpw = 0;
+	const char* raster_src = NULL;
+	const char* xform_src = NULL;
+	uint32_t gpu_ver;
+	uint64_t h64;
 
 	if (errlog && errsz > 0)
 		errlog[0] = '\0';
@@ -381,24 +417,71 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 		return PGL_G3D_PROG_INVALID;
 	}
 
+	mesh = strstr(vert_glsl, "uMVP") != NULL;
+	fullscreen = !mesh && strstr(frag_glsl, "gl_FragCoord") != NULL;
+	if (mesh) {
+		v_tex      = strstr(frag_glsl, "sampler") != NULL;
+		/* COLOUR-MODULATED textured variant (imgui): the FS multiplies a vec4
+		   varying by the texture sample (gl_FragColor = vColor * texture2D(...)),
+		   which the plain TEX_MOD kernel cannot express (it writes the fetched
+		   texel verbatim, no per-vertex colour).  Serialised as cs_is_geom = 4. */
+		v_texcol   = v_tex && strstr(frag_glsl, "* texture2D") != NULL;
+		/* The INSTANCED-LIT marker is a superset spelling (it CONTAINS the plain
+		   marker as a prefix, so sniff it first): 40-float records with per-instance
+		   emissive + alpha and the engine demo's reflect-spec lighting model.
+		   Both instanced flavours share the cs_is_geom=3 dispatch and bindings. */
+		v_inst_lit = !v_tex &&
+		             strstr(vert_glsl, "PGL_G3D_INSTANCED_LIT") != NULL;
+		/* The INSTANCED variant (gears): pass 1 reads a per-vertex instance index
+		   from pos.w and the per-gear matrices from a 4th SSBO.  Mutually exclusive
+		   with the textured variant; pass 2 stays the plain gouraud raster kernel. */
+		v_inst     = !v_tex && !v_inst_lit &&
+		             strstr(vert_glsl, "PGL_G3D_INSTANCED") != NULL;
+		/* The COLOUR variant (teapot's native gouraud fast-path shape) is a mesh VS
+		   that transforms by uMVP but declares NO uNormalMat: attribute 1 is a
+		   precomputed per-vertex colour, so pass 1 copies it straight through. */
+		v_color    = !v_tex && !v_inst &&
+		             strstr(vert_glsl, "uNormalMat") == NULL;
+		v_model    = strstr(vert_glsl, "uLightEye") != NULL ? 1 : 0;
+		/* the tex kernel is the legacy one-workgroup-per-triangle shape (0); the
+		   gouraud kernel is one-lane-per-triangle and covers 256 triangles per 16x16
+		   workgroup, so the daemon dispatches ceil(ntris/256) from cs_geom_tpw. */
+		v_tpw      = v_tex ? 0 : 256;
+		raster_src = v_texcol ? geom_raster_texcol_cs_glsl
+		               : (v_tex ? geom_raster_tex_cs_glsl
+		                       : geom_raster_cs_glsl);
+		xform_src  = v_inst_lit ? geom_xform_instlit_cs_glsl
+		               : (v_inst ? geom_xform_inst_cs_glsl
+		               : (v_texcol ? geom_xform_texcol_cs_glsl
+		                  : (v_tex ? geom_xform_tex_cs_glsl
+		                     : (v_color ? geom_xform_color_cs_glsl
+		                                : geom_xform_cs_glsl))));
+	}
+
 	/* --- DISK CACHE LOOKUP: skip the entire mesa compile when a previous
 	   launch already serialized this program.  This is the single biggest
 	   startup optimization: a heavy raymarch shader costs 10-18s PER RA
 	   strategy attempt (minutes total) on every cold launch; a cache hit
-	   loads the pre-compiled blob in <10ms. --- */
-	{
-		uint32_t gpu_ver = pgl_g3d_ensure_version();
-		uint64_t h64 = hash_sources_64(vert_glsl, frag_glsl);
-		if (gpu_ver != 0 && cache_load(&_progs[slot], gpu_ver, h64)) {
-			_progs[slot].vert = strdup(vert_glsl);
-			_progs[slot].frag = strdup(frag_glsl);
-			_progs[slot].hash = h;
-			_progs[slot].daemon_handle = -1;
-			_progs[slot].uploaded = 0;
-			_progs[slot].upload_declined = 0;
-			_progs[slot].used = 1;
-			return (pgl_g3d_prog)slot;
-		}
+	   loads the pre-compiled blob in <10ms.
+
+	   KEY: a fullscreen / plain program is keyed by its source text.  A MESH
+	   program is keyed by its kernel VARIANT instead, because (see the
+	   pair-skip below) its blob holds nothing derived from the app's own VS/FS
+	   - so every mesh app sharing a variant loads the ONE shared file and only
+	   the first of them per boot pays for the kernel compile. --- */
+	gpu_ver = pgl_g3d_ensure_version();
+	h64 = mesh ? hash_mesh_variant(v_tex, v_texcol, v_inst, v_inst_lit,
+	                               v_color, v_model, v_tpw, raster_src, xform_src)
+	           : hash_sources_64(vert_glsl, frag_glsl);
+	if (gpu_ver != 0 && cache_load(&_progs[slot], gpu_ver, h64)) {
+		_progs[slot].vert = strdup(vert_glsl);
+		_progs[slot].frag = strdup(frag_glsl);
+		_progs[slot].hash = h;
+		_progs[slot].daemon_handle = -1;
+		_progs[slot].uploaded = 0;
+		_progs[slot].upload_declined = 0;
+		_progs[slot].used = 1;
+		return (pgl_g3d_prog)slot;
 	}
 
 	{
@@ -415,13 +498,9 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 		   programs on the compute wrap ALONE and keep an empty VS/FS pair (the
 		   fullscreen route consumes only stage[COMPUTE]; the CPU-interpreter
 		   fallback is a separate compiler over the GLSL source and is
-		   unaffected).  Non-fullscreen programs keep the ES 1.00 pair compile,
-		   but for the MESH shape it is best-effort (see below). */
-		int fullscreen = strstr(vert_glsl, "uMVP") == NULL &&
-		                 strstr(frag_glsl, "gl_FragCoord") != NULL;
-		int mesh = strstr(vert_glsl, "uMVP") != NULL;
-		int fs_done = 0;
-		int pair_ok = 0;
+		   unaffected).  A MESH program does not compile the pair at all (see
+		   below); every other non-fullscreen shape keeps it.  `mesh` and
+		   `fullscreen` were sniffed above, before the disk-cache lookup. */
 		if (fullscreen) {
 			fs_done = pglc_compile_compute(frag_glsl, &res);
 			if (!fs_done) {
@@ -432,6 +511,30 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 				pglc_program_free(&res);
 				return PGL_G3D_PROG_INVALID;   /* per-shader: no GPU latch-off */
 			}
+			_progs[slot].prog = res;   /* take ownership of res.stage[].code */
+		} else if (mesh) {
+			/* A MESH program's ONLY GPU route is the fixed two-pass geometry
+			   kernel pair attached below; its own ES 1.00 VS/FS pair can never be
+			   consumed by anything:
+			     - the daemon dispatches a compiled program through the CSD whenever
+			       it carries a compute stage and never runs the binner (raspi5
+			       v3d_3d.c compile-disables the fixed/binner route with
+			       V3D_3D_ENABLE_FIXED_DRAW 0 and the compute branch pre-empts it;
+			       raspix is compute-only by construction; Adreno has no
+			       graphics-pipeline port and declines every pair up front);
+			     - the client refuses to upload a mesh program without a compute
+			       stage (pgl_g3d.c: "do not even upload a program that can never
+			       render"), so a kernels-failed mesh program is CPU-rasterized;
+			     - pgl_g3d_shader_uniform_dword() returns before the FS/VS binding
+			       tables once a compute stage exists ("a geom program never
+			       consults the FS/VS layouts").
+			   Compiling it anyway cost a full mesa frontend parse+link plus THREE
+			   backend stage compiles (VS, FS and the COORD binning variant) per
+			   mesh program, and it is also what dragged mesh apps into the mesa
+			   backend's hard abort on point-sprite builtins (a VS writing
+			   gl_PointSize kills the process instead of declining).  So skip it:
+			   the kernels below are the whole decision. */
+			memset(&_progs[slot].prog, 0, sizeof(_progs[slot].prog));
 		} else {
 			pair_ok = pglc_compile_glsl(vert_glsl, frag_glsl, &res);
 			if (!pair_ok) {
@@ -440,86 +543,24 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 					         res.log[0] ? res.log
 					                    : "pglc_compile_glsl failed");
 				pglc_program_free(&res);
-				/* A MESH program's only GPU route is the fixed two-pass
-				   geometry kernel pair attached below, which never consumes
-				   the app's VS/FS (the binner cannot rasterise real
-				   primitives, and a backend without a graphics-pipeline port
-				   - Adreno - declines EVERY pair up front).  Treating the
-				   pair's decline as fatal here kept every mesh app
-				   (glmatrix/teapot/gears/3ddemo) on the CPU interpreter on
-				   q8b, silently and in 0 ms.  So for the mesh shape carry on
-				   with an empty VS/FS pair and let the kernel compile decide;
-				   errlog already holds the pair's text should that fail too.
-				   Any other non-fullscreen shape has no compute route and
-				   still needs the pair. */
-				if (!mesh)
-					return PGL_G3D_PROG_INVALID;   /* per-shader: no GPU latch-off */
-				memset(&res, 0, sizeof(res));
+				return PGL_G3D_PROG_INVALID;   /* per-shader: no GPU latch-off */
 			}
+			_progs[slot].prog = res;   /* take ownership of res.stage[].code */
 		}
-		_progs[slot].prog = res;   /* take ownership of res.stage[].code */
 
 		/* Compute-route attach.  Two mutually exclusive shapes:
 		   - a MESH program (its VS transforms by uMVP) gets the fixed geometry
-		     rasterizer kernel (one lane per triangle) - the binner cannot
-		     rasterise real primitives on this silicon, so this is the only
-		     correct GPU route for mesh draws.  The kernel variant is selected by
-		     the app FS: no sampler -> the gouraud kernel (SSBO 0=fb 1=pos 2=nrm
-		     3=depth; teapot/gears); a sampler -> the TEXTURED variant
-		     (geom_raster_tex_cs_glsl: attr1 = uv, SSBO 4 = linear texture image,
-		     NEAREST+CLAMP, no TMU; 3ddemo).
-		   - a FULL-SCREEN program (no uMVP; shadertoy) gets its fragment source
-		     wrapped as a per-pixel compute kernel as before.
-		   A compute compile failure is NOT an error - the program keeps its
-		   VS/FS pair and its draws fall back to the CPU rasterizer. */
-		if (strstr(vert_glsl, "uMVP") != NULL) {
+		     rasterizer kernel pair selected by the variant sniff above (gouraud /
+		     textured / colour-modulated / instanced / colour).  This is the only
+		     correct GPU route for mesh draws: the binner cannot rasterise real
+		     primitives on this silicon.
+		   - a FULL-SCREEN program (no uMVP; shadertoy) already carries its
+		     fragment source wrapped as a per-pixel compute kernel.
+		   A compute compile failure on a non-mesh shape is NOT an error - the
+		   program keeps its VS/FS pair and its draws fall back to the CPU
+		   rasterizer. */
+		if (mesh) {
 			struct pglc_program gres, xres;
-			int tex = strstr(frag_glsl, "sampler") != NULL;
-			/* COLOUR-MODULATED textured variant (imgui): the FS multiplies a
-			   vec4 varying by the texture sample (gl_FragColor = vColor *
-			   texture2D(...)), which the plain TEX_MOD kernel cannot express
-			   (it writes the fetched texel verbatim, no per-vertex colour).  Sniff
-			   that product shape; when present, select the texcol kernels - the
-			   per-vertex colour is interleaved into binding 1 at a 10-float
-			   stride (the compute kernels keep to 4 SSBO bindings), the vout record
-			   grows to 12 floats, and pass 2 does bilinear sampling + colour
-			   modulation + SRC_ALPHA/ONE_MINUS_SRC_ALPHA blending + scissor with
-			   no depth write.  Serialised as cs_is_geom = 4. */
-			int texcol = tex && strstr(frag_glsl, "* texture2D") != NULL;
-			/* The INSTANCED variant (gears) is selected by a marker in the
-			   app VS: it swaps pass 1 for geom_xform_inst_cs_glsl, which reads
-			   a per-vertex instance index from pos.w and the per-gear matrices
-			   from a 4th SSBO.  Mutually exclusive with the textured variant
-			   (an instanced mesh carries no sampler).  Pass 2 is the plain
-			   gouraud raster kernel (V5, cs_geom_tpw = 256) since the vout
-			   record layout is unchanged.  The INSTANCED-LIT marker is a
-			   superset spelling (it CONTAINS the plain marker as a prefix, so
-			   sniff it first): 40-float records with per-instance emissive +
-			   alpha and the engine demo's reflect-spec lighting model,
-			   compiled as geom_xform_instlit_cs_glsl.  Both share the
-			   cs_is_geom=3 daemon dispatch and bindings. */
-			int inst_lit = !tex &&
-			               strstr(vert_glsl, "PGL_G3D_INSTANCED_LIT") != NULL;
-			int inst = !tex && !inst_lit &&
-			           strstr(vert_glsl, "PGL_G3D_INSTANCED") != NULL;
-			/* The COLOUR variant (teapot's native gouraud fast-path shape) is a
-			   mesh VS that transforms by uMVP but declares NO uNormalMat/uLightEye:
-			   attribute 1 is a precomputed per-vertex colour, not a normal, so pass 1
-			   (geom_xform_color_cs_glsl) copies it straight through instead of
-			   lighting it on the GPU.  Pass 2 (the gouraud raster kernel), the
-			   stride-6 upload and the cs_is_geom=1 daemon dispatch are shared with
-			   the lit variant unchanged. */
-			int color = !tex && !inst &&
-			            strstr(vert_glsl, "uNormalMat") == NULL;
-			const char* raster_src = texcol ? geom_raster_texcol_cs_glsl
-			                             : (tex ? geom_raster_tex_cs_glsl
-			                                    : geom_raster_cs_glsl);
-			const char* xform_src  = inst_lit ? geom_xform_instlit_cs_glsl
-			                             : (inst ? geom_xform_inst_cs_glsl
-			                             : (texcol ? geom_xform_texcol_cs_glsl
-			                                    : (tex ? geom_xform_tex_cs_glsl
-			                                           : (color ? geom_xform_color_cs_glsl
-			                                                  : geom_xform_cs_glsl))));
 			memset(&gres, 0, sizeof(gres));
 			memset(&xres, 0, sizeof(xres));
 			/* BOTH kernels must compile: the raster pass reads the vout
@@ -540,27 +581,31 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 				memset(&xres.stage[PGLC_STAGE_COMPUTE], 0,
 				       sizeof(xres.stage[PGLC_STAGE_COMPUTE]));
 				_progs[slot].is_geom = 1;
-				_progs[slot].geom_tex = tex;
-				_progs[slot].geom_texcol = texcol;
-				_progs[slot].geom_inst = inst || inst_lit;
-				_progs[slot].geom_inst_lit = inst_lit;
-				/* the tex kernel is the legacy one-workgroup-per-triangle shape
-				   (0); the gouraud kernel is one-lane-per-triangle and covers 256
-				   triangles per 16x16 workgroup, so the daemon dispatches the
-				   matching ceil(ntris/256) grid from cs_geom_tpw. */
-				_progs[slot].geom_tpw = tex ? 0 : 256;
-				_progs[slot].geom_model =
-					strstr(vert_glsl, "uLightEye") != NULL ? 1 : 0;
+				_progs[slot].geom_tex = v_tex;
+				_progs[slot].geom_texcol = v_texcol;
+				_progs[slot].geom_inst = v_inst || v_inst_lit;
+				_progs[slot].geom_inst_lit = v_inst_lit;
+				_progs[slot].geom_tpw = v_tpw;
+				_progs[slot].geom_model = v_model;
+			} else if (errlog && errsz > 0) {
+				/* The VS/FS pair is never compiled for a mesh program, so the
+				   kernel log is the only diagnostic there is.  The && above is
+				   short-circuit: when the RASTER kernel fails, xres is still
+				   zeroed and gres carries the text. */
+				snprintf(errlog, (size_t)errsz, "geom kernel compile failed: %s",
+				         gres.log[0] ? gres.log
+				         : (xres.log[0] ? xres.log : "(no error text)"));
 			}
 			pglc_program_free(&gres);
 			pglc_program_free(&xres);
-			/* No VS/FS pair AND no kernels: nothing the GPU could run, so
-			   decline instead of caching an empty program (whose draws would
-			   only ever bounce off has_compute == 0 on the CPU path). */
-			if (!pair_ok && !_progs[slot].is_geom) {
+			/* No kernels: nothing the GPU could run - and no VS/FS pair was
+			   compiled, since it could never be dispatched anyway - so decline
+			   instead of caching an empty program whose draws would only ever
+			   bounce off has_compute == 0 on the CPU path. */
+			if (!_progs[slot].is_geom) {
 				pglc_program_free(&_progs[slot].prog);
 				memset(&_progs[slot].prog, 0, sizeof(_progs[slot].prog));
-				return PGL_G3D_PROG_INVALID;   /* errlog: the pair's decline text */
+				return PGL_G3D_PROG_INVALID;
 			}
 		} else if (!fs_done) {
 			struct pglc_program cres;
@@ -599,8 +644,6 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 	/* --- DISK CACHE STORE: serialize the freshly compiled program and persist
 	   it so the next launch skips the multi-minute mesa compile entirely. --- */
 	{
-		uint32_t gpu_ver = pgl_g3d_ensure_version();
-		uint64_t h64 = hash_sources_64(vert_glsl, frag_glsl);
 		if (gpu_ver != 0) {
 			struct pglc_blob_opts copts;
 			uint32_t total;

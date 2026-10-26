@@ -6,7 +6,7 @@ TASK_OBJS = $(ARCH)/imgui_demo.o $(ARCH)/imgui_main.o
 EXTRA_LIBS_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 
 # <EGL/egl.h> + <GLES2/gl2.h> and the imgui headers are installed into the
-# shared build include dir by libs/gles and libs/imgui.  -I.../include resolves
+# shared build include dir by libs/gles and projects/imgui.  -I.../include resolves
 # <EGL/...>, <GLES2/...> and "imgui/..."; -I.../include/imgui lets the backend
 # headers find their sibling "imgui.h".
 CFLAGS += -I.. -I $(EXTRA_LIBS_DIR)/include -I $(EXTRA_LIBS_DIR)/include/imgui -D__ewokos__
@@ -17,7 +17,7 @@ LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib
 # longer touches portablegl.  libGLESv2.a carries the engine and, on PGL_G3D
 # targets, the on-device mesa GLSL->QPU compiler, so the app links only
 # libimgui + libEGL + libGLESv2 (that order: imgui -> gl*, EGL -> engine).
-IMGUI_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui.a \
+IMGUI_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui_gles.a \
 	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
 

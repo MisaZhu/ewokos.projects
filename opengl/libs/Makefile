@@ -10,11 +10,11 @@
 # demos builds only the ported demos (balls.c, grass.cpp) -- its Makefile lists
 # the still-unported shadertoy/sphere/cubemap as a migration backlog.
 #
-# imgui is migrated to GLES2+EGL: its single renderer backend
-# (backends/imgui_impl_gles2.cpp) draws ImGui's VBO/element-stream through the
-# standard libGLESv2 GLSL ES 1.00 front end -- no portablegl, no VAOs, no
-# glPolygonMode.  It builds after gles so <GLES2/gl2.h> is installed.
-DIRS = gles glcommon demos imgui
+# imgui moved out of this tree to projects/imgui: it now builds two archives
+# (libimgui_gles.a on the GLES2 backend, libimgui_vk.a on the Vulkan backend)
+# and is ordered from projects/Makefile after opengl (GLES2 headers) and
+# vulkan (vulkan headers).
+DIRS = gles glcommon demos
 # clean still sweeps every dir so stale objects never linger.
 # gles clean cascades into portablegl + pglcompiler.
 

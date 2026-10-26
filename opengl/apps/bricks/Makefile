@@ -22,7 +22,7 @@ LDFLAGS += -L $(EXTRA_LIBS_DIR)/lib
 # entry points.  libGLESv2.a already contains the portablegl engine (and, on
 # PGL_G3D targets, the on-device mesa GLSL->QPU compiler), so the app links the
 # standard trio libglcommon + libEGL + libGLESv2 and never names portablegl or
-# pglcompiler.  libimgui.a is intentionally omitted (no HUD).
+# pglcompiler.  libimgui_gles.a is intentionally omitted (no HUD).
 GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libglcommon.a \
 	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a

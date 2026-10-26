@@ -17,7 +17,7 @@ TASK_OBJS = $(ARCH)/rainwin.$(HW).o
 EXTRA_LIBS_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 # <EGL/egl.h> + <GLES2/gl2.h> are installed into the shared build include dir by
 # libs/gles, and the Dear ImGui headers land there under include/imgui
-# (installed by libs/imgui).  rainwin is C++ (ImGui is C++): -I.. reaches the
+# (installed by projects/imgui).  rainwin is C++ (ImGui is C++): -I.. reaches the
 # app's own headers (rainwin_glsl.h), -I.../include resolves <EGL/...>,
 # <GLES2/...> and "imgui/...", and -I.../include/imgui lets the backend header
 # find its sibling "imgui.h".
@@ -78,7 +78,7 @@ $(TASK_OBJS): rainwin.cpp rainwin_glsl.h
 # (on PGL_G3D targets) the on-device mesa GLSL->QPU compiler, so an app links
 # only libimgui + libEGL + libGLESv2 (imgui -> gl*, EGL -> engine) and never
 # names portablegl or pglcompiler.
-GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui.a \
+GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui_gles.a \
 	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
 

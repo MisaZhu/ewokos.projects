@@ -196,6 +196,11 @@ typedef struct vk_device_memory {
     uint32_t      type_index;
     void         *host;          /* always host-resident in the software model */
     int32_t       gfx_shm;       /* >0: GPU-addressable contiguous shm backing */
+    uint32_t      content_version; /* bumped on any pixel write into this backing
+                                    * (transfer/clear/draw, or a map flush/unmap);
+                                    * the GPU graphics path keys its sampled-image
+                                    * tile cache on it so an unchanged texture is
+                                    * tiled into the TMU layout once, not per draw */
     void         *mapped;        /* non-NULL while mapped                      */
     VkDeviceSize  map_offset, map_size;
 } vk_device_memory;

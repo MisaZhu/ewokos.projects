@@ -87,7 +87,7 @@ static int win_height = 600;
 static int g_steps = 96;
 
 #ifdef PGL_G3D
-static int g_scale = 2;   /* faithful-compute render-scale denominator; argv "scaleN"
+static int g_scale = 1;   /* faithful-compute render-scale denominator; argv "scaleN"
                              (N=1..9) overrides, 1 = native full-res */
 #endif
 

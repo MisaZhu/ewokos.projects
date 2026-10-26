@@ -176,7 +176,27 @@ static uint32_t struct_member_type(spirv_module *m, uint32_t struct_tid, uint32_
 
 static uint32_t member_offset(spirv_module *m, uint32_t struct_tid, uint32_t member)
 {
-    return (uint32_t)spirv_deco_int(m, struct_tid, member, DecoOffset, 0);
+    int off = spirv_deco_int(m, struct_tid, member, DecoOffset, -1);
+    if (off >= 0)
+        return (uint32_t)off;
+    /* No Offset decoration: an interface block (an Input/Output struct such as
+     * gl_PerVertex or a {vec4 Color; vec2 UV;} varying block) has no std140
+     * member offsets, so lay its members out sequentially by natural size.  A
+     * valid UBO/SSBO struct always carries Offset decorations and is unaffected.
+     * fill_input / copyback_outputs use the same layout to map members to
+     * consecutive locations, keeping access-chain offsets consistent. */
+    {
+        spirv_type *t = spirv_type_find(m, struct_tid);
+        uint32_t i, acc = 0;
+        if (!t)
+            return 0;
+        for (i = 0; i < member && i < t->nmembers; i++) {
+            uint32_t mt = struct_member_type(m, struct_tid, i);
+            uint32_t ms = spirv_type_size(m, mt, NULL);
+            acc += ms ? ms : 16u;
+        }
+        return acc;
+    }
 }
 
 static uint32_t elem_stride(spirv_module *m, uint32_t tid)
@@ -479,11 +499,30 @@ static void fill_input(interp *st, uint32_t var_id, uint32_t pointee, uint8_t *b
         }
     }
     loc = spirv_deco_int(m, var_id, 0xffffffff, DecoLocation, -1);
-    if (loc >= 0 && loc < SPIRV_MAX_LOCATIONS) {
+    if (loc >= 0) {
         spirv_type *t = spirv_type_find(m, pointee);
-        uint32_t nc = (t && t->op == OpTypeVector) ? t->comps : 1;
-        if (nc > 4) nc = 4;
-        for (i = 0; (uint32_t)i < nc; i++) ((float *)b)[i] = r->in_loc[loc][i];
+        if (t && t->op == OpTypeStruct) {
+            /* Interface block: each member occupies consecutive locations and
+             * lives at its sequential byte offset within the variable buffer
+             * (matching member_offset).  ImGui's fragment input
+             * {vec4 Color; vec2 UV;} at location 0 maps Color->0, UV->1. */
+            uint32_t mj, l = (uint32_t)loc;
+            for (mj = 0; mj < t->nmembers; mj++) {
+                uint32_t mt = struct_member_type(m, pointee, mj);
+                uint32_t mo = member_offset(m, pointee, mj);
+                spirv_type *mtt = spirv_type_find(m, mt);
+                uint32_t nc = (mtt && mtt->op == OpTypeVector) ? mtt->comps : 1;
+                if (nc > 4) nc = 4;
+                if (l < SPIRV_MAX_LOCATIONS)
+                    for (i = 0; (uint32_t)i < nc; i++)
+                        ((float *)(b + mo))[i] = r->in_loc[l][i];
+                l += (mtt && mtt->op == OpTypeMatrix) ? mtt->comps : 1u;
+            }
+        } else if (loc < SPIRV_MAX_LOCATIONS) {
+            uint32_t nc = (t && t->op == OpTypeVector) ? t->comps : 1;
+            if (nc > 4) nc = 4;
+            for (i = 0; (uint32_t)i < nc; i++) ((float *)b)[i] = r->in_loc[loc][i];
+        }
     }
 }
 
@@ -858,7 +897,41 @@ static void copyback_outputs(interp *st)
         uint32_t var = st->out_id[k], tid = st->out_type[k];
         uint8_t *b = st->out_base[k];
         int builtin = spirv_deco_int(m, var, 0xffffffff, DecoBuiltIn, -1);
+        spirv_type *t = spirv_type_find(m, tid);
         sval v;
+
+        /* Interface blocks (gl_PerVertex, or a struct of user varyings such as
+         * ImGui's {vec4 Color; vec2 UV;}) carry their BuiltIn / Location on each
+         * MEMBER, not on the variable.  Expand every member to its own slot so
+         * gl_Position (a member builtin) and multi-member varying structs are
+         * captured; each member consumes consecutive locations. */
+        if (t && t->op == OpTypeStruct) {
+            int var_loc = spirv_deco_int(m, var, 0xffffffff, DecoLocation, -1);
+            uint32_t mj, l = (uint32_t)(var_loc >= 0 ? var_loc : 0);
+            for (mj = 0; mj < t->nmembers; mj++) {
+                uint32_t mt = struct_member_type(m, tid, mj);
+                uint32_t mo = member_offset(m, tid, mj);
+                spirv_type *mtt = spirv_type_find(m, mt);
+                int mb = spirv_deco_int(m, tid, mj, DecoBuiltIn, -1);
+                sval mv;
+                if (mem_load(st, &mv, b, mo, mt) != 0) {
+                    st->error = 0;
+                } else if (mb == BiPosition) {
+                    for (i = 0; i < 4; i++) r->position[i] = (float)comp_f(&mv, i);
+                    r->wrote_position = 1;
+                } else if (mb == BiPointSize) {
+                    r->point_size = (float)comp_f(&mv, 0);
+                } else if (var_loc >= 0 && l < SPIRV_MAX_LOCATIONS) {
+                    int nc = mv.n ? mv.n : 1, li;
+                    if (nc > 4) nc = 4;
+                    for (li = 0; li < nc; li++) r->out_loc[l][li] = (float)comp_f(&mv, li);
+                    if (l >= r->num_out_loc) r->num_out_loc = l + 1;
+                }
+                l += (mtt && mtt->op == OpTypeMatrix) ? mtt->comps : 1u;
+            }
+            continue;
+        }
+
         if (mem_load(st, &v, b, 0, tid) != 0) { st->error = 0; continue; }
         if (builtin == BiPosition) {
             for (i = 0; i < 4; i++) r->position[i] = (float)comp_f(&v, i);

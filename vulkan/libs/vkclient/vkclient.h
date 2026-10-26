@@ -104,12 +104,17 @@ int32_t vk_program_free(int32_t prog_handle);
 /* One combined-image-sampler binding for vk_gfx_draw: `host` points at a tightly
  * packed RGBA8 image (w * h * 4 bytes, row pitch w * 4).  vkclient tiles it into
  * the V3D sampler layout (the TMU cannot read linear raster memory) before the
- * draw.  `linear` selects the TMU filter (0 = NEAREST, non-zero = LINEAR). */
+ * draw.  `linear` selects the TMU filter (0 = NEAREST, non-zero = LINEAR).
+ * `version` is the source image's content generation (libvulkan's
+ * vk_device_memory.content_version): vkclient caches the tiled result per slot
+ * and reconverts only when host/w/h/linear/version differ from what the slot
+ * already holds, so a static texture is tiled ONCE rather than every draw. */
 typedef struct vk_gfx_tex {
     const void *host;
     uint32_t    w;
     uint32_t    h;
     int         linear;
+    uint32_t    version;
 } vk_gfx_tex;
 
 /* Upload a serialized two-pass geom blob (pglc_program_serialize output with

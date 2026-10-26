@@ -27,7 +27,7 @@ CXXFLAGS += -DPGL_G3D
 endif
 endif
 CXXFLAGS += -I$(SDK_DIR)/include -I$(SDK_DIR)/include/imgui -D__ewokos__ -fno-threadsafe-statics
-GLES_LIBS = $(SDK_DIR)/lib/libimgui.a $(SDK_DIR)/lib/libEGL.a $(SDK_DIR)/lib/libGLESv2.a
+GLES_LIBS = $(SDK_DIR)/lib/libimgui_gles.a $(SDK_DIR)/lib/libEGL.a $(SDK_DIR)/lib/libGLESv2.a
 SYSTEM_LIBS = $(foreach lib,ewoksys ewokstl x++ x font graph widget++ cxx,$(SDK_DIR)/lib/lib$(lib).a)
 PYTHON ?= python3
 HOST_CC ?= cc

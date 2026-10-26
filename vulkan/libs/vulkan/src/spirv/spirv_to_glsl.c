@@ -32,13 +32,23 @@
  * variables onto generated harness parameters instead of GLSL in/out. */
 enum { GM_NONE = 0, GM_XFORM = 1, GM_RASTER = 2 };
 
-/* One recorded graphics-stage interface variable (location in/out). */
+/* One recorded graphics-stage interface variable (location in/out).  A struct
+ * interface block (e.g. ImGui's `out struct { vec4 Color; vec2 UV; }`) is
+ * recorded as ONE entry with is_struct set: its members are expanded onto
+ * consecutive SPIR-V locations, matching spirv_interp.c fill_input. */
+#define KIFACE_MAX_MEMBERS 8
 typedef struct {
     uint32_t id;
     int      loc;
-    uint32_t comps;
-    char     tn[12];     /* GLSL value type ("float"/"vec2"/..)              */
+    uint32_t comps;      /* flat: component count; struct: unused            */
+    char     tn[12];     /* flat: value type; struct: the struct type name    */
     char     pname[24];  /* generated harness parameter / local name          */
+    int      is_struct;
+    int      nmembers;
+    uint32_t mcomps[KIFACE_MAX_MEMBERS];
+    int      mloc[KIFACE_MAX_MEMBERS];
+    char     mtn[KIFACE_MAX_MEMBERS][12];
+    int      mvoff[KIFACE_MAX_MEMBERS];   /* raster: per-member vout offset   */
 } kern_iface;
 
 typedef struct {
@@ -72,6 +82,8 @@ typedef struct {
     kern_iface kin[SPIRV_MAX_LOCATIONS];  int nkin;   /* inputs / varyings    */
     kern_iface kout[SPIRV_MAX_LOCATIONS]; int nkout;  /* VS outputs (varyings)*/
     int        has_position;               /* VS wrote gl_Position            */
+    int        pos_block;                  /* position written via gl_PerVertex block */
+    uint32_t   pos_block_member;           /* member index of gl_Position in that block */
     int        has_vertexid;               /* VS reads gl_VertexID            */
     int        has_fragcoord;              /* FS reads gl_FragCoord           */
     int        has_frontfacing;            /* FS reads gl_FrontFacing         */
@@ -1362,6 +1374,107 @@ static int flatten_block(gctx *c, uint32_t id, uint32_t struct_tid,
     return 0;
 }
 
+/* Declare a struct interface block (an Input/Output struct such as ImGui's
+ * `{vec4 Color; vec2 UV;}`) as a GLSL struct-typed harness variable.  Each
+ * member must be a 32-bit float scalar/vector and occupies one consecutive
+ * SPIR-V location, matching spirv_interp.c fill_input / copyback_outputs.  The
+ * struct type is emitted here (during the global scan) so it precedes every
+ * function that references it; member access chains resolve to `.mN` via
+ * build_access_chain / member_sel. */
+static int declare_iface_block(gctx *c, uint32_t id, uint32_t struct_tid,
+                               int loc, int is_out)
+{
+    spirv_type *st = spirv_type_find(c->m, struct_tid);
+    char nm[32], stn[16];
+    uint32_t mj;
+    int l = loc;
+    kern_iface *ki;
+
+    if (is_out && c->mode == GM_RASTER)
+        return decl(c, "struct fragment output unsupported");
+    if (!st || st->nmembers == 0 || st->nmembers > KIFACE_MAX_MEMBERS)
+        return decl(c, "interface block member count unsupported");
+
+    if (is_out) {
+        if (c->nkout >= SPIRV_MAX_LOCATIONS) return decl(c, "too many vertex outputs");
+        ki = &c->kout[c->nkout];
+    } else {
+        if (c->nkin >= SPIRV_MAX_LOCATIONS) return decl(c, "too many inputs");
+        ki = &c->kin[c->nkin];
+    }
+    memset(ki, 0, sizeof(*ki));
+    ki->id = id; ki->loc = loc; ki->is_struct = 1;
+    for (mj = 0; mj < st->nmembers; mj++) {
+        uint32_t mt = struct_member_type(c, struct_tid, mj);
+        uint32_t mc = 0;
+        if (iface_float_comps(c, mt, &mc) != 0) return -1;
+        if (type_name(c, mt, ki->mtn[mj], sizeof ki->mtn[mj]) != 0) return -1;
+        ki->mcomps[mj] = mc;
+        ki->mloc[mj] = l;
+        l += 1;   /* a float scalar/vector member consumes exactly one location */
+    }
+    ki->nmembers = (int)st->nmembers;
+
+    snprintf(nm, sizeof nm, is_out ? "ko%d" : "ki%d", loc);
+    snprintf(stn, sizeof stn, "S%s", nm);
+    snprintf(ki->pname, sizeof ki->pname, "%s", nm);
+    snprintf(ki->tn, sizeof ki->tn, "%s", stn);
+
+    gf(c, "struct %s {\n", stn);
+    for (mj = 0; mj < st->nmembers; mj++)
+        gf(c, "    %s m%u;\n", ki->mtn[mj], mj);
+    gf(c, "};\n");
+
+    set_name(c, id, nm);
+    c->is_ptr[id] = 1;
+    if (is_out) c->nkout++; else c->nkin++;
+    return 0;
+}
+
+/* Handle the gl_PerVertex output interface block: Vulkan GLSL wraps the
+ * position in `out gl_PerVertex { vec4 gl_Position; };`, so the variable has no
+ * Location decoration and its MEMBERS carry the BuiltIn decorations.  Only
+ * gl_Position is meaningful to the geometry kernels, so record its member index
+ * and declare a matching GLSL struct type + harness variable (vkPerVertex);
+ * gen_xform_kernel aliases vkPosition to the Position member after the call. */
+static int declare_pervertex_block(gctx *c, uint32_t id, uint32_t struct_tid)
+{
+    spirv_type *st = spirv_type_find(c->m, struct_tid);
+    uint32_t mj;
+    int pos_member = -1;
+
+    if (c->mode != GM_XFORM)
+        return decl(c, "gl_PerVertex block on a non-vertex kernel");
+    if (!st || st->nmembers == 0 || st->nmembers > KIFACE_MAX_MEMBERS)
+        return decl(c, "bad gl_PerVertex block");
+
+    for (mj = 0; mj < st->nmembers; mj++) {
+        uint32_t mt = struct_member_type(c, struct_tid, mj);
+        uint32_t mc = 0;
+        int mb = spirv_deco_int(c->m, struct_tid, mj, DecoBuiltIn, -1);
+        if (iface_float_comps(c, mt, &mc) != 0) return -1;
+        if (mb == BiPosition) pos_member = (int)mj;
+    }
+    if (pos_member < 0)
+        return decl(c, "gl_PerVertex block without gl_Position");
+
+    gf(c, "struct vkPerVertex_t {\n");
+    for (mj = 0; mj < st->nmembers; mj++) {
+        uint32_t mt = struct_member_type(c, struct_tid, mj);
+        char tn[12];
+        if (type_name(c, mt, tn, sizeof tn) != 0) return -1;
+        gf(c, "    %s m%u;\n", tn, mj);
+    }
+    gf(c, "};\n");
+
+    c->has_position = 1;
+    c->pos_block = 1;
+    c->pos_block_member = (uint32_t)pos_member;
+    set_name(c, id, "vkPerVertex");
+    c->is_ptr[id] = 1;
+    return 0;
+}
+
 /* Declare one module-scope OpVariable for a generated kernel.  Interface
  * variables are RECORDED (not emitted as GLSL in/out) and bound to harness
  * parameter names; samplers are emitted as TMU uniforms (raster pass only);
@@ -1410,7 +1523,18 @@ static int declare_global_var_kernel(gctx *c, const spirv_insn *in)
                 return decl(c, "unsupported fragment built-in");
             }
         }
-        if (loc < 0) return decl(c, "interface variable without a location");
+        if (loc < 0) {
+            /* no location + no var-level builtin: the gl_PerVertex output block
+             * (its members carry the BuiltIn decorations instead). */
+            if (is_out && bt && bt->op == OpTypeStruct)
+                return declare_pervertex_block(c, id, pointee);
+            return decl(c, "interface variable without a location");
+        }
+        {
+            spirv_type *st = spirv_type_find(c->m, pointee);
+            if (st && st->op == OpTypeStruct)
+                return declare_iface_block(c, id, pointee, loc, is_out);
+        }
         if (iface_float_comps(c, pointee, &comps) != 0) return -1;
         if (type_name(c, pointee, tn, sizeof tn) != 0) return -1;
         if (is_out && c->mode == GM_RASTER) {
@@ -1541,22 +1665,37 @@ static char *gen_xform_kernel(spirv_module *m, const spirv_entry *e,
     L->num_flat = c.nflat;
     memcpy(L->flat, c.flat, sizeof(c.flat[0]) * (size_t)c.nflat);
 
-    /* attribute / vout layout */
-    L->num_attrs = c.nkin;
-    for (j = 0; j < c.nkin; j++) {
-        L->attrs[j].location = (uint32_t)c.kin[j].loc;
-        L->attrs[j].offset = aoff;
-        L->attrs[j].comps = c.kin[j].comps;
-        aoff += c.kin[j].comps;
-    }
-    L->attr_stride = aoff;
-    L->num_varyings = c.nkout;
-    for (j = 0; j < c.nkout; j++) {
-        L->varyings[j].location = (uint32_t)c.kout[j].loc;
-        L->varyings[j].offset = voff;
-        L->varyings[j].comps = c.kout[j].comps;
-        voff += c.kout[j].comps;
-        nvar += c.kout[j].comps;
+    /* attribute / vout layout (struct interface blocks expand to one slot per
+     * member, matching the consecutive locations recorded by declare_iface_block) */
+    {
+        int na = 0, nv = 0, mk;
+        for (j = 0; j < c.nkin; j++) {
+            int nm = c.kin[j].is_struct ? c.kin[j].nmembers : 1;
+            for (mk = 0; mk < nm; mk++) {
+                uint32_t mc = c.kin[j].is_struct ? c.kin[j].mcomps[mk] : c.kin[j].comps;
+                int      ml = c.kin[j].is_struct ? c.kin[j].mloc[mk]   : c.kin[j].loc;
+                if (na >= SPIRV_MAX_LOCATIONS) { decl(&c, "too many attribute slots"); goto done; }
+                L->attrs[na].location = (uint32_t)ml;
+                L->attrs[na].offset = aoff;
+                L->attrs[na].comps = mc;
+                aoff += mc; na++;
+            }
+        }
+        L->num_attrs = na;
+        L->attr_stride = aoff;
+        for (j = 0; j < c.nkout; j++) {
+            int nm = c.kout[j].is_struct ? c.kout[j].nmembers : 1;
+            for (mk = 0; mk < nm; mk++) {
+                uint32_t mc = c.kout[j].is_struct ? c.kout[j].mcomps[mk] : c.kout[j].comps;
+                int      ml = c.kout[j].is_struct ? c.kout[j].mloc[mk]   : c.kout[j].loc;
+                if (nv >= SPIRV_MAX_LOCATIONS) { decl(&c, "too many varying slots"); goto done; }
+                L->varyings[nv].location = (uint32_t)ml;
+                L->varyings[nv].offset = voff;
+                L->varyings[nv].comps = mc;
+                voff += mc; nvar += mc; nv++;
+            }
+        }
+        L->num_varyings = nv;
     }
     L->vout_stride = 8 + 4 * ((nvar + 3) / 4);
     L->uses_vertex_id = c.has_vertexid;
@@ -1573,7 +1712,8 @@ static char *gen_xform_kernel(spirv_module *m, const spirv_entry *e,
     gf(&c, "void vk_vs(");
     for (j = 0; j < c.nkin; j++) { gf(&c, "%sin %s %s", sep, c.kin[j].tn, c.kin[j].pname); sep = ", "; }
     if (c.has_vertexid) { gf(&c, "%sin int vkVertexIndex", sep); sep = ", "; }
-    gf(&c, "%sinout vec4 vkPosition", sep); sep = ", ";
+    if (c.pos_block) { gf(&c, "%sinout vkPerVertex_t vkPerVertex", sep); sep = ", "; }
+    else             { gf(&c, "%sinout vec4 vkPosition", sep); sep = ", "; }
     for (j = 0; j < c.nkout; j++) { gf(&c, "%sinout %s %s", sep, c.kout[j].tn, c.kout[j].pname); sep = ", "; }
     gf(&c, ") {\n");
     declare_phis(&c, 1);
@@ -1587,27 +1727,59 @@ static char *gen_xform_kernel(spirv_module *m, const spirv_entry *e,
     gf(&c, "    int vkVid = int(gl_WorkGroupID.x) * 64 + int(gl_LocalInvocationID.y) * 8 + int(gl_LocalInvocationID.x);\n");
     gf(&c, "    if (vkVid >= uVertCount) return;\n");
     if (L->attr_stride) gf(&c, "    int abase = vkVid * %u;\n", L->attr_stride);
-    for (j = 0; j < c.nkin; j++) {
-        uint32_t off = L->attrs[j].offset, comps = c.kin[j].comps;
-        if (comps == 1) {
-            gf(&c, "    %s %s = vattr[abase + %u];\n", c.kin[j].tn, c.kin[j].pname, off);
-        } else {
-            gf(&c, "    %s %s = %s(", c.kin[j].tn, c.kin[j].pname, c.kin[j].tn);
-            for (k = 0; k < (int)comps; k++)
-                gf(&c, "%svattr[abase + %u]", k ? ", " : "", off + (uint32_t)k);
-            gf(&c, ");\n");
+    {
+        int as = 0, mk;
+        for (j = 0; j < c.nkin; j++) {
+            if (c.kin[j].is_struct) {
+                gf(&c, "    %s %s = %s(", c.kin[j].tn, c.kin[j].pname, c.kin[j].tn);
+                for (mk = 0; mk < c.kin[j].nmembers; mk++) {
+                    uint32_t off = L->attrs[as].offset, mc = c.kin[j].mcomps[mk], q;
+                    gf(&c, "%s", mk ? ", " : "");
+                    if (mc == 1) gf(&c, "vattr[abase + %u]", off);
+                    else {
+                        gf(&c, "%s(", c.kin[j].mtn[mk]);
+                        for (q = 0; q < mc; q++) gf(&c, "%svattr[abase + %u]", q ? ", " : "", off + q);
+                        gf(&c, ")");
+                    }
+                    as++;
+                }
+                gf(&c, ");\n");
+            } else {
+                uint32_t off = L->attrs[as].offset, comps = c.kin[j].comps;
+                if (comps == 1) {
+                    gf(&c, "    %s %s = vattr[abase + %u];\n", c.kin[j].tn, c.kin[j].pname, off);
+                } else {
+                    gf(&c, "    %s %s = %s(", c.kin[j].tn, c.kin[j].pname, c.kin[j].tn);
+                    for (k = 0; k < (int)comps; k++)
+                        gf(&c, "%svattr[abase + %u]", k ? ", " : "", off + (uint32_t)k);
+                    gf(&c, ");\n");
+                }
+                as++;
+            }
         }
     }
-    gf(&c, "    vec4 vkPosition = vec4(0.0);\n");
-    for (j = 0; j < c.nkout; j++)
-        gf(&c, "    %s %s = %s(0.0);\n", c.kout[j].tn, c.kout[j].pname, c.kout[j].tn);
+    if (c.pos_block) gf(&c, "    vkPerVertex_t vkPerVertex;\n");
+    else             gf(&c, "    vec4 vkPosition = vec4(0.0);\n");
+    for (j = 0; j < c.nkout; j++) {
+        if (c.kout[j].is_struct) {
+            int mk;
+            gf(&c, "    %s %s = %s(", c.kout[j].tn, c.kout[j].pname, c.kout[j].tn);
+            for (mk = 0; mk < c.kout[j].nmembers; mk++)
+                gf(&c, "%s%s(0.0)", mk ? ", " : "", c.kout[j].mtn[mk]);
+            gf(&c, ");\n");
+        } else {
+            gf(&c, "    %s %s = %s(0.0);\n", c.kout[j].tn, c.kout[j].pname, c.kout[j].tn);
+        }
+    }
     sep = "";
     gf(&c, "    vk_vs(");
     for (j = 0; j < c.nkin; j++) { gf(&c, "%s%s", sep, c.kin[j].pname); sep = ", "; }
     if (c.has_vertexid) { gf(&c, "%svkVid + uVertexBase", sep); sep = ", "; }
-    gf(&c, "%svkPosition", sep); sep = ", ";
+    gf(&c, "%s%s", sep, c.pos_block ? "vkPerVertex" : "vkPosition"); sep = ", ";
     for (j = 0; j < c.nkout; j++) { gf(&c, "%s%s", sep, c.kout[j].pname); sep = ", "; }
     gf(&c, ");\n");
+    if (c.pos_block)
+        gf(&c, "    vec4 vkPosition = vkPerVertex.m%u;\n", c.pos_block_member);
     /* viewport transform + pack (Vulkan conventions, matching transform_vertex) */
     gf(&c, "    float w = vkPosition.w;\n");
     gf(&c, "    float iw = (w > 0.0) ? (1.0 / w) : 0.0;\n");
@@ -1626,11 +1798,26 @@ static char *gen_xform_kernel(spirv_module *m, const spirv_entry *e,
     gf(&c, "    vout[vbase + 5] = 0.0;\n");
     gf(&c, "    vout[vbase + 6] = 0.0;\n");
     gf(&c, "    vout[vbase + 7] = 0.0;\n");
-    for (j = 0; j < c.nkout; j++) {
-        uint32_t off = L->varyings[j].offset, comps = c.kout[j].comps;
-        for (k = 0; k < (int)comps; k++) {
-            comp_sel(comps, (uint32_t)k, sel, sizeof sel);
-            gf(&c, "    vout[vbase + %u] = %s%s;\n", off + (uint32_t)k, c.kout[j].pname, sel);
+    {
+        int vs = 0, mk;
+        for (j = 0; j < c.nkout; j++) {
+            if (c.kout[j].is_struct) {
+                for (mk = 0; mk < c.kout[j].nmembers; mk++) {
+                    uint32_t off = L->varyings[vs].offset, mc = c.kout[j].mcomps[mk];
+                    for (k = 0; k < (int)mc; k++) {
+                        comp_sel(mc, (uint32_t)k, sel, sizeof sel);
+                        gf(&c, "    vout[vbase + %u] = %s.m%d%s;\n", off + (uint32_t)k, c.kout[j].pname, mk, sel);
+                    }
+                    vs++;
+                }
+            } else {
+                uint32_t off = L->varyings[vs].offset, comps = c.kout[j].comps;
+                for (k = 0; k < (int)comps; k++) {
+                    comp_sel(comps, (uint32_t)k, sel, sizeof sel);
+                    gf(&c, "    vout[vbase + %u] = %s%s;\n", off + (uint32_t)k, c.kout[j].pname, sel);
+                }
+                vs++;
+            }
         }
     }
     gf(&c, "}\n");
@@ -1743,12 +1930,26 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
         if (!voff) { decl(&c, "out of memory"); goto done; }
         for (j = 0; j < c.nkin; j++) {
             uint32_t vc = 0;
-            off = find_varying_off(L, c.kin[j].loc, &vc);
-            if (off >= 0 && c.kin[j].comps > vc) {
-                decl(&c, "fragment input wider than the vertex output");
-                goto done;
+            if (c.kin[j].is_struct) {
+                int mk;
+                for (mk = 0; mk < c.kin[j].nmembers; mk++) {
+                    vc = 0;
+                    off = find_varying_off(L, c.kin[j].mloc[mk], &vc);
+                    if (off >= 0 && c.kin[j].mcomps[mk] > vc) {
+                        decl(&c, "fragment input wider than the vertex output");
+                        goto done;
+                    }
+                    c.kin[j].mvoff[mk] = off;
+                }
+                voff[j] = 0;   /* unused: struct members carry their own offsets */
+            } else {
+                off = find_varying_off(L, c.kin[j].loc, &vc);
+                if (off >= 0 && c.kin[j].comps > vc) {
+                    decl(&c, "fragment input wider than the vertex output");
+                    goto done;
+                }
+                voff[j] = off;
             }
-            voff[j] = off;
         }
         Lout->num_samplers = c.nsampler;
         for (j = 0; j < c.nsampler; j++) {
@@ -1839,9 +2040,17 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
     /* hoist every interpolated varying's three per-vertex component loads */
     if (fs) {
         for (j = 0; j < c.nkin; j++) {
-            if (voff[j] < 0) continue;
-            snprintf(tag, sizeof tag, "%d_", j);
-            emit_vary_loads(&c, vstride, voff[j], c.kin[j].comps, tag);
+            if (c.kin[j].is_struct) {
+                int mk;
+                for (mk = 0; mk < c.kin[j].nmembers; mk++) {
+                    if (c.kin[j].mvoff[mk] < 0) continue;
+                    snprintf(tag, sizeof tag, "%d_%d_", j, mk);
+                    emit_vary_loads(&c, vstride, c.kin[j].mvoff[mk], c.kin[j].mcomps[mk], tag);
+                }
+            } else if (voff[j] >= 0) {
+                snprintf(tag, sizeof tag, "%d_", j);
+                emit_vary_loads(&c, vstride, voff[j], c.kin[j].comps, tag);
+            }
         }
     } else {
         emit_vary_loads(&c, vstride, voff[0], 4, "0_");
@@ -1885,7 +2094,23 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
     gf(&c, "        int idx = py * uFbStride + px;\n");
     if (fs) {
         for (j = 0; j < c.nkin; j++) {
-            if (voff[j] < 0) {
+            if (c.kin[j].is_struct) {
+                int mk;
+                for (mk = 0; mk < c.kin[j].nmembers; mk++) {
+                    snprintf(tag, sizeof tag, "%d_%d_", j, mk);
+                    if (c.kin[j].mvoff[mk] < 0) {
+                        gf(&c, "        %s m%d_%d = %s(0.0);\n", c.kin[j].mtn[mk], j, mk, c.kin[j].mtn[mk]);
+                    } else {
+                        char mt[24];
+                        snprintf(mt, sizeof mt, "m%d_%d", j, mk);
+                        emit_vary_interp(&c, c.kin[j].mtn[mk], c.kin[j].mcomps[mk], tag, mt, 2);
+                    }
+                }
+                gf(&c, "        %s %s = %s(", c.kin[j].tn, c.kin[j].pname, c.kin[j].tn);
+                for (mk = 0; mk < c.kin[j].nmembers; mk++)
+                    gf(&c, "%sm%d_%d", mk ? ", " : "", j, mk);
+                gf(&c, ");\n");
+            } else if (voff[j] < 0) {
                 gf(&c, "        %s %s = %s(0.0);\n", c.kin[j].tn, c.kin[j].pname, c.kin[j].tn);
             } else {
                 snprintf(tag, sizeof tag, "%d_", j);
@@ -1915,8 +2140,23 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
     gf(&c, "                if (d >= depth[idx]) continue;\n");
     gf(&c, "            }\n");
     gf(&c, "        }\n");
-    /* pack the colour into the fb word (RGBA8 or BGRA8 memory order) */
+    /* pack the colour into the fb word (RGBA8 or BGRA8 memory order).  When
+     * uBlendMode != 0, blend against the current fb word first: mode 1 is the
+     * canonical SRC_ALPHA/ONE_MINUS_SRC_ALPHA (colour) + ONE/ONE_MINUS_SRC_ALPHA
+     * (alpha) combination used by ImGui, matching cpu_raster.c blend_pixel. */
     gf(&c, "        vec4 cc = clamp(vkColor, 0.0, 1.0);\n");
+    gf(&c, "        if (uBlendMode != 0) {\n");
+    gf(&c, "            uint dw = fb[idx];\n");
+    gf(&c, "            uint dr8, dg8, db8;\n");
+    gf(&c, "            if (uFbSwizzle == 0) { dr8 = dw & 255u; dg8 = (dw >> 8) & 255u; db8 = (dw >> 16) & 255u; }\n");
+    gf(&c, "            else                 { db8 = dw & 255u; dg8 = (dw >> 8) & 255u; dr8 = (dw >> 16) & 255u; }\n");
+    gf(&c, "            float da = float((dw >> 24) & 255u) / 255.0;\n");
+    gf(&c, "            vec3  dc = vec3(float(dr8), float(dg8), float(db8)) / 255.0;\n");
+    gf(&c, "            float sa = cc.a;\n");
+    gf(&c, "            vec3  oc = cc.rgb * sa + dc * (1.0 - sa);\n");
+    gf(&c, "            float oa = sa + da * (1.0 - sa);\n");
+    gf(&c, "            cc = clamp(vec4(oc, oa), 0.0, 1.0);\n");
+    gf(&c, "        }\n");
     gf(&c, "        uint r8 = uint(cc.r * 255.0 + 0.5);\n");
     gf(&c, "        uint g8 = uint(cc.g * 255.0 + 0.5);\n");
     gf(&c, "        uint b8 = uint(cc.b * 255.0 + 0.5);\n");

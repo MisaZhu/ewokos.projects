@@ -227,6 +227,7 @@ typedef struct {
     float sx, sy, sz;                  /* framebuffer-space position         */
     float inv_w;
     float vary[CPU_MAX_VARYING][4];    /* perspective-divided varyings        */
+    uint32_t num_vary;                 /* active varying slots the VS wrote   */
     int   valid;
 } vtx_out;
 
@@ -274,9 +275,17 @@ static int shade_vertex(vk_pipeline *p, vk_draw_ctx *dc, const spirv_module *mod
 
     o->clip[0] = res.position[0]; o->clip[1] = res.position[1];
     o->clip[2] = res.position[2]; o->clip[3] = res.position[3];
-    for (i = 0; i < SPIRV_MAX_LOCATIONS; i++) {
-        o->vary[i][0] = res.out_loc[i][0]; o->vary[i][1] = res.out_loc[i][1];
-        o->vary[i][2] = res.out_loc[i][2]; o->vary[i][3] = res.out_loc[i][3];
+    {
+        /* Only the varying slots the VS actually wrote need interpolating and
+         * feeding to the FS; carrying all SPIRV_MAX_LOCATIONS costs 4 divides
+         * per unused slot per fragment (ImGui writes just 2 of 16). */
+        uint32_t nv = res.num_out_loc;
+        if (nv > CPU_MAX_VARYING) nv = CPU_MAX_VARYING;
+        o->num_vary = nv;
+        for (i = 0; i < nv; i++) {
+            o->vary[i][0] = res.out_loc[i][0]; o->vary[i][1] = res.out_loc[i][1];
+            o->vary[i][2] = res.out_loc[i][2]; o->vary[i][3] = res.out_loc[i][3];
+        }
     }
     o->valid = 1;
     return 0;
@@ -298,7 +307,7 @@ static void transform_vertex(const VkViewport *vp, vtx_out *o)
 static int shade_fragment(vk_pipeline *p, vk_draw_ctx *dc, const spirv_module *mod,
                           const spirv_entry *e, float fx, float fy, float fz,
                           float inv_w, const float vary[CPU_MAX_VARYING][4],
-                          int front_facing, float out_rgba[4])
+                          uint32_t nvar, int front_facing, float out_rgba[4])
 {
     spirv_resources res;
     uint32_t i;
@@ -309,11 +318,11 @@ static int shade_fragment(vk_pipeline *p, vk_draw_ctx *dc, const spirv_module *m
     res.frag_coord[0] = fx; res.frag_coord[1] = fy;
     res.frag_coord[2] = fz; res.frag_coord[3] = inv_w;
     res.front_facing = front_facing;
-    for (i = 0; i < SPIRV_MAX_LOCATIONS; i++) {
+    for (i = 0; i < nvar && i < SPIRV_MAX_LOCATIONS; i++) {
         res.in_loc[i][0] = vary[i][0]; res.in_loc[i][1] = vary[i][1];
         res.in_loc[i][2] = vary[i][2]; res.in_loc[i][3] = vary[i][3];
     }
-    res.num_in_loc = SPIRV_MAX_LOCATIONS;
+    res.num_in_loc = nvar;
     if (e) {
         if (spirv_run(mod, e, &res) != 0)
             return -1;
@@ -380,7 +389,11 @@ static void raster_triangle(vk_pipeline *p, vk_draw_ctx *dc, const rt_state *rt,
     float area = edge(v0->sx, v0->sy, v1->sx, v1->sy, v2->sx, v2->sy);
     float minx, miny, maxx, maxy;
     int x0i, y0i, x1i, y1i, px, py, front;
+    uint32_t nvar;
     if (area == 0.0f) return;
+    nvar = v0->num_vary;
+    if (v1->num_vary > nvar) nvar = v1->num_vary;
+    if (v2->num_vary > nvar) nvar = v2->num_vary;
 
     /* back-face culling (area sign in framebuffer space, y-down) */
     front = (area < 0.0f) ? 1 : 0;
@@ -440,7 +453,7 @@ static void raster_triangle(vk_pipeline *p, vk_draw_ctx *dc, const rt_state *rt,
             /* perspective-correct interpolation */
             iw = b0*v0->inv_w + b1*v1->inv_w + b2*v2->inv_w;
             z = b0*v0->sz + b1*v1->sz + b2*v2->sz;
-            for (li = 0; li < CPU_MAX_VARYING; li++) {
+            for (li = 0; li < nvar; li++) {
                 int k;
                 float acc[4] = {0,0,0,0};
                 for (k = 0; k < 4; k++)
@@ -454,7 +467,7 @@ static void raster_triangle(vk_pipeline *p, vk_draw_ctx *dc, const rt_state *rt,
                     vary[li][0]=vary[li][1]=vary[li][2]=vary[li][3]=0.0f;
                 }
             }
-            st = shade_fragment(p, dc, fmod, fe, cx, cy, z, iw, vary, front, rgba);
+            st = shade_fragment(p, dc, fmod, fe, cx, cy, z, iw, vary, nvar, front, rgba);
             if (st != 0) continue;   /* decline or discard */
             write_fragment(p, rt, (uint32_t)px, (uint32_t)py, z, rgba);
         }
@@ -473,9 +486,9 @@ static void raster_point(vk_pipeline *p, vk_draw_ctx *dc, const rt_state *rt,
     if (has_sc && (px < sc->offset.x || py < sc->offset.y ||
         px >= sc->offset.x + (int)sc->extent.width ||
         py >= sc->offset.y + (int)sc->extent.height)) return;
-    for (li = 0; li < CPU_MAX_VARYING; li++)
+    for (li = 0; li < v->num_vary; li++)
         memcpy(vary[li], v->vary[li], 4 * sizeof(float));
-    if (shade_fragment(p, dc, fmod, fe, v->sx, v->sy, v->sz, v->inv_w, vary, 1, rgba) == 0)
+    if (shade_fragment(p, dc, fmod, fe, v->sx, v->sy, v->sz, v->inv_w, vary, v->num_vary, 1, rgba) == 0)
         write_fragment(p, rt, (uint32_t)px, (uint32_t)py, v->sz, rgba);
 }
 
@@ -486,6 +499,7 @@ static void raster_line(vk_pipeline *p, vk_draw_ctx *dc, const rt_state *rt,
     float dx = b->sx - a->sx, dy = b->sy - a->sy;
     int steps = (int)(fabsf(dx) > fabsf(dy) ? fabsf(dx) : fabsf(dy));
     int i;
+    uint32_t nvar = (a->num_vary > b->num_vary) ? a->num_vary : b->num_vary;
     if (steps < 1) steps = 1;
     for (i = 0; i <= steps; i++) {
         float t = (float)i / (float)steps;
@@ -495,7 +509,8 @@ static void raster_line(vk_pipeline *p, vk_draw_ctx *dc, const rt_state *rt,
         int px, py;
         v.sx = a->sx + dx * t; v.sy = a->sy + dy * t; v.sz = a->sz + (b->sz - a->sz) * t;
         v.inv_w = a->inv_w + (b->inv_w - a->inv_w) * t;
-        for (li = 0; li < CPU_MAX_VARYING; li++) {
+        v.num_vary = nvar;
+        for (li = 0; li < nvar; li++) {
             int k;
             for (k = 0; k < 4; k++)
                 v.vary[li][k] = a->vary[li][k] + (b->vary[li][k] - a->vary[li][k]) * t;
@@ -505,9 +520,9 @@ static void raster_line(vk_pipeline *p, vk_draw_ctx *dc, const rt_state *rt,
         if (has_sc && (px < sc->offset.x || py < sc->offset.y ||
             px >= sc->offset.x + (int)sc->extent.width ||
             py >= sc->offset.y + (int)sc->extent.height)) continue;
-        for (li = 0; li < CPU_MAX_VARYING; li++)
+        for (li = 0; li < nvar; li++)
             memcpy(vary[li], v.vary[li], 4 * sizeof(float));
-        if (shade_fragment(p, dc, fmod, fe, v.sx, v.sy, v.sz, v.inv_w, vary, 1, rgba) == 0)
+        if (shade_fragment(p, dc, fmod, fe, v.sx, v.sy, v.sz, v.inv_w, vary, nvar, 1, rgba) == 0)
             write_fragment(p, rt, (uint32_t)px, (uint32_t)py, v.sz, rgba);
     }
 }

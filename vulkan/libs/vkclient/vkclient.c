@@ -218,6 +218,23 @@ int32_t vk_program_free(int32_t prog_handle)
 static vk_stage_t _fb, _z, _attr, _unif;
 static vk_stage_t _tex[VKCLIENT_MAX_TEX];
 
+/* Per-slot key describing what is currently tiled into _tex[i].px.  A sampled
+ * image whose host pointer, size, filter and content version all still match
+ * this key is byte-for-byte what was tiled on the previous draw, so the TMU
+ * conversion (pglc_tex_store_2d) is skipped.  The version comes from the image's
+ * vk_device_memory content_version, bumped on every host-side pixel write, so a
+ * texture that changes re-tiles while a static one is converted exactly once. */
+typedef struct {
+    const void *host;
+    uint32_t    w;
+    uint32_t    h;
+    int         linear;
+    uint32_t    version;
+    int         valid;
+} vk_tex_key_t;
+
+static vk_tex_key_t _tex_key[VKCLIENT_MAX_TEX];
+
 /* Ensure `s` holds at least `need` bytes, growing with headroom so a render
  * target that resizes by a few pixels does not realloc every frame.  Returns 1
  * on success (s->px valid, s->cap >= need) or 0 on allocation failure (s reset).
@@ -265,6 +282,7 @@ static void gfx_abandon_staging(void)
         _tex[i].px = NULL;
         _tex[i].shm = 0;
         _tex[i].cap = 0;
+        _tex_key[i].valid = 0;   /* tiling discarded with the canvas */
     }
 }
 
@@ -376,21 +394,39 @@ int32_t vk_gfx_draw(int32_t prog_handle,
     /* Tile each bound combined-image-sampler into its persistent canvas.  V3D's
      * TMU cannot sample linear raster memory (pglc_tex_sampler_reads_raster() ==
      * false), so the RGBA8 host image is converted to the backend's tiled level-0
-     * layout every draw (correctness first; per-image change detection is a later
-     * optimisation). */
+     * layout.  The conversion is skipped while the slot's key (host/size/filter/
+     * content version) is unchanged, so a static texture is tiled once instead of
+     * every draw; any host-side write bumps the version and forces a re-tile. */
     ntex_bound = 0;
     if (tex != NULL) {
         for (i = 0; i < ntex && i < VKCLIENT_MAX_TEX; i++) {
             struct pglc_tex_layout layout;
+            uint32_t *prev_px;
             if (tex[i].host == NULL || tex[i].w == 0 || tex[i].h == 0)
                 break;   /* an unbound slot ends the contiguous binding run */
             if (!pglc_tex_layout_2d(tex[i].w, tex[i].h, 4u, &layout) ||
                 layout.size == 0)
                 return G2D_ERR_FAILED;
+            prev_px = _tex[i].px;
             if (!ensure_stage(&_tex[i], layout.size))
                 return G2D_ERR_FAILED;
-            pglc_tex_store_2d(_tex[i].px, tex[i].host, tex[i].w * 4u,
-                              tex[i].w, tex[i].h, 4u, &layout);
+            if (_tex[i].px != prev_px)      /* a grow realloc discards tiling */
+                _tex_key[i].valid = 0;
+            if (!(_tex_key[i].valid &&
+                  _tex_key[i].host == tex[i].host &&
+                  _tex_key[i].w == tex[i].w &&
+                  _tex_key[i].h == tex[i].h &&
+                  _tex_key[i].linear == tex[i].linear &&
+                  _tex_key[i].version == tex[i].version)) {
+                pglc_tex_store_2d(_tex[i].px, tex[i].host, tex[i].w * 4u,
+                                  tex[i].w, tex[i].h, 4u, &layout);
+                _tex_key[i].host = tex[i].host;
+                _tex_key[i].w = tex[i].w;
+                _tex_key[i].h = tex[i].h;
+                _tex_key[i].linear = tex[i].linear;
+                _tex_key[i].version = tex[i].version;
+                _tex_key[i].valid = 1;
+            }
             ntex_bound = i + 1;
         }
     }

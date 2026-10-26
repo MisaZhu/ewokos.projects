@@ -69,7 +69,7 @@ extern "C" void pgl_g3d_set_render_scale(int scale);
 static int win_width  = 800;
 static int win_height = 600;
 #ifdef PGL_G3D
-static int g_scale = 2;   /* faithful-compute render-scale denominator; argv "scaleN"
+static int g_scale = 1;   /* faithful-compute render-scale denominator; argv "scaleN"
                              (N=1..9) overrides, 1 = native full-res */
 #endif
 

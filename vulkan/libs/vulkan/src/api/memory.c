@@ -91,14 +91,25 @@ VKAPI_ATTR void VKAPI_CALL vkUnmapMemory(VkDevice device, VkDeviceMemory memory)
 {
     vk_device_memory *m = (vk_device_memory *)VK_H2P(memory);
     (void)device;
-    if (m) { m->mapped = NULL; m->map_size = 0; }
+    /* Unmap is the app's signal that it finished writing the mapping; bump the
+     * content version so any GPU-side tiling of an image in this backing is
+     * redone on the next draw that samples it. */
+    if (m) { m->content_version++; m->mapped = NULL; m->map_size = 0; }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkFlushMappedMemoryRanges(
     VkDevice device, uint32_t memoryRangeCount, const VkMappedMemoryRange *pMemoryRanges)
 {
-    (void)device; (void)memoryRangeCount; (void)pMemoryRanges;
-    return VK_SUCCESS;   /* host-coherent: nothing to flush */
+    uint32_t i;
+    (void)device;
+    /* Host-coherent, so there is nothing to flush for the GPU's benefit; but a
+     * flush is the app's signal that it wrote the mapping, so bump each range's
+     * backing content version to invalidate a cached image tiling. */
+    for (i = 0; pMemoryRanges && i < memoryRangeCount; i++) {
+        vk_device_memory *m = (vk_device_memory *)VK_H2P(pMemoryRanges[i].memory);
+        if (m) m->content_version++;
+    }
+    return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkInvalidateMappedMemoryRanges(

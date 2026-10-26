@@ -111,3 +111,4 @@ macemu/src/uae_cpu/cpuemu.cpp
 macemu/src/uae_cpu/cpustbl_nf.cpp
 macemu/src/uae_cpu/cpustbl.cpp
 macemu/src/uae_cpu/cputbl.h
+imgui/aarch64/.headers_staged

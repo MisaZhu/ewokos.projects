@@ -7,8 +7,8 @@ TASK_DIR = $(SDK_DIR)/rootfs/apps/$(TASK)
 TASK_OBJS = $(ARCH)/cnn.$(HW).o
 CXXFLAGS += -I$(SDK_DIR)/include -fno-threadsafe-statics
 GLES_LIBS = $(SDK_DIR)/lib/libEGL.a $(SDK_DIR)/lib/libGLESv2.a
-# Optional imgui support - enable if libimgui.a exists
-IMGUI_LIB = $(SDK_DIR)/lib/libimgui.a
+# Optional imgui support - enable if libimgui_gles.a exists
+IMGUI_LIB = $(SDK_DIR)/lib/libimgui_gles.a
 ifneq ($(wildcard $(IMGUI_LIB)),)
 CXXFLAGS += -DHAS_IMGUI -I$(SDK_DIR)/include/imgui
 GLES_LIBS := $(IMGUI_LIB) $(GLES_LIBS)

@@ -38,6 +38,9 @@
 #include <math.h>
 #include <unistd.h>
 
+#include "imgui/imgui.h"
+#include "imgui/backends/imgui_impl_vulkan.h"
+
 #include "teapot_data.h"
 #include "vkteapot_spirv.h"
 
@@ -125,6 +128,21 @@ static int  g_frames = 0;
  * write it to a file itself (fetched back separately).  NULL on a normal
  * desktop launch, which leaves behaviour unchanged. */
 static const char *g_fpslog = NULL;
+/* GPU-vs-CPU route indicator.  The Vulkan runtime exposes one physical device
+ * whose deviceType is VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU only when the
+ * start-up probe found usable silicon (V3D on raspi5); otherwise it reports a
+ * CPU device and every draw is software-rasterised.  This mirrors how bin/vktest
+ * classifies its back-end and, unlike the GL twin's glGpuActiveEWOK(), is a
+ * static property of the device rather than a per-program query. */
+static int g_gpu = 0;
+
+/* Dear ImGui input state, latched by on_event and consumed by the overlay frame
+ * builder.  Declared up here because on_event (which feeds it) precedes the
+ * ImGui helper block in this translation unit. */
+static int  mouse_x = 0, mouse_y = 0;
+static bool mouse_buttons[3] = { false, false, false };    /* left, right, mid */
+static bool key_ctrl = false, key_shift = false, key_alt = false, key_super = false;
+static ImGuiKey KeyCodeToImGuiKey(int keycode);
 
 /* present callback: blit the rendered swapchain image into the window graph. */
 static void VKAPI_CALL teapot_present(void *user, const void *pixels,
@@ -833,6 +851,14 @@ static int init_vulkan(uint32_t width, uint32_t height)
     }
     vkGetDeviceQueue(T.device, T.qfi, 0, &T.queue);
 
+    /* Classify the back-end for the on-screen GPU/CPU indicator (see g_gpu). */
+    {
+        VkPhysicalDeviceProperties pprops;
+        vkGetPhysicalDeviceProperties(T.phys, &pprops);
+        g_gpu = (pprops.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+                 pprops.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
+    }
+
     /* surface format -> swapchain */
     T.format = VK_FORMAT_B8G8R8A8_UNORM;
     {
@@ -1188,6 +1214,12 @@ static void render_frame(uint32_t idx, float dt)
      * to keep each dispatch small; a single whole-mesh draw is equivalent and
      * lets the GPU back-end stage the entire triangle list in one dispatch). */
     vkCmdDraw(T.cmd, (uint32_t)teapot.nvertices, 1, 0, 0);
+
+    /* Draw the ImGui overlay into the same render pass, on top of the teapot.
+     * The backend records its own pipeline binds / indexed draws into T.cmd,
+     * so the overlay is presented by the identical swapchain blit. */
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), T.cmd);
+
     vkCmdEndRenderPass(T.cmd);
     if (vkEndCommandBuffer(T.cmd) != VK_SUCCESS) return;
 
@@ -1210,8 +1242,42 @@ static void render_frame(uint32_t idx, float dt)
 
 static void on_event(xwin_t *xwin, xevent_t *ev)
 {
-    if (ev->type == XEVT_IM && ev->value.im.value == 27)  /* ESC closes */
-        xwin_close(xwin);
+    ImGuiIO& io = ImGui::GetIO();
+
+    if (ev->type == XEVT_IM) {
+        int key = ev->value.im.value;
+        int32_t state = ev->state;                 /* XIM_STATE_PRESS/RELEASE */
+
+        key_shift = (ev->value.im.shift != 0);
+        key_ctrl  = (ev->value.im.ctrl  != 0);
+
+        /* ESC (27) quits, matching the GL teapot twin. */
+        if (key == 27 && state == XIM_STATE_PRESS) {
+            xwin_close(xwin);
+            return;
+        }
+
+        ImGuiKey ik = KeyCodeToImGuiKey(key);
+        if (ik != ImGuiKey_None)
+            io.AddKeyEvent(ik, state == XIM_STATE_PRESS);
+        if (state == XIM_STATE_PRESS && key >= 32 && key < 127)
+            io.AddInputCharacter(key);
+    }
+    else if (ev->type == XEVT_MOUSE) {
+        gpos_t pos = xwin_get_inside_pos(xwin, ev->value.mouse.x, ev->value.mouse.y);
+        int32_t state  = ev->state;
+        int32_t button = ev->value.mouse.button;
+        bool down = (state == MOUSE_STATE_DOWN || state == MOUSE_STATE_DRAG);
+
+        mouse_x = pos.x;
+        mouse_y = pos.y;
+        if (button == MOUSE_BUTTON_LEFT)
+            mouse_buttons[0] = down;
+        else if (button == MOUSE_BUTTON_RIGHT)
+            mouse_buttons[1] = down;
+        else if (button == MOUSE_BUTTON_MID)
+            mouse_buttons[2] = down;
+    }
 }
 
 /* ---- fps accounting ------------------------------------------------------ */
@@ -1247,6 +1313,166 @@ static void update_fps(void)
     fps_count++;
 }
 
+/* ------------------------------------------------------------------ *
+ * Dear ImGui overlay: the FPS / GPU-vs-CPU readout is a small draggable
+ * ImGui window drawn on top of the teapot, mirroring projects/opengl/apps/
+ * teapot.  Here ImGui renders through its Vulkan backend into the SAME render
+ * pass and command buffer as the scene, so the overlay is presented by the very
+ * same swapchain blit.  xwin mouse/keyboard events are forwarded to it so the
+ * window stays interactive, and ESC still quits like the other demos.
+ * ------------------------------------------------------------------ */
+static void imgui_check_vk(VkResult err)
+{
+    if (err != VK_SUCCESS)
+        printf("vkteapot: imgui vulkan error %d\n", (int)err);
+}
+
+static void init_imgui(void)
+{
+    ImGui_ImplVulkan_InitInfo init_info;
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = NULL;                                 /* no imgui.ini    */
+    io.DisplaySize = ImVec2((float)T.width, (float)T.height);
+    ImGui::StyleColorsDark();
+
+    /* The backend renders into the scene's own render pass/subpass so the ImGui
+     * pipeline is render-pass-compatible with the framebuffer already bound.
+     * DescriptorPoolSize > 0 lets the backend create its own (free-set) pool for
+     * the font atlas; MinImageCount/ImageCount only size its internal per-frame
+     * buffer ring and are independent of the swapchain image count. */
+    memset(&init_info, 0, sizeof(init_info));
+    init_info.ApiVersion         = VK_API_VERSION_1_3;
+    init_info.Instance           = T.instance;
+    init_info.PhysicalDevice     = T.phys;
+    init_info.Device             = T.device;
+    init_info.QueueFamily        = T.qfi;
+    init_info.Queue              = T.queue;
+    init_info.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE;
+    init_info.MinImageCount      = 2;
+    init_info.ImageCount         = (T.sc_count >= 2) ? T.sc_count : 2;
+    init_info.CheckVkResultFn    = imgui_check_vk;
+    init_info.PipelineInfoMain.RenderPass = T.rp;
+    init_info.PipelineInfoMain.Subpass    = 0;
+    if (!ImGui_ImplVulkan_Init(&init_info))
+        printf("vkteapot: ImGui_ImplVulkan_Init failed\n");
+    io.Fonts->AddFontFromFileTTF("/usr/system/fonts/system.ttf", 16.0f);
+}
+
+/* Map an EwokOS key code to the matching ImGuiKey (same table as the GL twin). */
+static ImGuiKey KeyCodeToImGuiKey(int keycode)
+{
+    switch (keycode) {
+        case 9:   return ImGuiKey_Tab;
+        case 27:  return ImGuiKey_Escape;
+        case 13:  return ImGuiKey_Enter;
+        case 8:   return ImGuiKey_Backspace;
+        case 127: return ImGuiKey_Delete;
+        case 32:  return ImGuiKey_Space;
+        case 276: return ImGuiKey_LeftArrow;
+        case 275: return ImGuiKey_RightArrow;
+        case 273: return ImGuiKey_UpArrow;
+        case 274: return ImGuiKey_DownArrow;
+        case 278: return ImGuiKey_Home;
+        case 279: return ImGuiKey_End;
+        case 280: return ImGuiKey_PageUp;
+        case 281: return ImGuiKey_PageDown;
+        case 277: return ImGuiKey_Insert;
+        case '0': return ImGuiKey_0;
+        case '1': return ImGuiKey_1;
+        case '2': return ImGuiKey_2;
+        case '3': return ImGuiKey_3;
+        case '4': return ImGuiKey_4;
+        case '5': return ImGuiKey_5;
+        case '6': return ImGuiKey_6;
+        case '7': return ImGuiKey_7;
+        case '8': return ImGuiKey_8;
+        case '9': return ImGuiKey_9;
+        case 'a': case 'A': return ImGuiKey_A;
+        case 'b': case 'B': return ImGuiKey_B;
+        case 'c': case 'C': return ImGuiKey_C;
+        case 'd': case 'D': return ImGuiKey_D;
+        case 'e': case 'E': return ImGuiKey_E;
+        case 'f': case 'F': return ImGuiKey_F;
+        case 'g': case 'G': return ImGuiKey_G;
+        case 'h': case 'H': return ImGuiKey_H;
+        case 'i': case 'I': return ImGuiKey_I;
+        case 'j': case 'J': return ImGuiKey_J;
+        case 'k': case 'K': return ImGuiKey_K;
+        case 'l': case 'L': return ImGuiKey_L;
+        case 'm': case 'M': return ImGuiKey_M;
+        case 'n': case 'N': return ImGuiKey_N;
+        case 'o': case 'O': return ImGuiKey_O;
+        case 'p': case 'P': return ImGuiKey_P;
+        case 'q': case 'Q': return ImGuiKey_Q;
+        case 'r': case 'R': return ImGuiKey_R;
+        case 's': case 'S': return ImGuiKey_S;
+        case 't': case 'T': return ImGuiKey_T;
+        case 'u': case 'U': return ImGuiKey_U;
+        case 'v': case 'V': return ImGuiKey_V;
+        case 'w': case 'W': return ImGuiKey_W;
+        case 'x': case 'X': return ImGuiKey_X;
+        case 'y': case 'Y': return ImGuiKey_Y;
+        case 'z': case 'Z': return ImGuiKey_Z;
+        case 282: return ImGuiKey_F1;
+        case 283: return ImGuiKey_F2;
+        case 284: return ImGuiKey_F3;
+        case 285: return ImGuiKey_F4;
+        case 286: return ImGuiKey_F5;
+        case 287: return ImGuiKey_F6;
+        case 288: return ImGuiKey_F7;
+        case 289: return ImGuiKey_F8;
+        case 290: return ImGuiKey_F9;
+        case 291: return ImGuiKey_F10;
+        case 292: return ImGuiKey_F11;
+        case 293: return ImGuiKey_F12;
+        case ',': return ImGuiKey_Comma;
+        case '.': return ImGuiKey_Period;
+        case '/': return ImGuiKey_Slash;
+        case ';': return ImGuiKey_Semicolon;
+        case '\'': return ImGuiKey_Apostrophe;
+        case '[': return ImGuiKey_LeftBracket;
+        case ']': return ImGuiKey_RightBracket;
+        case '-': return ImGuiKey_Minus;
+        case '=': return ImGuiKey_Equal;
+        case '`': return ImGuiKey_GraveAccent;
+        default:  return ImGuiKey_None;
+    }
+}
+
+/* Build one ImGui frame: forward the latched input, then lay out the stats
+ * window.  The GPU/CPU route (g_gpu) is a static device property, so unlike the
+ * GL twin it is not re-queried per frame.  The resulting draw data is recorded
+ * into the scene command buffer by render_frame(). */
+static void process_imgui_frame(void)
+{
+    ImGuiIO& io = ImGui::GetIO();
+
+    io.DisplaySize  = ImVec2((float)T.width, (float)T.height);
+    io.MousePos     = ImVec2((float)mouse_x, (float)mouse_y);
+    io.MouseDown[0] = mouse_buttons[0];
+    io.MouseDown[1] = mouse_buttons[1];
+    io.MouseDown[2] = mouse_buttons[2];
+    io.KeyCtrl      = key_ctrl;
+    io.KeyShift     = key_shift;
+    io.KeyAlt       = key_alt;
+    io.KeySuper     = key_super;
+
+    ImGui_ImplVulkan_NewFrame();
+    ImGui::NewFrame();
+
+    ImGui::SetNextWindowPos(ImVec2(8.0f, 8.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("vkteapot", NULL,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Text("FPS: %d", fps);
+    ImGui::TextColored(g_gpu ? ImVec4(0.40f, 1.00f, 0.55f, 1.0f)
+                             : ImVec4(1.00f, 0.70f, 0.30f, 1.0f),
+                       "Renderer: %s", g_gpu ? "GPU" : "CPU");
+    ImGui::End();
+}
+
 static void on_repaint(xwin_t *xwin, graph_t *g)
 {
     uint32_t idx = 0;
@@ -1268,6 +1494,10 @@ static void on_repaint(xwin_t *xwin, graph_t *g)
         return;
     if (idx >= T.sc_count) idx = 0;
     dt = frame_dt();
+    /* Build and finish the ImGui frame first so its draw data is ready for
+     * render_frame() to record into the scene command buffer. */
+    process_imgui_frame();
+    ImGui::Render();
     render_frame(idx, dt);
     g_frames++;
     update_fps();
@@ -1332,6 +1562,10 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    /* ImGui's Vulkan backend reuses the scene device/queue/render pass, so it is
+     * initialised only after init_vulkan() has populated T. */
+    init_imgui();
+
     x_init(&x, NULL);
     x.on_loop = loop;
     xwin = xwin_open(&x, -1, 32, 32, TEAPOT_W, TEAPOT_H, "vkteapot", XWIN_STYLE_NORMAL);
@@ -1350,6 +1584,10 @@ int main(int argc, char *argv[])
     xwin_set_visible(xwin, true);
 
     x_run(&x, xwin);
+
+    /* Tear ImGui down before the Vulkan device it borrows is destroyed. */
+    ImGui_ImplVulkan_Shutdown();
+    ImGui::DestroyContext();
 
     xwin_destroy(xwin);
     cleanup_vulkan();

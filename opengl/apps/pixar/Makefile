@@ -15,7 +15,7 @@ TASK_OBJS = $(ARCH)/pixar.$(HW).o
 EXTRA_LIBS_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 
 # <EGL/egl.h> + <GLES2/gl2.h> are installed into the shared build include dir
-# by libs/gles; Dear ImGui headers land under include/imgui (libs/imgui);
+# by libs/gles; Dear ImGui headers land under include/imgui (projects/imgui);
 # glcommon installs gltools.h under include/glcommon with its bundled
 # stb_image.h alongside (libs/glcommon).  pixar is C++ (ImGui + std::string):
 # -I.. reaches the app's own dir, -I.../include resolves <EGL/...>,
@@ -80,7 +80,7 @@ $(TASK_OBJS): pixar.cpp pixar_glsl.h
 # already contains the portablegl engine and (on PGL_G3D targets) the
 # on-device mesa GLSL->QPU compiler, so the app never names portablegl or
 # pglcompiler.
-GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui.a \
+GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui_gles.a \
 	$(EXTRA_LIBS_DIR)/lib/libglcommon.a \
 	$(EXTRA_LIBS_DIR)/lib/libEGL.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a

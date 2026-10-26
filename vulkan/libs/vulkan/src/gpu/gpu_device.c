@@ -16,7 +16,9 @@
  *
  * Compilation is deferred to the first dispatch and cached on the pipeline's
  * backend_data, so a pipeline whose shader is outside the GPU subset still
- * creates successfully and simply runs on the CPU.
+ * creates successfully and simply runs on the CPU.  The compiled result is ALSO
+ * persisted across launches (gpu_cache.c), keyed on the generated GLSL, so a
+ * relaunch re-uploads the previous blob instead of re-running the mesa compile.
  *
  * Everything outside the GPU subset is DECLINED, never mis-compiled: a declined
  * dispatch (an unsupported construct, a compiler rejection, an unresolvable
@@ -50,6 +52,7 @@
 #include "spirv.h"
 #include "spirv_to_glsl.h"
 #include "vkclient.h"
+#include "gpu_cache.h"
 
 #include <pglcompiler.h>
 
@@ -57,6 +60,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* Wall-clock ms, for the prepare-cost lines below.  CLOCK_MONOTONIC is the same
+ * source portablegl's v3ct probes read, so a Vulkan prepare and a GLES
+ * glLinkProgram measured in the same boot are directly comparable. */
+static double gpu_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
 
 /* Per-pipeline GPU state, hung off pipeline->backend_data.  Lazily built on the
  * first dispatch; a declined pipeline keeps cpu_fallback set and the CPU back-end
@@ -160,7 +174,10 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
     struct pglc_program res;
     struct pglc_blob_opts opts;
     struct pglc_stage *cs;
-    uint32_t blobsz;
+    vk_gpu_cache_rec *rec;
+    uint32_t blobsz, gpu_ver;
+    uint64_t key;
+    double t0 = gpu_now_ms();
     void *blob;
     int32_t handle;
 
@@ -197,6 +214,39 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
                 gp->info.local_size[2]);
         free(glsl);
         GPU_DECLINE();
+    }
+
+    /* 1b. disk cache.  A previous launch already compiled this exact generated
+     *     GLSL for this silicon, so its serialized blob can go straight to the
+     *     daemon.  The transpile above still ran - the generated text IS the
+     *     key, which is what makes the record self-invalidating when the
+     *     transpiler changes - but the mesa compile and the serialize, which
+     *     dominate the prepare, are skipped.  A record whose blob the daemon
+     *     rejects (a wire-format change that did not bump the backend's
+     *     pglc_blob_format_version()) is discarded rather than fatal: control
+     *     falls through to the real compile below, whose store overwrites it. */
+    gpu_ver = vkclient_gpu_version();
+    key = vk_gpu_cache_key(glsl, NULL);
+    rec = vk_gpu_cache_load(gpu_ver, VK_GPU_CACHE_COMPUTE, key);
+    if (rec) {
+        handle = vk_program_upload(rec->blob, rec->blob_size);
+        if (handle >= 0) {
+            gp->info        = rec->info;
+            gp->unif_dwords = rec->a_dwords;
+            gp->bindings    = rec->a_bindings;   /* stolen from the record */
+            rec->a_bindings = NULL;
+            gp->nbindings   = rec->a_nbindings;
+            fprintf(stderr, "vulkan-gpu: '%s' compute prepare CACHED %.0f ms (blob %u B)\n",
+                    e->name, gpu_now_ms() - t0, rec->blob_size);
+            vk_gpu_cache_rec_free(rec);
+            free(glsl);
+            gp->handle   = handle;
+            gp->prepared = 1;
+            return gp;
+        }
+        fprintf(stderr, "vulkan-gpu: '%s' cached blob UPLOAD failed (handle=%d): recompiling\n",
+                e->name, (int)handle);
+        vk_gpu_cache_rec_free(rec);
     }
 
     /* 2. compile + link with the on-device mesa backend. */
@@ -267,6 +317,11 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
     }
 
     handle = vk_program_upload(blob, blobsz);
+    /* Persist only a blob the daemon actually accepted: caching one it rejected
+     * would make every later launch replay the rejection. */
+    if (handle >= 0)
+        vk_gpu_cache_store_compute(gpu_ver, key, &gp->info, gp->unif_dwords,
+                                   gp->bindings, gp->nbindings, blob, blobsz);
     free(blob);
     pglc_program_free(&res);
 
@@ -276,6 +331,8 @@ static gpu_pipeline *gpu_prepare(vk_pipeline *p)
         GPU_DECLINE();
     }
 
+    fprintf(stderr, "vulkan-gpu: '%s' compute prepare COMPILED %.0f ms (blob %u B)\n",
+            e->name, gpu_now_ms() - t0, blobsz);
     gp->handle = handle;
     gp->prepared = 1;
     return gp;
@@ -412,9 +469,12 @@ static int gfx_reflected(const struct pglc_uniform_binding *bs, uint32_t n,
 }
 
 /* Decode one vertex attribute component set to floats.  The GPU attribute stream
- * is plain float[], so only 32-bit float formats are staged; anything else falls
- * back to the {0,0,0,1} default exactly like cpu_raster.c's decode_attr (which
- * leaves the default for an unsupported format rather than declining). */
+ * is plain float[], so every format must be widened here.  This MUST stay in
+ * lock-step with cpu_raster.c decode_attr: an attribute format the GPU path
+ * decoded differently (or not at all) would silently mis-render on the GPU while
+ * the CPU fallback looked correct -- e.g. ImGui's packed R8G8B8A8_UNORM vertex
+ * colour fell through to the {0,0,0,1} default and drew a solid black box.  An
+ * unsupported format leaves the {0,0,0,1} default exactly like the CPU. */
 static void gfx_decode_attr(VkFormat f, const uint8_t *p, float *out)
 {
     out[0] = out[1] = out[2] = 0.0f;
@@ -430,6 +490,42 @@ static void gfx_decode_attr(VkFormat f, const uint8_t *p, float *out)
     case VK_FORMAT_R32G32B32A32_SFLOAT:
         out[0] = ((const float *)p)[0]; out[1] = ((const float *)p)[1];
         out[2] = ((const float *)p)[2]; out[3] = ((const float *)p)[3]; break;
+    case VK_FORMAT_R8_UNORM:
+        out[0] = p[0] / 255.0f; break;
+    case VK_FORMAT_R8G8_UNORM:
+        out[0] = p[0] / 255.0f; out[1] = p[1] / 255.0f; break;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        out[0] = p[0] / 255.0f; out[1] = p[1] / 255.0f;
+        out[2] = p[2] / 255.0f; out[3] = p[3] / 255.0f; break;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        out[0] = p[2] / 255.0f; out[1] = p[1] / 255.0f;
+        out[2] = p[0] / 255.0f; out[3] = p[3] / 255.0f; break;
+    case VK_FORMAT_R32_UINT:
+        out[0] = (float)*(const uint32_t *)p; break;
+    case VK_FORMAT_R32G32_UINT:
+        out[0] = (float)((const uint32_t *)p)[0];
+        out[1] = (float)((const uint32_t *)p)[1]; break;
+    case VK_FORMAT_R32G32B32_UINT:
+        out[0] = (float)((const uint32_t *)p)[0];
+        out[1] = (float)((const uint32_t *)p)[1];
+        out[2] = (float)((const uint32_t *)p)[2]; break;
+    case VK_FORMAT_R32G32B32A32_UINT:
+        out[0] = (float)((const uint32_t *)p)[0];
+        out[1] = (float)((const uint32_t *)p)[1];
+        out[2] = (float)((const uint32_t *)p)[2];
+        out[3] = (float)((const uint32_t *)p)[3]; break;
+    case VK_FORMAT_R16_SFLOAT: {
+        /* half -> float */
+        uint16_t h = *(const uint16_t *)p;
+        uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+        uint32_t exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+        uint32_t f32;
+        if (exp == 0) f32 = sign;                    /* flush denormals to 0 */
+        else if (exp == 31) f32 = sign | 0x7f800000 | (man << 13);
+        else f32 = sign | ((exp + 112) << 23) | (man << 13);
+        memcpy(&out[0], &f32, 4);
+        break;
+    }
     default:
         break;   /* unsupported: leave the {0,0,0,1} default (matches the CPU) */
     }
@@ -450,8 +546,11 @@ static gpu_pipeline *gpu_prepare_gfx(vk_pipeline *p)
     struct pglc_program res_x, res_r;
     struct pglc_blob_opts opts;
     struct pglc_stage *sx, *sr;
+    vk_gpu_cache_rec *rec;
     char err[256];
-    uint32_t i, blobsz;
+    uint32_t i, blobsz, gpu_ver;
+    uint64_t key;
+    double t0 = gpu_now_ms();
     void *blob = NULL;
     int32_t handle;
 
@@ -493,23 +592,69 @@ static gpu_pipeline *gpu_prepare_gfx(vk_pipeline *p)
             }
         }
     }
-    if (!vmod || !ve)
+    if (!vmod || !ve) {
+        fprintf(stderr, "vulkan-gpu: gfx prepare decline: no usable vertex stage\n");
         GFX_DECLINE();   /* no vertex shader: nothing to offload */
+    }
 
     /* 1. generate the two GLSL ES 3.10 compute kernels from VS (+ optional FS). */
     if (spirv_to_geom_kernels((spirv_module *)vmod, ve, (spirv_module *)fmod, fe,
-                              &kern, err, sizeof(err)) != 0)
+                              &kern, err, sizeof(err)) != 0) {
+        fprintf(stderr, "vulkan-gpu: geom kernel generation DECLINED: %.200s\n",
+                err[0] ? err : "(no reason)");
         GFX_DECLINE();
+    }
+
+    /* 1b. disk cache (see gpu_prepare for the staleness argument).  The key
+     *     covers BOTH generated kernels, so a record is served only when the
+     *     xform and the raster source are each byte-identical to what was
+     *     compiled before.  This is the most expensive prepare in the whole
+     *     back-end - it pays the mesa compile twice, and the raster kernel is a
+     *     large generated source (the full rasterizer harness plus the user's
+     *     fragment body inlined into it) - so it is also where the cache saves
+     *     the most. */
+    gpu_ver = vkclient_gpu_version();
+    key = vk_gpu_cache_key(kern.xform, kern.raster);
+    rec = vk_gpu_cache_load(gpu_ver, VK_GPU_CACHE_GFX, key);
+    if (rec) {
+        handle = vk_gfx_program_upload(rec->blob, rec->blob_size);
+        if (handle >= 0) {
+            gp->glayout      = rec->glayout;
+            gp->xf_dwords    = rec->a_dwords;
+            gp->rs_dwords    = rec->b_dwords;
+            gp->xf_bindings  = rec->a_bindings;   /* stolen from the record */
+            rec->a_bindings  = NULL;
+            gp->nxf_bindings = rec->a_nbindings;
+            gp->rs_bindings  = rec->b_bindings;   /* stolen from the record */
+            rec->b_bindings  = NULL;
+            gp->nrs_bindings = rec->b_nbindings;
+            fprintf(stderr, "vulkan-gpu: gfx prepare CACHED %.0f ms (blob %u B)\n",
+                    gpu_now_ms() - t0, rec->blob_size);
+            vk_gpu_cache_rec_free(rec);
+            GFX_CLEANUP();   /* res_x/res_r are still zeroed, blob still NULL */
+            gp->gfx      = 1;
+            gp->handle   = handle;
+            gp->prepared = 1;
+            return gp;
+        }
+        fprintf(stderr, "vulkan-gpu: cached gfx blob UPLOAD failed (handle=%d): recompiling\n",
+                (int)handle);
+        vk_gpu_cache_rec_free(rec);
+    }
 
     /* 2. compile both with the on-device mesa backend (pass 1 = xform, pass 2 =
      *    raster).  Each lands in its own pglc_program's COMPUTE stage. */
     if (!pglc_compile_compute_raw(kern.xform, &res_x) || !res_x.success ||
         res_x.stage[PGLC_STAGE_COMPUTE].code_words == 0) {
+        fprintf(stderr, "vulkan-gpu: XFORM kernel pglc compile FAILED: %.400s\n",
+                res_x.log[0] ? res_x.log : "(no log)");
         GFX_CLEANUP();
         GFX_DECLINE();
     }
     if (!pglc_compile_compute_raw(kern.raster, &res_r) || !res_r.success ||
         res_r.stage[PGLC_STAGE_COMPUTE].code_words == 0) {
+        fprintf(stderr, "vulkan-gpu: RASTER kernel pglc compile FAILED: %.400s\n",
+                res_r.log[0] ? res_r.log : "(no log)");
         GFX_CLEANUP();
         GFX_DECLINE();
     }
@@ -555,11 +700,19 @@ static gpu_pipeline *gpu_prepare_gfx(vk_pipeline *p)
     }
 
     handle = vk_gfx_program_upload(blob, blobsz);
+    /* Persist only a blob the daemon accepted (see gpu_prepare). */
+    if (handle >= 0)
+        vk_gpu_cache_store_gfx(gpu_ver, key, &gp->glayout,
+                               gp->xf_dwords, gp->xf_bindings, gp->nxf_bindings,
+                               gp->rs_dwords, gp->rs_bindings, gp->nrs_bindings,
+                               blob, blobsz);
     GFX_CLEANUP();
 
     if (handle < 0)
         GFX_DECLINE();
 
+    fprintf(stderr, "vulkan-gpu: gfx prepare COMPILED %.0f ms (blob %u B)\n",
+            gpu_now_ms() - t0, blobsz);
     gp->gfx      = 1;
     gp->handle   = handle;
     gp->prepared = 1;
@@ -680,7 +833,7 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
     vk_gfx_tex tex[VKCLIENT_MAX_TEX];
     VkViewport vp;
     uint32_t cbpp, rt_w, rt_h, fb_stride, ntris, nverts, astride;
-    uint32_t num_unif, ntex = 0, k, j, cull, frontcw, fbswz, clear_rgba = 0;
+    uint32_t num_unif, ntex = 0, k, j, cull, frontcw, fbswz, blend_mode = 0, clear_rgba = 0;
     int bgra, depth_on, have_depth, first_frame = 0;
     float lox, loy, hix, hiy;
     int cx0, cy0, cx1, cy1, scx, scy, scw, sch;
@@ -699,7 +852,21 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
     if (p->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) GFX_CPU();
     if (instanceCount != 1u)                               GFX_CPU();
     if (p->rasterizer_discard)                             GFX_CPU();
-    if (p->blend_enable)                                   GFX_CPU();   /* opaque only */
+    if (p->blend_enable) {
+        /* Only ImGui's canonical SRC_ALPHA/ONE_MINUS_SRC_ALPHA (colour) +
+         * ONE/ONE_MINUS_SRC_ALPHA (alpha), both ADD, maps to raster kernel
+         * blend mode 1; any other factor/op combination still declines to the
+         * (correct) CPU replay. */
+        if (p->color_op  == VK_BLEND_OP_ADD &&
+            p->src_color == VK_BLEND_FACTOR_SRC_ALPHA &&
+            p->dst_color == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+            p->alpha_op  == VK_BLEND_OP_ADD &&
+            p->src_alpha == VK_BLEND_FACTOR_ONE &&
+            p->dst_alpha == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+            blend_mode = 1u;
+        else
+            GFX_CPU();
+    }
 
     /* single RGBA8/BGRA8 colour attachment (the only formats the kernel packs) */
     if (dc->num_color != 1u || !dc->color[0] || !dc->color[0]->image)
@@ -959,6 +1126,10 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
         tex[bbind].h      = tim->extent.height;
         tex[bbind].linear = (smp && (smp->mag == VK_FILTER_LINEAR ||
                                      smp->min_f == VK_FILTER_LINEAR)) ? 1 : 0;
+        /* Content generation of the image backing: vkclient keys its tiled-texture
+         * cache on it, so an unchanged sampled image is not reconverted per draw.
+         * th is non-NULL here, which implies tim->mem is non-NULL. */
+        tex[bbind].version = tim->mem ? tim->mem->content_version : 0u;
         if (bbind + 1u > ntex)
             ntex = bbind + 1u;
     }
@@ -1001,7 +1172,7 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
         frontcw = (p->front_face == VK_FRONT_FACE_CLOCKWISE) ? 1u : 0u;
         v4[0] = frontcw;
         gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uFrontCW", v4, 1);
-        v4[0] = 0u;   /* opaque only (blend gated off above) */
+        v4[0] = blend_mode;
         gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uBlendMode", v4, 1);
         v4[0] = fbswz;
         gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uFbSwizzle", v4, 1);
@@ -1039,11 +1210,26 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
     }
 
     /* ---- dispatch the two passes over the g2dd PGL verbs ---- */
-    rc = vk_gfx_draw(gp->handle, fb_host, rt_w, rt_h, fb_stride,
-                     (cim->mem && cim->mem->gfx_shm > 0) ? cim->mem->gfx_shm : 0,
-                     attr, nverts, astride, unif, num_unif,
-                     first_frame, clear_rgba, clear_z,
-                     ntex ? tex : NULL, ntex);
+    {   /* TEMP-PERF */
+        struct timespec _g0, _g1;
+        static unsigned long long g_ns[2]; static unsigned long g_n[2];
+        int _cat = ntex ? 1 : 0;
+        clock_gettime(CLOCK_MONOTONIC, &_g0);
+        rc = vk_gfx_draw(gp->handle, fb_host, rt_w, rt_h, fb_stride,
+                         (cim->mem && cim->mem->gfx_shm > 0) ? cim->mem->gfx_shm : 0,
+                         attr, nverts, astride, unif, num_unif,
+                         first_frame, clear_rgba, clear_z,
+                         ntex ? tex : NULL, ntex);
+        clock_gettime(CLOCK_MONOTONIC, &_g1);
+        g_ns[_cat] += (unsigned long long)(_g1.tv_sec - _g0.tv_sec) * 1000000000ull
+                    + (unsigned long long)(_g1.tv_nsec - _g0.tv_nsec);
+        g_n[_cat]++;
+        if (g_n[0] >= 30 && g_n[1] >= 30) {
+            printf("[gpu] teapot=%llu us/draw  imgui=%llu us/draw  (nverts imgui=%u)\n",
+                   g_ns[0] / g_n[0] / 1000ull, g_ns[1] / g_n[1] / 1000ull, nverts);
+            g_ns[0] = g_ns[1] = 0; g_n[0] = g_n[1] = 0;
+        }
+    }
     free(unif);
 #undef GFX_CPU
 

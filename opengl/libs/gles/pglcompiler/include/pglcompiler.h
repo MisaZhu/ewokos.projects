@@ -143,6 +143,15 @@ uint32_t pglc_program_serialize(const struct pglc_program *main_prog,
                                 const struct pglc_blob_opts *opts,
                                 void *out, uint32_t cap);
 
+/* Version of the wire blob pglc_program_serialize() emits on this backend
+ * (V3D: G2D_PGL_PROGRAM_VERSION; Adreno: its ADRENO_PROG_VERSION and
+ * ADRENO_PROG_PIXEL_VERSION folded into one number).  A client that persists a
+ * serialized blob across launches MUST fold this into the record's validation,
+ * because the daemons do not all check it for them: V3D's bsp_g3d rejects a
+ * version above its own, but Adreno's bsp_cl validates only ADRENO_PROG_MAGIC
+ * and would load a stale layout without complaint. */
+uint32_t pglc_blob_format_version(void);
+
 /* 2D texture memory layout for the GPU's sampler.  V3D tiles level 0
  * (LT/UBLINEAR/UIF, chosen from the image size); Adreno's compute texture
  * kernels read linear raster memory (tiling == 0, stride == w*cpp).  The

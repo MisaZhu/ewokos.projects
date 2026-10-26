@@ -220,6 +220,19 @@ struct spirv_module {
      * variables, constants, functions, types).  Sized by bound; -1 = none. */
     int32_t   *def_at;
 
+    /* O(1) id -> object indexes, built once at parse finalize.  The interpreter
+     * resolves a result type (describe -> spirv_type_find) on nearly every
+     * instruction, materializes constants per invocation, and queries
+     * decorations while setting up interface/descriptor variables for every
+     * fragment.  Those finders were linear scans over m->types / m->consts /
+     * m->decos and dominated fragment-shading cost (~2.9 us/fragment measured
+     * on the blended ImGui overlay).  NULL => index not built; the finders then
+     * fall back to a linear scan, so behaviour is unchanged. */
+    spirv_type  **type_at;    /* [bound] id -> &types[k] or NULL              */
+    spirv_const **const_at;   /* [bound] id -> &consts[k] or NULL             */
+    uint32_t   *deco_start;   /* [bound+1] target -> [start,end) in deco_order */
+    uint32_t   *deco_order;   /* [ndecos] deco indices count-sorted by target  */
+
     uint32_t   glsl450_set;  /* ExtInstImport id for "GLSL.std.450" (0 = none) */
     int        uses_workgroup;
 
