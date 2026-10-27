@@ -1544,7 +1544,11 @@ static int declare_global_var_kernel(gctx *c, const spirv_insn *in)
             c->has_color = 1; set_name(c, id, "vkColor"); c->is_ptr[id] = 1;
             return 0;
         }
-        snprintf(nm, sizeof nm, is_out ? "ko%d" : "ki%d", loc);
+        /* The kernel harness parameter name is always "ko%d"/"ki%d"; format it
+         * into a right-sized buffer so GCC sees it fits pname[24] (nm[32] is
+         * shared with the sampler "v%u" path below and triggers a bogus
+         * -Wformat-truncation when copied wholesale). */
+        snprintf(nm, 12, is_out ? "ko%d" : "ki%d", loc);
         set_name(c, id, nm);
         c->is_ptr[id] = 1;
         if (is_out) {

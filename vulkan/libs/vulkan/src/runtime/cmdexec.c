@@ -307,6 +307,19 @@ static int gfx_can_defer_clear(const gfx_clear_state *cs)
     return cs->color_clear && cs->depth_clear && cs->clear_depth >= 1.0f;
 }
 
+/* Deferring the clear into the first draw is a GPU-backend optimisation only;
+ * on CPU-only builds vk_backend_gpu does not exist (internal.h declares it
+ * under VULKAN_GPU_BACKEND), so the answer is a constant false there. */
+static int gfx_device_is_gpu(const vk_command_buffer *cb)
+{
+#ifdef VULKAN_GPU_BACKEND
+    return cb->device && cb->device->backend == &vk_backend_gpu;
+#else
+    (void)cb;
+    return 0;
+#endif
+}
+
 void vk_clear_deferred(vk_draw_ctx *dc)
 {
     VkClearValue cv;
@@ -595,13 +608,13 @@ VkResult vk_execute_command_buffer(vk_command_buffer *cb)
         case VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE: exec_clear_depth_image(c); break;
         case VK_CMD_BEGIN_RENDER_PASS:
             gfx_clear_from_render_pass(c, &cs);
-            exec_begin_render_pass(c, cb->device &&
-                cb->device->backend == &vk_backend_gpu && gfx_can_defer_clear(&cs));
+            exec_begin_render_pass(c, gfx_device_is_gpu(cb) &&
+                gfx_can_defer_clear(&cs));
             break;
         case VK_CMD_BEGIN_RENDERING:
             gfx_clear_from_rendering(c, &cs);
-            exec_begin_rendering(c, cb->device &&
-                cb->device->backend == &vk_backend_gpu && gfx_can_defer_clear(&cs));
+            exec_begin_rendering(c, gfx_device_is_gpu(cb) &&
+                gfx_can_defer_clear(&cs));
             break;
         case VK_CMD_WRITE_TIMESTAMP:   exec_write_timestamp(c); break;
         case VK_CMD_SET_EVENT:
