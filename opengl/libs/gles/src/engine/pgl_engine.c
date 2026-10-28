@@ -475,6 +475,16 @@ void gles_engine_depth_rangef(GEfloat n, GEfloat f)
     pgl_DepthRangef(n, f);
 }
 
+/* Sample coverage state (MSAA not implemented, but queries must succeed). */
+static GEfloat g_sample_coverage_value = 1.0f;
+static GEbool  g_sample_coverage_invert = 0;
+
+void gles_engine_sample_coverage(GEfloat value, GEbool invert)
+{
+    g_sample_coverage_value = value;
+    g_sample_coverage_invert = invert;
+}
+
 void gles_engine_read_pixels(GEint x, GEint y, GEint w, GEint h,
                              GEenum format, GEenum type, void *pixels)
 {
@@ -626,11 +636,21 @@ void gles_engine_get_integerv(GEenum pname, GEint *data)
 
 void gles_engine_get_floatv(GEenum pname, GEfloat *data)
 {
+    if (!data) return;
+    if (pname == GLES2_GL_SAMPLE_COVERAGE_VALUE) {
+        *data = g_sample_coverage_value;
+        return;
+    }
     pgl_GetFloatv(EMAP(get_pname_map, pname), data);
 }
 
 void gles_engine_get_booleanv(GEenum pname, GEbool *data)
 {
+    if (!data) return;
+    if (pname == GLES2_GL_SAMPLE_COVERAGE_INVERT) {
+        *data = g_sample_coverage_invert;
+        return;
+    }
     pgl_GetBooleanv(EMAP(get_pname_map, pname), data);
 }
 

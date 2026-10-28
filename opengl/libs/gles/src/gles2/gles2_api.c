@@ -127,7 +127,7 @@ void glBlendEquationSeparate (GLenum modeRGB, GLenum modeAlpha) { gles_engine_bl
 void glDepthRangef (GLfloat n, GLfloat f) { gles_engine_depth_rangef(n, f); }
 
 void glHint (GLenum target, GLenum mode) { (void)target; (void)mode; /* software rasterizer: no hints */ }
-void glSampleCoverage (GLfloat value, GLboolean invert) { (void)value; (void)invert; }
+void glSampleCoverage (GLfloat value, GLboolean invert) { gles_engine_sample_coverage(value, invert); }
 void glReadPixels (GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void *pixels)
 { gles_engine_read_pixels(x, y, w, h, format, type, pixels); }
 
@@ -355,26 +355,108 @@ void glGetVertexAttribPointerv (GLuint i, GLenum p, void **ptr)
 
 /* --- framebuffers / renderbuffers ---------------------------------- *
  * The engine renders into the single default framebuffer provided by EGL, so
- * FBO objects are name-only and the default framebuffer is always complete. */
+ * FBO/RBO objects are tracked as name+state only (no off-screen allocation).
+ * glIsFramebuffer / glIsRenderbuffer / glGetRenderbufferParameteriv answer
+ * from the tracked state so conformance queries see correct results. */
+#define GLES2_MAX_FBO 64
+#define GLES2_MAX_RBO 64
 static GLuint g_fbo_next = 1, g_rbo_next = 1;
-void glGenFramebuffers (GLsizei n, GLuint *f) { GLsizei i; for (i=0;i<n;++i) f[i]=g_fbo_next++; }
-void glGenRenderbuffers (GLsizei n, GLuint *r) { GLsizei i; for (i=0;i<n;++i) r[i]=g_rbo_next++; }
-void glDeleteFramebuffers (GLsizei n, const GLuint *f) { (void)n; (void)f; }
-void glDeleteRenderbuffers (GLsizei n, const GLuint *r) { (void)n; (void)r; }
-void glBindFramebuffer (GLenum target, GLuint f) { (void)target; (void)f; }
-void glBindRenderbuffer (GLenum target, GLuint r) { (void)target; (void)r; }
+static GLuint g_bound_fbo = 0;
+static GLuint g_bound_rbo = 0;
+static struct { GLuint id; GLsizei w, h; GLenum format; } g_rbo_state[GLES2_MAX_RBO];
+static int g_rbo_count = 0;
+static GLuint g_fbo_names[GLES2_MAX_FBO];
+static int g_fbo_name_count = 0;
+static GLuint g_fbo_bound_names[GLES2_MAX_FBO]; /* names that have been bound at least once */
+static int g_fbo_bound_count = 0;
+
+static int rbo_find(GLuint id) {
+    int i; for (i = 0; i < g_rbo_count; ++i) if (g_rbo_state[i].id == id) return i; return -1;
+}
+static int fbo_is_bound_name(GLuint id) {
+    int i; for (i = 0; i < g_fbo_bound_count; ++i) if (g_fbo_bound_names[i] == id) return 1; return 0;
+}
+
+void glGenFramebuffers (GLsizei n, GLuint *f) {
+    GLsizei i;
+    for (i = 0; i < n; ++i) {
+        f[i] = g_fbo_next++;
+        if (g_fbo_name_count < GLES2_MAX_FBO) g_fbo_names[g_fbo_name_count++] = f[i];
+    }
+}
+void glGenRenderbuffers (GLsizei n, GLuint *r) {
+    GLsizei i;
+    for (i = 0; i < n; ++i) {
+        r[i] = g_rbo_next++;
+        if (g_rbo_count < GLES2_MAX_RBO) {
+            g_rbo_state[g_rbo_count].id = r[i];
+            g_rbo_state[g_rbo_count].w = 0;
+            g_rbo_state[g_rbo_count].h = 0;
+            g_rbo_state[g_rbo_count].format = 0;
+            g_rbo_count++;
+        }
+    }
+}
+void glDeleteFramebuffers (GLsizei n, const GLuint *f) {
+    GLsizei i;
+    for (i = 0; i < n; ++i) {
+        int j;
+        if (f[i] == g_bound_fbo) g_bound_fbo = 0;
+        for (j = 0; j < g_fbo_name_count; ++j)
+            if (g_fbo_names[j] == f[i]) { g_fbo_names[j] = g_fbo_names[--g_fbo_name_count]; break; }
+        for (j = 0; j < g_fbo_bound_count; ++j)
+            if (g_fbo_bound_names[j] == f[i]) { g_fbo_bound_names[j] = g_fbo_bound_names[--g_fbo_bound_count]; break; }
+    }
+}
+void glDeleteRenderbuffers (GLsizei n, const GLuint *r) {
+    GLsizei i;
+    for (i = 0; i < n; ++i) {
+        int idx = rbo_find(r[i]);
+        if (r[i] == g_bound_rbo) g_bound_rbo = 0;
+        if (idx >= 0) g_rbo_state[idx] = g_rbo_state[--g_rbo_count];
+    }
+}
+void glBindFramebuffer (GLenum target, GLuint f) {
+    (void)target;
+    g_bound_fbo = f;
+    if (f != 0 && !fbo_is_bound_name(f) && g_fbo_bound_count < GLES2_MAX_FBO)
+        g_fbo_bound_names[g_fbo_bound_count++] = f;
+}
+void glBindRenderbuffer (GLenum target, GLuint r) { (void)target; g_bound_rbo = r; }
 GLenum glCheckFramebufferStatus (GLenum target) { (void)target; return GL_FRAMEBUFFER_COMPLETE; }
-GLboolean glIsFramebuffer (GLuint f) { (void)f; return GL_FALSE; }
-GLboolean glIsRenderbuffer (GLuint r) { (void)r; return GL_FALSE; }
-void glRenderbufferStorage (GLenum t, GLenum f, GLsizei w, GLsizei h) { (void)t;(void)f;(void)w;(void)h; }
+GLboolean glIsFramebuffer (GLuint f) {
+    if (f == 0) return GL_FALSE;
+    return fbo_is_bound_name(f) ? GL_TRUE : GL_FALSE;
+}
+GLboolean glIsRenderbuffer (GLuint r) {
+    if (r == 0) return GL_FALSE;
+    return (r == g_bound_rbo && rbo_find(r) >= 0) ? GL_TRUE : GL_FALSE;
+}
+void glRenderbufferStorage (GLenum t, GLenum f, GLsizei w, GLsizei h) {
+    int idx;
+    (void)t;
+    idx = rbo_find(g_bound_rbo);
+    if (idx >= 0) { g_rbo_state[idx].w = w; g_rbo_state[idx].h = h; g_rbo_state[idx].format = f; }
+}
 void glFramebufferRenderbuffer (GLenum t, GLenum a, GLenum rt, GLuint rb) { (void)t;(void)a;(void)rt;(void)rb; }
 void glFramebufferTexture2D (GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l) { (void)t;(void)a;(void)tt;(void)tex;(void)l; }
 void glGetFramebufferAttachmentParameteriv (GLenum t, GLenum a, GLenum p, GLint *params) { (void)t;(void)a;(void)p; if(params)*params=0; }
-void glGetRenderbufferParameteriv (GLenum t, GLenum p, GLint *params) { (void)t;(void)p; if(params)*params=0; }
+void glGetRenderbufferParameteriv (GLenum t, GLenum p, GLint *params) {
+    int idx;
+    (void)t;
+    if (!params) return;
+    idx = rbo_find(g_bound_rbo);
+    if (idx < 0) { *params = 0; return; }
+    switch (p) {
+    case GL_RENDERBUFFER_WIDTH:  *params = g_rbo_state[idx].w; break;
+    case GL_RENDERBUFFER_HEIGHT: *params = g_rbo_state[idx].h; break;
+    default: *params = 0; break;
+    }
+}
 
 /* --- shader binary (interpreter only; no binary path) -------------- */
 void glShaderBinary (GLsizei c, const GLuint *s, GLenum f, const void *b, GLsizei l)
-{ (void)c;(void)s;(void)f;(void)b;(void)l; }
+{ (void)c;(void)s;(void)b;(void)l;(void)f; gles_engine_set_error(GL_INVALID_ENUM); }
 
 /* glUseProgram and the whole shader/program/uniform object model live in
  * gles2_shader.c. */

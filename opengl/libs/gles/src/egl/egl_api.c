@@ -38,6 +38,8 @@ typedef struct egl_config {
     EGLint depth, stencil;
     EGLint surface_types;
     EGLint renderable;
+    EGLint samples;
+    EGLint sample_buffers;
 } egl_config_t;
 
 typedef struct egl_context {
@@ -62,13 +64,25 @@ typedef struct egl_surface {
 } egl_surface_t;
 
 static egl_display_t g_display = { 0, 1, 4 };
-static egl_config_t  g_config  = {
-    /* id */ 1,
-    /* rgba */ 8, 8, 8, 8,
-    /* depth/stencil */ 16, 8,
-    /* surface_types */ EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
-    /* renderable */ EGL_OPENGL_ES2_BIT
+static egl_config_t  g_configs[2] = {
+    {
+        /* id */ 1,
+        /* rgba */ 8, 8, 8, 8,
+        /* depth/stencil */ 16, 8,
+        /* surface_types */ EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
+        /* renderable */ EGL_OPENGL_ES2_BIT,
+        /* samples */ 0, /* sample_buffers */ 0
+    },
+    {
+        /* id */ 2,
+        /* rgba */ 8, 8, 8, 8,
+        /* depth/stencil */ 16, 8,
+        /* surface_types */ EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
+        /* renderable */ EGL_OPENGL_ES2_BIT,
+        /* samples */ 4, /* sample_buffers */ 1
+    }
 };
+#define NUM_CONFIGS 2
 
 static EGLint g_error = EGL_SUCCESS;
 static egl_surface_t *g_current_draw = NULL;
@@ -185,6 +199,14 @@ const char *eglQueryString(EGLDisplay dpy, EGLint name)
 /* ------------------------------------------------------------------ *
  * Configs
  * ------------------------------------------------------------------ */
+static int config_is_valid(const egl_config_t *c)
+{
+    int i;
+    for (i = 0; i < NUM_CONFIGS; ++i)
+        if (c == &g_configs[i]) return 1;
+    return 0;
+}
+
 static EGLBoolean config_matches(const egl_config_t *c, const EGLint *attrib)
 {
     if (attrib == NULL)
@@ -209,14 +231,16 @@ static EGLBoolean config_matches(const egl_config_t *c, const EGLint *attrib)
 EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
                            EGLConfig *configs, EGLint config_size, EGLint *num_config)
 {
+    EGLint found = 0;
+    int i;
     if (dpy != (EGLDisplay)&g_display) return set_err(EGL_BAD_DISPLAY);
-    if (!config_matches(&g_config, attrib_list)) {
-        if (num_config) *num_config = 0;
-        return EGL_TRUE;
+    for (i = 0; i < NUM_CONFIGS; ++i) {
+        if (!config_matches(&g_configs[i], attrib_list)) continue;
+        if (configs && found < config_size)
+            configs[found] = (EGLConfig)&g_configs[i];
+        found++;
     }
-    if (configs && config_size > 0)
-        configs[0] = (EGLConfig)&g_config;
-    if (num_config) *num_config = 1;
+    if (num_config) *num_config = found;
     return EGL_TRUE;
 }
 
@@ -229,7 +253,7 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute
 {
     const egl_config_t *c = (const egl_config_t *)config;
     if (dpy != (EGLDisplay)&g_display) return set_err(EGL_BAD_DISPLAY);
-    if (c != &g_config || value == NULL) return set_err(EGL_BAD_CONFIG);
+    if (!config_is_valid(c) || value == NULL) return set_err(EGL_BAD_CONFIG);
     switch (attribute) {
     case EGL_CONFIG_ID:      *value = c->id; break;
     case EGL_RED_SIZE:       *value = c->red; break;
@@ -245,8 +269,8 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute
     case EGL_MAX_PBUFFER_WIDTH:  *value = 4096; break;
     case EGL_MAX_PBUFFER_HEIGHT: *value = 4096; break;
     case EGL_NATIVE_RENDERABLE:  *value = EGL_TRUE; break;
-    case EGL_SAMPLES:        *value = 0; break;
-    case EGL_SAMPLE_BUFFERS: *value = 0; break;
+    case EGL_SAMPLES:        *value = c->samples; break;
+    case EGL_SAMPLE_BUFFERS: *value = c->sample_buffers; break;
     default:                 *value = 0; break;
     }
     return EGL_TRUE;
@@ -261,7 +285,7 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
     egl_context_t *ctx;
     (void)share_context;
     if (dpy != (EGLDisplay)&g_display) { set_err(EGL_BAD_DISPLAY); return EGL_NO_CONTEXT; }
-    if (config != (EGLConfig)&g_config) { set_err(EGL_BAD_CONFIG); return EGL_NO_CONTEXT; }
+    if (!config_is_valid((const egl_config_t *)config)) { set_err(EGL_BAD_CONFIG); return EGL_NO_CONTEXT; }
     ctx = (egl_context_t *)calloc(1, sizeof(*ctx));
     if (ctx == NULL) { set_err(EGL_BAD_ALLOC); return EGL_NO_CONTEXT; }
     ctx->client_version = 2;
@@ -319,7 +343,7 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
     (void)attrib_list;
 
     if (dpy != (EGLDisplay)&g_display) { set_err(EGL_BAD_DISPLAY); return EGL_NO_SURFACE; }
-    if (config != (EGLConfig)&g_config) { set_err(EGL_BAD_CONFIG); return EGL_NO_SURFACE; }
+    if (!config_is_valid((const egl_config_t *)config)) { set_err(EGL_BAD_CONFIG); return EGL_NO_SURFACE; }
     if (xwin == NULL) { set_err(EGL_BAD_NATIVE_WINDOW); return EGL_NO_SURFACE; }
 
     if (xwin_fetch_graph(xwin, &g) == NULL || g.buffer == NULL || g.w <= 0 || g.h <= 0) {
@@ -356,7 +380,7 @@ EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLin
     egl_surface_t *s;
     int w = 0, h = 0;
     if (dpy != (EGLDisplay)&g_display) { set_err(EGL_BAD_DISPLAY); return EGL_NO_SURFACE; }
-    if (config != (EGLConfig)&g_config) { set_err(EGL_BAD_CONFIG); return EGL_NO_SURFACE; }
+    if (!config_is_valid((const egl_config_t *)config)) { set_err(EGL_BAD_CONFIG); return EGL_NO_SURFACE; }
     parse_wh(attrib_list, 1, 1, &w, &h);
     if (w <= 0 || h <= 0) { set_err(EGL_BAD_ATTRIBUTE); return EGL_NO_SURFACE; }
 
@@ -398,7 +422,7 @@ EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute,
     switch (attribute) {
     case EGL_WIDTH:  *value = s->w; break;
     case EGL_HEIGHT: *value = s->h; break;
-    case EGL_CONFIG_ID: *value = g_config.id; break;
+    case EGL_CONFIG_ID: *value = g_configs[0].id; break;
     default: *value = 0; break;
     }
     return EGL_TRUE;
@@ -512,8 +536,234 @@ EGLBoolean eglReleaseThread(void)
     return EGL_TRUE;
 }
 
+/* ------------------------------------------------------------------ *
+ * eglGetProcAddress: lookup table for exported GLES2 entry points.
+ * The GL functions live in libGLESv2.a (gles2_api.c / gles2_shader.c);
+ * we declare them with unspecified-parameter prototypes (valid C) to
+ * obtain their addresses without including <GLES2/gl2.h>.
+ * ------------------------------------------------------------------ */
+extern void glActiveTexture(); extern void glAttachShader();
+extern void glBindAttribLocation(); extern void glBindBuffer();
+extern void glBindFramebuffer(); extern void glBindRenderbuffer();
+extern void glBindTexture(); extern void glBindVertexArray();
+extern void glBlendColor(); extern void glBlendEquation();
+extern void glBlendEquationSeparate(); extern void glBlendFunc();
+extern void glBlendFuncSeparate(); extern void glBufferData();
+extern void glBufferSubData(); extern void glCheckFramebufferStatus();
+extern void glClear(); extern void glClearColor();
+extern void glClearDepthf(); extern void glClearStencil();
+extern void glColorMask(); extern void glCompileShader();
+extern void glCompressedTexImage2D(); extern void glCompressedTexSubImage2D();
+extern void glCopyTexImage2D(); extern void glCopyTexSubImage2D();
+extern void glCreateProgram(); extern void glCreateShader();
+extern void glCullFace(); extern void glDeleteBuffers();
+extern void glDeleteFramebuffers(); extern void glDeleteProgram();
+extern void glDeleteRenderbuffers(); extern void glDeleteShader();
+extern void glDeleteTextures(); extern void glDeleteVertexArrays();
+extern void glDepthFunc(); extern void glDepthMask();
+extern void glDepthRangef(); extern void glDetachShader();
+extern void glDisable(); extern void glDisableVertexAttribArray();
+extern void glDrawArrays(); extern void glDrawElements();
+extern void glEnable(); extern void glEnableVertexAttribArray();
+extern void glFinish(); extern void glFlush();
+extern void glFramebufferRenderbuffer(); extern void glFramebufferTexture2D();
+extern void glFrontFace(); extern void glGenBuffers();
+extern void glGenFramebuffers(); extern void glGenRenderbuffers();
+extern void glGenTextures(); extern void glGenVertexArrays();
+extern void glGenerateMipmap(); extern void glGetBooleanv();
+extern void glGetBufferParameteriv(); extern void glGetError();
+extern void glGetFloatv(); extern void glGetFramebufferAttachmentParameteriv();
+extern void glGetIntegerv(); extern void glGetProgramInfoLog();
+extern void glGetProgramiv(); extern void glGetRenderbufferParameteriv();
+extern void glGetShaderInfoLog(); extern void glGetShaderPrecisionFormat();
+extern void glGetShaderSource(); extern void glGetShaderiv();
+extern void glGetString(); extern void glGetTexParameterfv();
+extern void glGetTexParameteriv(); extern void glGetUniformLocation();
+extern void glGetVertexAttribPointerv(); extern void glGetVertexAttribfv();
+extern void glGetVertexAttribiv(); extern void glHint();
+extern void glIsBuffer(); extern void glIsEnabled();
+extern void glIsFramebuffer(); extern void glIsProgram();
+extern void glIsRenderbuffer(); extern void glIsShader();
+extern void glIsTexture(); extern void glIsVertexArray();
+extern void glLineWidth(); extern void glLinkProgram();
+extern void glPixelStorei(); extern void glPolygonOffset();
+extern void glReadPixels(); extern void glRenderbufferStorage();
+extern void glSampleCoverage(); extern void glScissor();
+extern void glShaderBinary(); extern void glShaderSource();
+extern void glStencilFunc(); extern void glStencilFuncSeparate();
+extern void glStencilMask(); extern void glStencilMaskSeparate();
+extern void glStencilOp(); extern void glStencilOpSeparate();
+extern void glTexImage2D(); extern void glTexParameterf();
+extern void glTexParameterfv(); extern void glTexParameteri();
+extern void glTexParameteriv(); extern void glTexSubImage2D();
+extern void glUniform1f(); extern void glUniform1fv();
+extern void glUniform1i(); extern void glUniform1iv();
+extern void glUniform2f(); extern void glUniform2fv();
+extern void glUniform2i(); extern void glUniform2iv();
+extern void glUniform3f(); extern void glUniform3fv();
+extern void glUniform3i(); extern void glUniform3iv();
+extern void glUniform4f(); extern void glUniform4fv();
+extern void glUniform4i(); extern void glUniform4iv();
+extern void glUniformMatrix2fv(); extern void glUniformMatrix3fv();
+extern void glUniformMatrix4fv(); extern void glUseProgram();
+extern void glValidateProgram(); extern void glVertexAttrib1f();
+extern void glVertexAttrib1fv(); extern void glVertexAttrib2f();
+extern void glVertexAttrib2fv(); extern void glVertexAttrib3f();
+extern void glVertexAttrib3fv(); extern void glVertexAttrib4f();
+extern void glVertexAttrib4fv(); extern void glVertexAttribPointer();
+extern void glViewport();
+
+typedef struct { const char *name; __eglMustCastToProperFunctionPointerType fn; } egl_proc_t;
+static const egl_proc_t g_proc_table[] = {
+    { "glActiveTexture", (__eglMustCastToProperFunctionPointerType)glActiveTexture },
+    { "glAttachShader", (__eglMustCastToProperFunctionPointerType)glAttachShader },
+    { "glBindAttribLocation", (__eglMustCastToProperFunctionPointerType)glBindAttribLocation },
+    { "glBindBuffer", (__eglMustCastToProperFunctionPointerType)glBindBuffer },
+    { "glBindFramebuffer", (__eglMustCastToProperFunctionPointerType)glBindFramebuffer },
+    { "glBindRenderbuffer", (__eglMustCastToProperFunctionPointerType)glBindRenderbuffer },
+    { "glBindTexture", (__eglMustCastToProperFunctionPointerType)glBindTexture },
+    { "glBindVertexArray", (__eglMustCastToProperFunctionPointerType)glBindVertexArray },
+    { "glBlendColor", (__eglMustCastToProperFunctionPointerType)glBlendColor },
+    { "glBlendEquation", (__eglMustCastToProperFunctionPointerType)glBlendEquation },
+    { "glBlendEquationSeparate", (__eglMustCastToProperFunctionPointerType)glBlendEquationSeparate },
+    { "glBlendFunc", (__eglMustCastToProperFunctionPointerType)glBlendFunc },
+    { "glBlendFuncSeparate", (__eglMustCastToProperFunctionPointerType)glBlendFuncSeparate },
+    { "glBufferData", (__eglMustCastToProperFunctionPointerType)glBufferData },
+    { "glBufferSubData", (__eglMustCastToProperFunctionPointerType)glBufferSubData },
+    { "glCheckFramebufferStatus", (__eglMustCastToProperFunctionPointerType)glCheckFramebufferStatus },
+    { "glClear", (__eglMustCastToProperFunctionPointerType)glClear },
+    { "glClearColor", (__eglMustCastToProperFunctionPointerType)glClearColor },
+    { "glClearDepthf", (__eglMustCastToProperFunctionPointerType)glClearDepthf },
+    { "glClearStencil", (__eglMustCastToProperFunctionPointerType)glClearStencil },
+    { "glColorMask", (__eglMustCastToProperFunctionPointerType)glColorMask },
+    { "glCompileShader", (__eglMustCastToProperFunctionPointerType)glCompileShader },
+    { "glCompressedTexImage2D", (__eglMustCastToProperFunctionPointerType)glCompressedTexImage2D },
+    { "glCompressedTexSubImage2D", (__eglMustCastToProperFunctionPointerType)glCompressedTexSubImage2D },
+    { "glCopyTexImage2D", (__eglMustCastToProperFunctionPointerType)glCopyTexImage2D },
+    { "glCopyTexSubImage2D", (__eglMustCastToProperFunctionPointerType)glCopyTexSubImage2D },
+    { "glCreateProgram", (__eglMustCastToProperFunctionPointerType)glCreateProgram },
+    { "glCreateShader", (__eglMustCastToProperFunctionPointerType)glCreateShader },
+    { "glCullFace", (__eglMustCastToProperFunctionPointerType)glCullFace },
+    { "glDeleteBuffers", (__eglMustCastToProperFunctionPointerType)glDeleteBuffers },
+    { "glDeleteFramebuffers", (__eglMustCastToProperFunctionPointerType)glDeleteFramebuffers },
+    { "glDeleteProgram", (__eglMustCastToProperFunctionPointerType)glDeleteProgram },
+    { "glDeleteRenderbuffers", (__eglMustCastToProperFunctionPointerType)glDeleteRenderbuffers },
+    { "glDeleteShader", (__eglMustCastToProperFunctionPointerType)glDeleteShader },
+    { "glDeleteTextures", (__eglMustCastToProperFunctionPointerType)glDeleteTextures },
+    { "glDeleteVertexArrays", (__eglMustCastToProperFunctionPointerType)glDeleteVertexArrays },
+    { "glDepthFunc", (__eglMustCastToProperFunctionPointerType)glDepthFunc },
+    { "glDepthMask", (__eglMustCastToProperFunctionPointerType)glDepthMask },
+    { "glDepthRangef", (__eglMustCastToProperFunctionPointerType)glDepthRangef },
+    { "glDetachShader", (__eglMustCastToProperFunctionPointerType)glDetachShader },
+    { "glDisable", (__eglMustCastToProperFunctionPointerType)glDisable },
+    { "glDisableVertexAttribArray", (__eglMustCastToProperFunctionPointerType)glDisableVertexAttribArray },
+    { "glDrawArrays", (__eglMustCastToProperFunctionPointerType)glDrawArrays },
+    { "glDrawElements", (__eglMustCastToProperFunctionPointerType)glDrawElements },
+    { "glEnable", (__eglMustCastToProperFunctionPointerType)glEnable },
+    { "glEnableVertexAttribArray", (__eglMustCastToProperFunctionPointerType)glEnableVertexAttribArray },
+    { "glFinish", (__eglMustCastToProperFunctionPointerType)glFinish },
+    { "glFlush", (__eglMustCastToProperFunctionPointerType)glFlush },
+    { "glFramebufferRenderbuffer", (__eglMustCastToProperFunctionPointerType)glFramebufferRenderbuffer },
+    { "glFramebufferTexture2D", (__eglMustCastToProperFunctionPointerType)glFramebufferTexture2D },
+    { "glFrontFace", (__eglMustCastToProperFunctionPointerType)glFrontFace },
+    { "glGenBuffers", (__eglMustCastToProperFunctionPointerType)glGenBuffers },
+    { "glGenFramebuffers", (__eglMustCastToProperFunctionPointerType)glGenFramebuffers },
+    { "glGenRenderbuffers", (__eglMustCastToProperFunctionPointerType)glGenRenderbuffers },
+    { "glGenTextures", (__eglMustCastToProperFunctionPointerType)glGenTextures },
+    { "glGenVertexArrays", (__eglMustCastToProperFunctionPointerType)glGenVertexArrays },
+    { "glGenerateMipmap", (__eglMustCastToProperFunctionPointerType)glGenerateMipmap },
+    { "glGetBooleanv", (__eglMustCastToProperFunctionPointerType)glGetBooleanv },
+    { "glGetBufferParameteriv", (__eglMustCastToProperFunctionPointerType)glGetBufferParameteriv },
+    { "glGetError", (__eglMustCastToProperFunctionPointerType)glGetError },
+    { "glGetFloatv", (__eglMustCastToProperFunctionPointerType)glGetFloatv },
+    { "glGetFramebufferAttachmentParameteriv", (__eglMustCastToProperFunctionPointerType)glGetFramebufferAttachmentParameteriv },
+    { "glGetIntegerv", (__eglMustCastToProperFunctionPointerType)glGetIntegerv },
+    { "glGetProgramInfoLog", (__eglMustCastToProperFunctionPointerType)glGetProgramInfoLog },
+    { "glGetProgramiv", (__eglMustCastToProperFunctionPointerType)glGetProgramiv },
+    { "glGetRenderbufferParameteriv", (__eglMustCastToProperFunctionPointerType)glGetRenderbufferParameteriv },
+    { "glGetShaderInfoLog", (__eglMustCastToProperFunctionPointerType)glGetShaderInfoLog },
+    { "glGetShaderPrecisionFormat", (__eglMustCastToProperFunctionPointerType)glGetShaderPrecisionFormat },
+    { "glGetShaderSource", (__eglMustCastToProperFunctionPointerType)glGetShaderSource },
+    { "glGetShaderiv", (__eglMustCastToProperFunctionPointerType)glGetShaderiv },
+    { "glGetString", (__eglMustCastToProperFunctionPointerType)glGetString },
+    { "glGetTexParameterfv", (__eglMustCastToProperFunctionPointerType)glGetTexParameterfv },
+    { "glGetTexParameteriv", (__eglMustCastToProperFunctionPointerType)glGetTexParameteriv },
+    { "glGetUniformLocation", (__eglMustCastToProperFunctionPointerType)glGetUniformLocation },
+    { "glGetVertexAttribPointerv", (__eglMustCastToProperFunctionPointerType)glGetVertexAttribPointerv },
+    { "glGetVertexAttribfv", (__eglMustCastToProperFunctionPointerType)glGetVertexAttribfv },
+    { "glGetVertexAttribiv", (__eglMustCastToProperFunctionPointerType)glGetVertexAttribiv },
+    { "glHint", (__eglMustCastToProperFunctionPointerType)glHint },
+    { "glIsBuffer", (__eglMustCastToProperFunctionPointerType)glIsBuffer },
+    { "glIsEnabled", (__eglMustCastToProperFunctionPointerType)glIsEnabled },
+    { "glIsFramebuffer", (__eglMustCastToProperFunctionPointerType)glIsFramebuffer },
+    { "glIsProgram", (__eglMustCastToProperFunctionPointerType)glIsProgram },
+    { "glIsRenderbuffer", (__eglMustCastToProperFunctionPointerType)glIsRenderbuffer },
+    { "glIsShader", (__eglMustCastToProperFunctionPointerType)glIsShader },
+    { "glIsTexture", (__eglMustCastToProperFunctionPointerType)glIsTexture },
+    { "glIsVertexArray", (__eglMustCastToProperFunctionPointerType)glIsVertexArray },
+    { "glLineWidth", (__eglMustCastToProperFunctionPointerType)glLineWidth },
+    { "glLinkProgram", (__eglMustCastToProperFunctionPointerType)glLinkProgram },
+    { "glPixelStorei", (__eglMustCastToProperFunctionPointerType)glPixelStorei },
+    { "glPolygonOffset", (__eglMustCastToProperFunctionPointerType)glPolygonOffset },
+    { "glReadPixels", (__eglMustCastToProperFunctionPointerType)glReadPixels },
+    { "glRenderbufferStorage", (__eglMustCastToProperFunctionPointerType)glRenderbufferStorage },
+    { "glSampleCoverage", (__eglMustCastToProperFunctionPointerType)glSampleCoverage },
+    { "glScissor", (__eglMustCastToProperFunctionPointerType)glScissor },
+    { "glShaderBinary", (__eglMustCastToProperFunctionPointerType)glShaderBinary },
+    { "glShaderSource", (__eglMustCastToProperFunctionPointerType)glShaderSource },
+    { "glStencilFunc", (__eglMustCastToProperFunctionPointerType)glStencilFunc },
+    { "glStencilFuncSeparate", (__eglMustCastToProperFunctionPointerType)glStencilFuncSeparate },
+    { "glStencilMask", (__eglMustCastToProperFunctionPointerType)glStencilMask },
+    { "glStencilMaskSeparate", (__eglMustCastToProperFunctionPointerType)glStencilMaskSeparate },
+    { "glStencilOp", (__eglMustCastToProperFunctionPointerType)glStencilOp },
+    { "glStencilOpSeparate", (__eglMustCastToProperFunctionPointerType)glStencilOpSeparate },
+    { "glTexImage2D", (__eglMustCastToProperFunctionPointerType)glTexImage2D },
+    { "glTexParameterf", (__eglMustCastToProperFunctionPointerType)glTexParameterf },
+    { "glTexParameterfv", (__eglMustCastToProperFunctionPointerType)glTexParameterfv },
+    { "glTexParameteri", (__eglMustCastToProperFunctionPointerType)glTexParameteri },
+    { "glTexParameteriv", (__eglMustCastToProperFunctionPointerType)glTexParameteriv },
+    { "glTexSubImage2D", (__eglMustCastToProperFunctionPointerType)glTexSubImage2D },
+    { "glUniform1f", (__eglMustCastToProperFunctionPointerType)glUniform1f },
+    { "glUniform1fv", (__eglMustCastToProperFunctionPointerType)glUniform1fv },
+    { "glUniform1i", (__eglMustCastToProperFunctionPointerType)glUniform1i },
+    { "glUniform1iv", (__eglMustCastToProperFunctionPointerType)glUniform1iv },
+    { "glUniform2f", (__eglMustCastToProperFunctionPointerType)glUniform2f },
+    { "glUniform2fv", (__eglMustCastToProperFunctionPointerType)glUniform2fv },
+    { "glUniform2i", (__eglMustCastToProperFunctionPointerType)glUniform2i },
+    { "glUniform2iv", (__eglMustCastToProperFunctionPointerType)glUniform2iv },
+    { "glUniform3f", (__eglMustCastToProperFunctionPointerType)glUniform3f },
+    { "glUniform3fv", (__eglMustCastToProperFunctionPointerType)glUniform3fv },
+    { "glUniform3i", (__eglMustCastToProperFunctionPointerType)glUniform3i },
+    { "glUniform3iv", (__eglMustCastToProperFunctionPointerType)glUniform3iv },
+    { "glUniform4f", (__eglMustCastToProperFunctionPointerType)glUniform4f },
+    { "glUniform4fv", (__eglMustCastToProperFunctionPointerType)glUniform4fv },
+    { "glUniform4i", (__eglMustCastToProperFunctionPointerType)glUniform4i },
+    { "glUniform4iv", (__eglMustCastToProperFunctionPointerType)glUniform4iv },
+    { "glUniformMatrix2fv", (__eglMustCastToProperFunctionPointerType)glUniformMatrix2fv },
+    { "glUniformMatrix3fv", (__eglMustCastToProperFunctionPointerType)glUniformMatrix3fv },
+    { "glUniformMatrix4fv", (__eglMustCastToProperFunctionPointerType)glUniformMatrix4fv },
+    { "glUseProgram", (__eglMustCastToProperFunctionPointerType)glUseProgram },
+    { "glValidateProgram", (__eglMustCastToProperFunctionPointerType)glValidateProgram },
+    { "glVertexAttrib1f", (__eglMustCastToProperFunctionPointerType)glVertexAttrib1f },
+    { "glVertexAttrib1fv", (__eglMustCastToProperFunctionPointerType)glVertexAttrib1fv },
+    { "glVertexAttrib2f", (__eglMustCastToProperFunctionPointerType)glVertexAttrib2f },
+    { "glVertexAttrib2fv", (__eglMustCastToProperFunctionPointerType)glVertexAttrib2fv },
+    { "glVertexAttrib3f", (__eglMustCastToProperFunctionPointerType)glVertexAttrib3f },
+    { "glVertexAttrib3fv", (__eglMustCastToProperFunctionPointerType)glVertexAttrib3fv },
+    { "glVertexAttrib4f", (__eglMustCastToProperFunctionPointerType)glVertexAttrib4f },
+    { "glVertexAttrib4fv", (__eglMustCastToProperFunctionPointerType)glVertexAttrib4fv },
+    { "glVertexAttribPointer", (__eglMustCastToProperFunctionPointerType)glVertexAttribPointer },
+    { "glViewport", (__eglMustCastToProperFunctionPointerType)glViewport },
+    { NULL, NULL }
+};
+
 __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *procname)
 {
-    (void)procname;
-    return NULL;   /* all supported entry points are exported directly */
+    const egl_proc_t *p;
+    if (procname == NULL) return NULL;
+    for (p = g_proc_table; p->name != NULL; ++p) {
+        if (strcmp(procname, p->name) == 0)
+            return p->fn;
+    }
+    return NULL;
 }

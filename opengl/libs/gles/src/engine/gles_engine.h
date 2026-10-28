@@ -127,6 +127,7 @@ void    gles_engine_blend_func_separate(GEenum srgb, GEenum drgb, GEenum sa, GEe
 void    gles_engine_blend_equation(GEenum mode);
 void    gles_engine_blend_equation_separate(GEenum rgb, GEenum alpha);
 void    gles_engine_depth_rangef(GEfloat n, GEfloat f);
+void    gles_engine_sample_coverage(GEfloat value, GEbool invert);
 void    gles_engine_read_pixels(GEint x, GEint y, GEint w, GEint h,
                                 GEenum format, GEenum type, void *pixels);
 
