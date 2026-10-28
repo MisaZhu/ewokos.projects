@@ -69,10 +69,12 @@ typedef struct {
     glsl_program *gp;
     GLuint        pgl_id;
     GLint         link_status;
+    GLint         validate_status;
     GLint         delete_flag;
     glsl_cell    *ublock;
     int           ublock_cells;
     char          log[LOG_LEN];
+    char          validate_log[LOG_LEN];
     int           in_use;
     /* attribute-location binds requested before link */
     char          bind_name[MAX_PENDING_BINDS][GLSL_NAME_LEN];
@@ -106,6 +108,10 @@ static program_obj *find_program(GLuint h)
 GLuint glCreateShader(GLenum type)
 {
     int i;
+    if (type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER) {
+        gles_engine_set_error(GL_INVALID_ENUM);
+        return 0;
+    }
     for (i = 0; i < MAX_SHADERS; ++i) {
         if (!g_shaders[i].in_use) {
             shader_obj *s = &g_shaders[i];
@@ -123,7 +129,11 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string,
 {
     shader_obj *s = find_shader(shader);
     size_t total = 0; int i; char *buf; size_t off = 0;
-    if (!s || !string || count < 0) return;
+    if (!s) { gles_engine_set_error(GL_INVALID_VALUE); return; }
+    if (count < 0 || (count > 0 && !string)) {
+        gles_engine_set_error(GL_INVALID_VALUE);
+        return;
+    }
     for (i = 0; i < count; ++i) {
         if (!string[i]) continue;
         total += (length && length[i] >= 0) ? (size_t)length[i] : strlen(string[i]);
@@ -144,7 +154,7 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string,
 void glCompileShader(GLuint shader)
 {
     shader_obj *s = find_shader(shader);
-    if (!s) return;
+    if (!s) { gles_engine_set_error(GL_INVALID_VALUE); return; }
     if (s->stage) { glsl_free_stage(s->stage); s->stage = NULL; }
     s->log[0] = '\0';
     if (!s->src) { s->compile_status = GL_FALSE; snprintf(s->log, LOG_LEN, "no source"); return; }
@@ -156,7 +166,8 @@ void glCompileShader(GLuint shader)
 void glGetShaderiv(GLuint shader, GLenum pname, GLint *params)
 {
     shader_obj *s = find_shader(shader);
-    if (!s || !params) return;
+    if (!s) { gles_engine_set_error(GL_INVALID_VALUE); return; }
+    if (!params) return;
     switch (pname) {
     case GL_COMPILE_STATUS:    *params = s->compile_status; break;
     case GL_SHADER_TYPE:       *params = (GLint)s->type; break;
@@ -247,7 +258,15 @@ void glAttachShader(GLuint program, GLuint shader)
 {
     program_obj *p = find_program(program);
     shader_obj *s = find_shader(shader);
-    if (!p || !s) return;
+    if (!p || !s) {
+        gles_engine_set_error((find_shader(program) || find_program(shader)) ?
+                              GL_INVALID_OPERATION : GL_INVALID_VALUE);
+        return;
+    }
+    if (p->vs_shader == shader || p->fs_shader == shader) {
+        gles_engine_set_error(GL_INVALID_OPERATION);
+        return;
+    }
     if (s->type == GL_VERTEX_SHADER)   { p->vs_shader = shader; }
     else if (s->type == GL_FRAGMENT_SHADER) { p->fs_shader = shader; }
 }
@@ -277,13 +296,14 @@ void glLinkProgram(GLuint program)
     program_obj *p = find_program(program);
     shader_obj *vs, *fs;
     int i;
-    if (!p) return;
+    if (!p) { gles_engine_set_error(GL_INVALID_VALUE); return; }
 
     /* release a previous link */
     if (p->pgl_id) { gles_engine_gpu_delete(p->pgl_id); gles_engine_delete_program(p->pgl_id); p->pgl_id = 0; }
     if (p->gp) { glsl_free_program(p->gp); p->gp = NULL; }
     free(p->ublock); p->ublock = NULL; p->ublock_cells = 0;
     p->log[0] = '\0'; p->link_status = GL_FALSE;
+        p->validate_status = GL_FALSE; p->validate_log[0] = '\0';
 
     vs = find_shader(p->vs_shader);
     fs = find_shader(p->fs_shader);
@@ -331,7 +351,11 @@ void glUseProgram(GLuint program)
     if (program == 0) { g_cur = NULL; gles_engine_use_program(0); return; }
     {
         program_obj *p = find_program(program);
-        if (!p) return;
+        if (!p) { gles_engine_set_error(GL_INVALID_VALUE); return; }
+        if (!p->link_status || !p->pgl_id) {
+            gles_engine_set_error(GL_INVALID_OPERATION);
+            return;
+        }
         g_cur = p;
         gles_engine_use_program(p->pgl_id);
     }
@@ -342,7 +366,44 @@ void glUseProgram(GLuint program)
  * engine. */
 GLuint gles2_current_program_handle(void) { return g_cur ? g_cur->handle : 0; }
 
-void glValidateProgram(GLuint program) { (void)program; /* always valid if linked */ }
+void glValidateProgram(GLuint program)
+{
+    program_obj *p = find_program(program);
+    int sampler_type[32] = { 0 };
+    int i;
+    if (!p) { gles_engine_set_error(GL_INVALID_VALUE); return; }
+    p->validate_status = GL_FALSE;
+    p->validate_log[0] = '\0';
+    if (!p->link_status || !p->gp || !p->ublock ||
+        !gles_engine_program_executable(p->pgl_id)) {
+        snprintf(p->validate_log, LOG_LEN, "validate: program is not linked and executable");
+        return;
+    }
+    for (i = 0; i < p->gp->nuniforms; ++i) {
+        glsl_uniform *u = &p->gp->uniforms[i];
+        int unit, cube;
+        if (u->type != T_SAMPLER2D && u->type != T_SAMPLERCUBE) continue;
+        unit = p->ublock[u->offset].i;
+        cube = u->type == T_SAMPLERCUBE;
+        if (unit < 0 || unit >= 32) {
+            snprintf(p->validate_log, LOG_LEN, "validate: %s selects invalid texture unit %d",
+                     u->name, unit);
+            return;
+        }
+        if (sampler_type[unit] && sampler_type[unit] != u->type) {
+            snprintf(p->validate_log, LOG_LEN,
+                     "validate: sampler2D and samplerCube alias texture unit %d", unit);
+            return;
+        }
+        sampler_type[unit] = u->type;
+        if (!gles_engine_texture_complete(unit, cube)) {
+            snprintf(p->validate_log, LOG_LEN, "validate: %s has an incomplete texture on unit %d",
+                     u->name, unit);
+            return;
+        }
+    }
+    p->validate_status = GL_TRUE;
+}
 GLboolean glIsProgram(GLuint program) { return find_program(program) ? GL_TRUE : GL_FALSE; }
 
 void glDeleteProgram(GLuint program)
@@ -360,10 +421,11 @@ void glDeleteProgram(GLuint program)
 void glGetProgramiv(GLuint program, GLenum pname, GLint *params)
 {
     program_obj *p = find_program(program);
-    if (!p || !params) return;
+    if (!p) { gles_engine_set_error(GL_INVALID_VALUE); return; }
+    if (!params) return;
     switch (pname) {
     case GL_LINK_STATUS:     *params = p->link_status; break;
-    case GL_VALIDATE_STATUS: *params = p->link_status; break;
+    case GL_VALIDATE_STATUS: *params = p->validate_status; break;
     case GL_DELETE_STATUS:   *params = p->delete_flag; break;
     case GL_ATTACHED_SHADERS:*params = (p->vs_shader?1:0) + (p->fs_shader?1:0); break;
     case GL_ACTIVE_UNIFORMS: *params = p->gp ? p->gp->nuniforms : 0; break;
@@ -467,48 +529,77 @@ void glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *l
 
 /* ------------------------------------------------------------------ */
 /* uniform setters (operate on the current program) */
-static glsl_uniform *cur_uniform(GLint loc)
+static glsl_uniform *cur_uniform(GLint loc, GLsizei count, const void *values,
+                                 int comps, int kind, int dim)
 {
-    if (!g_cur || !g_cur->gp || !g_cur->ublock) return NULL;
-    if (loc < 0 || loc >= g_cur->gp->nuniforms) return NULL;
-    return &g_cur->gp->uniforms[loc];
+    glsl_uniform *u;
+    int elements;
+    if (loc == -1) return NULL;
+    if (!g_cur || !g_cur->link_status || !g_cur->gp || !g_cur->ublock ||
+        loc < 0 || loc >= g_cur->gp->nuniforms) {
+        gles_engine_set_error(GL_INVALID_OPERATION);
+        return NULL;
+    }
+    if (count < 0 || !values) {
+        gles_engine_set_error(GL_INVALID_VALUE);
+        return NULL;
+    }
+    if (count == 0) return NULL;
+    u = &g_cur->gp->uniforms[loc];
+    elements = u->array_len > 0 ? u->array_len : 1;
+    if (count > elements) {
+        gles_engine_set_error(GL_INVALID_OPERATION);
+        return NULL;
+    }
+    if (kind == 0) {
+        int expected = glsl_float_type_of_len(comps);
+        if (u->type != expected) {
+            gles_engine_set_error(GL_INVALID_OPERATION);
+            return NULL;
+        }
+    } else if (kind == 1) {
+        if (!glsl_is_int_family(u->type) || glsl_vec_len(u->type) != comps ||
+            ((u->type == T_SAMPLER2D || u->type == T_SAMPLERCUBE) && comps != 1)) {
+            gles_engine_set_error(GL_INVALID_OPERATION);
+            return NULL;
+        }
+    } else {
+        int expected = dim == 2 ? T_MAT2 : dim == 3 ? T_MAT3 : T_MAT4;
+        if (u->type != expected) {
+            gles_engine_set_error(GL_INVALID_OPERATION);
+            return NULL;
+        }
+    }
+    return u;
 }
 
 static void uni_fv(GLint loc, GLsizei count, const GLfloat *v, int comps)
 {
-    glsl_uniform *U = cur_uniform(loc);
-    int k, j, isint;
+    glsl_uniform *U = cur_uniform(loc, count, v, comps, 0, 0);
+    int k, j;
     glsl_cell *c;
-    if (!U || !v || count < 1) return;
-    isint = glsl_is_int_family(U->type);
+    if (!U) return;
     for (k = 0; k < count; ++k) {
         c = g_cur->ublock + U->offset + k * U->elem_stride;
-        for (j = 0; j < comps && j < U->ncomp; ++j) {
-            GLfloat f = v[k * comps + j];
-            if (isint) c[j].i = (int)f; else c[j].f = f;
-        }
+        for (j = 0; j < comps; ++j) c[j].f = v[k * comps + j];
     }
 }
 
 static void uni_iv(GLint loc, GLsizei count, const GLint *v, int comps)
 {
-    glsl_uniform *U = cur_uniform(loc);
-    int k, j, isint;
+    glsl_uniform *U = cur_uniform(loc, count, v, comps, 1, 0);
+    int k, j;
     glsl_cell *c;
-    if (!U || !v || count < 1) return;
-    isint = glsl_is_int_family(U->type);
+    if (!U) return;
     for (k = 0; k < count; ++k) {
         c = g_cur->ublock + U->offset + k * U->elem_stride;
-        for (j = 0; j < comps && j < U->ncomp; ++j) {
-            GLint iv = v[k * comps + j];
-            if (isint) c[j].i = iv; else c[j].f = (GLfloat)iv;
-        }
+        for (j = 0; j < comps; ++j) c[j].i = v[k * comps + j];
     }
 }
 
 static void uni_mat(GLint loc, GLsizei count, const GLfloat *v, int dim)
 {
-    glsl_uniform *U = cur_uniform(loc);
+    glsl_uniform *U = cur_uniform(loc, count, v, dim * dim, 2, dim);
     int k, j, n = dim * dim;
     glsl_cell *c;
     if (!U || !v || count < 1) return;
@@ -534,9 +625,9 @@ void glUniform1iv(GLint l, GLsizei c, const GLint *v)   { uni_iv(l,c,v,1); }
 void glUniform2iv(GLint l, GLsizei c, const GLint *v)   { uni_iv(l,c,v,2); }
 void glUniform3iv(GLint l, GLsizei c, const GLint *v)   { uni_iv(l,c,v,3); }
 void glUniform4iv(GLint l, GLsizei c, const GLint *v)   { uni_iv(l,c,v,4); }
-void glUniformMatrix2fv(GLint l, GLsizei c, GLboolean t, const GLfloat *v) { (void)t; uni_mat(l,c,v,2); }
-void glUniformMatrix3fv(GLint l, GLsizei c, GLboolean t, const GLfloat *v) { (void)t; uni_mat(l,c,v,3); }
-void glUniformMatrix4fv(GLint l, GLsizei c, GLboolean t, const GLfloat *v) { (void)t; uni_mat(l,c,v,4); }
+void glUniformMatrix2fv(GLint l, GLsizei c, GLboolean t, const GLfloat *v) { if (t != GL_FALSE) { gles_engine_set_error(GL_INVALID_VALUE); return; } uni_mat(l,c,v,2); }
+void glUniformMatrix3fv(GLint l, GLsizei c, GLboolean t, const GLfloat *v) { if (t != GL_FALSE) { gles_engine_set_error(GL_INVALID_VALUE); return; } uni_mat(l,c,v,3); }
+void glUniformMatrix4fv(GLint l, GLsizei c, GLboolean t, const GLfloat *v) { if (t != GL_FALSE) { gles_engine_set_error(GL_INVALID_VALUE); return; } uni_mat(l,c,v,4); }
 
 void glGetUniformfv(GLuint program, GLint location, GLfloat *params)
 {

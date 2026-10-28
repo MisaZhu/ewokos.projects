@@ -132,6 +132,7 @@ void    gles_engine_read_pixels(GEint x, GEint y, GEint w, GEint h,
 
 /* pgl_* error ordinals are translated back to standard GL error values. */
 GEenum       gles_engine_get_error(void);
+void         gles_engine_set_error(GEenum error);
 const uint8_t *gles_engine_get_string(GEenum name);
 void         gles_engine_get_integerv(GEenum pname, GEint *data);
 void         gles_engine_get_floatv(GEenum pname, GEfloat *data);
@@ -145,6 +146,8 @@ void gles_engine_delete_buffers(GEint n, const GEuint *buffers);
 void gles_engine_bind_buffer(GEenum target, GEuint buffer);
 void gles_engine_buffer_data(GEenum target, GEiptr size, const void *data, GEenum usage);
 void gles_engine_buffer_sub_data(GEenum target, GEiptr offset, GEiptr size, const void *data);
+void gles_engine_get_buffer_parameteriv(GEenum target, GEenum pname, GEint *params);
+GEbool gles_engine_is_buffer(GEuint buffer);
 
 /* ------------------------------------------------------------------ *
  * Textures
@@ -162,7 +165,23 @@ void gles_engine_tex_image_2d(GEenum target, GEint level, GEint internalformat,
 void gles_engine_tex_sub_image_2d(GEenum target, GEint level, GEint xoff, GEint yoff,
                                   GEint w, GEint h, GEenum format, GEenum type,
                                   const void *data);
+void gles_engine_compressed_tex_image_2d(GEenum target, GEint level, GEenum internalformat,
+                                         GEint w, GEint h, GEint border,
+                                         GEint image_size, const void *data);
+void gles_engine_compressed_tex_sub_image_2d(GEenum target, GEint level,
+                                             GEint xoff, GEint yoff, GEint w, GEint h,
+                                             GEenum format, GEint image_size,
+                                             const void *data);
+void gles_engine_copy_tex_image_2d(GEenum target, GEint level, GEenum internalformat,
+                                   GEint x, GEint y, GEint w, GEint h, GEint border);
+void gles_engine_copy_tex_sub_image_2d(GEenum target, GEint level,
+                                       GEint xoff, GEint yoff, GEint x, GEint y,
+                                       GEint w, GEint h);
 void gles_engine_generate_mipmap(GEenum target);
+void gles_engine_get_tex_parameteriv(GEenum target, GEenum pname, GEint *params);
+void gles_engine_get_tex_parameterfv(GEenum target, GEenum pname, GEfloat *params);
+GEbool gles_engine_is_texture(GEuint texture);
+GEbool gles_engine_texture_complete(GEint unit, GEint cube);
 
 /* ------------------------------------------------------------------ *
  * Vertex attributes / draw
@@ -172,6 +191,10 @@ void gles_engine_vertex_attrib_pointer(GEuint index, GEint size, GEenum type,
                                        const void *pointer);
 void gles_engine_enable_vertex_attrib_array(GEuint index);
 void gles_engine_disable_vertex_attrib_array(GEuint index);
+void gles_engine_vertex_attrib4f(GEuint index, const GEfloat value[4]);
+void gles_engine_get_vertex_attribiv(GEuint index, GEenum pname, GEint *params);
+void gles_engine_get_vertex_attribfv(GEuint index, GEenum pname, GEfloat *params);
+void gles_engine_get_vertex_attrib_pointerv(GEuint index, GEenum pname, void **pointer);
 void gles_engine_draw_arrays(GEenum mode, GEint first, GEint count);
 void gles_engine_draw_elements(GEenum mode, GEint count, GEenum type, const void *indices);
 
@@ -180,6 +203,7 @@ void gles_engine_draw_elements(GEenum mode, GEint count, GEenum type, const void
  * ------------------------------------------------------------------ */
 void gles_engine_use_program(GEuint program);
 void gles_engine_delete_program(GEuint program);
+GEbool gles_engine_program_executable(GEuint program);
 
 /* ------------------------------------------------------------------ *
  * Transparent GPU (V3D) offload bridge

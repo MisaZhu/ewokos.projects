@@ -318,7 +318,7 @@ static glsl_val vm_builtin(env *E, int id, const glsl_val *av, int nargs)
         unit=ci(a.data,a.type,0); uv=b;
         rgba[0]=rgba[1]=rgba[2]=1; rgba[3]=1;
         co[0]=cf(uv.data,uv.type,0); co[1]=cf(uv.data,uv.type,1);
-        if(E->texfn) E->texfn(unit, 2, co, rgba, E->texuser);
+        sample_texture(E,unit,2,co,NULL,NULL,1,0.0f,rgba);
         for(i=0;i<4;++i) o[i].f=rgba[i];
         setval(&v,T_VEC4,-1,o,4,0,0); return v;
     }
@@ -327,7 +327,7 @@ static glsl_val vm_builtin(env *E, int id, const glsl_val *av, int nargs)
         unit=ci(a.data,a.type,0); uv=b; w=cf(uv.data,uv.type,uv.n-1);
         rgba[0]=rgba[1]=rgba[2]=1;rgba[3]=1;
         co[0]=w!=0?cf(uv.data,uv.type,0)/w:0; co[1]=w!=0?cf(uv.data,uv.type,1)/w:0;
-        if(E->texfn&&w!=0) E->texfn(unit, 2, co, rgba, E->texuser);
+        if(w!=0) sample_texture(E,unit,2,co,NULL,NULL,1,0.0f,rgba);
         for(i=0;i<4;++i)o[i].f=rgba[i];
         setval(&v,T_VEC4,-1,o,4,0,0); return v;
     }
@@ -336,7 +336,16 @@ static glsl_val vm_builtin(env *E, int id, const glsl_val *av, int nargs)
         unit=ci(a.data,a.type,0); dir=b;
         rgba[0]=rgba[1]=rgba[2]=1;rgba[3]=1;
         co[0]=cf(dir.data,dir.type,0); co[1]=cf(dir.data,dir.type,1); co[2]=cf(dir.data,dir.type,2);
-        if(E->texfn) E->texfn(unit, 3, co, rgba, E->texuser);
+        sample_texture(E,unit,3,co,NULL,NULL,1,0.0f,rgba);
+        for(i=0;i<4;++i)o[i].f=rgba[i];
+        setval(&v,T_VEC4,-1,o,4,0,0); return v;
+    }
+    case BF_TEXTURECUBELOD: {
+        glsl_val dir; int unit; float rgba[4],co[3]; glsl_cell*o=sc(E,4);
+        unit=ci(a.data,a.type,0); dir=b;
+        rgba[0]=rgba[1]=rgba[2]=1;rgba[3]=1;
+        co[0]=cf(dir.data,dir.type,0); co[1]=cf(dir.data,dir.type,1); co[2]=cf(dir.data,dir.type,2);
+        sample_texture(E,unit,3,co,NULL,NULL,1,cf(c.data,c.type,0),rgba);
         for(i=0;i<4;++i)o[i].f=rgba[i];
         setval(&v,T_VEC4,-1,o,4,0,0); return v;
     }
@@ -345,7 +354,7 @@ static glsl_val vm_builtin(env *E, int id, const glsl_val *av, int nargs)
         unit=ci(a.data,a.type,0); uv=b;
         rgba[0]=rgba[1]=rgba[2]=1;rgba[3]=1;
         co[0]=cf(uv.data,uv.type,0); co[1]=cf(uv.data,uv.type,1);
-        if(E->texfn) E->texfn(unit, 2, co, rgba, E->texuser);
+        sample_texture(E,unit,2,co,NULL,NULL,1,cf(c.data,c.type,0),rgba);
         for(i=0;i<4;++i)o[i].f=rgba[i];
         setval(&v,T_VEC4,-1,o,4,0,0); return v;
     }
@@ -883,7 +892,11 @@ static int vm_ce(vmc *C, const glsl_expr *e)
         int slots[32], nargs = e->nargs, ab, op, xid;
         if (nargs > 32 || (e->kind == EX_CTOR && glsl_is_uint(e->ctor_type)) ||
             (e->kind == EX_CALL && !e->is_user_fn &&
-             (e->op_builtin == BF_FLOAT_BITS_TO_UINT || e->op_builtin == BF_ROUND))) {
+             (e->op_builtin == BF_FLOAT_BITS_TO_UINT || e->op_builtin == BF_ROUND)) ||
+            (e->kind == EX_CALL && !e->is_user_fn && !C->stage->is_vertex &&
+             e->op_builtin >= BF_TEXTURE2D && e->op_builtin <= BF_FWIDTH)) {
+            /* Fragment texture LOD and derivatives need expression re-evaluation
+             * with shifted inputs; pre-evaluated VM operands cannot provide it. */
             C->failed = 1; return -1;
         }
         for (i = 0; i < nargs; ++i) {

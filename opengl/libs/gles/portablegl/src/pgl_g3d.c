@@ -202,7 +202,8 @@ typedef struct {
 	   A plain 2D slot leaves cube/depth/arrstride64 at 0. */
 	int            cube;
 	uint32_t       depth;
-	uint32_t       arrstride64;
+	uint32_t       arrstride64; /* complete mip-tree distance between layers */
+	uint32_t       levels;      /* 1 for legacy/single-level uploads */
 } pgl_g3d_tex_slot_t;
 static pgl_g3d_tex_slot_t _tex[PGL_G3D_MAX_TEX];
 
@@ -226,9 +227,12 @@ static int      _batch_tex_slot = -1;
    expansion.  Persistent GL-style unit state, re-established per frame by the
    caller (portablegl's pgl_gpu_frame). */
 static int      _ctex_bind[PGL_G3D_MAX_TEX_UNITS] = { -1, -1, -1, -1 };
-/* per-unit TMU filter (PGL_G3D_TEX_FILTER_*), set alongside the binding and
-   packed into the high nibble of req.ctex_ub_pad[u] on flush. */
-static int      _ctex_filter[PGL_G3D_MAX_TEX_UNITS];
+/* Per-unit mag/min/mip filters (PGL_G3D_TEX_FILTER_*), set with the binding.
+   The legacy high nibble keeps mag for older daemons; new requests also carry
+   the explicit packed sampler byte. */
+static int      _ctex_mag_filter[PGL_G3D_MAX_TEX_UNITS];
+static int      _ctex_min_filter[PGL_G3D_MAX_TEX_UNITS];
+static int      _ctex_mip_filter[PGL_G3D_MAX_TEX_UNITS];
 /* Phase B2c extended render state of the open batch (scissor / polygon offset /
    colour mask); part of the homogeneity key, copied into req.ext on flush. */
 static pgl_g3d_ext_t _batch_ext;
@@ -598,13 +602,18 @@ void pgl_g3d_flush(void)
 			req.ctex_stride[u] = t->stride;
 			req.ctex_tiling[u] = (uint8_t)t->tiling;
 			req.ctex_ub_pad[u] = G2D_PGL_CTEX_UB_PAD_PACK(t->ub_pad,
-			    _ctex_filter[u] == PGL_G3D_TEX_FILTER_LINEAR ?
+			    _ctex_mag_filter[u] == PGL_G3D_TEX_FILTER_LINEAR ?
 			        G2D_PGL_CTEX_FILTER_LINEAR : G2D_PGL_CTEX_FILTER_NEAREST);
 			/* A cubemap slot carries its 6-layer array geometry so the
 			   daemon builds image_depth=5 + array_stride; a plain 2D slot
 			   leaves both 0 (single-layer record, unchanged). */
 			req.ctex_depth[u]       = (uint8_t)t->depth;
 			req.ctex_arrstride64[u] = t->arrstride64;
+			req.ctex_levels[u]      = (uint8_t)(t->levels ? t->levels : 1u);
+			req.ctex_sampler[u]     = G2D_PGL_CTEX_SAMPLER_PACK(
+			    _ctex_mag_filter[u] == PGL_G3D_TEX_FILTER_LINEAR,
+			    _ctex_min_filter[u] == PGL_G3D_TEX_FILTER_LINEAR,
+			    _ctex_mip_filter[u] == PGL_G3D_TEX_FILTER_LINEAR);
 		}
 	}
 
@@ -980,7 +989,9 @@ void pgl_g3d_bind_tex_unit(int unit, int tex_slot)
 	pgl_g3d_bind_tex_unit_filter(unit, tex_slot, PGL_G3D_TEX_FILTER_NEAREST);
 }
 
-void pgl_g3d_bind_tex_unit_filter(int unit, int tex_slot, int filter)
+void pgl_g3d_bind_tex_unit_sampler(int unit, int tex_slot,
+                                   int mag_filter, int min_filter,
+                                   int mip_filter)
 {
 	if (!_enabled)
 		return;
@@ -994,8 +1005,18 @@ void pgl_g3d_bind_tex_unit_filter(int unit, int tex_slot, int filter)
 		_ctex_bind[unit] = -1;
 	else
 		_ctex_bind[unit] = tex_slot;
-	_ctex_filter[unit] = (filter == PGL_G3D_TEX_FILTER_LINEAR) ?
-	                     PGL_G3D_TEX_FILTER_LINEAR : PGL_G3D_TEX_FILTER_NEAREST;
+	_ctex_mag_filter[unit] = (mag_filter == PGL_G3D_TEX_FILTER_LINEAR) ?
+	                         PGL_G3D_TEX_FILTER_LINEAR : PGL_G3D_TEX_FILTER_NEAREST;
+	_ctex_min_filter[unit] = (min_filter == PGL_G3D_TEX_FILTER_LINEAR) ?
+	                         PGL_G3D_TEX_FILTER_LINEAR : PGL_G3D_TEX_FILTER_NEAREST;
+	_ctex_mip_filter[unit] = (mip_filter == PGL_G3D_TEX_FILTER_LINEAR) ?
+	                         PGL_G3D_TEX_FILTER_LINEAR : PGL_G3D_TEX_FILTER_NEAREST;
+}
+
+void pgl_g3d_bind_tex_unit_filter(int unit, int tex_slot, int filter)
+{
+	pgl_g3d_bind_tex_unit_sampler(unit, tex_slot, filter, filter,
+	                              PGL_G3D_TEX_FILTER_NEAREST);
 }
 
 int pgl_g3d_batch_tri_compiled(const float* n0, const float* n1, const float* n2,
@@ -1638,13 +1659,18 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 			req.ctex_stride[u] = t->stride;
 			req.ctex_tiling[u] = (uint8_t)t->tiling;
 			req.ctex_ub_pad[u] = G2D_PGL_CTEX_UB_PAD_PACK(t->ub_pad,
-			    _ctex_filter[u] == PGL_G3D_TEX_FILTER_LINEAR ?
+			    _ctex_mag_filter[u] == PGL_G3D_TEX_FILTER_LINEAR ?
 			        G2D_PGL_CTEX_FILTER_LINEAR : G2D_PGL_CTEX_FILTER_NEAREST);
 			/* A cubemap slot carries its 6-layer array geometry so the
 			   daemon builds image_depth=5 + array_stride; a plain 2D slot
 			   leaves both 0 (single-layer record, unchanged). */
 			req.ctex_depth[u]       = (uint8_t)t->depth;
 			req.ctex_arrstride64[u] = t->arrstride64;
+			req.ctex_levels[u]      = (uint8_t)(t->levels ? t->levels : 1u);
+			req.ctex_sampler[u]     = G2D_PGL_CTEX_SAMPLER_PACK(
+			    _ctex_mag_filter[u] == PGL_G3D_TEX_FILTER_LINEAR,
+			    _ctex_min_filter[u] == PGL_G3D_TEX_FILTER_LINEAR,
+			    _ctex_mip_filter[u] == PGL_G3D_TEX_FILTER_LINEAR);
 		}
 	}
 
@@ -1753,6 +1779,7 @@ static int tex_slot_fill(int slot, int w, int h, const void* rgba8,
 	t->ub_pad = layout->ub_pad;
 	t->stride = layout->stride;
 	t->size   = layout->size;
+	t->levels = 1u;
 	return 1;
 }
 
@@ -1806,6 +1833,8 @@ int pgl_g3d_upload_texture_cube_tiled(int slot, int w, int h,
 	   one buffer (6*w*h*4) with w == h. */
 	if (w <= 0 || w != h || src == NULL)
 		return -3;
+	if (!pglc_tex_sampler_cube_supported())
+		return -7;
 	if (!pglc_tex_layout_2d((uint32_t)w, (uint32_t)h, 4u, &layout))
 		return -4;
 	if (layout.size == 0)
@@ -1853,6 +1882,107 @@ int pgl_g3d_upload_texture_cube_tiled(int slot, int w, int h,
 	t->cube   = 1;
 	t->depth  = 6u;
 	t->arrstride64 = layer_size / 64u;
+	t->levels = 1u;
+	return 1;
+}
+
+int pgl_g3d_upload_texture_mips_tiled(int slot, uint32_t depth, uint32_t levels,
+                                      const pgl_g3d_tex_level_t* images)
+{
+	struct pglc_tex_layout layouts[PGL_G3D_MAX_TEX_LEVELS];
+	pgl_g3d_tex_slot_t* t;
+	uint32_t* pxw = NULL;
+	uint8_t* px;
+	ewokos_addr_t phy = 0;
+	uint32_t base_w, base_h, full_levels = 1u;
+	uint32_t layer_size, tree_size;
+	size_t total;
+	int shm = 0;
+	uint32_t layer, level;
+
+	if (!_enabled || slot < 0 || slot >= PGL_G3D_MAX_TEX || images == NULL)
+		return 0;
+	if ((depth != 1u && depth != 6u) || levels == 0u ||
+	    levels > PGL_G3D_MAX_TEX_LEVELS)
+		return 0;
+	if (depth == 6u && !pglc_tex_sampler_cube_supported())
+		return 0;
+	base_w = images[0].w;
+	base_h = images[0].h;
+	if (base_w == 0u || base_h == 0u || images[0].rgba8 == NULL ||
+	    (depth == 6u && base_w != base_h))
+		return 0;
+	if (levels > 1u) {
+		uint32_t w = base_w, h = base_h;
+		if ((base_w & (base_w - 1u)) != 0u ||
+		    (base_h & (base_h - 1u)) != 0u)
+			return 0;
+		while (w > 1u || h > 1u) {
+			w = w > 1u ? w / 2u : 1u;
+			h = h > 1u ? h / 2u : 1u;
+			++full_levels;
+		}
+		if (levels != full_levels)
+			return 0;
+	}
+	for (layer = 0; layer < depth; ++layer) {
+		for (level = 0; level < levels; ++level) {
+			const pgl_g3d_tex_level_t* image = &images[layer * levels + level];
+			uint32_t expected_w = base_w >> level;
+			uint32_t expected_h = base_h >> level;
+			if (expected_w == 0u) expected_w = 1u;
+			if (expected_h == 0u) expected_h = 1u;
+			if (image->rgba8 == NULL || image->w != expected_w ||
+			    image->h != expected_h)
+				return 0;
+		}
+	}
+	if (!pglc_tex_layout_mip_chain(base_w, base_h, 4u, levels - 1u,
+	                               layouts))
+		return 0;
+	tree_size = layouts[0].offset + layouts[0].size;
+	if (tree_size == 0u || tree_size > UINT32_MAX - 63u)
+		return 0;
+	layer_size = (tree_size + 63u) & ~63u;
+	total = (size_t)layer_size * depth;
+	if (total > UINT32_MAX)
+		return 0;
+
+	t = &_tex[slot];
+	if (t->pixels != NULL) {
+		if (_nverts != 0 && _batch_fs == PGL_G3D_FS_TEX_MOD &&
+		    _batch_tex_slot == slot)
+			pgl_g3d_flush();
+		g2d_shm_free(t->pixels);
+		memset(t, 0, sizeof(*t));
+	}
+	if (g2d_shm_alloc_phy((uint32_t)total, &shm, &pxw, &phy) != 0 ||
+	    shm <= 0 || pxw == NULL)
+		return 0;
+	px = (uint8_t*)pxw;
+	memset(px, 0, total);
+	for (layer = 0; layer < depth; ++layer) {
+		for (level = 0; level < levels; ++level) {
+			const pgl_g3d_tex_level_t* image = &images[layer * levels + level];
+			pglc_tex_store_2d(px + (size_t)layer * layer_size +
+			                  layouts[level].offset,
+			                 image->rgba8, image->w * 4u,
+			                 image->w, image->h, 4u, &layouts[level]);
+		}
+	}
+	t->shm = shm;
+	t->pixels = pxw;
+	t->phy = phy;
+	t->w = (int)base_w;
+	t->h = (int)base_h;
+	t->tiling = layouts[0].tiling;
+	t->ub_pad = layouts[0].ub_pad;
+	t->stride = layouts[0].stride;
+	t->size = (uint32_t)total;
+	t->cube = depth == 6u;
+	t->depth = depth;
+	t->arrstride64 = layer_size / 64u;
+	t->levels = levels;
 	return 1;
 }
 

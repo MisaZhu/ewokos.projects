@@ -3692,28 +3692,23 @@ static void pgl_gpu_fence(void)
     }
 }
 
-/* Phase D texture cache: map a GL texture name to a pgl_g3d slot, re-uploading
- * only when the id, size, or data pointer change.  PGL_G3D_MAX_TEX slots;
- * a miss evicts round-robin.  Returns the slot index, or -1 when the texture
- * cannot be represented by the GPU TEX_MOD kernel (unbound / not 2D / not
- * tightly-packed RGBA8 / non-NEAREST filter / non-CLAMP_TO_EDGE wrap) so the
- * caller declines the GPU path and rasterizes on the CPU.  pgl_TexSubImage2D
- * that mutates data in place without reallocating is NOT detected - the caller
- * must pgl_g3d_free_texture the slot (or resize) to force a re-upload. */
+/* Phase D texture cache: map a GL texture name to a pgl_g3d slot.  Every
+ * active level's datagen participates in the key, so an in-place TexSubImage
+ * cannot leave a stale staged image behind. */
 typedef struct {
     GLuint      tex_id;   /* 0 = free slot */
     GLsizei     w, h;
-    const void* data;     /* glTexture.data pointer, to catch realloc-on-resize */
+    const void* data;     /* level-0 pointer, to catch realloc-on-resize */
     int         slot;
-    int         tiled;    /* 1 = V3D tiled layout (compiled samplers), 0 = raster (TEX_MOD) */
+    int         tiled;    /* 1 = backend sampler layout, 0 = raster TEX_MOD */
+    int         levels;
+    GLuint      datagen[PGL_MAX_MIP_LEVELS];
 } pgl_gpu_tex_entry_t;
 static pgl_gpu_tex_entry_t _pgl_gpu_tex[PGL_G3D_MAX_TEX];
 static int _pgl_gpu_tex_next;
 
-/* Resolve tex_id to its glTexture, or NULL when it cannot back any GPU sampler
- * (unbound / out of range / deleted / not a 2D tightly-packed RGBA8 image with
- * data / not NEAREST-filtered).  The wrap mode is NOT checked here: the TEX_MOD
- * and compiled resolvers apply their own (CLAMP_TO_EDGE vs REPEAT). */
+/* Resolve tex_id to a defined canonical 2D texture.  Filter, wrap and mip
+ * completeness are path-specific and checked by the two resolvers below. */
 static glTexture* pgl_gpu_tex_get(GLuint tex_id)
 {
     glTexture* t;
@@ -3725,13 +3720,10 @@ static glTexture* pgl_gpu_tex_get(GLuint tex_id)
     t = &c->textures.a[tex_id];
     /* pgl_BindTexture stores type as target-(GL_TEXTURE_UNBOUND+1) (see the
      * pglDrawFrame tex check), NOT the raw GL_TEXTURE_2D enum. */
-    if (t->deleted || t->type != GL_TEXTURE_2D-(GL_TEXTURE_UNBOUND+1) || t->data == NULL)
+    if (t->deleted || t->type != GL_TEXTURE_2D-(GL_TEXTURE_UNBOUND+1) ||
+        !t->levels[0][0].defined || t->levels[0][0].data == NULL)
         return NULL;
-    if (t->w <= 0 || t->h <= 0)
-        return NULL;
-    if (t->format != GL_RGBA)
-        return NULL;
-    if (t->mag_filter != GL_NEAREST || t->min_filter != GL_NEAREST)
+    if (t->levels[0][0].w <= 0 || t->levels[0][0].h <= 0)
         return NULL;
     return t;
 }
@@ -3745,14 +3737,31 @@ static glTexture* pgl_gpu_tex_get(GLuint tex_id)
  * or -1 on an upload failure (which does NOT latch the GPU off). */
 static int pgl_gpu_tex_cache(GLuint tex_id, glTexture* t, int tiled)
 {
-    int i, ok;
+    const glTextureLevel* base = &t->levels[0][0];
+    int i, ok, level, levels = 1;
 
+    if (tiled && t->min_filter != GL_NEAREST && t->min_filter != GL_LINEAR) {
+        int w = base->w, h = base->h;
+        while (w > 1 || h > 1) {
+            w = w > 1 ? w / 2 : 1;
+            h = h > 1 ? h / 2 : 1;
+            ++levels;
+        }
+    }
+    if (levels > PGL_MAX_MIP_LEVELS)
+        return -1;
     for (i = 0; i < PGL_G3D_MAX_TEX; i++) {
         if (_pgl_gpu_tex[i].tex_id == tex_id &&
-            _pgl_gpu_tex[i].w == t->w && _pgl_gpu_tex[i].h == t->h &&
-            _pgl_gpu_tex[i].data == (const void*)t->data &&
-            _pgl_gpu_tex[i].tiled == tiled) {
-            return _pgl_gpu_tex[i].slot;
+            _pgl_gpu_tex[i].w == base->w && _pgl_gpu_tex[i].h == base->h &&
+            _pgl_gpu_tex[i].data == (const void*)base->data &&
+            _pgl_gpu_tex[i].tiled == tiled &&
+            _pgl_gpu_tex[i].levels == levels) {
+            for (level = 0; level < levels; ++level)
+                if (_pgl_gpu_tex[i].datagen[level] !=
+                    t->levels[0][level].datagen)
+                    break;
+            if (level == levels)
+                return _pgl_gpu_tex[i].slot;
         }
     }
 
@@ -3766,18 +3775,31 @@ static int pgl_gpu_tex_cache(GLuint tex_id, glTexture* t, int tiled)
     i = _pgl_gpu_tex_next;
     if (_pgl_gpu_tex[i].tex_id != 0)
         pgl_g3d_free_texture(_pgl_gpu_tex[i].slot);
-    ok = tiled ? pgl_g3d_upload_texture_tiled(i, t->w, t->h, t->data)
-               : pgl_g3d_upload_texture(i, t->w, t->h, t->data);
+    if (tiled) {
+        pgl_g3d_tex_level_t images[PGL_MAX_MIP_LEVELS];
+        for (level = 0; level < levels; ++level) {
+            images[level].rgba8 = t->levels[0][level].data;
+            images[level].w = (uint32_t)t->levels[0][level].w;
+            images[level].h = (uint32_t)t->levels[0][level].h;
+        }
+        ok = pgl_g3d_upload_texture_mips_tiled(i, 1u, (uint32_t)levels, images);
+    } else {
+        ok = pgl_g3d_upload_texture(i, base->w, base->h, base->data);
+    }
     if (!ok) {
         _pgl_gpu_tex[i].tex_id = 0;
         return -1;
     }
+    memset(&_pgl_gpu_tex[i], 0, sizeof(_pgl_gpu_tex[i]));
     _pgl_gpu_tex[i].tex_id = tex_id;
-    _pgl_gpu_tex[i].w = t->w;
-    _pgl_gpu_tex[i].h = t->h;
-    _pgl_gpu_tex[i].data = (const void*)t->data;
+    _pgl_gpu_tex[i].w = base->w;
+    _pgl_gpu_tex[i].h = base->h;
+    _pgl_gpu_tex[i].data = (const void*)base->data;
     _pgl_gpu_tex[i].slot = i;
     _pgl_gpu_tex[i].tiled = tiled;
+    _pgl_gpu_tex[i].levels = levels;
+    for (level = 0; level < levels; ++level)
+        _pgl_gpu_tex[i].datagen[level] = t->levels[0][level].datagen;
     _pgl_gpu_tex_next = (i + 1) % PGL_G3D_MAX_TEX;
     return i;
 }
@@ -3788,7 +3810,8 @@ static int pgl_gpu_tex_slot(GLuint tex_id)
     if (!t)
         return -1;
     /* GPU TEX_MOD is point-sampled, CLAMP-to-edge, and reads raster rows. */
-    if (t->wrap_s != GL_CLAMP_TO_EDGE || t->wrap_t != GL_CLAMP_TO_EDGE)
+    if (t->mag_filter != GL_NEAREST || t->min_filter != GL_NEAREST ||
+        t->wrap_s != GL_CLAMP_TO_EDGE || t->wrap_t != GL_CLAMP_TO_EDGE)
         return -1;
     return pgl_gpu_tex_cache(tex_id, t, 0);
 }
@@ -3806,7 +3829,8 @@ static int pgl_gpu_ctex_slot(GLuint tex_id)
     glTexture* t = pgl_gpu_tex_get(tex_id);
     if (!t)
         return -1;
-    if (t->wrap_s != GL_REPEAT || t->wrap_t != GL_REPEAT)
+    if (t->wrap_s != GL_REPEAT || t->wrap_t != GL_REPEAT ||
+        !pgl_texture_complete(t, 0))
         return -1;
     return pgl_gpu_tex_cache(tex_id, t, 1);
 }
@@ -4201,15 +4225,21 @@ static int pgl_gpu_frame(frag_func fs, void* uniforms)
         for (u = 0; u < e->n_tex_units; u++) {
             int slot = pgl_gpu_ctex_slot(e->tex_units[u]);
             glTexture* ft = pgl_gpu_tex_get(e->tex_units[u]);
-            /* the TMU filters bilinearly when the GL object asks for LINEAR
-             * (mag LINEAR and a LINEAR-family min filter); anything else
-             * samples NEAREST, the historic fixed sampler. */
-            int filt = (ft && ft->mag_filter == GL_LINEAR &&
-                        ft->min_filter != GL_NEAREST &&
-                        ft->min_filter != GL_NEAREST_MIPMAP_NEAREST &&
-                        ft->min_filter != GL_NEAREST_MIPMAP_LINEAR)
-                       ? PGL_G3D_TEX_FILTER_LINEAR : PGL_G3D_TEX_FILTER_NEAREST;
-            pgl_g3d_bind_tex_unit_filter(u, slot, filt);
+            int mag = PGL_G3D_TEX_FILTER_NEAREST;
+            int min = PGL_G3D_TEX_FILTER_NEAREST;
+            int mip = PGL_G3D_TEX_FILTER_NEAREST;
+            if (ft) {
+                if (ft->mag_filter == GL_LINEAR)
+                    mag = PGL_G3D_TEX_FILTER_LINEAR;
+                if (ft->min_filter == GL_LINEAR ||
+                    ft->min_filter == GL_LINEAR_MIPMAP_NEAREST ||
+                    ft->min_filter == GL_LINEAR_MIPMAP_LINEAR)
+                    min = PGL_G3D_TEX_FILTER_LINEAR;
+                if (ft->min_filter == GL_NEAREST_MIPMAP_LINEAR ||
+                    ft->min_filter == GL_LINEAR_MIPMAP_LINEAR)
+                    mip = PGL_G3D_TEX_FILTER_LINEAR;
+            }
+            pgl_g3d_bind_tex_unit_sampler(u, slot, mag, min, mip);
             if (slot < 0) {
                 static int _gf_unb = 0;
                 glTexture* t = (e->tex_units[u] && c && (int)e->tex_units[u] < c->textures.size)
@@ -4440,6 +4470,7 @@ static void vertex_stage(const GLvoid* indices, GLsizei count, GLsizei instance_
     // of GL_MAX_VERTEX_ATTRIBS and vertices does it become a benefit?
     int enabled[GL_MAX_VERTEX_ATTRIBS] = { 0 };
     for (i=0, j=0; i<GL_MAX_VERTEX_ATTRIBS; ++i) {
+        c->vertex_attribs_vs[i] = v[i].current_value;
         if (v[i].enabled) {
             if (v[i].divisor == 0) {
                 enabled[j++] = i;
@@ -4504,6 +4535,8 @@ static void draw_point(glVertex* vert, float poly_offset)
     //	clamp(point.z, c->depth_range_near, c->depth_range_far);
 
     Shader_Builtins builtins;
+    builtins.fs_input_dx = NULL;
+    builtins.fs_input_dy = NULL;
     // 3.3 spec pg 110 says r,q are supposed to be replaced with 0 and 1...
     // but PointCoord is a vec2 and that is not in the 4.6 spec so it must be a typo
 
@@ -4517,6 +4550,8 @@ static void draw_point(glVertex* vert, float poly_offset)
     float y = point.y + 0.5f;
     float p_size = c->point_size;
     float origin = (c->point_spr_origin == GL_UPPER_LEFT) ? -1.0f : 1.0f;
+    SET_V2(builtins.gl_PointCoord_dx, 1.0f/p_size, 0.0f);
+    SET_V2(builtins.gl_PointCoord_dy, 0.0f, origin/p_size);
     // NOTE/TODO, According to the spec if the clip coordinate, ie the
     // center of the point is outside the clip volume, you're supposed to
     // clip the whole thing, but some vendors don't do that because it's
@@ -4658,24 +4693,36 @@ static int depthtest(u32 zval, u32 zbufval)
 }
 
 
-static void setup_fs_input(float t, float* v1_out, float* v2_out, float wa, float wb, unsigned int provoke)
+static void setup_fs_input(float t, float dt_dx, float dt_dy, float* v1_out, float* v2_out, float wa, float wb, unsigned int provoke)
 {
     float* vs_output = &c->vs_output.output_buf[0];
 
     float inv_wa = 1.0/wa;
     float inv_wb = 1.0/wb;
+    float dq = inv_wb - inv_wa;
+    float q = inv_wa + t*dq;
 
     for (int i=0; i<c->vs_output.size; ++i) {
         if (c->vs_output.interpolation[i] == PGL_SMOOTH) {
-            c->fs_input[i] = (v1_out[i]*inv_wa + t*(v2_out[i]*inv_wb - v1_out[i]*inv_wa)) / (inv_wa + t*(inv_wb - inv_wa));
+            float dn = v2_out[i]*inv_wb - v1_out[i]*inv_wa;
+            c->fs_input[i] = (v1_out[i]*inv_wa + t*dn) / q;
+            c->fs_input_dx[i] = (dn - c->fs_input[i]*dq)*dt_dx/q;
+            c->fs_input_dy[i] = (dn - c->fs_input[i]*dq)*dt_dy/q;
 
         } else if (c->vs_output.interpolation[i] == PGL_NOPERSPECTIVE) {
-            c->fs_input[i] = v1_out[i] + t*(v2_out[i] - v1_out[i]);
+            float dv = v2_out[i] - v1_out[i];
+            c->fs_input[i] = v1_out[i] + t*dv;
+            c->fs_input_dx[i] = dv*dt_dx;
+            c->fs_input_dy[i] = dv*dt_dy;
         } else {
             c->fs_input[i] = vs_output[provoke*c->vs_output.size + i];
+            c->fs_input_dx[i] = 0.0f;
+            c->fs_input_dy[i] = 0.0f;
         }
     }
 
+    c->builtins.fs_input_dx = c->fs_input_dx;
+    c->builtins.fs_input_dy = c->fs_input_dy;
     c->builtins.discard = GL_FALSE;
 }
 
@@ -4842,12 +4889,14 @@ static void draw_thick_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_ou
     float m = (y2-y1)/(x2-x1);
     Line line = make_Line(x1, y1, x2, y2);
 
-    float t, x, y, z, w;
+    float t, x, y, z, w, dt_dx, dt_dy;
 
     vec2 p1 = { x1, y1 }, p2 = { x2, y2 };
     vec2 pr, sub_p2p1 = sub_v2s(p2, p1);
     float line_length_squared = len_v2(sub_p2p1);
     line_length_squared *= line_length_squared;
+    dt_dx = line_length_squared > 0.0f ? sub_p2p1.x/line_length_squared : 0.0f;
+    dt_dy = line_length_squared > 0.0f ? sub_p2p1.y/line_length_squared : 0.0f;
 
     frag_func fragment_shader = c->programs.a[c->cur_program].fragment_shader;
     void* uniform = c->programs.a[c->cur_program].uniform;
@@ -4916,7 +4965,7 @@ static void draw_thick_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_ou
                         SET_V4(c->builtins.gl_FragCoord, j, y, z, 1/w);
                         c->builtins.discard = GL_FALSE;
                         c->builtins.gl_FragDepth = z;
-                        setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                        setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                         fragment_shader(c->fs_input, &c->builtins, uniform);
                         if (!c->builtins.discard)
                             draw_pixel(c->builtins.gl_FragColor, j, y, c->builtins.gl_FragDepth, fragdepth_or_discard);
@@ -4946,7 +4995,7 @@ static void draw_thick_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_ou
                         SET_V4(c->builtins.gl_FragCoord, x, j, z, 1/w);
                         c->builtins.discard = GL_FALSE;
                         c->builtins.gl_FragDepth = z;
-                        setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                        setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                         fragment_shader(c->fs_input, &c->builtins, uniform);
                         if (!c->builtins.discard)
                             draw_pixel(c->builtins.gl_FragColor, x, j, c->builtins.gl_FragDepth, fragdepth_or_discard);
@@ -4975,7 +5024,7 @@ static void draw_thick_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_ou
                         SET_V4(c->builtins.gl_FragCoord, x, j, z, 1/w);
                         c->builtins.discard = GL_FALSE;
                         c->builtins.gl_FragDepth = z;
-                        setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                        setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                         fragment_shader(c->fs_input, &c->builtins, uniform);
                         if (!c->builtins.discard)
                             draw_pixel(c->builtins.gl_FragColor, x, j, c->builtins.gl_FragDepth, fragdepth_or_discard);
@@ -5005,7 +5054,7 @@ static void draw_thick_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_ou
                         SET_V4(c->builtins.gl_FragCoord, j, y, z, 1/w);
                         c->builtins.discard = GL_FALSE;
                         c->builtins.gl_FragDepth = z;
-                        setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                        setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                         fragment_shader(c->fs_input, &c->builtins, uniform);
                         if (!c->builtins.discard)
                             draw_pixel(c->builtins.gl_FragColor, j, y, c->builtins.gl_FragDepth, fragdepth_or_discard);
@@ -5062,6 +5111,8 @@ static void draw_thick_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_ou
     vec2 v1r, pr; // v2r
 
     float dot_1212 = dot_v2s(v12, v12);
+    float dt_dx = dot_1212 > 0.0f ? v12.x/dot_1212 : 0.0f;
+    float dt_dy = dot_1212 > 0.0f ? v12.y/dot_1212 : 0.0f;
 
     float x_min, x_max, y_min, y_max;
 
@@ -5152,7 +5203,7 @@ static void draw_thick_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_ou
                     SET_V4(c->builtins.gl_FragCoord, x, y, z, 1/w);
                     c->builtins.discard = GL_FALSE;
                     c->builtins.gl_FragDepth = z;
-                    setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                    setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
 
                     fragment_shader(c->fs_input, &c->builtins, uniform);
                     if (!c->builtins.discard)
@@ -5181,7 +5232,7 @@ static void draw_thick_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_ou
 #define swap_(a, b) do{ __typeof__(a) tmp;  tmp = a; a = b; b = tmp; } while(0)
 static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, float* v2_out, unsigned int provoke, float poly_offset)
 {
-    float t, z, w;
+    float t, z, w, dt_dx, dt_dy;
     int x, y;
 
     frag_func fragment_shader = c->programs.a[c->cur_program].fragment_shader;
@@ -5207,6 +5258,8 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
         vec2 pr, sub_p2p1 = sub_v2s(p2, p1);
         float line_length_squared = len_v2(sub_p2p1);
         line_length_squared *= line_length_squared;
+        dt_dx = line_length_squared > 0.0f ? sub_p2p1.x/line_length_squared : 0.0f;
+        dt_dy = line_length_squared > 0.0f ? sub_p2p1.y/line_length_squared : 0.0f;
 
         // TODO should be done for each fragment, after poly_offset is added?
         z1 = rsw_mapf(z1, -1.0f, 1.0f, c->depth_range_near, c->depth_range_far);
@@ -5232,7 +5285,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                 SET_V4(c->builtins.gl_FragCoord, x, y, z, 1/w);
                 c->builtins.discard = GL_FALSE;
                 c->builtins.gl_FragDepth = z;
-                setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                 fragment_shader(c->fs_input, &c->builtins, uniform);
                 if (!c->builtins.discard) {
                     c->builtins.gl_FragColor.w *= rfpart_(yend)*xgap;
@@ -5245,7 +5298,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                 SET_V4(c->builtins.gl_FragCoord, x, y+1, z, 1/w);
                 c->builtins.discard = GL_FALSE;
                 c->builtins.gl_FragDepth = z;
-                setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                 fragment_shader(c->fs_input, &c->builtins, uniform);
                 if (!c->builtins.discard) {
                     c->builtins.gl_FragColor.w *= fpart_(yend)*xgap;
@@ -5275,7 +5328,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                 SET_V4(c->builtins.gl_FragCoord, x, y, z, 1/w);
                 c->builtins.discard = GL_FALSE;
                 c->builtins.gl_FragDepth = z;
-                setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                 fragment_shader(c->fs_input, &c->builtins, uniform);
                 if (!c->builtins.discard) {
                     c->builtins.gl_FragColor.w *= rfpart_(yend)*xgap;
@@ -5288,7 +5341,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                 SET_V4(c->builtins.gl_FragCoord, x, y+1, z, 1/w);
                 c->builtins.discard = GL_FALSE;
                 c->builtins.gl_FragDepth = z;
-                setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                 fragment_shader(c->fs_input, &c->builtins, uniform);
                 if (!c->builtins.discard) {
                     c->builtins.gl_FragColor.w *= fpart_(yend)*xgap;
@@ -5311,7 +5364,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                     SET_V4(c->builtins.gl_FragCoord, x, y, z, 1/w);
                     c->builtins.discard = GL_FALSE;
                     c->builtins.gl_FragDepth = z;
-                    setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                    setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                     fragment_shader(c->fs_input, &c->builtins, uniform);
                     if (!c->builtins.discard) {
                         c->builtins.gl_FragColor.w *= rfpart_(intery);
@@ -5324,7 +5377,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                     SET_V4(c->builtins.gl_FragCoord, x, y+1, z, 1/w);
                     c->builtins.discard = GL_FALSE;
                     c->builtins.gl_FragDepth = z;
-                    setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                    setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                     fragment_shader(c->fs_input, &c->builtins, uniform);
                     if (!c->builtins.discard) {
                         c->builtins.gl_FragColor.w *= fpart_(intery);
@@ -5348,6 +5401,8 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
         vec2 pr, sub_p2p1 = sub_v2s(p2, p1);
         float line_length_squared = len_v2(sub_p2p1);
         line_length_squared *= line_length_squared;
+        dt_dx = line_length_squared > 0.0f ? sub_p2p1.x/line_length_squared : 0.0f;
+        dt_dy = line_length_squared > 0.0f ? sub_p2p1.y/line_length_squared : 0.0f;
 
         // TODO should be done for each fragment, after poly_offset is added?
         z1 = rsw_mapf(z1, -1.0f, 1.0f, c->depth_range_near, c->depth_range_far);
@@ -5371,7 +5426,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                 SET_V4(c->builtins.gl_FragCoord, x, y, z, 1/w);
                 c->builtins.discard = GL_FALSE;
                 c->builtins.gl_FragDepth = z;
-                setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                 fragment_shader(c->fs_input, &c->builtins, uniform);
                 if (!c->builtins.discard) {
                     c->builtins.gl_FragColor.w *= rfpart_(xend)*ygap;
@@ -5384,7 +5439,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                 SET_V4(c->builtins.gl_FragCoord, x+1, y, z, 1/w);
                 c->builtins.discard = GL_FALSE;
                 c->builtins.gl_FragDepth = z;
-                setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                 fragment_shader(c->fs_input, &c->builtins, uniform);
                 if (!c->builtins.discard) {
                     c->builtins.gl_FragColor.w *= fpart_(xend)*ygap;
@@ -5412,7 +5467,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                 SET_V4(c->builtins.gl_FragCoord, x, y, z, 1/w);
                 c->builtins.discard = GL_FALSE;
                 c->builtins.gl_FragDepth = z;
-                setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                 fragment_shader(c->fs_input, &c->builtins, uniform);
                 if (!c->builtins.discard) {
                     c->builtins.gl_FragColor.w *= rfpart_(xend)*ygap;
@@ -5425,7 +5480,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                 SET_V4(c->builtins.gl_FragCoord, x+1, y, z, 1/w);
                 c->builtins.discard = GL_FALSE;
                 c->builtins.gl_FragDepth = z;
-                setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                 fragment_shader(c->fs_input, &c->builtins, uniform);
                 if (!c->builtins.discard) {
                     c->builtins.gl_FragColor.w *= fpart_(xend)*ygap;
@@ -5448,7 +5503,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                     SET_V4(c->builtins.gl_FragCoord, x, y, z, 1/w);
                     c->builtins.discard = GL_FALSE;
                     c->builtins.gl_FragDepth = z;
-                    setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                    setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                     fragment_shader(c->fs_input, &c->builtins, uniform);
                     if (!c->builtins.discard) {
                         c->builtins.gl_FragColor.w *= rfpart_(interx);
@@ -5461,7 +5516,7 @@ static void draw_aa_line(vec3 hp1, vec3 hp2, float w1, float w2, float* v1_out, 
                     SET_V4(c->builtins.gl_FragCoord, x+1, y, z, 1/w);
                     c->builtins.discard = GL_FALSE;
                     c->builtins.gl_FragDepth = z;
-                    setup_fs_input(t, v1_out, v2_out, w1, w2, provoke);
+                    setup_fs_input(t, dt_dx, dt_dy, v1_out, v2_out, w1, w2, provoke);
                     fragment_shader(c->fs_input, &c->builtins, uniform);
                     if (!c->builtins.discard) {
                         c->builtins.gl_FragColor.w *= fpart_(interx);
@@ -5916,12 +5971,22 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
 
     float alpha, beta, gamma, tmp, tmp2, z;
     float fs_input[GL_MAX_VERTEX_OUTPUT_COMPONENTS];
+    float fs_input_dx[GL_MAX_VERTEX_OUTPUT_COMPONENTS];
+    float fs_input_dy[GL_MAX_VERTEX_OUTPUT_COMPONENTS];
     float* vs_output = &c->vs_output.output_buf[0];
 
     int vs_output_size = c->vs_output.size;
     float inv_w0 = 1.0f/p0.w;
     float inv_w1 = 1.0f/p1.w;
     float inv_w2 = 1.0f/p2.w;
+    float dbeta_dx = l20.A / denom_l20_hp1;
+    float dbeta_dy = l20.B / denom_l20_hp1;
+    float dgamma_dx = l01.A / denom_l01_hp2;
+    float dgamma_dy = l01.B / denom_l01_hp2;
+    float dalpha_dx = -dbeta_dx - dgamma_dx;
+    float dalpha_dy = -dbeta_dy - dgamma_dy;
+    float dq_dx = dalpha_dx*inv_w0 + dbeta_dx*inv_w1 + dgamma_dx*inv_w2;
+    float dq_dy = dalpha_dy*inv_w0 + dbeta_dy*inv_w1 + dgamma_dy*inv_w2;
 
     // Precompute depth mapping
     float depth_near = c->depth_range_near;
@@ -5931,6 +5996,8 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
     int fragdepth_or_discard = c->programs.a[c->cur_program].fragdepth_or_discard;
     Shader_Builtins builtins;
     builtins.gl_InstanceID = c->builtins.gl_InstanceID;
+    builtins.fs_input_dx = NULL;
+    builtins.fs_input_dy = NULL;
 
     // The 4-wide NEON span fill below drops scattered single pixels inside
     // filled quads (dotted seams along each quad diagonal, showing the clear
@@ -6046,6 +6113,8 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
     }
 #else
     float perspective[GL_MAX_VERTEX_OUTPUT_COMPONENTS*3];
+    builtins.fs_input_dx = fs_input_dx;
+    builtins.fs_input_dy = fs_input_dy;
     for (int i=0; i<vs_output_size; ++i) {
         perspective[i] = v0->vs_out[i]/p0.w;
         perspective[GL_MAX_VERTEX_OUTPUT_COMPONENTS + i] = v1->vs_out[i]/p1.w;
@@ -6080,10 +6149,18 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
                         if (interp == PGL_SMOOTH) {
                             tmp = alpha*perspective[i] + beta*perspective[GL_MAX_VERTEX_OUTPUT_COMPONENTS + i] + gamma*perspective[2*GL_MAX_VERTEX_OUTPUT_COMPONENTS + i];
                             fs_input[i] = tmp/tmp2;
+                            tmp = dalpha_dx*perspective[i] + dbeta_dx*perspective[GL_MAX_VERTEX_OUTPUT_COMPONENTS + i] + dgamma_dx*perspective[2*GL_MAX_VERTEX_OUTPUT_COMPONENTS + i];
+                            fs_input_dx[i] = (tmp - fs_input[i]*dq_dx)/tmp2;
+                            tmp = dalpha_dy*perspective[i] + dbeta_dy*perspective[GL_MAX_VERTEX_OUTPUT_COMPONENTS + i] + dgamma_dy*perspective[2*GL_MAX_VERTEX_OUTPUT_COMPONENTS + i];
+                            fs_input_dy[i] = (tmp - fs_input[i]*dq_dy)/tmp2;
                         } else if (interp == PGL_NOPERSPECTIVE) {
                             fs_input[i] = alpha * v0->vs_out[i] + beta * v1->vs_out[i] + gamma * v2->vs_out[i];
+                            fs_input_dx[i] = dalpha_dx*v0->vs_out[i] + dbeta_dx*v1->vs_out[i] + dgamma_dx*v2->vs_out[i];
+                            fs_input_dy[i] = dalpha_dy*v0->vs_out[i] + dbeta_dy*v1->vs_out[i] + dgamma_dy*v2->vs_out[i];
                         } else {
                             fs_input[i] = vs_output[provoke*vs_output_size + i];
+                            fs_input_dx[i] = 0.0f;
+                            fs_input_dy[i] = 0.0f;
                         }
                     }
 
@@ -6600,9 +6677,33 @@ static void draw_pixel(vec4 cf, int x, int y, float z, int do_frag_processing)
 
 // I just set everything even if not everything applies to the type
 // see section 3.8.15 pg 181 of spec for what it's supposed to be
-// TODO better name and inline?
+static void free_texture_levels(glTexture* tex)
+{
+    int face, level;
+    for (face = 0; face < PGL_TEXTURE_FACES; ++face) {
+        for (level = 0; level < PGL_MAX_MIP_LEVELS; ++level) {
+            glTextureLevel* l = &tex->levels[face][level];
+            if (tex->data == l->data)
+                tex->data = NULL;
+            PGL_FREE(l->data);
+            memset(l, 0, sizeof(*l));
+        }
+    }
+}
+
+static void sync_texture_level0(glTexture* tex, int cube)
+{
+    glTextureLevel* l = &tex->levels[0][0];
+    tex->w = l->w;
+    tex->h = l->h;
+    tex->d = 1;
+    tex->format = l->internalformat;
+    tex->data = cube ? NULL : l->data;
+}
+
 static void INIT_TEX(glTexture* tex, GLenum target)
 {
+    memset(tex->levels, 0, sizeof(tex->levels));
     tex->type = target;
     tex->mag_filter = GL_LINEAR;
     if (target != GL_TEXTURE_RECTANGLE) {
@@ -6690,9 +6791,16 @@ static void init_glVertex_Attrib(glVertex_Attrib* v)
     GLboolean enabled;
     GLuint divisor;
 */
+    v->size = 4;
+    v->type = GL_FLOAT;
+    v->stride = 0;
+    v->specified_stride = 0;
+    v->offset = 0;
+    v->normalized = GL_FALSE;
     v->buf = 0;
     v->enabled = 0;
     v->divisor = 0;
+    v->current_value = make_v4(0.0f, 0.0f, 0.0f, 1.0f);
 }
 
 // TODO these are currently equivalent to memset(0) or = {0}...
@@ -6924,9 +7032,15 @@ PGLDEF void free_glContext(glContext* ctx)
     }
 
     for (i=0; i<ctx->textures.size; ++i) {
+        free_texture_levels(&ctx->textures.a[i]);
         if (!ctx->textures.a[i].user_owned) {
             PGL_FREE(ctx->textures.a[i].data);
         }
+    }
+    for (i=0; i<GL_NUM_TEXTURE_TYPES-GL_TEXTURE_UNBOUND-1; ++i) {
+        free_texture_levels(&ctx->default_textures[i]);
+        if (!ctx->default_textures[i].user_owned)
+            PGL_FREE(ctx->default_textures[i].data);
     }
 
     //free vectors
@@ -7146,6 +7260,7 @@ PGLDEF void pgl_GenBuffers(GLsizei n, GLuint* buffers)
             c->buffers.a[i].deleted = GL_FALSE;
             c->buffers.a[i].size = 0;
             c->buffers.a[i].type = type_unbound;
+            c->buffers.a[i].usage = GL_STATIC_DRAW;
             buffers[j++] = i;
         }
     }
@@ -7156,6 +7271,7 @@ PGLDEF void pgl_GenBuffers(GLsizei n, GLuint* buffers)
         for (int i=s; j<n; i++) {
             c->buffers.a[i].size = 0;
             c->buffers.a[i].type = type_unbound;
+            c->buffers.a[i].usage = GL_STATIC_DRAW;
             c->buffers.a[i].data = NULL;
             c->buffers.a[i].deleted = GL_FALSE;
             c->buffers.a[i].user_owned = GL_FALSE;
@@ -7185,6 +7301,12 @@ PGLDEF void pgl_DeleteBuffers(GLsizei n, const GLuint* buffers)
             c->bound_buffers[type] = 0;
         }
 
+        for (GLuint va = 0; va < c->vertex_arrays.size; ++va) {
+            for (GLuint a = 0; a < GL_MAX_VERTEX_ATTRIBS; ++a) {
+                if (c->vertex_arrays.a[va].vertex_attribs[a].buf == buffers[i])
+                    c->vertex_arrays.a[va].vertex_attribs[a].buf = 0;
+            }
+        }
         if (!c->buffers.a[buffers[i]].user_owned) {
             PGL_FREE(c->buffers.a[buffers[i]].data);
         }
@@ -7200,8 +7322,7 @@ PGLDEF void pgl_GenTextures(GLsizei n, GLuint* textures)
     int j = 0;
     for (int i=1; i<c->textures.size && j<n; ++i) {
         if (c->textures.a[i].deleted) {
-            c->textures.a[i].deleted = GL_FALSE;
-            c->textures.a[i].type = GL_TEXTURE_UNBOUND;
+            INIT_TEX(&c->textures.a[i], GL_TEXTURE_UNBOUND);
             textures[j++] = i;
         }
     }
@@ -7209,10 +7330,8 @@ PGLDEF void pgl_GenTextures(GLsizei n, GLuint* textures)
         int s = c->textures.size;
         cvec_extend_glTexture(&c->textures, n-j);
         for (int i=s; j<n; i++) {
-            c->textures.a[i].deleted = GL_FALSE;
-            c->textures.a[i].type = GL_TEXTURE_UNBOUND;
+            INIT_TEX(&c->textures.a[i], GL_TEXTURE_UNBOUND);
             c->textures.a[i].user_owned = GL_FALSE;
-            c->textures.a[i].data = NULL;
             textures[j++] = i;
         }
     }
@@ -7252,9 +7371,12 @@ PGLDEF void pgl_DeleteTextures(GLsizei n, const GLuint* textures)
         // NOTE(rswinkle): type is stored as correct index not the raw enum value
         // so no need to subtract here see pgl_BindTexture
         type = c->textures.a[textures[i]].type;
-        if (textures[i] == c->bound_textures[type])
+        if (type != GL_TEXTURE_UNBOUND &&
+            type < GL_NUM_TEXTURE_TYPES - GL_TEXTURE_UNBOUND - 1 &&
+            textures[i] == c->bound_textures[type])
             c->bound_textures[type] = 0;
 
+        free_texture_levels(&c->textures.a[textures[i]]);
         if (!c->textures.a[textures[i]].user_owned) {
             PGL_FREE(c->textures.a[textures[i]].data);
         }
@@ -7297,10 +7419,9 @@ PGLDEF void pgl_BindBuffer(GLenum target, GLuint buffer)
 // TODO reuse code, call pgl_NamedBufferData() internally, remove duplicated error checks?
 PGLDEF void pgl_BufferData(GLenum target, GLsizeiptr size, const GLvoid* data, GLenum usage)
 {
-    //TODO check for usage later
-    PGL_UNUSED(usage);
-
     PGL_ERR((target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER), GL_INVALID_ENUM);
+    PGL_ERR((usage != GL_STREAM_DRAW && usage != GL_STATIC_DRAW &&
+             usage != GL_DYNAMIC_DRAW), GL_INVALID_ENUM);
     PGL_ERR(size < 0, GL_INVALID_VALUE);
 
     target -= GL_ARRAY_BUFFER;
@@ -7319,6 +7440,7 @@ PGLDEF void pgl_BufferData(GLenum target, GLsizeiptr size, const GLvoid* data, G
 
     c->buffers.a[c->bound_buffers[target]].user_owned = GL_FALSE;
     c->buffers.a[c->bound_buffers[target]].size = size;
+    c->buffers.a[c->bound_buffers[target]].usage = usage;
 }
 
 PGLDEF void pgl_BufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const GLvoid* data)
@@ -7336,10 +7458,9 @@ PGLDEF void pgl_BufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, c
 
 PGLDEF void pgl_NamedBufferData(GLuint buffer, GLsizeiptr size, const GLvoid* data, GLenum usage)
 {
-    //check for usage later
-    PGL_UNUSED(usage);
-
     PGL_ERR((!buffer || buffer >= c->buffers.size || c->buffers.a[buffer].deleted), GL_INVALID_OPERATION);
+    PGL_ERR((usage != GL_STREAM_DRAW && usage != GL_STATIC_DRAW &&
+             usage != GL_DYNAMIC_DRAW), GL_INVALID_ENUM);
     PGL_ERR(size < 0, GL_INVALID_VALUE);
 
     //always NULL or valid
@@ -7354,6 +7475,7 @@ PGLDEF void pgl_NamedBufferData(GLuint buffer, GLsizeiptr size, const GLvoid* da
 
     c->buffers.a[buffer].user_owned = GL_FALSE;
     c->buffers.a[buffer].size = size;
+    c->buffers.a[buffer].usage = usage;
 }
 
 PGLDEF void pgl_NamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const GLvoid* data)
@@ -7397,6 +7519,7 @@ static void set_texparami(glTexture* tex, GLenum pname, GLint param)
     // if it's not NEAREST, it assumes LINEAR so I could
     // just say that's good rather than these switch statements
     //
+    GLint original_param = param;
     // TODO compress this code
     if (pname == GL_TEXTURE_MIN_FILTER) {
         // TODO technically GL_TEXTURE_RECTANGLE can only have NEAREST OR LINEAR, no mipmapping
@@ -7416,8 +7539,12 @@ static void set_texparami(glTexture* tex, GLenum pname, GLint param)
             PGL_SET_ERR(GL_INVALID_ENUM);
             return;
         }
-        tex->min_filter = param;
+        tex->min_filter = original_param;
     } else if (pname == GL_TEXTURE_MAG_FILTER) {
+        if (param != GL_NEAREST && param != GL_LINEAR) {
+            PGL_SET_ERR(GL_INVALID_ENUM);
+            return;
+        }
         switch (param) {
         case GL_NEAREST:
         case GL_NEAREST_MIPMAP_NEAREST:
@@ -7433,7 +7560,6 @@ static void set_texparami(glTexture* tex, GLenum pname, GLint param)
             PGL_SET_ERR(GL_INVALID_ENUM);
             return;
         }
-        tex->min_filter = param;
         tex->mag_filter = param;
     } else if (pname == GL_TEXTURE_WRAP_S) {
         PGL_ERR((param != GL_REPEAT && param != GL_CLAMP_TO_EDGE && param != GL_CLAMP_TO_BORDER && param != GL_MIRRORED_REPEAT), GL_INVALID_ENUM);
@@ -7464,15 +7590,12 @@ static void get_texparami(glTexture* tex, GLenum pname, GLenum type, GLvoid* par
     case GL_TEXTURE_MIN_FILTER: val = tex->min_filter; break;
     case GL_TEXTURE_MAG_FILTER: val = tex->mag_filter; break;
     case GL_TEXTURE_WRAP_S:
-        PGL_ERR((pname != GL_REPEAT && pname != GL_CLAMP_TO_EDGE && pname != GL_CLAMP_TO_BORDER && pname != GL_MIRRORED_REPEAT), GL_INVALID_ENUM);
         val = tex->wrap_s;
         break;
     case GL_TEXTURE_WRAP_T:
-        PGL_ERR((pname != GL_REPEAT && pname != GL_CLAMP_TO_EDGE && pname != GL_CLAMP_TO_BORDER && pname != GL_MIRRORED_REPEAT), GL_INVALID_ENUM);
         val = tex->wrap_t;
         break;
     case GL_TEXTURE_WRAP_R:
-        PGL_ERR((pname != GL_REPEAT && pname != GL_CLAMP_TO_EDGE && pname != GL_CLAMP_TO_BORDER && pname != GL_MIRRORED_REPEAT), GL_INVALID_ENUM);
         val = tex->wrap_r;
         break;
     default:
@@ -7752,119 +7875,179 @@ PGLDEF void pgl_TexImage1D(GLenum target, GLint level, GLint internalformat, GLs
     tex->user_owned = GL_FALSE;
 }
 
+static int texture_format_components(GLenum format)
+{
+    switch (format) {
+    case GL_ALPHA:
+    case GL_LUMINANCE:
+    case GL_RED:
+        return 1;
+    case GL_LUMINANCE_ALPHA:
+    case GL_RG:
+        return 2;
+    case GL_RGB:
+    case GL_BGR:
+        return 3;
+    case GL_RGBA:
+    case GL_BGRA:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
+static int texture_type_valid(GLenum type)
+{
+    return type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_SHORT_5_6_5 ||
+           type == GL_UNSIGNED_SHORT_4_4_4_4 || type == GL_UNSIGNED_SHORT_5_5_5_1;
+}
+
+static int texture_format_type_valid(GLenum format, GLenum type)
+{
+    if (type == GL_UNSIGNED_BYTE)
+        return texture_format_components(format) != 0;
+    if (type == GL_UNSIGNED_SHORT_5_6_5)
+        return format == GL_RGB;
+    return format == GL_RGBA;
+}
+
+static u8 texture_expand_bits(unsigned value, unsigned max_value)
+{
+    return (u8)((value * 255u + max_value / 2u) / max_value);
+}
+
+static void unpack_texture_rgba(u8* out, int out_pitch, const u8* in, int in_pitch,
+                                int w, int h, GLenum format, GLenum type)
+{
+    int x, y;
+    int components = texture_format_components(format);
+    for (y = 0; y < h; ++y) {
+        const u8* src = in + (size_t)y * (size_t)in_pitch;
+        u8* dst = out + (size_t)y * (size_t)out_pitch;
+        for (x = 0; x < w; ++x) {
+            unsigned r = 0, g = 0, b = 0, a = 255;
+            if (type == GL_UNSIGNED_BYTE) {
+                const u8* p = src + x * components;
+                if (format == GL_RGBA || format == GL_BGRA) {
+                    r = p[0]; g = p[1]; b = p[2]; a = p[3];
+                } else if (format == GL_RGB || format == GL_BGR) {
+                    r = p[0]; g = p[1]; b = p[2];
+                } else if (format == GL_LUMINANCE) {
+                    r = g = b = p[0];
+                } else if (format == GL_LUMINANCE_ALPHA) {
+                    r = g = b = p[0]; a = p[1];
+                } else if (format == GL_ALPHA) {
+                    a = p[0];
+                } else if (format == GL_RG) {
+                    r = p[0]; g = p[1];
+                } else {
+                    r = p[0];
+                }
+                if (format == GL_BGR || format == GL_BGRA) {
+                    unsigned tmp = r; r = b; b = tmp;
+                }
+            } else {
+                unsigned v = (unsigned)src[x * 2] | ((unsigned)src[x * 2 + 1] << 8);
+                if (type == GL_UNSIGNED_SHORT_5_6_5) {
+                    r = texture_expand_bits((v >> 11) & 31u, 31u);
+                    g = texture_expand_bits((v >> 5) & 63u, 63u);
+                    b = texture_expand_bits(v & 31u, 31u);
+                } else if (type == GL_UNSIGNED_SHORT_4_4_4_4) {
+                    r = texture_expand_bits((v >> 12) & 15u, 15u);
+                    g = texture_expand_bits((v >> 8) & 15u, 15u);
+                    b = texture_expand_bits((v >> 4) & 15u, 15u);
+                    a = texture_expand_bits(v & 15u, 15u);
+                } else {
+                    r = texture_expand_bits((v >> 11) & 31u, 31u);
+                    g = texture_expand_bits((v >> 6) & 31u, 31u);
+                    b = texture_expand_bits((v >> 1) & 31u, 31u);
+                    a = (v & 1u) ? 255u : 0u;
+                }
+            }
+            dst[x * 4] = (u8)r;
+            dst[x * 4 + 1] = (u8)g;
+            dst[x * 4 + 2] = (u8)b;
+            dst[x * 4 + 3] = (u8)a;
+        }
+    }
+}
+
+static glTexture* texture_for_2d_target(GLenum target, int* face, int* cube)
+{
+    int target_idx;
+    int cur_tex_i;
+    *face = 0;
+    *cube = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
+            target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+    if (*cube) {
+        *face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X;
+        target_idx = GL_TEXTURE_CUBE_MAP - GL_TEXTURE_UNBOUND - 1;
+    } else {
+        target_idx = target - GL_TEXTURE_UNBOUND - 1;
+    }
+    cur_tex_i = c->bound_textures[target_idx];
+    return cur_tex_i ? &c->textures.a[cur_tex_i] : &c->default_textures[target_idx];
+}
+
+static int texture_level_size(GLsizei width, GLsizei height, size_t* size)
+{
+    if (height && (size_t)width > ((size_t)-1) / ((size_t)height * 4u))
+        return 0;
+    *size = (size_t)width * (size_t)height * 4u;
+    return 1;
+}
+
+static void install_texture_level(glTexture* tex, int face, int level,
+                                  GLenum internalformat, GLsizei width, GLsizei height,
+                                  u8* pixels, int cube)
+{
+    glTextureLevel* l = &tex->levels[face][level];
+    if (tex->data == l->data)
+        tex->data = NULL;
+    PGL_FREE(l->data);
+    l->data = pixels;
+    l->w = width;
+    l->h = height;
+    l->internalformat = internalformat;
+    l->defined = GL_TRUE;
+    l->datagen = ++tex->datagen;
+    tex->user_owned = GL_FALSE;
+    sync_texture_level0(tex, cube);
+}
+
 PGLDEF void pgl_TexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid* data)
 {
-    PGL_UNUSED(level);
-    PGL_UNUSED(internalformat);
-    PGL_UNUSED(border);
-
-    // TODO GL_TEXTURE_1D_ARRAY
-    PGL_ERR((target != GL_TEXTURE_2D &&
-             target != GL_TEXTURE_1D_ARRAY &&
+    glTexture* tex;
+    u8* pixels;
+    size_t size, row_bytes, pitch;
+    int face, cube, components;
+    PGL_ERR((target != GL_TEXTURE_2D && target != GL_TEXTURE_1D_ARRAY &&
              target != GL_TEXTURE_RECTANGLE &&
-             target != GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
-             target != GL_TEXTURE_CUBE_MAP_NEGATIVE_X &&
-             target != GL_TEXTURE_CUBE_MAP_POSITIVE_Y &&
-             target != GL_TEXTURE_CUBE_MAP_NEGATIVE_Y &&
-             target != GL_TEXTURE_CUBE_MAP_POSITIVE_Z &&
-             target != GL_TEXTURE_CUBE_MAP_NEGATIVE_Z), GL_INVALID_ENUM);
-
-    PGL_ERR((width < 0 || width > PGL_MAX_TEXTURE_SIZE), GL_INVALID_VALUE);
-    PGL_ERR((height < 0 || height > PGL_MAX_TEXTURE_SIZE), GL_INVALID_VALUE);
-
-    PGL_ERR(type != GL_UNSIGNED_BYTE, GL_INVALID_ENUM);
-
-    int components;
-#ifdef PGL_DONT_CONVERT_TEXTURES
-    PGL_ERR(format != GL_RGBA, GL_INVALID_ENUM);
-    components = 4;
-#else
-    CHECK_FORMAT_GET_COMP(format, components);
-#endif
-
-    // Have to handle cubemaps specially since they have 1 real target
-    // and 6 pseudo targets
-    int target_idx;
-    if (target < GL_TEXTURE_CUBE_MAP_POSITIVE_X) {
-        //target is 2D, 1D_ARRAY, or RECTANGLE
-        target_idx = target-GL_TEXTURE_UNBOUND-1;
+             (target < GL_TEXTURE_CUBE_MAP_POSITIVE_X ||
+              target > GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)), GL_INVALID_ENUM);
+    PGL_ERR((level < 0 || level >= PGL_MAX_MIP_LEVELS || border != 0 ||
+             width < 0 || height < 0 || width > PGL_MAX_TEXTURE_SIZE ||
+             height > PGL_MAX_TEXTURE_SIZE), GL_INVALID_VALUE);
+    components = texture_format_components(format);
+    PGL_ERR(!components || !texture_type_valid(type), GL_INVALID_ENUM);
+    PGL_ERR((internalformat != format || !texture_format_type_valid(format, type)),
+            GL_INVALID_OPERATION);
+    cube = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+    PGL_ERR((cube && width != height), GL_INVALID_VALUE);
+    PGL_ERR(!texture_level_size(width, height, &size), GL_OUT_OF_MEMORY);
+    tex = texture_for_2d_target(target, &face, &cube);
+    pixels = (u8*)PGL_MALLOC(size ? size : 1u);
+    PGL_ERR(!pixels, GL_OUT_OF_MEMORY);
+    if (data) {
+        row_bytes = (size_t)width * (size_t)(type == GL_UNSIGNED_BYTE ? components : 2);
+        pitch = (row_bytes + (size_t)c->unpack_alignment - 1u) /
+                (size_t)c->unpack_alignment * (size_t)c->unpack_alignment;
+        unpack_texture_rgba(pixels, width * 4, (const u8*)data, (int)pitch,
+                            width, height, format, type);
     } else {
-        target_idx = GL_TEXTURE_CUBE_MAP-GL_TEXTURE_UNBOUND-1;
+        memset(pixels, 0, size);
     }
-    int cur_tex_i = c->bound_textures[target_idx];
-
-    // Have to handle 0 specially as well
-    glTexture* tex = NULL;
-    if (cur_tex_i) {
-        tex = &c->textures.a[cur_tex_i];
-    } else {
-        tex = &c->default_textures[target_idx];
-    }
-
-    // TODO If I ever support type other than GL_UNSIGNED_BYTE (also using for both internalformat and format)
-    int byte_width = width * components;
-    int padding_needed = byte_width % c->unpack_alignment;
-    int padded_row_len = (!padding_needed) ? byte_width : byte_width + c->unpack_alignment - padding_needed;
-
-    if (target < GL_TEXTURE_CUBE_MAP_POSITIVE_X) {
-        //target is 2D, 1D_ARRAY, or RECTANGLE
-        tex->w = width;
-        tex->h = height;
-        tex->d = 1;
-
-        // either NULL or valid
-        PGL_FREE(tex->data);
-
-        //TODO support other internal formats? components should be of internalformat not format hardcoded 4 until I support more than RGBA
-        tex->data = (u8*)PGL_MALLOC(height * width*4);
-        PGL_ERR(!tex->data, GL_OUT_OF_MEMORY);
-
-        if (data) {
-            convert_format_to_packed_rgba(tex->data, (u8*)data, width, height, padded_row_len, format);
-        }
-
-        tex->user_owned = GL_FALSE;
-        tex->datagen++;
-
-    } else {  //CUBE_MAP
-        // If we're reusing a texture, and we haven't already loaded
-        // one of the planes of the cubemap, data is either NULL or valid
-        if (!tex->w)
-            PGL_FREE(tex->data);
-
-        // TODO specs say INVALID_VALUE, man/ref pages say INVALID_ENUM?
-        // https://registry.khronos.org/OpenGL-Refpages/gl4/html/pgl_TexImage2D.xhtml
-        PGL_ERR(width != height, GL_INVALID_VALUE);
-
-        // TODO hardcoded 4 as long as we only support RGBA/UBYTES
-        int mem_size = width*height*6 * 4;
-        if (tex->w == 0) {
-            tex->w = width;
-            tex->h = width; //same cause square
-            tex->d = 1;
-
-            tex->data = (u8*)PGL_MALLOC(mem_size);
-            PGL_ERR(!tex->data, GL_OUT_OF_MEMORY);
-        } else if (tex->w != width) {
-            //TODO spec doesn't say all sides must have same dimensions but it makes sense
-            //and this site suggests it http://www.opengl.org/wiki/Cubemap_Texture
-            PGL_SET_ERR(GL_INVALID_VALUE);
-            return;
-        }
-
-        //use target as plane index
-        target -= GL_TEXTURE_CUBE_MAP_POSITIVE_X;
-
-        // TODO handle different format and internalformat
-        int p = height*width*4;
-        u8* texdata = tex->data;
-
-        if (data) {
-            convert_format_to_packed_rgba(&texdata[target*p], (u8*)data, width, height, padded_row_len, format);
-        }
-
-        tex->user_owned = GL_FALSE;
-    } //end CUBE_MAP
+    install_texture_level(tex, face, level, internalformat, width, height, pixels, cube);
 }
 
 PGLDEF void pgl_TexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const GLvoid* data)
@@ -7953,80 +8136,34 @@ PGLDEF void pgl_TexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei
 
 PGLDEF void pgl_TexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* data)
 {
-    PGL_UNUSED(level);
-
-    // TODO GL_TEXTURE_1D_ARRAY
+    glTexture* tex;
+    glTextureLevel* l;
+    size_t row_bytes, pitch;
+    int face, cube, components;
     PGL_ERR((target != GL_TEXTURE_2D &&
-             target != GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
-             target != GL_TEXTURE_CUBE_MAP_NEGATIVE_X &&
-             target != GL_TEXTURE_CUBE_MAP_POSITIVE_Y &&
-             target != GL_TEXTURE_CUBE_MAP_NEGATIVE_Y &&
-             target != GL_TEXTURE_CUBE_MAP_POSITIVE_Z &&
-             target != GL_TEXTURE_CUBE_MAP_NEGATIVE_Z), GL_INVALID_ENUM);
-
-    PGL_ERR((width < 0 || width > PGL_MAX_TEXTURE_SIZE), GL_INVALID_VALUE);
-    PGL_ERR((height < 0 || height > PGL_MAX_TEXTURE_SIZE), GL_INVALID_VALUE);
-    PGL_ERR(type != GL_UNSIGNED_BYTE, GL_INVALID_ENUM);
-
-    int components;
-#ifdef PGL_DONT_CONVERT_TEXTURES
-    PGL_ERR(format != GL_RGBA, GL_INVALID_ENUM);
-    components = 4;
-#else
-    CHECK_FORMAT_GET_COMP(format, components);
-#endif
-
-    // Have to handle cubemaps specially since they have 1 real target
-    // and 6 pseudo targets
-    int target_idx;
-    if (target == GL_TEXTURE_2D) {
-        target_idx = target-GL_TEXTURE_UNBOUND-1;
-    } else {
-        target_idx = GL_TEXTURE_CUBE_MAP-GL_TEXTURE_UNBOUND-1;
-    }
-    int cur_tex_i = c->bound_textures[target_idx];
-
-    // Have to handle 0 specially as well
-    glTexture* tex = NULL;
-    if (cur_tex_i) {
-        tex = &c->textures.a[cur_tex_i];
-    } else {
-        tex = &c->default_textures[target_idx];
-    }
-
-    u8* d = (u8*)data;
-
-    int byte_width = width * components;
-    int padding_needed = byte_width % c->unpack_alignment;
-    int padded_row_len = (!padding_needed) ? byte_width : byte_width + c->unpack_alignment - padding_needed;
-
-    if (target == GL_TEXTURE_2D) {
-        u32* texdata = (u32*)tex->data;
-
-        PGL_ERR((xoffset < 0 || xoffset + width > tex->w || yoffset < 0 || yoffset + height > tex->h), GL_INVALID_VALUE);
-
-        int w = tex->w;
-
-        // TODO maybe better to covert the whole input image if
-        // necessary then do the original memcpy's even with
-        // the extra alloc and free
-        for (int i=0; i<height; ++i) {
-            convert_format_to_packed_rgba((u8*)&texdata[(yoffset+i)*w + xoffset], &d[i*padded_row_len], width, 1, padded_row_len, format);
-        }
-
-    } else {  //CUBE_MAP
-        u32* texdata = (u32*)tex->data;
-
-        int w = tex->w;
-
-        target -= GL_TEXTURE_CUBE_MAP_POSITIVE_X; //use target as plane index
-
-        int p = w*w;
-
-        for (int i=0; i<height; ++i) {
-            convert_format_to_packed_rgba((u8*)&texdata[p*target + (yoffset+i)*w + xoffset], &d[i*padded_row_len], width, 1, padded_row_len, format);
-        }
-    } //end CUBE_MAP
+             (target < GL_TEXTURE_CUBE_MAP_POSITIVE_X ||
+              target > GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)), GL_INVALID_ENUM);
+    PGL_ERR((level < 0 || level >= PGL_MAX_MIP_LEVELS || width < 0 || height < 0),
+            GL_INVALID_VALUE);
+    components = texture_format_components(format);
+    PGL_ERR(!components || !texture_type_valid(type), GL_INVALID_ENUM);
+    PGL_ERR(!texture_format_type_valid(format, type), GL_INVALID_OPERATION);
+    tex = texture_for_2d_target(target, &face, &cube);
+    l = &tex->levels[face][level];
+    PGL_ERR(!l->defined, GL_INVALID_OPERATION);
+    PGL_ERR((format != l->internalformat), GL_INVALID_OPERATION);
+    PGL_ERR((xoffset < 0 || yoffset < 0 || xoffset > l->w - width ||
+             yoffset > l->h - height), GL_INVALID_VALUE);
+    if (!width || !height)
+        return;
+    PGL_ERR(!data, GL_INVALID_OPERATION);
+    row_bytes = (size_t)width * (size_t)(type == GL_UNSIGNED_BYTE ? components : 2);
+    pitch = (row_bytes + (size_t)c->unpack_alignment - 1u) /
+            (size_t)c->unpack_alignment * (size_t)c->unpack_alignment;
+    unpack_texture_rgba(l->data + ((size_t)yoffset * (size_t)l->w + (size_t)xoffset) * 4u,
+                        l->w * 4, (const u8*)data, (int)pitch,
+                        width, height, format, type);
+    l->datagen = ++tex->datagen;
 }
 
 PGLDEF void pgl_TexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const GLvoid* data)
@@ -8126,6 +8263,7 @@ PGLDEF void pgl_VertexAttribPointer(GLuint index, GLint size, GLenum type, GLboo
     v->size = size;
     v->type = type;
     v->normalized = normalized;
+    v->specified_stride = stride;
     v->stride = (stride) ? stride : size*type_sz;
 
     // offset can still really be a pointer if using the 0 VAO and no bound ARRAY_BUFFER.
@@ -9226,11 +9364,117 @@ PGLDEF const GLubyte* pgl_GetStringi(GLenum name, GLuint index) { return NULL; }
 
 PGLDEF void pgl_ColorMaski(GLuint buf, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {}
 
+static int texture_power_of_two(int value)
+{
+    return value > 0 && !(value & (value - 1));
+}
+
+static int texture_max_mip_level(int width, int height)
+{
+    int level = 0;
+    while (width > 1 || height > 1) {
+        width = width > 1 ? width / 2 : 1;
+        height = height > 1 ? height / 2 : 1;
+        ++level;
+    }
+    return level;
+}
+
+PGLDEF int pgl_texture_complete(const glTexture* tex, int cube)
+{
+    int face, level, faces = cube ? PGL_TEXTURE_FACES : 1;
+    int max_level, mipmapped;
+    const glTextureLevel* base = &tex->levels[0][0];
+    if (!base->defined || !base->data || base->w <= 0 || base->h <= 0)
+        return 0;
+    for (face = 0; face < faces; ++face) {
+        const glTextureLevel* l = &tex->levels[face][0];
+        if (!l->defined || !l->data || l->w != base->w || l->h != base->h ||
+            l->internalformat != base->internalformat)
+            return 0;
+    }
+    mipmapped = tex->min_filter != GL_NEAREST && tex->min_filter != GL_LINEAR;
+    if ((!texture_power_of_two(base->w) || !texture_power_of_two(base->h)) &&
+        (mipmapped || tex->wrap_s != GL_CLAMP_TO_EDGE || tex->wrap_t != GL_CLAMP_TO_EDGE))
+        return 0;
+    if (!mipmapped)
+        return 1;
+    if (!texture_power_of_two(base->w) || !texture_power_of_two(base->h))
+        return 0;
+    max_level = texture_max_mip_level(base->w, base->h);
+    for (level = 1; level <= max_level; ++level) {
+        int expected_w = base->w >> level;
+        int expected_h = base->h >> level;
+        if (!expected_w) expected_w = 1;
+        if (!expected_h) expected_h = 1;
+        for (face = 0; face < faces; ++face) {
+            const glTextureLevel* l = &tex->levels[face][level];
+            if (!l->defined || !l->data || l->w != expected_w || l->h != expected_h ||
+                l->internalformat != base->internalformat)
+                return 0;
+        }
+    }
+    return 1;
+}
+
 PGLDEF void pgl_GenerateMipmap(GLenum target)
 {
-    //TODO not implemented, not sure it's worth it.
-    //For example mipmap generation code see
-    //https://github.com/thebeast33/cro_lib/blob/master/cro_mipmap.h
+    glTexture* tex;
+    glTextureLevel* base;
+    int face, level, cube, faces, max_level;
+    PGL_ERR(target != GL_TEXTURE_2D && target != GL_TEXTURE_CUBE_MAP, GL_INVALID_ENUM);
+    tex = texture_for_2d_target(target == GL_TEXTURE_CUBE_MAP ?
+                                GL_TEXTURE_CUBE_MAP_POSITIVE_X : target, &face, &cube);
+    faces = cube ? PGL_TEXTURE_FACES : 1;
+    base = &tex->levels[0][0];
+    PGL_ERR(!base->defined || !base->data || base->w <= 0 || base->h <= 0,
+            GL_INVALID_OPERATION);
+    PGL_ERR(!texture_power_of_two(base->w) || !texture_power_of_two(base->h),
+            GL_INVALID_OPERATION);
+    for (face = 0; face < faces; ++face) {
+        const glTextureLevel* l = &tex->levels[face][0];
+        PGL_ERR(!l->defined || !l->data || l->w != base->w || l->h != base->h ||
+                l->internalformat != base->internalformat, GL_INVALID_OPERATION);
+    }
+    max_level = texture_max_mip_level(base->w, base->h);
+    for (face = 0; face < faces; ++face) {
+        for (level = 1; level <= max_level; ++level) {
+            glTextureLevel* src = &tex->levels[face][level - 1];
+            int dw = src->w > 1 ? src->w / 2 : 1;
+            int dh = src->h > 1 ? src->h / 2 : 1;
+            size_t size;
+            u8* pixels;
+            int x, y, channel;
+            if (!texture_level_size(dw, dh, &size)) {
+                PGL_SET_ERR(GL_OUT_OF_MEMORY);
+                return;
+            }
+            pixels = (u8*)PGL_MALLOC(size ? size : 1u);
+            PGL_ERR(!pixels, GL_OUT_OF_MEMORY);
+            for (y = 0; y < dh; ++y) {
+                int y0 = y * src->h / dh;
+                int y1 = (y + 1) * src->h / dh;
+                if (y1 <= y0) y1 = y0 + 1;
+                for (x = 0; x < dw; ++x) {
+                    int x0 = x * src->w / dw;
+                    int x1 = (x + 1) * src->w / dw;
+                    unsigned sums[4] = { 0, 0, 0, 0 };
+                    int sx, sy, count;
+                    if (x1 <= x0) x1 = x0 + 1;
+                    for (sy = y0; sy < y1; ++sy)
+                        for (sx = x0; sx < x1; ++sx)
+                            for (channel = 0; channel < 4; ++channel)
+                                sums[channel] += src->data[((size_t)sy * src->w + sx) * 4 + channel];
+                    count = (x1 - x0) * (y1 - y0);
+                    for (channel = 0; channel < 4; ++channel)
+                        pixels[((size_t)y * dw + x) * 4 + channel] =
+                            (u8)((sums[channel] + (unsigned)count / 2u) / (unsigned)count);
+                }
+            }
+            install_texture_level(tex, face, level, base->internalformat,
+                                  dw, dh, pixels, cube);
+        }
+    }
 }
 
 PGLDEF void pgl_GetDoublev(GLenum pname, GLdouble* params) { }
@@ -9304,7 +9548,10 @@ PGLDEF GLboolean pgl_UnmapNamedBuffer(GLuint buffer) { return GL_TRUE; }
 // TODO?
 
 PGLDEF void pgl_ActiveTexture(GLenum texture) { }
-PGLDEF void pgl_TexParameterf(GLenum target, GLenum pname, GLfloat param) {}
+PGLDEF void pgl_TexParameterf(GLenum target, GLenum pname, GLfloat param)
+{
+    pgl_TexParameteri(target, pname, (GLint)param);
+}
 
 PGLDEF void pgl_TextureParameterf(GLuint texture, GLenum pname, GLfloat param) {}
 
@@ -9316,7 +9563,557 @@ PGLDEF void pgl_TextureParameterliv(GLuint texture, GLenum pname, const GLint* p
 PGLDEF void pgl_TextureParameterluiv(GLuint texture, GLenum pname, const GLuint* params) {}
 
 PGLDEF void pgl_CompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const GLvoid* data) {}
-PGLDEF void pgl_CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid* data) {}
+/* ETC decoding is derived from Mesa's texcompress_etc.c.
+ * Copyright (C) 2011 LunarG, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+typedef struct pglEtcBlock {
+    u8 base[3][3];
+    u8 paint[4][3];
+    const int* modifiers[2];
+    u32 indices;
+    u64 alpha_indices;
+    int distance;
+    int flipped;
+    int opaque;
+    int individual;
+    int differential;
+    int t_mode;
+    int h_mode;
+    int planar;
+} pglEtcBlock;
+
+static const int pgl_etc1_modifiers[8][4] = {
+    { 2, 8, -2, -8 }, { 5, 17, -5, -17 },
+    { 9, 29, -9, -29 }, { 13, 42, -13, -42 },
+    { 18, 60, -18, -60 }, { 24, 80, -24, -80 },
+    { 33, 106, -33, -106 }, { 47, 183, -47, -183 }
+};
+
+static const int pgl_etc2_distances[8] = { 3, 6, 11, 16, 23, 32, 41, 64 };
+
+static const int pgl_etc2_alpha_modifiers[16][8] = {
+    { -3, -6, -9, -15, 2, 5, 8, 14 },
+    { -3, -7, -10, -13, 2, 6, 9, 12 },
+    { -2, -5, -8, -13, 1, 4, 7, 12 },
+    { -2, -4, -6, -13, 1, 3, 5, 12 },
+    { -3, -6, -8, -12, 2, 5, 7, 11 },
+    { -3, -7, -9, -11, 2, 6, 8, 10 },
+    { -4, -7, -8, -11, 3, 6, 7, 10 },
+    { -3, -5, -8, -11, 2, 4, 7, 10 },
+    { -2, -6, -8, -10, 1, 5, 7, 9 },
+    { -2, -5, -8, -10, 1, 4, 7, 9 },
+    { -2, -4, -8, -10, 1, 3, 7, 9 },
+    { -2, -5, -7, -10, 1, 4, 6, 9 },
+    { -3, -4, -7, -10, 2, 3, 6, 9 },
+    { -1, -2, -3, -10, 0, 1, 2, 9 },
+    { -4, -6, -8, -9, 3, 5, 7, 8 },
+    { -3, -5, -7, -9, 2, 4, 6, 8 }
+};
+
+static const int pgl_etc2_punch_modifiers[8][4] = {
+    { 0, 8, 0, -8 }, { 0, 17, 0, -17 },
+    { 0, 29, 0, -29 }, { 0, 42, 0, -42 },
+    { 0, 60, 0, -60 }, { 0, 80, 0, -80 },
+    { 0, 106, 0, -106 }, { 0, 183, 0, -183 }
+};
+
+static u8 pgl_etc_clamp(int value)
+{
+    return (u8)(value < 0 ? 0 : value > 255 ? 255 : value);
+}
+
+static u8 pgl_etc_diff_hi(u8 value)
+{
+    return (u8)((value & 0xf8) | (value >> 5));
+}
+
+static u8 pgl_etc_diff_lo(u8 value)
+{
+    static const int delta[8] = { 0, 1, 2, 3, -4, -3, -2, -1 };
+    int v = (value >> 3) + delta[value & 7];
+    return (u8)((v << 3) | (v >> 2));
+}
+
+static u8 pgl_etc_ind_hi(u8 value)
+{
+    return (u8)((value & 0xf0) | ((value & 0xf0) >> 4));
+}
+
+static u8 pgl_etc_ind_lo(u8 value)
+{
+    return (u8)(((value & 0xf) << 4) | (value & 0xf));
+}
+
+static u8 pgl_etc_extend4(unsigned value)
+{
+    return (u8)((value << 4) | value);
+}
+
+static void pgl_etc1_decode_block(const u8* src, u8 out[64])
+{
+    u8 base[2][3];
+    u32 indices = ((u32)src[4] << 24) | ((u32)src[5] << 16) |
+                  ((u32)src[6] << 8) | src[7];
+    int channel, x, y;
+    for (channel = 0; channel < 3; ++channel) {
+        if (src[3] & 2) {
+            base[0][channel] = pgl_etc_diff_hi(src[channel]);
+            base[1][channel] = pgl_etc_diff_lo(src[channel]);
+        } else {
+            base[0][channel] = pgl_etc_ind_hi(src[channel]);
+            base[1][channel] = pgl_etc_ind_lo(src[channel]);
+        }
+    }
+    for (y = 0; y < 4; ++y) {
+        for (x = 0; x < 4; ++x) {
+            int bit = y + x * 4;
+            int index = (int)(((indices >> (15 + bit)) & 2) |
+                              ((indices >> bit) & 1));
+            int subblock = (src[3] & 1) ? y >= 2 : x >= 2;
+            int table = subblock ? (src[3] >> 2) & 7 : (src[3] >> 5) & 7;
+            int modifier = pgl_etc1_modifiers[table][index];
+            u8* dst = out + (y * 4 + x) * 4;
+            dst[0] = pgl_etc_clamp(base[subblock][0] + modifier);
+            dst[1] = pgl_etc_clamp(base[subblock][1] + modifier);
+            dst[2] = pgl_etc_clamp(base[subblock][2] + modifier);
+            dst[3] = 255;
+        }
+    }
+}
+
+static u8 pgl_etc2_t_base1(const u8* src, int channel)
+{
+    unsigned value;
+    if (channel == 0)
+        value = (((src[0] >> 3) & 3) << 2) | (src[0] & 3);
+    else if (channel == 1)
+        value = (src[1] >> 4) & 15;
+    else
+        value = src[1] & 15;
+    return pgl_etc_extend4(value);
+}
+
+static u8 pgl_etc2_t_base2(const u8* src, int channel)
+{
+    unsigned value = channel == 0 ? (src[2] >> 4) & 15 :
+                     channel == 1 ? src[2] & 15 : (src[3] >> 4) & 15;
+    return pgl_etc_extend4(value);
+}
+
+static u8 pgl_etc2_h_base1(const u8* src, int channel)
+{
+    unsigned value;
+    if (channel == 0)
+        value = (src[0] >> 3) & 15;
+    else if (channel == 1)
+        value = ((src[0] & 7) << 1) | ((src[1] >> 4) & 1);
+    else
+        value = (src[1] & 8) | ((src[1] & 3) << 1) | ((src[2] >> 7) & 1);
+    return pgl_etc_extend4(value);
+}
+
+static u8 pgl_etc2_h_base2(const u8* src, int channel)
+{
+    unsigned value = channel == 0 ? (src[2] >> 3) & 15 :
+                     channel == 1 ? ((src[2] & 7) << 1) | ((src[3] >> 7) & 1) :
+                                    (src[3] >> 3) & 15;
+    return pgl_etc_extend4(value);
+}
+
+static u8 pgl_etc2_planar_o(const u8* src, int channel)
+{
+    unsigned value;
+    if (channel == 0) {
+        value = (src[0] >> 1) & 0x3f;
+        return (u8)((value << 2) | (value >> 4));
+    }
+    if (channel == 1) {
+        value = ((src[0] & 1) << 6) | ((src[1] >> 1) & 0x3f);
+        return (u8)((value << 1) | (value >> 6));
+    }
+    value = ((src[1] & 1) << 5) | (src[2] & 0x18) |
+            ((src[2] & 3) << 1) | ((src[3] >> 7) & 1);
+    return (u8)((value << 2) | (value >> 4));
+}
+
+static u8 pgl_etc2_planar_h(const u8* src, int channel)
+{
+    unsigned value;
+    if (channel == 0) {
+        value = ((src[3] & 0x7c) >> 1) | (src[3] & 1);
+        return (u8)((value << 2) | (value >> 4));
+    }
+    if (channel == 1) {
+        value = (src[4] >> 1) & 0x7f;
+        return (u8)((value << 1) | (value >> 6));
+    }
+    value = ((src[4] & 1) << 5) | ((src[5] >> 3) & 0x1f);
+    return (u8)((value << 2) | (value >> 4));
+}
+
+static u8 pgl_etc2_planar_v(const u8* src, int channel)
+{
+    unsigned value;
+    if (channel == 0) {
+        value = ((src[5] & 7) << 3) | ((src[6] >> 5) & 7);
+        return (u8)((value << 2) | (value >> 4));
+    }
+    if (channel == 1) {
+        value = ((src[6] & 0x1f) << 2) | ((src[7] >> 6) & 3);
+        return (u8)((value << 1) | (value >> 6));
+    }
+    value = src[7] & 0x3f;
+    return (u8)((value << 2) | (value >> 4));
+}
+
+static void pgl_etc2_parse_block(pglEtcBlock* block, const u8* src, int punchthrough)
+{
+    static const int delta[8] = { 0, 1, 2, 3, -4, -3, -2, -1 };
+    int r = (src[0] >> 3) + delta[src[0] & 7];
+    int g = (src[1] >> 3) + delta[src[1] & 7];
+    int b = (src[2] >> 3) + delta[src[2] & 7];
+    int diffbit = punchthrough ? 0 : src[3] & 2;
+    int channel;
+    memset(block, 0, sizeof(*block));
+    block->opaque = punchthrough ? (src[3] & 2) != 0 : 1;
+    if (!diffbit && !punchthrough) {
+        block->individual = 1;
+        for (channel = 0; channel < 3; ++channel) {
+            block->base[0][channel] = pgl_etc_ind_hi(src[channel]);
+            block->base[1][channel] = pgl_etc_ind_lo(src[channel]);
+        }
+    } else if (r < 0 || r > 31) {
+        block->t_mode = 1;
+        for (channel = 0; channel < 3; ++channel) {
+            block->base[0][channel] = pgl_etc2_t_base1(src, channel);
+            block->base[1][channel] = pgl_etc2_t_base2(src, channel);
+        }
+        block->distance = pgl_etc2_distances[(((src[3] >> 2) & 3) << 1) |
+                                             (src[3] & 1)];
+        for (channel = 0; channel < 3; ++channel) {
+            block->paint[0][channel] = block->base[0][channel];
+            block->paint[1][channel] = pgl_etc_clamp(block->base[1][channel] + block->distance);
+            block->paint[2][channel] = block->base[1][channel];
+            block->paint[3][channel] = pgl_etc_clamp(block->base[1][channel] - block->distance);
+        }
+    } else if (g < 0 || g > 31) {
+        unsigned value1, value2;
+        block->h_mode = 1;
+        for (channel = 0; channel < 3; ++channel) {
+            block->base[0][channel] = pgl_etc2_h_base1(src, channel);
+            block->base[1][channel] = pgl_etc2_h_base2(src, channel);
+        }
+        value1 = ((unsigned)block->base[0][0] << 16) |
+                 ((unsigned)block->base[0][1] << 8) | block->base[0][2];
+        value2 = ((unsigned)block->base[1][0] << 16) |
+                 ((unsigned)block->base[1][1] << 8) | block->base[1][2];
+        block->distance = pgl_etc2_distances[(src[3] & 4) |
+                                             ((src[3] & 1) << 1) |
+                                             (value1 >= value2)];
+        for (channel = 0; channel < 3; ++channel) {
+            block->paint[0][channel] = pgl_etc_clamp(block->base[0][channel] + block->distance);
+            block->paint[1][channel] = pgl_etc_clamp(block->base[0][channel] - block->distance);
+            block->paint[2][channel] = pgl_etc_clamp(block->base[1][channel] + block->distance);
+            block->paint[3][channel] = pgl_etc_clamp(block->base[1][channel] - block->distance);
+        }
+    } else if (b < 0 || b > 31) {
+        block->planar = 1;
+        block->opaque = 1;
+        for (channel = 0; channel < 3; ++channel) {
+            block->base[0][channel] = pgl_etc2_planar_o(src, channel);
+            block->base[1][channel] = pgl_etc2_planar_h(src, channel);
+            block->base[2][channel] = pgl_etc2_planar_v(src, channel);
+        }
+    } else {
+        block->differential = 1;
+        for (channel = 0; channel < 3; ++channel) {
+            block->base[0][channel] = pgl_etc_diff_hi(src[channel]);
+            block->base[1][channel] = pgl_etc_diff_lo(src[channel]);
+        }
+    }
+    if (block->individual || block->differential) {
+        int table0 = (src[3] >> 5) & 7;
+        int table1 = (src[3] >> 2) & 7;
+        block->modifiers[0] = (!punchthrough || block->opaque) ?
+                              pgl_etc1_modifiers[table0] : pgl_etc2_punch_modifiers[table0];
+        block->modifiers[1] = (!punchthrough || block->opaque) ?
+                              pgl_etc1_modifiers[table1] : pgl_etc2_punch_modifiers[table1];
+        block->flipped = src[3] & 1;
+    }
+    block->indices = ((u32)src[4] << 24) | ((u32)src[5] << 16) |
+                     ((u32)src[6] << 8) | src[7];
+}
+
+static void pgl_etc2_decode_block(const u8* src, int punchthrough, u8 out[64])
+{
+    pglEtcBlock block;
+    int x, y;
+    pgl_etc2_parse_block(&block, src, punchthrough);
+    for (y = 0; y < 4; ++y) {
+        for (x = 0; x < 4; ++x) {
+            int bit = y + x * 4;
+            int index = (int)(((block.indices >> (15 + bit)) & 2) |
+                              ((block.indices >> bit) & 1));
+            u8* dst = out + (y * 4 + x) * 4;
+            dst[3] = 255;
+            if (punchthrough && !block.opaque && index == 2 && !block.planar) {
+                dst[0] = dst[1] = dst[2] = dst[3] = 0;
+            } else if (block.individual || block.differential) {
+                int subblock = block.flipped ? y >= 2 : x >= 2;
+                int modifier = block.modifiers[subblock][index];
+                dst[0] = pgl_etc_clamp(block.base[subblock][0] + modifier);
+                dst[1] = pgl_etc_clamp(block.base[subblock][1] + modifier);
+                dst[2] = pgl_etc_clamp(block.base[subblock][2] + modifier);
+            } else if (block.t_mode || block.h_mode) {
+                dst[0] = block.paint[index][0];
+                dst[1] = block.paint[index][1];
+                dst[2] = block.paint[index][2];
+            } else {
+                int channel;
+                for (channel = 0; channel < 3; ++channel) {
+                    int value = (x * (block.base[1][channel] - block.base[0][channel]) +
+                                 y * (block.base[2][channel] - block.base[0][channel]) +
+                                 4 * block.base[0][channel] + 2) >> 2;
+                    dst[channel] = pgl_etc_clamp(value);
+                }
+            }
+        }
+    }
+}
+
+static void pgl_etc2_decode_rgba_block(const u8* src, u8 out[64])
+{
+    u64 indices = ((u64)src[2] << 40) | ((u64)src[3] << 32) |
+                  ((u64)src[4] << 24) | ((u64)src[5] << 16) |
+                  ((u64)src[6] << 8) | src[7];
+    int base = src[0], multiplier = (src[1] >> 4) & 15, table = src[1] & 15;
+    int x, y;
+    pgl_etc2_decode_block(src + 8, 0, out);
+    for (y = 0; y < 4; ++y) {
+        for (x = 0; x < 4; ++x) {
+            int bit = ((3 - y) + (3 - x) * 4) * 3;
+            int index = (int)((indices >> bit) & 7);
+            int alpha = base + pgl_etc2_alpha_modifiers[table][index] * multiplier;
+            out[(y * 4 + x) * 4 + 3] = pgl_etc_clamp(alpha);
+        }
+    }
+}
+
+static int pgl_etc_format_info(GLenum format, int* block_bytes)
+{
+    switch (format) {
+    case GL_ETC1_RGB8_OES:
+    case GL_COMPRESSED_RGB8_ETC2:
+    case GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2:
+        *block_bytes = 8;
+        return 1;
+    case GL_COMPRESSED_RGBA8_ETC2_EAC:
+        *block_bytes = 16;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int pgl_etc_image_size(GLsizei width, GLsizei height, int block_bytes,
+                              GLsizei* image_size)
+{
+    size_t blocks_w = ((size_t)width + 3u) / 4u;
+    size_t blocks_h = ((size_t)height + 3u) / 4u;
+    size_t size = blocks_w * blocks_h * (size_t)block_bytes;
+    if (width < 0 || height < 0 || size > 0x7fffffffu)
+        return 0;
+    *image_size = (GLsizei)size;
+    return 1;
+}
+
+static void pgl_etc_decode(u8* out, int out_pitch, const u8* src,
+                           GLsizei width, GLsizei height, GLenum format)
+{
+    int block_bytes = 0;
+    int punchthrough = format == GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2;
+    int bx, by, x, y;
+    if (!pgl_etc_format_info(format, &block_bytes))
+        return;
+    for (by = 0; by < height; by += 4) {
+        for (bx = 0; bx < width; bx += 4) {
+            u8 decoded[64];
+            const u8* block = src + ((size_t)(by / 4) * ((size_t)(width + 3) / 4u) +
+                                     (size_t)(bx / 4)) * (size_t)block_bytes;
+            if (format == GL_ETC1_RGB8_OES)
+                pgl_etc1_decode_block(block, decoded);
+            else if (format == GL_COMPRESSED_RGBA8_ETC2_EAC)
+                pgl_etc2_decode_rgba_block(block, decoded);
+            else
+                pgl_etc2_decode_block(block, punchthrough, decoded);
+            for (y = 0; y < 4 && by + y < height; ++y)
+                for (x = 0; x < 4 && bx + x < width; ++x)
+                    memcpy(out + (size_t)(by + y) * (size_t)out_pitch + (bx + x) * 4,
+                           decoded + (y * 4 + x) * 4, 4);
+        }
+    }
+}
+
+PGLDEF void pgl_CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid* data)
+{
+    glTexture* tex;
+    u8* pixels;
+    size_t size;
+    GLsizei expected;
+    int face, cube, block_bytes;
+    PGL_ERR((target != GL_TEXTURE_2D &&
+             (target < GL_TEXTURE_CUBE_MAP_POSITIVE_X ||
+              target > GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)), GL_INVALID_ENUM);
+    PGL_ERR(!pgl_etc_format_info(internalformat, &block_bytes), GL_INVALID_ENUM);
+    PGL_ERR((level < 0 || level >= PGL_MAX_MIP_LEVELS || border != 0 ||
+             width < 0 || height < 0 || width > PGL_MAX_TEXTURE_SIZE ||
+             height > PGL_MAX_TEXTURE_SIZE), GL_INVALID_VALUE);
+    cube = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+    PGL_ERR(cube && width != height, GL_INVALID_VALUE);
+    PGL_ERR(!pgl_etc_image_size(width, height, block_bytes, &expected) ||
+            imageSize != expected, GL_INVALID_VALUE);
+    PGL_ERR(imageSize > 0 && !data, GL_INVALID_VALUE);
+    PGL_ERR(!texture_level_size(width, height, &size), GL_OUT_OF_MEMORY);
+    pixels = (u8*)PGL_MALLOC(size ? size : 1u);
+    PGL_ERR(!pixels, GL_OUT_OF_MEMORY);
+    if (width && height)
+        pgl_etc_decode(pixels, width * 4, (const u8*)data, width, height, internalformat);
+    tex = texture_for_2d_target(target, &face, &cube);
+    install_texture_level(tex, face, level, internalformat, width, height, pixels, cube);
+}
+
+PGLDEF void pgl_CompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const GLvoid* data)
+{
+    glTexture* tex;
+    glTextureLevel* l;
+    u8* pixels;
+    size_t size;
+    GLsizei expected;
+    int face, cube, block_bytes, x, y;
+    PGL_ERR((target != GL_TEXTURE_2D &&
+             (target < GL_TEXTURE_CUBE_MAP_POSITIVE_X ||
+              target > GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)), GL_INVALID_ENUM);
+    PGL_ERR(!pgl_etc_format_info(format, &block_bytes), GL_INVALID_ENUM);
+    PGL_ERR(format == GL_ETC1_RGB8_OES, GL_INVALID_OPERATION);
+    PGL_ERR((level < 0 || level >= PGL_MAX_MIP_LEVELS || width < 0 || height < 0),
+            GL_INVALID_VALUE);
+    tex = texture_for_2d_target(target, &face, &cube);
+    l = &tex->levels[face][level];
+    PGL_ERR(!l->defined || l->internalformat != format, GL_INVALID_OPERATION);
+    PGL_ERR((xoffset < 0 || yoffset < 0 || (xoffset & 3) || (yoffset & 3) ||
+             xoffset > l->w - width || yoffset > l->h - height), GL_INVALID_VALUE);
+    PGL_ERR(((width & 3) && xoffset + width != l->w) ||
+            ((height & 3) && yoffset + height != l->h), GL_INVALID_VALUE);
+    PGL_ERR(!pgl_etc_image_size(width, height, block_bytes, &expected) ||
+            imageSize != expected, GL_INVALID_VALUE);
+    PGL_ERR(imageSize > 0 && !data, GL_INVALID_VALUE);
+    if (!width || !height)
+        return;
+    PGL_ERR(!texture_level_size(width, height, &size), GL_OUT_OF_MEMORY);
+    pixels = (u8*)PGL_MALLOC(size);
+    PGL_ERR(!pixels, GL_OUT_OF_MEMORY);
+    pgl_etc_decode(pixels, width * 4, (const u8*)data, width, height, format);
+    for (y = 0; y < height; ++y)
+        for (x = 0; x < width; ++x)
+            memcpy(l->data + ((size_t)(yoffset + y) * (size_t)l->w + xoffset + x) * 4u,
+                   pixels + ((size_t)y * (size_t)width + x) * 4u, 4);
+    PGL_FREE(pixels);
+    l->datagen = ++tex->datagen;
+}
+
+static void pgl_copy_texel(u8* dst, GLint x, GLint y, GLenum internalformat)
+{
+    u32 pixel = 0;
+    int64_t sx = x, sy = (int64_t)c->back_buffer.h - 1 - (int64_t)y;
+    unsigned r, g, b, a;
+    if (sx >= 0 && sx < c->back_buffer.w && sy >= 0 && sy < c->back_buffer.h)
+        pixel = ((const u32*)c->back_buffer.buf)[(size_t)sy * (size_t)c->back_buffer.w + (size_t)sx];
+    r = (pixel >> 16) & 255u;
+    g = (pixel >> 8) & 255u;
+    b = pixel & 255u;
+    a = (pixel >> 24) & 255u;
+    if (internalformat == GL_ALPHA) {
+        r = g = b = 0;
+    } else if (internalformat == GL_LUMINANCE || internalformat == GL_LUMINANCE_ALPHA) {
+        g = b = r;
+        if (internalformat == GL_LUMINANCE) a = 255;
+    } else if (internalformat == GL_RGB) {
+        a = 255;
+    }
+    dst[0] = (u8)r;
+    dst[1] = (u8)g;
+    dst[2] = (u8)b;
+    dst[3] = (u8)a;
+}
+
+PGLDEF void pgl_CopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border)
+{
+    glTexture* tex;
+    u8* pixels;
+    size_t size;
+    int face, cube, col, row;
+    PGL_ERR((target != GL_TEXTURE_2D &&
+             (target < GL_TEXTURE_CUBE_MAP_POSITIVE_X ||
+              target > GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)), GL_INVALID_ENUM);
+    PGL_ERR((internalformat != GL_ALPHA && internalformat != GL_LUMINANCE &&
+             internalformat != GL_LUMINANCE_ALPHA && internalformat != GL_RGB &&
+             internalformat != GL_RGBA), GL_INVALID_ENUM);
+    PGL_ERR((level < 0 || level >= PGL_MAX_MIP_LEVELS || border != 0 ||
+             width < 0 || height < 0 || width > PGL_MAX_TEXTURE_SIZE ||
+             height > PGL_MAX_TEXTURE_SIZE), GL_INVALID_VALUE);
+    cube = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+    PGL_ERR(cube && width != height, GL_INVALID_VALUE);
+    PGL_ERR(!texture_level_size(width, height, &size), GL_OUT_OF_MEMORY);
+    pixels = (u8*)PGL_MALLOC(size ? size : 1u);
+    PGL_ERR(!pixels, GL_OUT_OF_MEMORY);
+    for (row = 0; row < height; ++row)
+        for (col = 0; col < width; ++col)
+            pgl_copy_texel(pixels + ((size_t)row * (size_t)width + col) * 4u,
+                           x + col, y + row, internalformat);
+    tex = texture_for_2d_target(target, &face, &cube);
+    install_texture_level(tex, face, level, internalformat, width, height, pixels, cube);
+}
+
+PGLDEF void pgl_CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    glTexture* tex;
+    glTextureLevel* l;
+    int face, cube, col, row;
+    PGL_ERR((target != GL_TEXTURE_2D &&
+             (target < GL_TEXTURE_CUBE_MAP_POSITIVE_X ||
+              target > GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)), GL_INVALID_ENUM);
+    PGL_ERR((level < 0 || level >= PGL_MAX_MIP_LEVELS || width < 0 || height < 0),
+            GL_INVALID_VALUE);
+    tex = texture_for_2d_target(target, &face, &cube);
+    l = &tex->levels[face][level];
+    PGL_ERR(!l->defined, GL_INVALID_OPERATION);
+    PGL_ERR((xoffset < 0 || yoffset < 0 || xoffset > l->w - width ||
+             yoffset > l->h - height), GL_INVALID_VALUE);
+    for (row = 0; row < height; ++row)
+        for (col = 0; col < width; ++col)
+            pgl_copy_texel(l->data + ((size_t)(yoffset + row) * (size_t)l->w + xoffset + col) * 4u,
+                           x + col, y + row, l->internalformat);
+    l->datagen = ++tex->datagen;
+}
 PGLDEF void pgl_CompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const GLvoid* data) {}
 
 PGLDEF void pgl_TexBuffer(GLenum target, GLenum internalformat, GLuint buffer) { }
@@ -9518,95 +10315,130 @@ PGLDEF vec4 texture1D(GLuint tex, float x)
     }
 }
 
+static vec4 texture_sample_level(const glTexture* tex, int face, int level,
+                                 float x, float y, GLenum filter)
+{
+    const glTextureLevel* l = &tex->levels[face][level];
+    const Color* pixels = (const Color*)l->data;
+    int i0, j0, i1, j1;
+    float u = x * l->w;
+    float v = y * l->h;
+    if (filter == GL_NEAREST) {
+        i0 = wrap((int)floorf(u), l->w, tex->wrap_s);
+        j0 = wrap((int)floorf(v), l->h, tex->wrap_t);
+#ifdef PGL_ENABLE_CLAMP_TO_BORDER
+        if ((i0 | j0) < 0) return tex->border_color;
+#endif
+        return Color_to_v4(pixels[j0 * l->w + i0]);
+    }
+
+    u -= 0.5f;
+    v -= 0.5f;
+    i0 = (int)floorf(u);
+    j0 = (int)floorf(v);
+    i1 = wrap(i0 + 1, l->w, tex->wrap_s);
+    j1 = wrap(j0 + 1, l->h, tex->wrap_t);
+    {
+        float alpha = u - floorf(u);
+        float beta = v - floorf(v);
+        vec4 c00, c10, c01, c11;
+        i0 = wrap(i0, l->w, tex->wrap_s);
+        j0 = wrap(j0, l->h, tex->wrap_t);
+#ifdef PGL_ENABLE_CLAMP_TO_BORDER
+        c00 = ((i0 | j0) < 0) ? tex->border_color : Color_to_v4(pixels[j0 * l->w + i0]);
+        c10 = ((i1 | j0) < 0) ? tex->border_color : Color_to_v4(pixels[j0 * l->w + i1]);
+        c01 = ((i0 | j1) < 0) ? tex->border_color : Color_to_v4(pixels[j1 * l->w + i0]);
+        c11 = ((i1 | j1) < 0) ? tex->border_color : Color_to_v4(pixels[j1 * l->w + i1]);
+#else
+        c00 = Color_to_v4(pixels[j0 * l->w + i0]);
+        c10 = Color_to_v4(pixels[j0 * l->w + i1]);
+        c01 = Color_to_v4(pixels[j1 * l->w + i0]);
+        c11 = Color_to_v4(pixels[j1 * l->w + i1]);
+#endif
+#ifdef PGL_HERMITE_SMOOTHING
+        alpha = alpha * alpha * (3.0f - 2.0f * alpha);
+        beta = beta * beta * (3.0f - 2.0f * beta);
+#endif
+        c00 = scale_v4(c00, (1.0f - alpha) * (1.0f - beta));
+        c10 = scale_v4(c10, alpha * (1.0f - beta));
+        c01 = scale_v4(c01, (1.0f - alpha) * beta);
+        c11 = scale_v4(c11, alpha * beta);
+        return add_v4s(add_v4s(add_v4s(c00, c10), c01), c11);
+    }
+}
+
+static vec4 texture_sample_with_lod(const glTexture* tex, int face, int cube,
+                                    float x, float y, float lod)
+{
+    int max_level, level0, level1;
+    float fraction;
+    GLenum filter;
+    vec4 a, b;
+    if (!pgl_texture_complete(tex, cube))
+        return make_v4(0.0f, 0.0f, 0.0f, 1.0f);
+    max_level = texture_max_mip_level(tex->levels[face][0].w, tex->levels[face][0].h);
+    if (lod < 0.0f) lod = 0.0f;
+    if (lod > (float)max_level) lod = (float)max_level;
+    if (lod == 0.0f)
+        return texture_sample_level(tex, face, 0, x, y, tex->mag_filter);
+
+    if (tex->min_filter == GL_NEAREST || tex->min_filter == GL_LINEAR)
+        return texture_sample_level(tex, face, 0, x, y, tex->min_filter);
+
+    filter = (tex->min_filter == GL_NEAREST_MIPMAP_NEAREST ||
+              tex->min_filter == GL_NEAREST_MIPMAP_LINEAR) ? GL_NEAREST : GL_LINEAR;
+    if (tex->min_filter == GL_NEAREST_MIPMAP_NEAREST ||
+        tex->min_filter == GL_LINEAR_MIPMAP_NEAREST) {
+        level0 = (int)floorf(lod + 0.5f);
+        if (level0 > max_level) level0 = max_level;
+        return texture_sample_level(tex, face, level0, x, y, filter);
+    }
+
+    level0 = (int)floorf(lod);
+    level1 = level0 + 1;
+    if (level1 > max_level) level1 = max_level;
+    fraction = lod - floorf(lod);
+    a = texture_sample_level(tex, face, level0, x, y, filter);
+    if (level0 == level1) return a;
+    b = texture_sample_level(tex, face, level1, x, y, filter);
+    return add_v4s(scale_v4(a, 1.0f - fraction), scale_v4(b, fraction));
+}
+
+static glTexture* texture2d_object(GLuint tex)
+{
+    return tex ? &c->textures.a[tex]
+               : &c->default_textures[GL_TEXTURE_2D - GL_TEXTURE_1D];
+}
+
+PGLDEF vec4 texture2D_lod(GLuint tex, float x, float y, float lod)
+{
+    return texture_sample_with_lod(texture2d_object(tex), 0, 0, x, y, lod);
+}
+
 PGLDEF vec4 texture2D(GLuint tex, float x, float y)
 {
-    int i0, j0, i1, j1;
+    return texture2D_lod(tex, x, y, 0.0f);
+}
 
-    glTexture* t = NULL;
-    if (tex) {
-        t = &c->textures.a[tex];
-    } else {
-        t = &c->default_textures[GL_TEXTURE_2D-GL_TEXTURE_1D];
+PGLDEF vec4 texture2D_grad(GLuint tex, float x, float y,
+                           const float* ddx, const float* ddy)
+{
+    glTexture* object = texture2d_object(tex);
+    const glTextureLevel* base = &object->levels[0][0];
+    float rx, ry, rho, lod;
+    if (!pgl_texture_complete(object, 0))
+        return make_v4(0.0f, 0.0f, 0.0f, 1.0f);
+    rx = ddx[0] * base->w;
+    ry = ddx[1] * base->h;
+    rho = sqrtf(rx * rx + ry * ry);
+    rx = ddy[0] * base->w;
+    ry = ddy[1] * base->h;
+    {
+        float ry_len = sqrtf(rx * rx + ry * ry);
+        if (ry_len > rho) rho = ry_len;
     }
-    Color* texdata = (Color*)t->data;
-
-    int w = t->w;
-    int h = t->h;
-
-    float dw = w - EPSILON;
-    float dh = h - EPSILON;
-
-    float xw = x * dw;
-    float yh = y * dh;
-
-    // TODO don't just use mag_filter all the time?
-    // is it worth bothering?
-    // Or maybe it makes more sense to use min_filter all the time
-    // since that defaults to NEAREST?
-    if (t->mag_filter == GL_NEAREST) {
-        i0 = wrap(floorf(xw), w, t->wrap_s);
-        j0 = wrap(floorf(yh), h, t->wrap_t);
-
-#ifdef PGL_ENABLE_CLAMP_TO_BORDER
-        if ((i0 | j0) < 0) return t->border_color;
-#endif
-        return Color_to_v4(texdata[j0*w + i0]);
-
-    } else {
-        // LINEAR
-        // This seems right to me since pixel centers are 0.5 but
-        // this isn't exactly what's described in the spec or FoCG
-        i0 = wrap(floorf(xw - 0.5f), w, t->wrap_s);
-        j0 = wrap(floorf(yh - 0.5f), h, t->wrap_t);
-        i1 = wrap(floorf(xw + 0.499999f), w, t->wrap_s);
-        j1 = wrap(floorf(yh + 0.499999f), h, t->wrap_t);
-
-        float tmp2;
-        float alpha = modff(xw+0.5f, &tmp2);
-        float beta = modff(yh+0.5f, &tmp2);
-        if (alpha < 0) ++alpha;
-        if (beta < 0) ++beta;
-
-        //hermite smoothing is optional
-        //looks like my nvidia implementation doesn't do it
-        //but it can look a little better
-#ifdef PGL_HERMITE_SMOOTHING
-        alpha = alpha*alpha * (3 - 2*alpha);
-        beta = beta*beta * (3 - 2*beta);
-#endif
-
-
-#ifdef PGL_ENABLE_CLAMP_TO_BORDER
-        vec4 cij, ci1j, cij1, ci1j1;
-        if ((i0 | j0) < 0) cij = t->border_color;
-        else cij = Color_to_v4(texdata[j0*w + i0]);
-
-        if ((i1 | j0) < 0) ci1j = t->border_color;
-        else ci1j = Color_to_v4(texdata[j0*w + i1]);
-
-        if ((i0 | j1) < 0) cij1 = t->border_color;
-        else cij1 = Color_to_v4(texdata[j1*w + i0]);
-
-        if ((i1 | j1) < 0) ci1j1 = t->border_color;
-        else ci1j1 = Color_to_v4(texdata[j1*w + i1]);
-#else
-        vec4 cij = Color_to_v4(texdata[j0*w + i0]);
-        vec4 ci1j = Color_to_v4(texdata[j0*w + i1]);
-        vec4 cij1 = Color_to_v4(texdata[j1*w + i0]);
-        vec4 ci1j1 = Color_to_v4(texdata[j1*w + i1]);
-#endif
-
-        cij = scale_v4(cij, (1-alpha)*(1-beta));
-        ci1j = scale_v4(ci1j, alpha*(1-beta));
-        cij1 = scale_v4(cij1, (1-alpha)*beta);
-        ci1j1 = scale_v4(ci1j1, alpha*beta);
-
-        cij = add_v4s(cij, ci1j);
-        cij = add_v4s(cij, cij1);
-        cij = add_v4s(cij, ci1j1);
-
-        return cij;
-    }
+    lod = rho > 1.0f ? log2f(rho) : 0.0f;
+    return texture_sample_with_lod(object, 0, 0, x, y, lod);
 }
 
 PGLDEF vec4 texture3D(GLuint tex, float x, float y, float z)
@@ -9903,133 +10735,82 @@ PGLDEF vec4 texture_rect(GLuint tex, float x, float y)
     }
 }
 
+static glTexture* texture_cube_object(GLuint texture)
+{
+    return texture ? &c->textures.a[texture]
+                   : &c->default_textures[GL_TEXTURE_CUBE_MAP - GL_TEXTURE_1D];
+}
+
+static void texture_cube_coords(float x, float y, float z,
+                                int* face, float* out_u, float* out_v)
+{
+    float ax = fabsf(x), ay = fabsf(y), az = fabsf(z);
+    float ma, s, t;
+    if (ax >= ay && ax >= az) {
+        ma = ax;
+        t = -y;
+        if (x >= 0.0f) { *face = 0; s = -z; }
+        else           { *face = 1; s = z; }
+    } else if (ay >= az) {
+        ma = ay;
+        s = x;
+        if (y >= 0.0f) { *face = 2; t = z; }
+        else           { *face = 3; t = -z; }
+    } else {
+        ma = az;
+        t = -y;
+        if (z >= 0.0f) { *face = 4; s = x; }
+        else           { *face = 5; s = -x; }
+    }
+    if (ma == 0.0f) {
+        *face = 0;
+        *out_u = *out_v = 0.0f;
+        return;
+    }
+    *out_u = (s / ma + 1.0f) * 0.5f;
+    *out_v = (t / ma + 1.0f) * 0.5f;
+}
+
+PGLDEF vec4 texture_cubemap_lod(GLuint texture, float x, float y, float z, float lod)
+{
+    int face;
+    float u, v;
+    texture_cube_coords(x, y, z, &face, &u, &v);
+    return texture_sample_with_lod(texture_cube_object(texture), face, 1, u, v, lod);
+}
+
 PGLDEF vec4 texture_cubemap(GLuint texture, float x, float y, float z)
 {
-    glTexture* tex = NULL;
-    if (texture) {
-        tex = &c->textures.a[texture];
-    } else {
-        tex = &c->default_textures[GL_TEXTURE_CUBE_MAP-GL_TEXTURE_1D];
+    return texture_cubemap_lod(texture, x, y, z, 0.0f);
+}
+
+PGLDEF vec4 texture_cubemap_grad(GLuint texture, float x, float y, float z,
+                                 const float* ddx, const float* ddy)
+{
+    glTexture* object = texture_cube_object(texture);
+    const glTextureLevel* base = &object->levels[0][0];
+    int face, facex, facey;
+    float u, v, ux, vx, uy, vy, dux, dvx, duy, dvy, rx, ry, rho, lod;
+    if (!pgl_texture_complete(object, 1))
+        return make_v4(0.0f, 0.0f, 0.0f, 1.0f);
+    texture_cube_coords(x, y, z, &face, &u, &v);
+    texture_cube_coords(x + ddx[0], y + ddx[1], z + ddx[2], &facex, &ux, &vx);
+    texture_cube_coords(x + ddy[0], y + ddy[1], z + ddy[2], &facey, &uy, &vy);
+    dux = facex == face ? ux - u : 1.0f;
+    dvx = facex == face ? vx - v : 1.0f;
+    duy = facey == face ? uy - u : 1.0f;
+    dvy = facey == face ? vy - v : 1.0f;
+    rx = dux * base->w;
+    ry = dvx * base->h;
+    rho = sqrtf(rx * rx + ry * ry);
+    rx = duy * base->w;
+    ry = dvy * base->h;
+    {
+        float y_len = sqrtf(rx * rx + ry * ry);
+        if (y_len > rho) rho = y_len;
     }
-    Color* texdata = (Color*)tex->data;
-
-    float x_mag = (x < 0) ? -x : x;
-    float y_mag = (y < 0) ? -y : y;
-    float z_mag = (z < 0) ? -z : z;
-
-    float s, t, max;
-
-    int p, i0, j0, i1, j1;
-
-    //there should be a better/shorter way to do this ...
-    if (x_mag > y_mag) {
-        if (x_mag > z_mag) {  //x largest
-            max = x_mag;
-            t = -y;
-            if (x_mag == x) {
-                p = 0;
-                s = -z;
-            } else {
-                p = 1;
-                s = z;
-            }
-        } else { //z largest
-            max = z_mag;
-            t = -y;
-            if (z_mag == z) {
-                p = 4;
-                s = x;
-            } else {
-                p = 5;
-                s = -x;
-            }
-        }
-    } else {
-        if (y_mag > z_mag) {  //y largest
-            max = y_mag;
-            s = x;
-            if (y_mag == y) {
-                p = 2;
-                t = z;
-            } else {
-                p = 3;
-                t = -z;
-            }
-        } else { //z largest
-            max = z_mag;
-            t = -y;
-            if (z_mag == z) {
-                p = 4;
-                s = x;
-            } else {
-                p = 5;
-                s = -x;
-            }
-        }
-    }
-
-    // TODO As I understand this, this prevents x and y from ever being
-    // outside [0, 1] so there's no need for me to put CLAMP_TO_BORDER ifdefs
-    // in here, since even CLAMP_TO_EDGE should never happen.
-    x = (s/max + 1.0f)/2.0f;
-    y = (t/max + 1.0f)/2.0f;
-
-    int w = tex->w;
-    int h = tex->h;
-
-    float dw = w - EPSILON;
-    float dh = h - EPSILON;
-
-    int plane = w*w;
-    float xw = x * dw;
-    float yh = y * dh;
-
-    if (tex->mag_filter == GL_NEAREST) {
-        i0 = wrap(floorf(xw), w, tex->wrap_s);
-        j0 = wrap(floorf(yh), h, tex->wrap_t);
-
-        vec4 tmpvec4 = Color_to_v4(texdata[p*plane + j0*w + i0]);
-        return tmpvec4;
-
-    } else {
-        // LINEAR
-        // This seems right to me since pixel centers are 0.5 but
-        // this isn't exactly what's described in the spec or FoCG
-        i0 = wrap(floorf(xw - 0.5f), tex->w, tex->wrap_s);
-        j0 = wrap(floorf(yh - 0.5f), tex->h, tex->wrap_t);
-        i1 = wrap(floorf(xw + 0.499999f), tex->w, tex->wrap_s);
-        j1 = wrap(floorf(yh + 0.499999f), tex->h, tex->wrap_t);
-
-        float tmp2;
-        float alpha = modff(xw+0.5f, &tmp2);
-        float beta = modff(yh+0.5f, &tmp2);
-        if (alpha < 0) ++alpha;
-        if (beta < 0) ++beta;
-
-        //hermite smoothing is optional
-        //looks like my nvidia implementation doesn't do it
-        //but it can look a little better
-#ifdef PGL_HERMITE_SMOOTHING
-        alpha = alpha*alpha * (3 - 2*alpha);
-        beta = beta*beta * (3 - 2*beta);
-#endif
-
-        vec4 cij = Color_to_v4(texdata[p*plane + j0*w + i0]);
-        vec4 ci1j = Color_to_v4(texdata[p*plane + j0*w + i1]);
-        vec4 cij1 = Color_to_v4(texdata[p*plane + j1*w + i0]);
-        vec4 ci1j1 = Color_to_v4(texdata[p*plane + j1*w + i1]);
-
-        cij = scale_v4(cij, (1-alpha)*(1-beta));
-        ci1j = scale_v4(ci1j, alpha*(1-beta));
-        cij1 = scale_v4(cij1, (1-alpha)*beta);
-        ci1j1 = scale_v4(ci1j1, alpha*beta);
-
-        cij = add_v4s(cij, ci1j);
-        cij = add_v4s(cij, cij1);
-        cij = add_v4s(cij, ci1j1);
-
-        return cij;
-    }
+    lod = rho > 1.0f ? log2f(rho) : 0.0f;
+    return texture_sample_with_lod(object, face, 1, u, v, lod);
 }
 
 PGLDEF vec4 texelFetch1D(GLuint tex, int x, int lod)
@@ -10162,6 +10943,8 @@ PGLDEF void pglDrawFrame(void)
     void* uniforms = c->programs.a[c->cur_program].uniform;
 
     Shader_Builtins builtins;
+    builtins.fs_input_dx = NULL;
+    builtins.fs_input_dy = NULL;
 #ifdef PGL_G3D
     /* WS4/WS5: dispatch the frame on the VideoCore GPU when this frag shader has
      * a registered compiled program; fall through to the CPU loop otherwise. */
@@ -10188,6 +10971,8 @@ PGLDEF void pglDrawFrame(void)
 PGLDEF void pglDrawFrame2(frag_func frag_shader, void* uniforms)
 {
     Shader_Builtins builtins;
+    builtins.fs_input_dx = NULL;
+    builtins.fs_input_dy = NULL;
 #ifdef PGL_G3D
     /* WS4/WS5: dispatch the frame on the VideoCore GPU when this frag shader has
      * a registered compiled program; fall through to the CPU loop otherwise. */
@@ -10635,19 +11420,19 @@ PGLDEF int setup_default_textures(void)
     // If this was called in init_glContext() or immediately after we would know
     // 0 was already bound
     pgl_BindTexture(GL_TEXTURE_1D, 0);
-    pgl_TexImage1D(GL_TEXTURE_1D, 0, GL_COMPRESSED_RGBA, w, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_TexImage1D(GL_TEXTURE_1D, 0, GL_RGBA, w, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
     pgl_BindTexture(GL_TEXTURE_2D, 0);
-    pgl_TexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
     pgl_BindTexture(GL_TEXTURE_3D, 0);
-    pgl_TexImage3D(GL_TEXTURE_3D, 0, GL_COMPRESSED_RGBA, w, h, d, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_TexImage3D(GL_TEXTURE_3D, 0, GL_RGBA, w, h, d, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
     pgl_BindTexture(GL_TEXTURE_1D_ARRAY, 0);
-    pgl_TexImage2D(GL_TEXTURE_1D_ARRAY, 0, GL_COMPRESSED_RGBA, w, frames, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_TexImage2D(GL_TEXTURE_1D_ARRAY, 0, GL_RGBA, w, frames, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
     pgl_BindTexture(GL_TEXTURE_2D_ARRAY, 0);
-    pgl_TexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_COMPRESSED_RGBA, w, h, frames, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+    pgl_TexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, w, h, frames, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
 
     pgl_BindTexture(GL_TEXTURE_RECTANGLE, 0);
     pgl_TexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
@@ -10662,7 +11447,7 @@ PGLDEF int setup_default_textures(void)
         GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
     };
     for (int i=0; i<6; i++) {
-        pgl_TexImage2D(cube[i], 0, GL_COMPRESSED_RGBA, w, h, 0,
+        pgl_TexImage2D(cube[i], 0, GL_RGBA, w, h, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, image);
     }
 

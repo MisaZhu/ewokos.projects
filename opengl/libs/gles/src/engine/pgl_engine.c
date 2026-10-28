@@ -284,6 +284,11 @@ static const epair format_map[] = {
     { GLES2_GL_RGBA,            GL_RGBA            },
     { GLES2_GL_LUMINANCE,       GL_LUMINANCE       },
     { GLES2_GL_LUMINANCE_ALPHA, GL_LUMINANCE_ALPHA },
+    { GLES2_GL_ETC1_RGB8_OES,   GL_ETC1_RGB8_OES   },
+    { GLES2_GL_COMPRESSED_RGB8_ETC2, GL_COMPRESSED_RGB8_ETC2 },
+    { GLES2_GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,
+      GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2 },
+    { GLES2_GL_COMPRESSED_RGBA8_ETC2_EAC, GL_COMPRESSED_RGBA8_ETC2_EAC },
 };
 
 static const epair type_map[] = {
@@ -291,6 +296,9 @@ static const epair type_map[] = {
     { GLES2_GL_UNSIGNED_SHORT, GL_UNSIGNED_SHORT },
     { GLES2_GL_UNSIGNED_INT,   GL_UNSIGNED_INT   },
     { GLES2_GL_FLOAT,          GL_FLOAT          },
+    { GLES2_GL_UNSIGNED_SHORT_5_6_5, GL_UNSIGNED_SHORT_5_6_5 },
+    { GLES2_GL_UNSIGNED_SHORT_4_4_4_4, GL_UNSIGNED_SHORT_4_4_4_4 },
+    { GLES2_GL_UNSIGNED_SHORT_5_5_5_1, GL_UNSIGNED_SHORT_5_5_5_1 },
 };
 
 static const epair pixel_store_map[] = {
@@ -472,26 +480,92 @@ void gles_engine_read_pixels(GEint x, GEint y, GEint w, GEint h,
 {
     u32 *fb;
     unsigned char *dst;
-    int row, col;
-    (void)format;
-    if (!g_inited || !pixels || type != GLES2_GL_UNSIGNED_BYTE) return;
-    gles_engine_gpu_flush();   /* land coalesced GPU draws before reading pixels */
+    int row, col, bpp;
+    size_t stride;
+    if (!g_inited) return;
+    if (w < 0 || h < 0) {
+        gles_engine_set_error(GLES2_GL_INVALID_VALUE);
+        return;
+    }
+    if (!pixels) {
+        gles_engine_set_error(GLES2_GL_INVALID_OPERATION);
+        return;
+    }
+    if (format != GLES2_GL_RGBA && format != GLES2_GL_RGB) {
+        gles_engine_set_error(GLES2_GL_INVALID_ENUM);
+        return;
+    }
+    if (type == GLES2_GL_UNSIGNED_BYTE) {
+        bpp = format == GLES2_GL_RGBA ? 4 : 3;
+    } else if (type == GLES2_GL_UNSIGNED_SHORT_5_6_5 && format == GLES2_GL_RGB) {
+        bpp = 2;
+    } else if ((type == GLES2_GL_UNSIGNED_SHORT_4_4_4_4 ||
+                type == GLES2_GL_UNSIGNED_SHORT_5_5_5_1) &&
+               format == GLES2_GL_RGBA) {
+        bpp = 2;
+    } else {
+        gles_engine_set_error(GLES2_GL_INVALID_ENUM);
+        return;
+    }
+    gles_engine_gpu_flush();
     fb = (u32 *)pglGetBackBuffer();
     if (!fb) return;
     dst = (unsigned char *)pixels;
-    /* GL framebuffer origin is bottom-left; the back buffer is top-left. */
+    stride = ((size_t)w * (size_t)bpp + (size_t)g_ctx.pack_alignment - 1u) /
+             (size_t)g_ctx.pack_alignment * (size_t)g_ctx.pack_alignment;
     for (row = 0; row < h; ++row) {
-        int sy = g_h - 1 - (y + row);
-        if (sy < 0 || sy >= g_h) { memset(dst + (size_t)row * w * 4, 0, (size_t)w * 4); continue; }
+        int64_t sy = (int64_t)g_h - 1 - ((int64_t)y + row);
         for (col = 0; col < w; ++col) {
-            int sx = x + col;
-            u32 p = (sx >= 0 && sx < g_w) ? fb[sy * g_w + sx] : 0;
-            dst[((size_t)row * w + col) * 4 + 0] = (unsigned char)((p >> 16) & 0xff); /* R */
-            dst[((size_t)row * w + col) * 4 + 1] = (unsigned char)((p >>  8) & 0xff); /* G */
-            dst[((size_t)row * w + col) * 4 + 2] = (unsigned char)( p        & 0xff); /* B */
-            dst[((size_t)row * w + col) * 4 + 3] = (unsigned char)((p >> 24) & 0xff); /* A */
+            int64_t sx = (int64_t)x + col;
+            u32 p = (sx >= 0 && sx < g_w && sy >= 0 && sy < g_h)
+                        ? fb[(size_t)sy * (size_t)g_w + (size_t)sx] : 0;
+            unsigned r = (p >> 16) & 0xff, g = (p >> 8) & 0xff;
+            unsigned b = p & 0xff, a = (p >> 24) & 0xff;
+            unsigned char *out = dst + (size_t)row * stride + (size_t)col * (size_t)bpp;
+            if (type == GLES2_GL_UNSIGNED_BYTE) {
+                out[0] = (unsigned char)r;
+                out[1] = (unsigned char)g;
+                out[2] = (unsigned char)b;
+                if (bpp == 4) out[3] = (unsigned char)a;
+            } else {
+                unsigned short v;
+                if (type == GLES2_GL_UNSIGNED_SHORT_5_6_5)
+                    v = (unsigned short)(((r * 31u + 127u) / 255u) << 11 |
+                                         ((g * 63u + 127u) / 255u) << 5 |
+                                         ((b * 31u + 127u) / 255u));
+                else if (type == GLES2_GL_UNSIGNED_SHORT_4_4_4_4)
+                    v = (unsigned short)(((r * 15u + 127u) / 255u) << 12 |
+                                         ((g * 15u + 127u) / 255u) << 8 |
+                                         ((b * 15u + 127u) / 255u) << 4 |
+                                         ((a * 15u + 127u) / 255u));
+                else
+                    v = (unsigned short)(((r * 31u + 127u) / 255u) << 11 |
+                                         ((g * 31u + 127u) / 255u) << 6 |
+                                         ((b * 31u + 127u) / 255u) << 1 |
+                                         (a >= 128u));
+                out[0] = (unsigned char)(v & 0xff);
+                out[1] = (unsigned char)(v >> 8);
+            }
         }
+        if (stride > (size_t)w * (size_t)bpp)
+            memset(dst + (size_t)row * stride + (size_t)w * (size_t)bpp, 0,
+                   stride - (size_t)w * (size_t)bpp);
     }
+}
+
+void gles_engine_set_error(GEenum error)
+{
+    GLenum pgl_error;
+    if (!g_inited || g_ctx.error != GL_NO_ERROR) return;
+    switch (error) {
+    case GLES2_GL_INVALID_ENUM:                  pgl_error = GL_INVALID_ENUM; break;
+    case GLES2_GL_INVALID_VALUE:                 pgl_error = GL_INVALID_VALUE; break;
+    case GLES2_GL_INVALID_OPERATION:             pgl_error = GL_INVALID_OPERATION; break;
+    case GLES2_GL_INVALID_FRAMEBUFFER_OPERATION: pgl_error = GL_INVALID_FRAMEBUFFER_OPERATION; break;
+    case GLES2_GL_OUT_OF_MEMORY:                 pgl_error = GL_OUT_OF_MEMORY; break;
+    default: return;
+    }
+    g_ctx.error = pgl_error;
 }
 
 GEenum gles_engine_get_error(void)
@@ -523,6 +597,19 @@ const uint8_t *gles_engine_get_string(GEenum name)
 
 void gles_engine_get_integerv(GEenum pname, GEint *data)
 {
+    if (!data) return;
+    if (pname == GLES2_GL_IMPLEMENTATION_COLOR_READ_FORMAT) {
+        *data = GLES2_GL_RGBA;
+        return;
+    }
+    if (pname == GLES2_GL_IMPLEMENTATION_COLOR_READ_TYPE) {
+        *data = GLES2_GL_UNSIGNED_BYTE;
+        return;
+    }
+    if (pname == GLES2_GL_PACK_ALIGNMENT || pname == GLES2_GL_UNPACK_ALIGNMENT) {
+        *data = pname == GLES2_GL_PACK_ALIGNMENT ? g_ctx.pack_alignment : g_ctx.unpack_alignment;
+        return;
+    }
     if (pname == GLES2_GL_MAX_VERTEX_ATTRIBS) {
         if (data) *data = GL_MAX_VERTEX_ATTRIBS;
         return;
@@ -570,11 +657,59 @@ void gles_engine_buffer_sub_data(GEenum target, GEiptr offset, GEiptr size, cons
                       (GLsizeiptr)size, data);
 }
 
+void gles_engine_get_buffer_parameteriv(GEenum target, GEenum pname, GEint *params)
+{
+    GLenum ptarget = EMAP(buffer_target_map, target);
+    GLuint buffer;
+    if (!params) return;
+    if (ptarget != GL_ARRAY_BUFFER && ptarget != GL_ELEMENT_ARRAY_BUFFER) {
+        gles_engine_set_error(GLES2_GL_INVALID_ENUM);
+        return;
+    }
+    if (pname != GLES2_GL_BUFFER_SIZE && pname != GLES2_GL_BUFFER_USAGE) {
+        gles_engine_set_error(GLES2_GL_INVALID_ENUM);
+        return;
+    }
+    buffer = g_ctx.bound_buffers[ptarget - GL_ARRAY_BUFFER];
+    if (!buffer) {
+        gles_engine_set_error(GLES2_GL_INVALID_OPERATION);
+        return;
+    }
+    if (pname == GLES2_GL_BUFFER_SIZE)
+        *params = g_ctx.buffers.a[buffer].size;
+    else {
+        unsigned i;
+        *params = 0;
+        for (i = 0; i < sizeof(buffer_usage_map) / sizeof(buffer_usage_map[0]); ++i) {
+            if (buffer_usage_map[i].p == g_ctx.buffers.a[buffer].usage) {
+                *params = (GEint)buffer_usage_map[i].s;
+                break;
+            }
+        }
+    }
+}
+
+GEbool gles_engine_is_buffer(GEuint buffer)
+{
+    if (!g_inited || !buffer || buffer >= g_ctx.buffers.size) return GL_FALSE;
+    return !g_ctx.buffers.a[buffer].deleted &&
+           g_ctx.buffers.a[buffer].type < GL_NUM_BUFFER_TYPES - GL_ARRAY_BUFFER;
+}
+
 /* ------------------------------------------------------------------ *
  * Textures
  * ------------------------------------------------------------------ */
 void gles_engine_gen_textures(GEint n, GEuint *textures)    { pgl_GenTextures(n, textures); }
-void gles_engine_delete_textures(GEint n, const GEuint *t)  { pgl_DeleteTextures(n, t); }
+void gles_engine_delete_textures(GEint n, const GEuint *t)
+{
+    GEint i;
+    int unit;
+    if (n < 0 || !t) { pgl_DeleteTextures(n, t); return; }
+    for (i = 0; i < n; ++i)
+        for (unit = 0; unit < 32; ++unit)
+            if (g_tex_unit[unit] == t[i]) g_tex_unit[unit] = 0;
+    pgl_DeleteTextures(n, t);
+}
 
 void gles_engine_bind_texture(GEenum target, GEuint texture)
 {
@@ -660,9 +795,107 @@ void gles_engine_tex_sub_image_2d(GEenum target, GEint level, GEint xoff, GEint 
                       EMAP(format_map, format), EMAP(type_map, type), data);
 }
 
+void gles_engine_compressed_tex_image_2d(GEenum target, GEint level, GEenum internalformat,
+                                         GEint w, GEint h, GEint border,
+                                         GEint image_size, const void *data)
+{
+    pgl_CompressedTexImage2D(EMAP(tex_target_map, target), level,
+                             EMAP(format_map, internalformat), w, h, border,
+                             image_size, data);
+}
+
+void gles_engine_compressed_tex_sub_image_2d(GEenum target, GEint level,
+                                             GEint xoff, GEint yoff, GEint w, GEint h,
+                                             GEenum format, GEint image_size,
+                                             const void *data)
+{
+    pgl_CompressedTexSubImage2D(EMAP(tex_target_map, target), level, xoff, yoff,
+                                w, h, EMAP(format_map, format), image_size, data);
+}
+
+void gles_engine_copy_tex_image_2d(GEenum target, GEint level, GEenum internalformat,
+                                   GEint x, GEint y, GEint w, GEint h, GEint border)
+{
+    gles_engine_gpu_flush();
+    pgl_CopyTexImage2D(EMAP(tex_target_map, target), level,
+                       EMAP(format_map, internalformat), x, y, w, h, border);
+}
+
+void gles_engine_copy_tex_sub_image_2d(GEenum target, GEint level,
+                                       GEint xoff, GEint yoff, GEint x, GEint y,
+                                       GEint w, GEint h)
+{
+    gles_engine_gpu_flush();
+    pgl_CopyTexSubImage2D(EMAP(tex_target_map, target), level, xoff, yoff,
+                          x, y, w, h);
+}
+
 void gles_engine_generate_mipmap(GEenum target)
 {
     pgl_GenerateMipmap(EMAP(tex_target_map, target));
+}
+
+static glTexture *engine_bound_texture(GEenum target, int *target_index)
+{
+    GLenum ptarget = EMAP(tex_target_map, target);
+    int idx;
+    GLuint name;
+    if (ptarget != GL_TEXTURE_2D && ptarget != GL_TEXTURE_CUBE_MAP) return NULL;
+    idx = ptarget - GL_TEXTURE_UNBOUND - 1;
+    if (target_index) *target_index = idx;
+    name = g_ctx.bound_textures[idx];
+    return name ? &g_ctx.textures.a[name] : &g_ctx.default_textures[idx];
+}
+
+void gles_engine_get_tex_parameteriv(GEenum target, GEenum pname, GEint *params)
+{
+    glTexture *tex = engine_bound_texture(target, NULL);
+    const epair *map = NULL;
+    unsigned count = 0, i, value = 0;
+    if (!params) return;
+    if (!tex) { gles_engine_set_error(GLES2_GL_INVALID_ENUM); return; }
+    switch (pname) {
+    case GLES2_GL_TEXTURE_MIN_FILTER: value = tex->min_filter; map = texfilter_map; count = sizeof(texfilter_map) / sizeof(texfilter_map[0]); break;
+    case GLES2_GL_TEXTURE_MAG_FILTER: value = tex->mag_filter; map = texfilter_map; count = sizeof(texfilter_map) / sizeof(texfilter_map[0]); break;
+    case GLES2_GL_TEXTURE_WRAP_S: value = tex->wrap_s; map = texwrap_map; count = sizeof(texwrap_map) / sizeof(texwrap_map[0]); break;
+    case GLES2_GL_TEXTURE_WRAP_T: value = tex->wrap_t; map = texwrap_map; count = sizeof(texwrap_map) / sizeof(texwrap_map[0]); break;
+    default: gles_engine_set_error(GLES2_GL_INVALID_ENUM); return;
+    }
+    *params = (GEint)value;
+    for (i = 0; i < count; ++i) {
+        if (map[i].p == value) { *params = (GEint)map[i].s; break; }
+    }
+}
+
+void gles_engine_get_tex_parameterfv(GEenum target, GEenum pname, GEfloat *params)
+{
+    GEint value;
+    if (!params) return;
+    gles_engine_get_tex_parameteriv(target, pname, &value);
+    *params = (GEfloat)value;
+}
+
+GEbool gles_engine_is_texture(GEuint texture)
+{
+    if (!g_inited || !texture || texture >= g_ctx.textures.size) return GL_FALSE;
+    return !g_ctx.textures.a[texture].deleted &&
+           g_ctx.textures.a[texture].type != GL_TEXTURE_UNBOUND;
+}
+
+GEbool gles_engine_texture_complete(GEint unit, GEint cube)
+{
+    GLuint name;
+    glTexture *tex;
+    if (unit < 0 || unit >= 32) return GL_FALSE;
+    name = g_tex_unit[unit];
+    if (name) {
+        if (name >= g_ctx.textures.size || g_ctx.textures.a[name].deleted) return GL_FALSE;
+        tex = &g_ctx.textures.a[name];
+    } else {
+        tex = &g_ctx.default_textures[cube ? GL_TEXTURE_CUBE_MAP - GL_TEXTURE_UNBOUND - 1
+                                          : GL_TEXTURE_2D - GL_TEXTURE_UNBOUND - 1];
+    }
+    return (GEbool)pgl_texture_complete(tex, cube != 0);
 }
 
 /* ------------------------------------------------------------------ *
@@ -677,6 +910,81 @@ void gles_engine_vertex_attrib_pointer(GEuint index, GEint size, GEenum type,
 
 void gles_engine_enable_vertex_attrib_array(GEuint index)  { pgl_EnableVertexAttribArray(index); }
 void gles_engine_disable_vertex_attrib_array(GEuint index) { pgl_DisableVertexAttribArray(index); }
+
+void gles_engine_vertex_attrib4f(GEuint index, const GEfloat value[4])
+{
+    glVertex_Attrib *a;
+    if (index >= GL_MAX_VERTEX_ATTRIBS || !value) {
+        gles_engine_set_error(GLES2_GL_INVALID_VALUE);
+        return;
+    }
+    a = &g_ctx.vertex_arrays.a[g_ctx.cur_vertex_array].vertex_attribs[index];
+    a->current_value = make_v4(value[0], value[1], value[2], value[3]);
+}
+
+static glVertex_Attrib *engine_vertex_attrib(GEuint index)
+{
+    if (!g_inited || index >= GL_MAX_VERTEX_ATTRIBS) {
+        gles_engine_set_error(GLES2_GL_INVALID_VALUE);
+        return NULL;
+    }
+    return &g_ctx.vertex_arrays.a[g_ctx.cur_vertex_array].vertex_attribs[index];
+}
+
+void gles_engine_get_vertex_attribiv(GEuint index, GEenum pname, GEint *params)
+{
+    glVertex_Attrib *a = engine_vertex_attrib(index);
+    unsigned i;
+    if (!a || !params) return;
+    switch (pname) {
+    case GLES2_GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: *params = (GEint)a->buf; break;
+    case GLES2_GL_VERTEX_ATTRIB_ARRAY_ENABLED: *params = a->enabled; break;
+    case GLES2_GL_VERTEX_ATTRIB_ARRAY_SIZE: *params = a->size; break;
+    case GLES2_GL_VERTEX_ATTRIB_ARRAY_STRIDE: *params = a->specified_stride; break;
+    case GLES2_GL_VERTEX_ATTRIB_ARRAY_TYPE:
+        *params = (GEint)a->type;
+        for (i = 0; i < sizeof(type_map) / sizeof(type_map[0]); ++i)
+            if (type_map[i].p == a->type) { *params = (GEint)type_map[i].s; break; }
+        break;
+    case GLES2_GL_VERTEX_ATTRIB_ARRAY_NORMALIZED: *params = a->normalized; break;
+    case GLES2_GL_CURRENT_VERTEX_ATTRIB:
+        params[0] = (GEint)a->current_value.x;
+        params[1] = (GEint)a->current_value.y;
+        params[2] = (GEint)a->current_value.z;
+        params[3] = (GEint)a->current_value.w;
+        break;
+    default: gles_engine_set_error(GLES2_GL_INVALID_ENUM); break;
+    }
+}
+
+void gles_engine_get_vertex_attribfv(GEuint index, GEenum pname, GEfloat *params)
+{
+    glVertex_Attrib *a = engine_vertex_attrib(index);
+    GEint values[4];
+    int i;
+    if (!a || !params) return;
+    if (pname == GLES2_GL_CURRENT_VERTEX_ATTRIB) {
+        params[0] = a->current_value.x;
+        params[1] = a->current_value.y;
+        params[2] = a->current_value.z;
+        params[3] = a->current_value.w;
+        return;
+    }
+    gles_engine_get_vertex_attribiv(index, pname, values);
+    params[0] = (GEfloat)values[0];
+    for (i = 1; i < 4; ++i) params[i] = 0.0f;
+}
+
+void gles_engine_get_vertex_attrib_pointerv(GEuint index, GEenum pname, void **pointer)
+{
+    glVertex_Attrib *a = engine_vertex_attrib(index);
+    if (!a || !pointer) return;
+    if (pname != GLES2_GL_VERTEX_ATTRIB_ARRAY_POINTER) {
+        gles_engine_set_error(GLES2_GL_INVALID_ENUM);
+        return;
+    }
+    *pointer = (void *)(uintptr_t)a->offset;
+}
 
 void gles_engine_draw_arrays(GEenum mode, GEint first, GEint count)
 {
@@ -794,17 +1102,28 @@ static interp_entry *find_entry(GLuint id)
 
 /* texture sampling callback: resolve unit -> portablegl texture name, sample. */
 static void bridge_tex_sample(int unit, int dim, const float *coord,
+                              const glsl_tex_derivatives *deriv,
                               float out_rgba[4], void *user)
 {
     GLuint tex = gles_engine_texture_for_unit(unit);
+    vec4 c;
     (void)user;
     if (dim == 3) {
-        vec4 c = texture_cubemap(tex, coord[0], coord[1], coord[2]);
-        out_rgba[0] = c.x; out_rgba[1] = c.y; out_rgba[2] = c.z; out_rgba[3] = c.w;
+        if (deriv && deriv->has_lod)
+            c = texture_cubemap_lod(tex, coord[0], coord[1], coord[2], deriv->lod);
+        else if (deriv)
+            c = texture_cubemap_grad(tex, coord[0], coord[1], coord[2], deriv->ddx, deriv->ddy);
+        else
+            c = texture_cubemap(tex, coord[0], coord[1], coord[2]);
     } else {
-        vec4 c = texture2D(tex, coord[0], coord[1]);
-        out_rgba[0] = c.x; out_rgba[1] = c.y; out_rgba[2] = c.z; out_rgba[3] = c.w;
+        if (deriv && deriv->has_lod)
+            c = texture2D_lod(tex, coord[0], coord[1], deriv->lod);
+        else if (deriv)
+            c = texture2D_grad(tex, coord[0], coord[1], deriv->ddx, deriv->ddy);
+        else
+            c = texture2D(tex, coord[0], coord[1]);
     }
+    out_rgba[0] = c.x; out_rgba[1] = c.y; out_rgba[2] = c.z; out_rgba[3] = c.w;
 }
 
 static void interp_vert(float *vs_output, vec4 *vertex_attribs,
@@ -818,7 +1137,7 @@ static void interp_vert(float *vs_output, vec4 *vertex_attribs,
     n = e->gp->nattr_components;
     if (n > GLSL_MAX_ATTRIBS) n = GLSL_MAX_ATTRIBS;
     for (i = 0; i < n; ++i) attribs[i] = &vertex_attribs[i].x;
-    glsl_run_vertex(e->gp, attribs, n, e->ublock, vs_output,
+    glsl_run_vertex(e->gp, attribs, n, e->ublock, bridge_tex_sample, e, vs_output,
                     (float *)&builtins->gl_Position, builtins->gl_InstanceID);
 }
 
@@ -829,9 +1148,11 @@ static void interp_frag(float *fs_input, Shader_Builtins *builtins, void *unifor
     float fdepth = 0;
     (void)uniforms;
     if (!e || !e->gp) return;
-    glsl_run_fragment(e->gp, fs_input, e->ublock,
-                      (const float *)&builtins->gl_FragCoord,
+    glsl_run_fragment(e->gp, fs_input, builtins->fs_input_dx, builtins->fs_input_dy,
+                      e->ublock, (const float *)&builtins->gl_FragCoord,
                       (const float *)&builtins->gl_PointCoord,
+                      (const float *)&builtins->gl_PointCoord_dx,
+                      (const float *)&builtins->gl_PointCoord_dy,
                       builtins->gl_FrontFacing, bridge_tex_sample, e,
                       (float *)&builtins->gl_FragColor, &disc, &fdepth, &wrote_depth);
     if (disc) builtins->discard = GL_TRUE;
@@ -901,6 +1222,15 @@ void gles_engine_delete_program(GEuint program)
     pgl_DeleteProgram(program);
 }
 
+GEbool gles_engine_program_executable(GEuint program)
+{
+    if (!g_inited || !program || program >= g_ctx.programs.size ||
+        g_ctx.programs.a[program].deleted || !find_entry(program))
+        return GL_FALSE;
+    return g_ctx.programs.a[program].vertex_shader &&
+           g_ctx.programs.a[program].fragment_shader ? GL_TRUE : GL_FALSE;
+}
+
 void gles_engine_release_interpreted_program(GEuint program)
 {
     interp_entry *e = find_entry(program);
@@ -967,8 +1297,16 @@ static void ff_texblit_frag(float *fs_input, Shader_Builtins *builtins, void *un
     vec4 c;
     (void)uniforms;
     if (!e) return;
-    c = texture2D(gles_engine_texture_for_unit(e->ublock[e->g_sampler_off].i),
-                  fs_input[e->g_uv_slot * 4 + 0], fs_input[e->g_uv_slot * 4 + 1]);
+    {
+        static const float zero[2] = {0.0f, 0.0f};
+        const float *dx = builtins->fs_input_dx
+                        ? builtins->fs_input_dx + e->g_uv_slot * 4 : zero;
+        const float *dy = builtins->fs_input_dy
+                        ? builtins->fs_input_dy + e->g_uv_slot * 4 : zero;
+        c = texture2D_grad(gles_engine_texture_for_unit(e->ublock[e->g_sampler_off].i),
+                           fs_input[e->g_uv_slot * 4 + 0], fs_input[e->g_uv_slot * 4 + 1],
+                           dx, dy);
+    }
     /* Colour-modulated blit (imgui): gl_FragColor = vColor * texture2D(...).
      * Multiply by the interpolated modulating varying exactly as the
      * interpreter's EX_MUL would, so pixels stay bit-identical. */
@@ -1322,6 +1660,10 @@ static int match_shadertoy(const glsl_program *gp, int *effect, int *time_off,
     s0 = glsl_uniform_index(gp, "iChannel0");
     s1 = glsl_uniform_index(gp, "iChannel1");
     s2 = glsl_uniform_index(gp, "iChannel2");
+    /* The native effect bodies receive only scalar coordinates, not expression
+     * gradients.  Keep procedural effects on this fast path and let textured
+     * effects use the interpreter's derivative-aware sampling. */
+    if (s0 >= 0 || s1 >= 0 || s2 >= 0) return 0;
     ch_off[0] = (s0 >= 0) ? gp->uniforms[s0].offset : -1;
     ch_off[1] = (s1 >= 0) ? gp->uniforms[s1].offset : -1;
     ch_off[2] = (s2 >= 0) ? gp->uniforms[s2].offset : -1;
@@ -1647,7 +1989,9 @@ static GLuint  g_gpu_ctexname[PGL_G3D_MAX_TEX];
 static int     g_gpu_ctexused[PGL_G3D_MAX_TEX];
 static int     g_gpu_ctexw[PGL_G3D_MAX_TEX];
 static int     g_gpu_ctexh[PGL_G3D_MAX_TEX];
-static GLuint  g_gpu_ctexgen[PGL_G3D_MAX_TEX];
+static int     g_gpu_ctexdepth[PGL_G3D_MAX_TEX];
+static int     g_gpu_ctexlevels[PGL_G3D_MAX_TEX];
+static GLuint  g_gpu_ctexgen[PGL_G3D_MAX_TEX][PGL_TEXTURE_FACES][PGL_MAX_MIP_LEVELS];
 
 /* one reusable interleaved staging buffer (grown on demand) */
 static float  *g_gpu_stage = NULL;
@@ -2204,40 +2548,71 @@ static void gpu_coalesce_flush(void)
  * (which gates on GL_REPEAT, the raspi5 compiled-sampler record's wrap).
  * Returns -1 when the texture cannot back a compiled sampler, leaving its unit
  * unbound so the draw declines to the CPU. */
+static int gpu_ctex_cache_matches(int slot, const glTexture *t,
+                                  int depth, int levels)
+{
+    int face, level;
+    if (g_gpu_ctexw[slot] != (int)t->levels[0][0].w ||
+        g_gpu_ctexh[slot] != (int)t->levels[0][0].h ||
+        g_gpu_ctexdepth[slot] != depth || g_gpu_ctexlevels[slot] != levels)
+        return 0;
+    for (face = 0; face < depth; ++face)
+        for (level = 0; level < levels; ++level)
+            if (g_gpu_ctexgen[slot][face][level] !=
+                t->levels[face][level].datagen)
+                return 0;
+    return 1;
+}
+
 static int gpu_ctex_slot(GLuint name)
 {
     const glTexture *t;
-    int i, slot = -1, is_cube;
+    const glTextureLevel *base;
+    pgl_g3d_tex_level_t images[PGL_TEXTURE_FACES * PGL_MAX_MIP_LEVELS];
+    int i, slot = -1, is_cube, depth, levels = 1;
+    int face, level;
     if (name == 0 || (int)name >= g_ctx.textures.size) return -1;
     t = &g_ctx.textures.a[name];
-    if (t->deleted || !t->data || t->w <= 0 || t->h <= 0) return -1;
-    /* portablegl stores a texture's type shifted by GL_TEXTURE_UNBOUND+1 (see
-     * pgl_BindTexture); a cubemap's six square faces are concatenated in
-     * t->data (6*w*h*4, w == h).  The raspi5 compiled-sampler record is fixed
-     * GL_REPEAT (its filter follows the GL object, see gpu_ctex_filter), which
-     * a plain 2D image must match to be
-     * stageable.  A cubemap is loaded CLAMP_TO_EDGE but samples through the
-     * same record as a 6-layer 2D array (mesa lowers textureCube to an array +
-     * face-index TMU fetch, and a face coordinate never leaves [0,1]), so the
-     * wrap gate is a 2D-only check and a cube is staged by the cube upload. */
     is_cube = (t->type == GL_TEXTURE_CUBE_MAP - (GL_TEXTURE_UNBOUND + 1));
+    if (t->deleted ||
+        (!is_cube && t->type != GL_TEXTURE_2D - (GL_TEXTURE_UNBOUND + 1)) ||
+        !pgl_texture_complete(t, is_cube))
+        return -1;
+    /* The compiled sampler record currently supports REPEAT for 2D.  Cube
+     * coordinates remain within a face, so its CLAMP_TO_EDGE object state is
+     * already represented by the lowered array fetch. */
     if (!is_cube && (t->wrap_s != GL_REPEAT || t->wrap_t != GL_REPEAT))
         return -1;
+    base = &t->levels[0][0];
+    depth = is_cube ? PGL_TEXTURE_FACES : 1;
+    if (t->min_filter != GL_NEAREST && t->min_filter != GL_LINEAR) {
+        int w = base->w, h = base->h;
+        while (w > 1 || h > 1) {
+            w = w > 1 ? w / 2 : 1;
+            h = h > 1 ? h / 2 : 1;
+            ++levels;
+        }
+    }
+    if (levels > PGL_MAX_MIP_LEVELS) return -1;
+    for (face = 0; face < depth; ++face) {
+        for (level = 0; level < levels; ++level) {
+            const glTextureLevel *src = &t->levels[face][level];
+            pgl_g3d_tex_level_t *dst = &images[face * levels + level];
+            dst->rgba8 = src->data;
+            dst->w = (uint32_t)src->w;
+            dst->h = (uint32_t)src->h;
+        }
+    }
     for (i = 0; i < PGL_G3D_MAX_TEX; ++i)
         if (g_gpu_ctexused[i] && g_gpu_ctexname[i] == name) {
-            if (g_gpu_ctexw[i] == (int)t->w && g_gpu_ctexh[i] == (int)t->h &&
-                g_gpu_ctexgen[i] == t->datagen)
-                return i;   /* already staged tiled, pixels unchanged */
-            slot = i;       /* same name, fresh pixels: re-stage in place */
+            if (gpu_ctex_cache_matches(i, t, depth, levels))
+                return i;
+            slot = i;
             break;
         }
     if (slot < 0) {
         /* A back-end slot holds either a raster (TEX_MOD) or a tiled (compiled
-         * TMU) image, never both.  gpu_on_texture claimed a raster slot for this
-         * name at glTexImage2D time; drop it so the tiled upload below can reuse
-         * the same physical slot, otherwise a program that re-uploads its
-         * samplers every frame fills the raster map and every ctex staging
-         * returns -1 (unbound TMU unit -> silent decline to the CPU). */
+         * TMU) image, never both. */
         for (i = 0; i < PGL_G3D_MAX_TEX; ++i)
             if (g_gpu_texused[i] && g_gpu_texname[i] == name) {
                 g_gpu_texused[i] = 0;
@@ -2245,42 +2620,42 @@ static int gpu_ctex_slot(GLuint name)
             }
         for (i = 0; i < PGL_G3D_MAX_TEX; ++i)
             if (!g_gpu_ctexused[i] && !g_gpu_texused[i]) { slot = i; break; }
-        if (slot < 0) return -1;   /* slot table full: stays CPU-only */
+        if (slot < 0) return -1;
     }
-    if (is_cube) {
-        int rc = pgl_g3d_upload_texture_cube_tiled(slot, (int)t->w, (int)t->h, t->data);
-        if (rc != 1) {
-            slog("pglctex: CUBE upload fail rc=%d name=%u slot=%d w=%d h=%d type=%d data=%p\n",
-                 rc, (unsigned)name, slot, (int)t->w, (int)t->h, (int)t->type, (void*)t->data);
-            return -1;   /* transient upload failure: decline, do not latch */
-        }
-    } else if (!pgl_g3d_upload_texture_tiled(slot, (int)t->w, (int)t->h, t->data)) {
-        return -1;   /* transient upload failure: decline, do not latch the GPU */
-    }
+    if (!pgl_g3d_upload_texture_mips_tiled(slot, (uint32_t)depth,
+                                           (uint32_t)levels, images))
+        return -1;   /* unsupported layout/allocation failure: use CPU sampler */
     g_gpu_ctexused[slot] = 1;
     g_gpu_ctexname[slot] = name;
-    g_gpu_ctexw[slot] = (int)t->w;
-    g_gpu_ctexh[slot] = (int)t->h;
-    g_gpu_ctexgen[slot] = t->datagen;
+    g_gpu_ctexw[slot] = (int)base->w;
+    g_gpu_ctexh[slot] = (int)base->h;
+    g_gpu_ctexdepth[slot] = depth;
+    g_gpu_ctexlevels[slot] = levels;
+    for (face = 0; face < depth; ++face)
+        for (level = 0; level < levels; ++level)
+            g_gpu_ctexgen[slot][face][level] = t->levels[face][level].datagen;
     return slot;
 }
 
-/* TMU filter for a staged texture: the GL object's LINEAR request (mag LINEAR
- * with a LINEAR-family min filter) maps onto the hardware's bilinear sampler;
- * everything else samples NEAREST, the historic fixed sampler record.  Only
- * the compiled-sampler (ctex) path honours this; the raster TEX_MOD kernel
- * still reads texels directly. */
-static int gpu_ctex_filter(GLuint name)
+static void gpu_ctex_bind(int unit, GLuint name, int slot)
 {
-    const glTexture *t;
-    if (name == 0 || (int)name >= g_ctx.textures.size) return PGL_G3D_TEX_FILTER_NEAREST;
-    t = &g_ctx.textures.a[name];
-    if (t->mag_filter != GL_LINEAR) return PGL_G3D_TEX_FILTER_NEAREST;
-    if (t->min_filter == GL_NEAREST ||
-        t->min_filter == GL_NEAREST_MIPMAP_NEAREST ||
-        t->min_filter == GL_NEAREST_MIPMAP_LINEAR)
-        return PGL_G3D_TEX_FILTER_NEAREST;
-    return PGL_G3D_TEX_FILTER_LINEAR;
+    const glTexture *t = NULL;
+    int mag = PGL_G3D_TEX_FILTER_NEAREST;
+    int min = PGL_G3D_TEX_FILTER_NEAREST;
+    int mip = PGL_G3D_TEX_FILTER_NEAREST;
+    if (name != 0 && (int)name < g_ctx.textures.size)
+        t = &g_ctx.textures.a[name];
+    if (t) {
+        mag = t->mag_filter == GL_LINEAR ? PGL_G3D_TEX_FILTER_LINEAR : mag;
+        if (t->min_filter == GL_LINEAR ||
+            t->min_filter == GL_LINEAR_MIPMAP_NEAREST ||
+            t->min_filter == GL_LINEAR_MIPMAP_LINEAR)
+            min = PGL_G3D_TEX_FILTER_LINEAR;
+        if (t->min_filter == GL_NEAREST_MIPMAP_LINEAR ||
+            t->min_filter == GL_LINEAR_MIPMAP_LINEAR)
+            mip = PGL_G3D_TEX_FILTER_LINEAR;
+    }
+    pgl_g3d_bind_tex_unit_sampler(unit, slot, mag, min, mip);
 }
 
 /* Free staged tiled slots holding textures the current program does NOT sample.
@@ -2385,14 +2760,13 @@ static int gpu_try_fullscreen(gpu_entry *e, GLenum mode, GLint first, GLsizei co
         int tmu = 0;
         for (i = 0; i < gp->nuniforms; ++i) {
             const glsl_uniform *u = &gp->uniforms[i];
-            int unit, slot, filt;
+            int unit, slot;
             GLuint tex;
             if (!u->is_sampler) continue;
             unit = g_active->ublock[u->offset].i;
             tex = gles_engine_texture_for_unit(unit);
             slot = gpu_ctex_slot(tex);
-            filt = gpu_ctex_filter(tex);
-            pgl_g3d_bind_tex_unit_filter(tmu, slot, filt);
+            gpu_ctex_bind(tmu, tex, slot);
             ++tmu;
         }
     }

@@ -12,7 +12,8 @@
 #include "glsl.h"
 #include "glsl_util.h"
 
-enum { CTRL_NONE = 0, CTRL_BREAK, CTRL_CONTINUE, CTRL_RETURN, CTRL_DISCARD };
+enum { CTRL_NONE = 0, CTRL_BREAK, CTRL_CONTINUE, CTRL_RETURN, CTRL_DISCARD,
+       CTRL_REPLAY };
 
 typedef struct {
     glsl_program *prog;
@@ -23,10 +24,13 @@ typedef struct {
     const float *const *attribs; int nattribs;
     float *varyings_out;             /* VS writes                        */
     const float *varyings_in;        /* FS reads                         */
+    const float *varyings_dx;        /* FS screen-x derivatives          */
+    const float *varyings_dy;        /* FS screen-y derivatives          */
     const glsl_cell *ublock;         /* uniform block (cells)            */
 
     /* builtins */
     float gl_position[4], gl_fragcolor[4], gl_fragcoord[4], gl_pointcoord[2];
+    float gl_pointcoord_dx[2], gl_pointcoord_dy[2];
     int   front_facing, instance_id;
     float gl_fragdepth; int wrote_depth;
 
@@ -36,6 +40,9 @@ typedef struct {
     const glsl_func *fn; glsl_cell *locals;
 
     int ctrl;
+    const glsl_expr *replay_target;
+    glsl_val replay_result;
+    int replay_active, replay_have;
     glsl_cell ret_buf[256]; int ret_type, ret_stid, ret_n, ret_arr, ret_elem;
     int err;
 } env;
@@ -123,6 +130,81 @@ static int find_global_entry(const glsl_stage *st, int scope, int slot)
 
 static void resolve_lv(env *E, const glsl_expr *e, lv *out);
 static glsl_val eval(env *E, const glsl_expr *e);
+static glsl_val make_scalar_f(env *E, float f);
+
+static void run_main(env *E);
+
+static glsl_val eval_shifted(env *E, const glsl_expr *e, int axis)
+{
+    const float *delta = axis == 0 ? E->varyings_dx : E->varyings_dy;
+    float shifted[GLSL_MAX_VARYINGS * 4];
+    env saved;
+    glsl_val result;
+    int replay_err, i, n = E->prog->nvaryings * 4;
+
+    /* Vertex texture lookups use an implicit LOD of zero, and a replay already
+     * has all of its inputs shifted.  Neither case needs another replay. */
+    if (E->is_vertex || E->replay_active)
+        return eval(E, e);
+
+    saved = *E;
+    if (saved.varyings_in) {
+        for (i = 0; i < n; ++i)
+            shifted[i] = saved.varyings_in[i] + (delta ? delta[i] : 0.0f);
+        E->varyings_in = shifted;
+    }
+    E->gl_fragcoord[axis] += 1.0f;
+    for (i = 0; i < 2; ++i) {
+        const float *point_delta = axis == 0 ? saved.gl_pointcoord_dx
+                                             : saved.gl_pointcoord_dy;
+        E->gl_pointcoord[i] = saved.gl_pointcoord[i] + point_delta[i];
+    }
+    E->replay_target = e;
+    E->replay_active = 1;
+    E->replay_have = 0;
+    E->ctrl = CTRL_NONE;
+
+    /* Replay from main() so locals, function calls and control flow are
+     * reconstructed with the shifted inputs.  Keep the real invocation's
+     * globals and stack untouched by giving the replay its own storage. */
+    if (E->prog->fs_gcells > 0) {
+        glsl_cell *globals = stk(E, E->prog->fs_gcells);
+        if (!E->err) {
+            if (E->prog->fs_ginit)
+                memcpy(globals, E->prog->fs_ginit,
+                       E->prog->fs_gcells * sizeof(glsl_cell));
+            else
+                memset(globals, 0, E->prog->fs_gcells * sizeof(glsl_cell));
+            E->gstore = globals;
+        }
+    }
+    if (!E->err)
+        run_main(E);
+    replay_err = E->err;
+    result = E->replay_result;
+    if (!E->replay_have)
+        replay_err = 1;
+    *E = saved;
+    if (replay_err) {
+        E->err = 1;
+        return make_scalar_f(E, 0);
+    }
+    return copy_val(E, result.type, result.st_id, result.data, result.n,
+                    result.array_len, result.elem_cells);
+}
+
+static void sample_texture(env *E, int unit, int dim, const float *coord,
+                           const float *ddx, const float *ddy,
+                           int has_lod, float lod, float out[4])
+{
+    glsl_tex_derivatives deriv;
+    deriv.ddx = ddx;
+    deriv.ddy = ddy;
+    deriv.has_lod = has_lod;
+    deriv.lod = lod;
+    if (E->ctrl == CTRL_REPLAY) return;
+    if (E->texfn) E->texfn(unit, dim, coord, &deriv, out, E->texuser);
+}
 
 static void resolve_var_lv(env *E, const glsl_expr *e, lv *L)
 {
@@ -798,49 +880,79 @@ static glsl_val builtin(env *E, int id, glsl_expr **args, int nargs)
         setval(&v,glsl_bool_type_of_len(a.n),-1,d,a.n,0,0); return v;
     }
     case BF_TEXTURE2D: {
-        glsl_val uv; int unit; float rgba[4], co[2]; glsl_cell*o=sc(E,4);
+        glsl_val uv, ux, uy; int unit;
+        float rgba[4], co[2], dx[2], dy[2]; glsl_cell*o=sc(E,4);
         a=eval(E,args[0]); unit=ci(a.data,a.type,0);
         uv=eval(E,args[1]);
+        ux=eval_shifted(E,args[1],0); uy=eval_shifted(E,args[1],1);
         rgba[0]=rgba[1]=rgba[2]=1; rgba[3]=1;
         co[0]=cf(uv.data,uv.type,0); co[1]=cf(uv.data,uv.type,1);
-        if(E->texfn) E->texfn(unit, 2, co, rgba, E->texuser);
+        dx[0]=cf(ux.data,ux.type,0)-co[0]; dx[1]=cf(ux.data,ux.type,1)-co[1];
+        dy[0]=cf(uy.data,uy.type,0)-co[0]; dy[1]=cf(uy.data,uy.type,1)-co[1];
+        sample_texture(E,unit,2,co,dx,dy,E->is_vertex,0.0f,rgba);
         for(i=0;i<4;++i) o[i].f=rgba[i];
         setval(&v,T_VEC4,-1,o,4,0,0); return v;
     }
     case BF_TEXTURE2DPROJ: {
-        glsl_val uv; int unit; float rgba[4],w,co[2]; glsl_cell*o=sc(E,4);
+        glsl_val uv, ux, uy; int unit;
+        float rgba[4],w,wx,wy,co[2],dx[2]={0,0},dy[2]={0,0}; glsl_cell*o=sc(E,4);
         a=eval(E,args[0]); unit=ci(a.data,a.type,0);
         uv=eval(E,args[1]); w=cf(uv.data,uv.type,uv.n-1);
+        ux=eval_shifted(E,args[1],0); uy=eval_shifted(E,args[1],1);
+        wx=cf(ux.data,ux.type,ux.n-1); wy=cf(uy.data,uy.type,uy.n-1);
         rgba[0]=rgba[1]=rgba[2]=1;rgba[3]=1;
         co[0]=w!=0?cf(uv.data,uv.type,0)/w:0; co[1]=w!=0?cf(uv.data,uv.type,1)/w:0;
-        if(E->texfn&&w!=0) E->texfn(unit, 2, co, rgba, E->texuser);
+        if(w!=0&&wx!=0){dx[0]=cf(ux.data,ux.type,0)/wx-co[0];dx[1]=cf(ux.data,ux.type,1)/wx-co[1];}
+        if(w!=0&&wy!=0){dy[0]=cf(uy.data,uy.type,0)/wy-co[0];dy[1]=cf(uy.data,uy.type,1)/wy-co[1];}
+        if(w!=0) sample_texture(E,unit,2,co,dx,dy,E->is_vertex,0.0f,rgba);
         for(i=0;i<4;++i)o[i].f=rgba[i];
         setval(&v,T_VEC4,-1,o,4,0,0); return v;
     }
     case BF_TEXTURECUBE: {
-        glsl_val dir; int unit; float rgba[4],co[3]; glsl_cell*o=sc(E,4);
+        glsl_val dir, dirx, diry; int unit;
+        float rgba[4],co[3],dx[3],dy[3]; glsl_cell*o=sc(E,4);
         a=eval(E,args[0]); unit=ci(a.data,a.type,0);
         dir=eval(E,args[1]);
+        dirx=eval_shifted(E,args[1],0); diry=eval_shifted(E,args[1],1);
         rgba[0]=rgba[1]=rgba[2]=1;rgba[3]=1;
         co[0]=cf(dir.data,dir.type,0); co[1]=cf(dir.data,dir.type,1); co[2]=cf(dir.data,dir.type,2);
-        if(E->texfn) E->texfn(unit, 3, co, rgba, E->texuser);
+        dx[0]=cf(dirx.data,dirx.type,0)-co[0];dx[1]=cf(dirx.data,dirx.type,1)-co[1];dx[2]=cf(dirx.data,dirx.type,2)-co[2];
+        dy[0]=cf(diry.data,diry.type,0)-co[0];dy[1]=cf(diry.data,diry.type,1)-co[1];dy[2]=cf(diry.data,diry.type,2)-co[2];
+        sample_texture(E,unit,3,co,dx,dy,E->is_vertex,0.0f,rgba);
+        for(i=0;i<4;++i)o[i].f=rgba[i];
+        setval(&v,T_VEC4,-1,o,4,0,0); return v;
+    }
+    case BF_TEXTURECUBELOD: {
+        glsl_val dir; int unit; float rgba[4],co[3],lod; glsl_cell*o=sc(E,4);
+        a=eval(E,args[0]); unit=ci(a.data,a.type,0);
+        dir=eval(E,args[1]); lod=cf(eval(E,args[2]).data,T_FLOAT,0);
+        rgba[0]=rgba[1]=rgba[2]=1;rgba[3]=1;
+        co[0]=cf(dir.data,dir.type,0); co[1]=cf(dir.data,dir.type,1); co[2]=cf(dir.data,dir.type,2);
+        sample_texture(E,unit,3,co,NULL,NULL,1,lod,rgba);
         for(i=0;i<4;++i)o[i].f=rgba[i];
         setval(&v,T_VEC4,-1,o,4,0,0); return v;
     }
     case BF_TEXTURE2DLOD: {
-        glsl_val uv; int unit; float rgba[4],co[2]; glsl_cell*o=sc(E,4);
+        glsl_val uv; int unit; float rgba[4],co[2],lod; glsl_cell*o=sc(E,4);
         a=eval(E,args[0]); unit=ci(a.data,a.type,0);
-        uv=eval(E,args[1]);
+        uv=eval(E,args[1]); lod=cf(eval(E,args[2]).data,T_FLOAT,0);
         rgba[0]=rgba[1]=rgba[2]=1;rgba[3]=1;
         co[0]=cf(uv.data,uv.type,0); co[1]=cf(uv.data,uv.type,1);
-        if(E->texfn) E->texfn(unit, 2, co, rgba, E->texuser);
-        for(i=0;i<4;++i)o[i].f=rgba[i];
+        sample_texture(E,unit,2,co,NULL,NULL,1,lod,rgba);
+        for(i=0;i<4;++i) o[i].f=rgba[i];
         setval(&v,T_VEC4,-1,o,4,0,0); return v;
     }
-    case BF_DFDX: case BF_DFDY: case BF_FWIDTH:
-        a=eval(E,args[0]); d=sc(E,a.n);
-        for(i=0;i<a.n;++i) d[i].f=0;
+    case BF_DFDX: case BF_DFDY: case BF_FWIDTH: {
+        glsl_val ax, ay;
+        a=eval(E,args[0]); ax=eval_shifted(E,args[0],0); ay=eval_shifted(E,args[0],1);
+        d=sc(E,a.n);
+        for(i=0;i<a.n;++i) {
+            float dx=cf(ax.data,ax.type,i)-cf(a.data,a.type,i);
+            float dy=cf(ay.data,ay.type,i)-cf(a.data,a.type,i);
+            d[i].f=id==BF_DFDX?dx:id==BF_DFDY?dy:fabsf(dx)+fabsf(dy);
+        }
         setval(&v,a.n==1?T_FLOAT:glsl_float_type_of_len(a.n),-1,d,a.n,0,0); return v;
+    }
     default:
         E->err = 1; return make_scalar_f(E, 0);
     }
@@ -890,7 +1002,7 @@ static glsl_val call_user(env *E, const glsl_expr *e)
      * silently loses the rest of its body.  Only `discard` propagates out of a
      * call (it must reach the top to drop the fragment); break/continue are
      * always consumed by a loop inside the callee and never escape a function. */
-    if (E->ctrl != CTRL_DISCARD) E->ctrl = CTRL_NONE;
+    if (E->ctrl != CTRL_DISCARD && E->ctrl != CTRL_REPLAY) E->ctrl = CTRL_NONE;
     /* Restore the caller's frame BEFORE writing back out/inout params.  The
      * argument expressions e->args[i] belong to the caller's scope, so the
      * resolve_lv below must run against the caller's E->fn/E->locals.  The old
@@ -936,6 +1048,14 @@ glsl_val eval(env *E, const glsl_expr *e)
     glsl_val v, a, b;
     if (!e) return make_scalar_f(E, 0);
     if (E->err) { setval(&v, T_FLOAT, -1, E->prog->scratch, 0, 0, 0); return v; }
+    if (E->replay_active && e == E->replay_target) {
+        E->replay_target = NULL;
+        v = eval(E, e);
+        E->replay_result = v;
+        E->replay_have = 1;
+        E->ctrl = CTRL_REPLAY;
+        return v;
+    }
     switch (e->kind) {
     case EX_FLOAT: return make_scalar_f(E, e->lit_f);
     case EX_INT:   return make_scalar_i(E, e->lit_i);
@@ -1040,6 +1160,7 @@ static int exec_stmt(env *E, const glsl_stmt *s)
 {
     int save_sc;
     if (!s || E->err) return CTRL_NONE;
+    if (E->ctrl == CTRL_REPLAY) return E->ctrl;
     save_sc = E->scratch_top;
     switch (s->kind) {
     case ST_EXPR:
@@ -1081,7 +1202,7 @@ static int exec_stmt(env *E, const glsl_stmt *s)
             if (s->body) exec_stmt(E, s->body);
             if (E->ctrl == CTRL_BREAK) { E->ctrl = CTRL_NONE; break; }
             if (E->ctrl == CTRL_CONTINUE) E->ctrl = CTRL_NONE;
-            if (E->ctrl == CTRL_RETURN || E->ctrl == CTRL_DISCARD) break;
+            if (E->ctrl == CTRL_RETURN || E->ctrl == CTRL_DISCARD || E->ctrl == CTRL_REPLAY) break;
         }
         break;
     }
@@ -1093,7 +1214,7 @@ static int exec_stmt(env *E, const glsl_stmt *s)
             if (s->body) exec_stmt(E, s->body);
             if (E->ctrl == CTRL_BREAK) { E->ctrl = CTRL_NONE; break; }
             if (E->ctrl == CTRL_CONTINUE) E->ctrl = CTRL_NONE;
-            if (E->ctrl == CTRL_RETURN || E->ctrl == CTRL_DISCARD) break;
+            if (E->ctrl == CTRL_RETURN || E->ctrl == CTRL_DISCARD || E->ctrl == CTRL_REPLAY) break;
             c = eval(E, s->expr);
             if (!ci(c.data, c.type, 0)) break;
         }
@@ -1109,7 +1230,7 @@ static int exec_stmt(env *E, const glsl_stmt *s)
             if (s->body) exec_stmt(E, s->body);
             if (E->ctrl == CTRL_BREAK) { E->ctrl = CTRL_NONE; break; }
             if (E->ctrl == CTRL_CONTINUE) E->ctrl = CTRL_NONE;
-            if (E->ctrl == CTRL_RETURN || E->ctrl == CTRL_DISCARD) break;
+            if (E->ctrl == CTRL_RETURN || E->ctrl == CTRL_DISCARD || E->ctrl == CTRL_REPLAY) break;
             if (s->post) eval(E, s->post);
         }
         break;
@@ -1138,7 +1259,8 @@ int glsl_exec_block(env *E, const glsl_stmt *blk)
     if (!blk) return CTRL_NONE;
     for (s = blk->children; s; s = s->next) {
         exec_stmt(E, s);
-        if (E->ctrl == CTRL_RETURN || E->ctrl == CTRL_DISCARD || E->err) break;
+        if (E->ctrl == CTRL_RETURN || E->ctrl == CTRL_DISCARD ||
+            E->ctrl == CTRL_REPLAY || E->err) break;
         /* break/continue propagate to the enclosing loop */
         if (E->ctrl == CTRL_BREAK || E->ctrl == CTRL_CONTINUE) break;
     }
@@ -1164,8 +1286,8 @@ static void run_main(env *E)
 }
 
 void glsl_run_vertex(glsl_program *p, const float *const *attribs, int nattribs,
-                     const void *uniform_block, float *varyings_out,
-                     float out_gl_position[4], int instance_id)
+                     const void *uniform_block, glsl_tex_sample_fn texfn, void *texuser,
+                     float *varyings_out, float out_gl_position[4], int instance_id)
 {
     env E;
     int i;
@@ -1182,6 +1304,7 @@ void glsl_run_vertex(glsl_program *p, const float *const *attribs, int nattribs,
     E.attribs = attribs; E.nattribs = nattribs;
     E.varyings_out = varyings_out;
     E.ublock = (const glsl_cell *)uniform_block;
+    E.texfn = texfn; E.texuser = texuser;
     E.instance_id = instance_id;
     E.scratch_top = 0; E.stack_top = 0;
     if (!vm_run(p, p->vs, 1, &E))
@@ -1190,8 +1313,11 @@ void glsl_run_vertex(glsl_program *p, const float *const *attribs, int nattribs,
 }
 
 void glsl_run_fragment(glsl_program *p, const float *varyings_in,
+                       const float *varyings_dx, const float *varyings_dy,
                        const void *uniform_block, const float gl_fragcoord[4],
-                       const float gl_pointcoord[2], int front_facing,
+                       const float gl_pointcoord[2],
+                       const float gl_pointcoord_dx[2],
+                       const float gl_pointcoord_dy[2], int front_facing,
                        glsl_tex_sample_fn texfn, void *texuser,
                        float out_gl_fragcolor[4], int *out_discard,
                        float *out_gl_fragdepth, int *out_wrote_depth)
@@ -1208,9 +1334,15 @@ void glsl_run_fragment(glsl_program *p, const float *varyings_in,
     if (p->fs_ginit && p->fs_gcells > 0)
         memcpy(p->fs_gstore, p->fs_ginit, p->fs_gcells * sizeof(glsl_cell));
     E.varyings_in = varyings_in;
+    E.varyings_dx = varyings_dx;
+    E.varyings_dy = varyings_dy;
     E.ublock = (const glsl_cell *)uniform_block;
     for (i = 0; i < 4; ++i) E.gl_fragcoord[i] = gl_fragcoord[i];
-    for (i = 0; i < 2; ++i) E.gl_pointcoord[i] = gl_pointcoord[i];
+    for (i = 0; i < 2; ++i) {
+        E.gl_pointcoord[i] = gl_pointcoord[i];
+        E.gl_pointcoord_dx[i] = gl_pointcoord_dx ? gl_pointcoord_dx[i] : 0.0f;
+        E.gl_pointcoord_dy[i] = gl_pointcoord_dy ? gl_pointcoord_dy[i] : 0.0f;
+    }
     E.front_facing = front_facing;
     E.texfn = texfn; E.texuser = texuser;
     E.gl_fragdepth = gl_fragcoord[2];

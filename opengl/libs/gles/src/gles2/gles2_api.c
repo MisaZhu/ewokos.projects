@@ -42,6 +42,8 @@ typedef struct {
     GLboolean   enabled;
     GLboolean   configured;  /* glVertexAttribPointer was called for this slot */
     GLboolean   enableSet;   /* enable/disable was called for this slot */
+    GLfloat     current[4];
+    GLboolean   currentSet;
 } gles2_attrib_state;
 typedef struct {
     int                used;
@@ -49,6 +51,7 @@ typedef struct {
     gles2_attrib_state attrib[GLES2_MAX_ATTRIB];
 } gles2_vao;
 static gles2_vao g_vao[GLES2_MAX_VAO];
+static gles2_vao g_default_vao;
 static GLuint    g_vao_next = 1;
 static GLuint    g_bound_vao = 0;      /* 0 = default (no VAO bound) */
 static GLuint    g_cur_array_buffer = 0;
@@ -58,6 +61,11 @@ static gles2_vao *g_vao_slot(GLuint id)
     if (id == 0 || id > GLES2_MAX_VAO) return NULL;
     if (!g_vao[id - 1].used) return NULL;
     return &g_vao[id - 1];
+}
+
+static gles2_vao *g_current_vao(void)
+{
+    return g_bound_vao ? g_vao_slot(g_bound_vao) : &g_default_vao;
 }
 
 /* --- state --------------------------------------------------------- */
@@ -153,7 +161,7 @@ void glBindBuffer (GLenum target, GLuint buffer)
     if (target == GL_ARRAY_BUFFER) {
         g_cur_array_buffer = buffer;
     } else if (target == GL_ELEMENT_ARRAY_BUFFER) {
-        gles2_vao *v = g_vao_slot(g_bound_vao);
+        gles2_vao *v = g_current_vao();
         if (v) v->elemBuffer = buffer;
     }
     gles_engine_bind_buffer(target, buffer);
@@ -183,7 +191,7 @@ void glGenerateMipmap (GLenum target) { gles_engine_generate_mipmap(target); }
 void glVertexAttribPointer (GLuint index, GLint size, GLenum type, GLboolean normalized,
                             GLsizei stride, const void *pointer)
 {
-    gles2_vao *v = g_vao_slot(g_bound_vao);
+    gles2_vao *v = g_current_vao();
     if (v && index < GLES2_MAX_ATTRIB) {
         gles2_attrib_state *a = &v->attrib[index];
         a->arrayBuffer = g_cur_array_buffer;
@@ -194,7 +202,7 @@ void glVertexAttribPointer (GLuint index, GLint size, GLenum type, GLboolean nor
 }
 void glEnableVertexAttribArray (GLuint index)
 {
-    gles2_vao *v = g_vao_slot(g_bound_vao);
+    gles2_vao *v = g_current_vao();
     if (v && index < GLES2_MAX_ATTRIB) {
         v->attrib[index].enabled = GL_TRUE; v->attrib[index].enableSet = GL_TRUE;
     }
@@ -202,7 +210,7 @@ void glEnableVertexAttribArray (GLuint index)
 }
 void glDisableVertexAttribArray (GLuint index)
 {
-    gles2_vao *v = g_vao_slot(g_bound_vao);
+    gles2_vao *v = g_current_vao();
     if (v && index < GLES2_MAX_ATTRIB) {
         v->attrib[index].enabled = GL_FALSE; v->attrib[index].enableSet = GL_TRUE;
     }
@@ -234,36 +242,45 @@ void glDeleteVertexArrays (GLsizei n, const GLuint *arrays)
     for (i = 0; i < n; ++i) {
         GLuint id = arrays[i];
         if (id == 0 || id > GLES2_MAX_VAO) continue;
-        if (g_bound_vao == id) g_bound_vao = 0;
-        memset(&g_vao[id - 1], 0, sizeof(gles2_vao));
+        if (g_bound_vao == id) {
+            memset(&g_vao[id - 1], 0, sizeof(gles2_vao));
+            glBindVertexArray(0);
+        } else {
+            memset(&g_vao[id - 1], 0, sizeof(gles2_vao));
+        }
     }
 }
 GLboolean glIsVertexArray (GLuint array)
 { return g_vao_slot(array) ? GL_TRUE : GL_FALSE; }
 void glBindVertexArray (GLuint array)
 {
+    static const GLfloat initial[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    GLuint saved_array_buffer = g_cur_array_buffer;
     gles2_vao *v;
     int i;
-    if (array == 0) { g_bound_vao = 0; return; }
-    v = g_vao_slot(array);
-    if (!v) return; /* unknown name: leave state untouched */
+    v = array ? g_vao_slot(array) : &g_default_vao;
+    if (!v) {
+        gles_engine_set_error(GL_INVALID_OPERATION);
+        return;
+    }
     g_bound_vao = array;
     /* Replay the recorded attribute state through the existing engine path. */
     for (i = 0; i < GLES2_MAX_ATTRIB; ++i) {
         gles2_attrib_state *a = &v->attrib[i];
-        if (a->configured && a->arrayBuffer != g_cur_array_buffer) {
-            g_cur_array_buffer = a->arrayBuffer;
-            gles_engine_bind_buffer(GL_ARRAY_BUFFER, a->arrayBuffer);
-        }
+        gles_engine_bind_buffer(GL_ARRAY_BUFFER,
+                                a->configured ? a->arrayBuffer : 0);
         if (a->configured)
             gles_engine_vertex_attrib_pointer((GLuint)i, a->size, a->type,
                                               a->normalized, a->stride, a->pointer);
-        if (a->enableSet) {
-            if (a->enabled) gles_engine_enable_vertex_attrib_array((GLuint)i);
-            else            gles_engine_disable_vertex_attrib_array((GLuint)i);
-        }
+        else
+            gles_engine_vertex_attrib_pointer((GLuint)i, 4, GL_FLOAT,
+                                              GL_FALSE, 0, NULL);
+        if (a->enabled) gles_engine_enable_vertex_attrib_array((GLuint)i);
+        else            gles_engine_disable_vertex_attrib_array((GLuint)i);
+        gles_engine_vertex_attrib4f((GLuint)i, a->currentSet ? a->current : initial);
     }
-    gles_engine_bind_buffer(GL_ELEMENT_ARRAY_BUFFER, v->elemBuffer);
+    gles_engine_bind_buffer(GL_ARRAY_BUFFER, saved_array_buffer);
+        gles_engine_bind_buffer(GL_ELEMENT_ARRAY_BUFFER, v->elemBuffer);
 }
 
 /* OES_vertex_array_object aliases (<GLES2/gl2ext.h>). */
@@ -275,17 +292,34 @@ void glDrawArrays (GLenum mode, GLint first, GLsizei count) { gles_engine_draw_a
 void glDrawElements (GLenum mode, GLsizei count, GLenum type, const void *indices)
 { gles_engine_draw_elements(mode, count, type, indices); }
 
-/* Constant (generic) vertex attributes are not used by the migrated GLES2
- * consumers (they all feed attributes through VBOs), and portablegl exposes no
- * setter for them, so these are accepted and ignored. */
-void glVertexAttrib1f (GLuint i, GLfloat x) { (void)i; (void)x; }
-void glVertexAttrib2f (GLuint i, GLfloat x, GLfloat y) { (void)i; (void)x; (void)y; }
-void glVertexAttrib3f (GLuint i, GLfloat x, GLfloat y, GLfloat z) { (void)i; (void)x; (void)y; (void)z; }
-void glVertexAttrib4f (GLuint i, GLfloat x, GLfloat y, GLfloat z, GLfloat w) { (void)i; (void)x; (void)y; (void)z; (void)w; }
-void glVertexAttrib1fv (GLuint i, const GLfloat *v) { (void)i; (void)v; }
-void glVertexAttrib2fv (GLuint i, const GLfloat *v) { (void)i; (void)v; }
-void glVertexAttrib3fv (GLuint i, const GLfloat *v) { (void)i; (void)v; }
-void glVertexAttrib4fv (GLuint i, const GLfloat *v) { (void)i; (void)v; }
+/* Generic attributes are part of VAO state even when their arrays are disabled. */
+static void gles2_set_vertex_attrib(GLuint i, const GLfloat *v)
+{
+    gles2_vao *vao = g_current_vao();
+    if (vao && i < GLES2_MAX_ATTRIB) {
+        gles2_attrib_state *a = &vao->attrib[i];
+        memcpy(a->current, v, sizeof(a->current));
+        a->currentSet = GL_TRUE;
+    }
+    gles_engine_vertex_attrib4f(i, v);
+}
+
+void glVertexAttrib1f (GLuint i, GLfloat x)
+{ GLfloat v[4] = { x, 0.0f, 0.0f, 1.0f }; gles2_set_vertex_attrib(i, v); }
+void glVertexAttrib2f (GLuint i, GLfloat x, GLfloat y)
+{ GLfloat v[4] = { x, y, 0.0f, 1.0f }; gles2_set_vertex_attrib(i, v); }
+void glVertexAttrib3f (GLuint i, GLfloat x, GLfloat y, GLfloat z)
+{ GLfloat v[4] = { x, y, z, 1.0f }; gles2_set_vertex_attrib(i, v); }
+void glVertexAttrib4f (GLuint i, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
+{ GLfloat v[4] = { x, y, z, w }; gles2_set_vertex_attrib(i, v); }
+void glVertexAttrib1fv (GLuint i, const GLfloat *v)
+{ if (v) glVertexAttrib1f(i, v[0]); }
+void glVertexAttrib2fv (GLuint i, const GLfloat *v)
+{ if (v) glVertexAttrib2f(i, v[0], v[1]); }
+void glVertexAttrib3fv (GLuint i, const GLfloat *v)
+{ if (v) glVertexAttrib3f(i, v[0], v[1], v[2]); }
+void glVertexAttrib4fv (GLuint i, const GLfloat *v)
+{ if (v) glVertexAttrib4f(i, v[0], v[1], v[2], v[3]); }
 
 /* --- texture parameter arrays / queries ---------------------------- */
 void glTexParameterfv (GLenum target, GLenum pname, const GLfloat *params)
@@ -293,28 +327,31 @@ void glTexParameterfv (GLenum target, GLenum pname, const GLfloat *params)
 void glTexParameteriv (GLenum target, GLenum pname, const GLint *params)
 { if (params) glTexParameteri(target, pname, params[0]); }
 void glGetTexParameterfv (GLenum target, GLenum pname, GLfloat *params)
-{ (void)target; (void)pname; if (params) params[0] = 0; }
+{ gles_engine_get_tex_parameterfv(target, pname, params); }
 void glGetTexParameteriv (GLenum target, GLenum pname, GLint *params)
-{ (void)target; (void)pname; if (params) params[0] = 0; }
+{ gles_engine_get_tex_parameteriv(target, pname, params); }
 
 /* --- compressed / copy texture paths (unused by the consumers) ----- */
 void glCompressedTexImage2D (GLenum t, GLint l, GLenum f, GLsizei w, GLsizei h, GLint b, GLsizei s, const void *d)
-{ (void)t;(void)l;(void)f;(void)w;(void)h;(void)b;(void)s;(void)d; }
+{ gles_engine_compressed_tex_image_2d(t, l, f, w, h, b, s, d); }
 void glCompressedTexSubImage2D (GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLsizei s, const void *d)
-{ (void)t;(void)l;(void)x;(void)y;(void)w;(void)h;(void)f;(void)s;(void)d; }
+{ gles_engine_compressed_tex_sub_image_2d(t, l, x, y, w, h, f, s, d); }
 void glCopyTexImage2D (GLenum t, GLint l, GLenum f, GLint x, GLint y, GLsizei w, GLsizei h, GLint b)
-{ (void)t;(void)l;(void)f;(void)x;(void)y;(void)w;(void)h;(void)b; }
+{ gles_engine_copy_tex_image_2d(t, l, f, x, y, w, h, b); }
 void glCopyTexSubImage2D (GLenum t, GLint l, GLint x, GLint y, GLint sx, GLint sy, GLsizei w, GLsizei h)
-{ (void)t;(void)l;(void)x;(void)y;(void)sx;(void)sy;(void)w;(void)h; }
+{ gles_engine_copy_tex_sub_image_2d(t, l, x, y, sx, sy, w, h); }
 
 /* --- buffer / object queries --------------------------------------- */
 void glGetBufferParameteriv (GLenum target, GLenum pname, GLint *params)
-{ (void)target; (void)pname; if (params) *params = 0; }
-GLboolean glIsBuffer (GLuint b)  { return b ? GL_TRUE : GL_FALSE; }
-GLboolean glIsTexture (GLuint t) { return t ? GL_TRUE : GL_FALSE; }
-void glGetVertexAttribfv (GLuint i, GLenum p, GLfloat *params) { (void)i;(void)p; if (params) params[0]=0; }
-void glGetVertexAttribiv (GLuint i, GLenum p, GLint *params)   { (void)i;(void)p; if (params) params[0]=0; }
-void glGetVertexAttribPointerv (GLuint i, GLenum p, void **ptr) { (void)i;(void)p; if (ptr) *ptr=NULL; }
+{ gles_engine_get_buffer_parameteriv(target, pname, params); }
+GLboolean glIsBuffer (GLuint b)  { return gles_engine_is_buffer(b); }
+GLboolean glIsTexture (GLuint t) { return gles_engine_is_texture(t); }
+void glGetVertexAttribfv (GLuint i, GLenum p, GLfloat *params)
+{ gles_engine_get_vertex_attribfv(i, p, params); }
+void glGetVertexAttribiv (GLuint i, GLenum p, GLint *params)
+{ gles_engine_get_vertex_attribiv(i, p, params); }
+void glGetVertexAttribPointerv (GLuint i, GLenum p, void **ptr)
+{ gles_engine_get_vertex_attrib_pointerv(i, p, ptr); }
 
 /* --- framebuffers / renderbuffers ---------------------------------- *
  * The engine renders into the single default framebuffer provided by EGL, so

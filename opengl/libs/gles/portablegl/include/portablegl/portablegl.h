@@ -341,6 +341,8 @@ PGL_MAX_VERTICES refers to the number of output vertices of a single draw call.
 #define PGL_MAX_VERTICES 500000
 #define PGL_MAX_ALIASED_WIDTH 2048.0f
 #define PGL_MAX_TEXTURE_SIZE 16384
+#define PGL_MAX_MIP_LEVELS 15
+#define PGL_TEXTURE_FACES 6
 #define PGL_MAX_3D_TEXTURE_SIZE 8192
 #define PGL_MAX_ARRAY_TEXTURE_LAYERS 8192
 
@@ -2509,6 +2511,13 @@ enum
 	GL_COMPRESSED_RG,
 	GL_COMPRESSED_RGB,
 	GL_COMPRESSED_RGBA,
+	GL_ETC1_RGB8_OES,
+	GL_COMPRESSED_RGB8_ETC2,
+	GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,
+	GL_COMPRESSED_RGBA8_ETC2_EAC,
+	GL_UNSIGNED_SHORT_5_6_5,
+	GL_UNSIGNED_SHORT_4_4_4_4,
+	GL_UNSIGNED_SHORT_5_5_5_1,
 	//lots more go here but not important
 
 	// None of these are used currently just to help porting
@@ -2768,6 +2777,8 @@ void pgl_set_max_vertices(int max_vertices);
 
 #define PGL_MAX_ALIASED_WIDTH 2048.0f
 #define PGL_MAX_TEXTURE_SIZE 16384
+#define PGL_MAX_MIP_LEVELS 15
+#define PGL_TEXTURE_FACES 6
 #define PGL_MAX_3D_TEXTURE_SIZE 8192
 #define PGL_MAX_ARRAY_TEXTURE_LAYERS 8192
 #define PGL_MAX_DEBUG_MESSAGE_LENGTH 256
@@ -2813,7 +2824,11 @@ typedef struct Shader_Builtins
 	// fragment inputs
 	vec4 gl_FragCoord;
 	vec2 gl_PointCoord;
+	vec2 gl_PointCoord_dx;     // internal fragment point-coordinate derivatives
+	vec2 gl_PointCoord_dy;
 	GLboolean gl_FrontFacing;  // struct packing fail I know
+	const float* fs_input_dx;  // internal fragment varying screen derivatives
+	const float* fs_input_dy;
 
 	// fragment outputs
 	vec4 gl_FragColor;
@@ -2856,6 +2871,7 @@ typedef struct glBuffer
 
 	GLsizei size;
 	GLenum type;
+	GLenum usage;
 	u8* data;
 
 	GLboolean deleted;
@@ -2871,11 +2887,13 @@ typedef struct glVertex_Attrib
 	GLint size;      // number of components 1-4
 	GLenum type;     // GL_FLOAT, default
 	GLsizei stride;  //
+	GLsizei specified_stride;
 	GLsizeiptr offset;  //
 	GLboolean normalized;
 	GLuint buf;
 	GLboolean enabled;
 	GLuint divisor;
+	vec4 current_value;
 } glVertex_Attrib;
 
 typedef struct glVertex_Array
@@ -2886,6 +2904,16 @@ typedef struct glVertex_Array
 	GLboolean deleted;
 
 } glVertex_Array;
+
+typedef struct glTextureLevel
+{
+	GLsizei w;
+	GLsizei h;
+	GLenum internalformat;
+	GLuint datagen;
+	u8* data;
+	GLboolean defined;
+} glTextureLevel;
 
 typedef struct glTexture
 {
@@ -2919,6 +2947,10 @@ typedef struct glTexture
 
 	/* Bumped on every pixel (re)upload so GPU-side staged copies can detect
 	   staleness and re-stage (see pgl_engine gpu_ctex_slot). */
+	/* Canonical RGBA8 storage for 2D and cube-map faces.  The legacy data/w/h
+	   fields alias 2D level zero for the existing software/GPU fast paths. */
+	glTextureLevel levels[PGL_TEXTURE_FACES][PGL_MAX_MIP_LEVELS];
+
 	GLuint datagen;
 } glTexture;
 
@@ -3216,6 +3248,8 @@ typedef struct glContext
 	Shader_Builtins builtins;
 	Vertex_Shader_output vs_output;
 	float fs_input[GL_MAX_VERTEX_OUTPUT_COMPONENTS];
+	float fs_input_dx[GL_MAX_VERTEX_OUTPUT_COMPONENTS];
+	float fs_input_dy[GL_MAX_VERTEX_OUTPUT_COMPONENTS];
 
 	GLboolean depth_test;
 	GLboolean line_smooth;
@@ -3320,10 +3354,15 @@ typedef struct glContext
 //shader texture functions
 PGLDEF vec4 texture1D(GLuint tex, float x);
 PGLDEF vec4 texture2D(GLuint tex, float x, float y);
+PGLDEF vec4 texture2D_lod(GLuint tex, float x, float y, float lod);
+PGLDEF vec4 texture2D_grad(GLuint tex, float x, float y, const float* ddx, const float* ddy);
+PGLDEF int pgl_texture_complete(const glTexture* tex, int cube);
 PGLDEF vec4 texture3D(GLuint tex, float x, float y, float z);
 PGLDEF vec4 texture2DArray(GLuint tex, float x, float y, int z);
 PGLDEF vec4 texture_rect(GLuint tex, float x, float y);
 PGLDEF vec4 texture_cubemap(GLuint texture, float x, float y, float z);
+PGLDEF vec4 texture_cubemap_lod(GLuint texture, float x, float y, float z, float lod);
+PGLDEF vec4 texture_cubemap_grad(GLuint texture, float x, float y, float z, const float* ddx, const float* ddy);
 
 PGLDEF vec4 texelFetch1D(GLuint tex, int x, int lod);
 PGLDEF vec4 texelFetch2D(GLuint tex, int x, int y, int lod);
@@ -3530,6 +3569,9 @@ PGLDEF void pgl_TextureParameterluiv(GLuint texture, GLenum pname, const GLuint*
 
 PGLDEF void pgl_CompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const GLvoid* data);
 PGLDEF void pgl_CompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid* data);
+PGLDEF void pgl_CompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const GLvoid* data);
+PGLDEF void pgl_CopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border);
+PGLDEF void pgl_CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height);
 PGLDEF void pgl_CompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const GLvoid* data);
 
 PGLDEF void pgl_TexBuffer(GLenum target, GLenum internalformat, GLuint buffer);

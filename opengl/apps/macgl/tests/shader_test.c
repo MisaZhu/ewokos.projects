@@ -10,9 +10,10 @@
 #include "../gen/macgl_glsl.h"
 
 static int texture_failures;
-static void data_texture(int unit, int dim, const float *uv, float out[4], void *user)
+static void data_texture(int unit, int dim, const float *uv,
+                         const glsl_tex_derivatives *deriv, float out[4], void *user)
 {
-    (void)user;
+    (void)deriv; (void)user;
     if (unit != 0 || dim != 2 || !isfinite(uv[0]) || !isfinite(uv[1]) ||
         uv[0] < 0 || uv[0] >= 1 || uv[1] < 0 || uv[1] >= 1) {
         ++texture_failures;
@@ -42,7 +43,7 @@ static void pixel(glsl_program *p, glsl_cell *u, float x, float y, float out[4])
 {
     float coord[4] = {x, y, 0, 1}, point[2] = {0, 0}, depth;
     int discard = 0, wrote = 0;
-    glsl_run_fragment(p, NULL, u, coord, point, 1, data_texture, NULL,
+    glsl_run_fragment(p, NULL, NULL, NULL, u, coord, point, NULL, NULL, 1, data_texture, NULL,
                       out, &discard, &depth, &wrote);
 }
 

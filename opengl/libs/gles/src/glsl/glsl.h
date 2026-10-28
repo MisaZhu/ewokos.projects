@@ -201,7 +201,7 @@ enum {
     BF_LESS_THAN, BF_LESS_THAN_EQUAL, BF_GREATER_THAN, BF_GREATER_THAN_EQUAL,
     BF_EQUAL, BF_NOT_EQUAL, BF_ANY, BF_ALL, BF_NOT,
     BF_TEXTURE2D, BF_TEXTURE2DPROJ, BF_TEXTURE2DLOD, BF_TEXTURECUBE,
-    BF_DFDX, BF_DFDY, BF_FWIDTH,
+    BF_TEXTURECUBELOD, BF_DFDX, BF_DFDY, BF_FWIDTH,
     BF_TANH,                  /* GLSL ES 3.00 hyperbolic tangent         */
     BF_ROUND, BF_FLOAT_BITS_TO_UINT,
     BF_USER_START
@@ -319,8 +319,17 @@ typedef struct glsl_program {
  * unit  = sampler uniform value (texture unit)
  * dim   = 2 for texture2D/2DProj/2DLod, 3 for textureCube
  * coord = dim floats (s,t) or (x,y,z)
+ * deriv = screen-space gradients, or an explicit LOD when has_lod is nonzero
  * out   = rgba result. */
+typedef struct {
+    const float *ddx;
+    const float *ddy;
+    float lod;
+    int has_lod;
+} glsl_tex_derivatives;
+
 typedef void (*glsl_tex_sample_fn)(int unit, int dim, const float *coord,
+                                   const glsl_tex_derivatives *deriv,
                                    float out_rgba[4], void *user);
 
 /* ------------------------------------------------------------------ *
@@ -353,15 +362,20 @@ void glsl_bind_attrib_location(glsl_stage *vs, const char *name, int loc);
 void glsl_run_vertex(glsl_program *p,
                      const float *const *attribs, int nattribs,
                      const void *uniform_block,
+                     glsl_tex_sample_fn texfn, void *texuser,
                      float *varyings_out,        /* nvaryings*4 floats   */
                      float out_gl_position[4],
                      int instance_id);
 
 void glsl_run_fragment(glsl_program *p,
                        const float *varyings_in, /* nvaryings*4 floats   */
+                       const float *varyings_dx,
+                       const float *varyings_dy,
                        const void *uniform_block,
                        const float gl_fragcoord[4],
                        const float gl_pointcoord[2],
+                       const float gl_pointcoord_dx[2],
+                       const float gl_pointcoord_dy[2],
                        int front_facing,
                        glsl_tex_sample_fn texfn, void *texuser,
                        float out_gl_fragcolor[4],

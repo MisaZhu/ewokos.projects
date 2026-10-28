@@ -107,6 +107,7 @@ static const bif k_bifs[] = {
     {"not",BF_NOT,1},
     {"texture2D",BF_TEXTURE2D,-1},{"texture2DProj",BF_TEXTURE2DPROJ,-1},
     {"texture2DLod",BF_TEXTURE2DLOD,3},{"textureCube",BF_TEXTURECUBE,-1},
+    {"textureCubeLod",BF_TEXTURECUBELOD,3},
     {"dFdx",BF_DFDX,1},{"dFdy",BF_DFDY,1},{"fwidth",BF_FWIDTH,1},
     {NULL,0,0}
 };

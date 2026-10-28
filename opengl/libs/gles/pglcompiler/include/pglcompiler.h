@@ -168,10 +168,22 @@ struct pglc_tex_layout {
    uint32_t padded_h;
    uint32_t stride;
    uint32_t size;
+   uint32_t offset;   /* byte offset within one complete mip tree */
 };
 
 bool pglc_tex_layout_2d(uint32_t w, uint32_t h, uint32_t cpp,
                         struct pglc_tex_layout *out);
+
+/* Lay out levels 0..last_level of one POT image in the backend's native mip
+ * tree order.  Each out[level] describes that level and its byte offset from
+ * the tree base.  Returns false when the backend cannot represent the chain;
+ * callers must keep the CPU sampler rather than uploading level 0 alone. */
+bool pglc_tex_layout_mip_chain(uint32_t w, uint32_t h, uint32_t cpp,
+                               uint32_t last_level,
+                               struct pglc_tex_layout *out);
+
+/* Whether the daemon can bind six complete mip trees as a samplerCube. */
+bool pglc_tex_sampler_cube_supported(void);
 
 /* Copy a raster image (src, src_stride bytes/row) into `dst` laid out per
  * `l` (dst must hold l->size bytes). */

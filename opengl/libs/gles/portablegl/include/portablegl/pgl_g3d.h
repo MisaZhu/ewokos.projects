@@ -230,6 +230,21 @@ int  pgl_g3d_upload_texture_tiled(int slot, int w, int h, const void* rgba8);
 int  pgl_g3d_upload_texture_cube_tiled(int slot, int w, int h,
                                        const void* faces_rgba8);
 
+/* Canonical RGBA8 levels for a complete sampler image.  images is indexed
+ * [layer * levels + level], with depth 1 for 2D or 6 for +X..-Z cube faces.
+ * A multi-level upload must contain the complete POT chain through 1x1. */
+#define PGL_G3D_MAX_TEX_LEVELS 15u
+typedef struct {
+    const void* rgba8;
+    uint32_t w, h;
+} pgl_g3d_tex_level_t;
+
+/* Upload every face/level as one backend-native mip tree (or six trees for a
+ * cubemap).  Returns 0 without binding anything when the backend cannot
+ * represent the requested chain; the caller must retain its CPU sampler. */
+int pgl_g3d_upload_texture_mips_tiled(int slot, uint32_t depth, uint32_t levels,
+                                      const pgl_g3d_tex_level_t* images);
+
 /* Release a texture slot's shm segment (safe on an unused slot).  Any open
    TEX_MOD batch referencing the slot is flushed first so the driver never
    sees a dangling physical base. */
@@ -407,6 +422,12 @@ int  pgl_g3d_batch_tri_compiled(const float* n0, const float* n1, const float* n
 #define PGL_G3D_TEX_FILTER_LINEAR  1
 void pgl_g3d_bind_tex_unit(int unit, int tex_slot);
 void pgl_g3d_bind_tex_unit_filter(int unit, int tex_slot, int filter);
+/* Full GL filter state: mag/min select texel filtering, mip selects filtering
+ * between levels.  The legacy entry above maps filter to mag+min and NEAREST
+ * mip filtering. */
+void pgl_g3d_bind_tex_unit_sampler(int unit, int tex_slot,
+                                   int mag_filter, int min_filter,
+                                   int mip_filter);
 
 /* === WS4 generic compiled-mesh draw path (arbitrary 3D geometry) ============
    These drive a static vertex mesh with an on-device-compiled program whose

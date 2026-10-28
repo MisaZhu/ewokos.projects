@@ -64,9 +64,10 @@ ifneq ($(wildcard $(VK_HDR_DIR)/vulkan/vulkan.h),)
 TARGETS += $(IMGUI_VK)
 endif
 
-# Header staging is shared by both variants; the stamp file keeps the cp -r
-# from re-running on every make.
-HDR_STAMP = $(ARCH)/.headers_staged
+# Header staging is shared by both variants.  Keep the stamp in the destination
+# SDK: an ARCH-only source-tree stamp incorrectly suppresses installation for a
+# different HW, or after that HW's build directory has been cleaned.
+HDR_STAMP = $(BUILD_DIR)/include/imgui/.headers_staged
 
 all: $(TARGETS)
 

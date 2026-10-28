@@ -23,9 +23,10 @@ static glsl_program *link_source(const char *source)
     return p;
 }
 
-static void black_texture(int unit, int dim, const float *coord, float rgba[4], void *user)
+static void black_texture(int unit, int dim, const float *coord,
+                          const glsl_tex_derivatives *deriv, float rgba[4], void *user)
 {
-    (void)unit; (void)dim; (void)coord; (void)user;
+    (void)unit; (void)dim; (void)coord; (void)deriv; (void)user;
     memset(rgba, 0, 4 * sizeof(float));
 }
 
@@ -33,7 +34,7 @@ static void pixel(glsl_program *p, glsl_cell *uniforms, float x, float y, float 
 {
     float coord[4] = {x, y, 0, 1}, point[2] = {0, 0}, depth;
     int discard = 0, wrote = 0;
-    glsl_run_fragment(p, NULL, uniforms, coord, point, 1, black_texture, NULL,
+    glsl_run_fragment(p, NULL, NULL, NULL, uniforms, coord, point, NULL, NULL, 1, black_texture, NULL,
                       out, &discard, &depth, &wrote);
 }
 
