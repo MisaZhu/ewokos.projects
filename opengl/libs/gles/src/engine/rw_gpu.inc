@@ -55,6 +55,32 @@ static struct rw_batch_key {
 } rw_batch;
 static rw_texture *rw_batch_texture,*rw_batch_texture1;
 static int rw_verified;
+/* Resolved dword offsets of the raster/xform uniforms that rw_gpu_flush patches
+ * on every dispatch.  The binding tables are fixed once the program compiles,
+ * but the original rw_patch rescanned the whole table with a strcmp per name
+ * per call -- 9 names x ~768 dispatches/frame of string matching on the render
+ * thread.  Cache the offsets at compile time and turn each patch into a direct
+ * memcpy.  -1 means the name is absent from the stage, which reproduces
+ * rw_patch's no-match behaviour (a no-op).  A GLSL stage cannot declare two
+ * uniforms with the same name, so first-match equals only-match. */
+static struct {
+    int rs_target, rs_clipRect, rs_dispatchOffset, rs_blendState, rs_texState,
+        rs_fogColor, rs_alphaRef, rs_envState, rs_fxParams, xs_nverts;
+} rw_ploc;
+static int rw_find_off(const struct pglc_stage *s,const char *name,uint32_t n)
+{
+    for(uint32_t i=0;i<s->num_uniform_bindings;i++) {
+        const struct pglc_uniform_binding *u=&s->uniform_bindings[i];
+        if(!strcmp(u->name,name) && u->num_components==n)
+            return (int)u->dword_offset;
+    }
+    return -1;
+}
+static void rw_patch_off(int off,uint32_t base,const void *value,uint32_t n)
+{
+    if(off>=0) memcpy(rw_unif.px+base+off,value,n*4);
+}
+
 /* The native RW vertex contracts emit a fog coordinate even when fog is
  * disabled; in that common case every vertex carries exactly 1.0.  Keep a
  * batch-wide flag so the raster kernel can skip the RGB mix entirely. */
@@ -365,6 +391,23 @@ static int rw_gpu_compile(void)
     }
     if(blob.px) g2d_shm_free(blob.px);
     if(rw_program<0) { printf("PGL RW GPU daemon declined program %d\n",rw_program); rw_blocked=1; return 0; }
+    /* Resolve the per-dispatch uniform offsets once for this program so the
+     * flush path skips the strcmp scan (see rw_ploc).  nverts lives on the
+     * xform stage and is only patched in the two-pass route. */
+    {
+        const struct pglc_stage *rs=&rw_rs.stage[PGLC_STAGE_COMPUTE];
+        rw_ploc.rs_target        =rw_find_off(rs,"target",4);
+        rw_ploc.rs_clipRect      =rw_find_off(rs,"clipRect",4);
+        rw_ploc.rs_dispatchOffset=rw_find_off(rs,"dispatchOffset",2);
+        rw_ploc.rs_blendState    =rw_find_off(rs,"blendState",4);
+        rw_ploc.rs_texState      =rw_find_off(rs,"texState",4);
+        rw_ploc.rs_fogColor      =rw_find_off(rs,"fogColor",4);
+        rw_ploc.rs_alphaRef      =rw_find_off(rs,"alphaRef",4);
+        rw_ploc.rs_envState      =rw_find_off(rs,"envState",4);
+        rw_ploc.rs_fxParams      =rw_find_off(rs,"fxParams",4);
+        rw_ploc.xs_nverts        =rw_direct_mode ? -1 :
+            rw_find_off(&rw_xs.stage[PGLC_STAGE_COMPUTE],"nverts",1);
+    }
     if(profile_enabled()) printf("PGL_PROFILE RW GPU ordered raster ready handle=%d kind=%d\n",
                                  rw_program,opts.geom_kind);
     return 1;
@@ -519,14 +562,6 @@ static rw_texture *rw_gpu_texture(GLuint name,const glTexture *t,const rw_textur
     }
     r->name=name; r->gen=t->datagen; r->w=t->w;r->h=t->h;r->layout=layout;
     return r;
-}
-static void rw_patch(const struct pglc_stage *s,uint32_t base,const char *name,const void *value,uint32_t n)
-{
-    for(uint32_t i=0;i<s->num_uniform_bindings;i++) {
-        const struct pglc_uniform_binding *u=&s->uniform_bindings[i];
-        if(!strcmp(u->name,name) && u->num_components==n)
-            memcpy(rw_unif.px+base+u->dword_offset,value,n*4);
-    }
 }
 static int rw_collect(const glVertex *a,const glVertex *b,const glVertex *c,void *user)
 {
@@ -746,9 +781,9 @@ static int rw_gpu_flush(void)
         if(clip[0]>=clip[2] || clip[1]>=clip[3]) continue;
         memset(rw_unif.px,0,nwords*4);
         if (!rw_direct_mode)
-            rw_patch(&rw_xs.stage[PGLC_STAGE_COMPUTE],0,"nverts",&n,1);
-        rw_patch(&rw_rs.stage[PGLC_STAGE_COMPUTE],split,"target",target,4);
-        rw_patch(&rw_rs.stage[PGLC_STAGE_COMPUTE],split,"clipRect",clip,4);
+            rw_patch_off(rw_ploc.xs_nverts,0,&n,1);
+        rw_patch_off(rw_ploc.rs_target,split,target,4);
+        rw_patch_off(rw_ploc.rs_clipRect,split,clip,4);
         {
             /* The compute launch window is expressed in framebuffer rows
              * (top-left origin), while RW/portablegl screen coordinates use
@@ -757,26 +792,25 @@ static int rw_gpu_flush(void)
              * clip[1] here launches the opposite vertical band and leaves
              * most pixels disabled by the shader's clipRect test. */
             int dispatch_offset[2]={clip[0],g_h-clip[3]};
-            rw_patch(&rw_rs.stage[PGLC_STAGE_COMPUTE],split,
-                "dispatchOffset",dispatch_offset,2);
+            rw_patch_off(rw_ploc.rs_dispatchOffset,split,dispatch_offset,2);
         }
-        rw_patch(&rw_rs.stage[PGLC_STAGE_COMPUTE],split,"blendState",rw_batch.blend,4);
-        rw_patch(&rw_rs.stage[PGLC_STAGE_COMPUTE],split,"texState",rw_batch.ts,4);
+        rw_patch_off(rw_ploc.rs_blendState,split,rw_batch.blend,4);
+        rw_patch_off(rw_ploc.rs_texState,split,rw_batch.ts,4);
         {
             float fog[4];
             memcpy(fog,rw_batch.fog,sizeof fog);
             /* fogColor.a is unused by the RW fragment contract and serves as
              * a uniform branch flag for the compute rasterizer. */
             fog[3]=rw_batch_fog_enabled ? 1.0f : 0.0f;
-            rw_patch(&rw_rs.stage[PGLC_STAGE_COMPUTE],split,"fogColor",fog,4);
+            rw_patch_off(rw_ploc.rs_fogColor,split,fog,4);
         }
         /* These values are draw/batch state, not per-vertex state.  Patch them
          * once immediately before dispatch; doing this from rw_collect for
          * every vertex needlessly copied the same uniform block millions of
          * times per frame. */
-        rw_patch(&rw_rs.stage[PGLC_STAGE_COMPUTE],split,"alphaRef",rw_batch.alpha,4);
-        rw_patch(&rw_rs.stage[PGLC_STAGE_COMPUTE],split,"envState",rw_batch.ts1,4);
-        rw_patch(&rw_rs.stage[PGLC_STAGE_COMPUTE],split,"fxParams",rw_batch.fx,4);
+        rw_patch_off(rw_ploc.rs_alphaRef,split,rw_batch.alpha,4);
+        rw_patch_off(rw_ploc.rs_envState,split,rw_batch.ts1,4);
+        rw_patch_off(rw_ploc.rs_fxParams,split,rw_batch.fx,4);
         /* Keep the declared span stable for rw_attr's shm id.  The shader
          * consumes only `n` vertices; the fixed span prevents an older g2dd
          * attach cache from retaining a short mapping across draw layouts. */

@@ -8,7 +8,8 @@ DIRS = macemu \
 	cards \
 	mine \
 	vulkan \
-	imgui
+	imgui \
+	re3
 #	previous video saver minivmac nx11
 
 # qt needs the Qt tree that projects/qt/build.sh produces; if it is missing for
