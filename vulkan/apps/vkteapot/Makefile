@@ -17,7 +17,7 @@ TASK_DIR = $(BUILD_DIR)/rootfs/apps/$(TASK)
 VULKAN_LIB = $(BUILD_DIR)/lib/libvulkan.a
 IMGUI_VK_LIB = $(BUILD_DIR)/lib/libimgui_vk.a
 
-VK_GPU_HWS := raspi5 q8b
+VK_GPU_HWS := raspi5 raspix q8b
 VK_GPU_LIBS :=
 ifeq ($(PGL_G3D),yes)
 ifneq ($(filter $(HW),$(VK_GPU_HWS)),)
@@ -33,7 +33,7 @@ all: $(TASK)
 # not the runtime.  The Dear ImGui Vulkan overlay (libimgui_vk.a) references the
 # runtime's vk* entry points, so it must precede libvulkan.a in the link order;
 # ImGui is C++, hence -lcxx on every target.  On the GPU targets (PGL_G3D:
-# raspi5, q8b) the teapot draw qualifies for the GPU back-end and the
+# raspi5, raspix, q8b) the teapot draw qualifies for the GPU back-end and the
 # g2dclient/ewokstl libs are pulled in; elsewhere it is CPU-only.  On q8b the
 # same geom_kind-5 pipeline is compiled to Adreno compute kernels and dispatched
 # through the machine's PGL backend.
