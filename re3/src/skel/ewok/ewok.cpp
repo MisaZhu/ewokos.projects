@@ -198,9 +198,19 @@ static void ewokOnResize(xwin_t *xwin)
 	int height = xwin->xinfo->wsr.h;
 	if (height <= 0 || width <= 0)
 		return;
+	/* Keep the camera and GPU target at the logical game size.  Fullscreen
+	 * scaling is performed by EGL when the finished frame is presented. */
+	if (getenv("RE3_NATIVE_RENDER_SIZE") != nil)
+		return;
 
 	RsGlobal.maximumHeight = height;
 	RsGlobal.maximumWidth = width;
+	/* xwin_fullscreen() is called while the RenderWare/EGL surface is still
+	 * being created.  The window server invokes this callback once during that
+	 * transition, before Scene.camera exists; defer the camera event until the
+	 * normal post-initialisation path has a camera to resize. */
+	if (Scene.camera == nil)
+		return;
 
 	RwRect r;
 	r.x = 0;
@@ -478,6 +488,38 @@ ewok_on_window_created(xwin_t *xwin)
 	xwin->on_min = ewokOnMin;
 	xwin->on_show = ewokOnShow;
 	xwin->on_resize = ewokOnResize;
+	/* RE3 presents synchronously.  Set this before the first fullscreen
+	 * rebuild, rather than in psPostRWinit after EGL creation, so xserverd does
+	 * not allocate a second full-screen handoff canvas for a GUI-launched
+	 * process.  That transient allocation is enough to exhaust q8b's shared
+	 * graphics memory when launched from xlauncher or xterm. */
+	if (xwin->xinfo != nil) {
+		xwin->xinfo->fps_async_force_sync = true;
+		xwin->xinfo->fps_async = false;
+	}
+
+	/* RE3 starts in fullscreen mode.  This must happen before EGL creates its
+	 * surface so the GPU backbuffer is allocated at the final workspace size;
+	 * resizing an already-created surface can require a large contiguous q8b
+	 * allocation and may force an avoidable CPU fallback.  RE3_WINDOWED=1 is a
+	 * deliberate debugging escape hatch and keeps the old windowed behaviour. */
+	if (getenv("RE3_WINDOWED") == NULL &&
+			xwin->xinfo->state != XWIN_STATE_MAX) {
+		g_windowedInfo = *xwin->xinfo;
+		g_windowedPrevious = xwin->xinfo_prev;
+		xwin_fullscreen(xwin);
+		g_borderlessFullscreen = true;
+		PSGLOBAL(fullScreen) = TRUE;
+	} else if (xwin->xinfo->state == XWIN_STATE_MAX) {
+		/* XWIN_STYLE_MAX made xwin_open allocate the final fullscreen
+		 * workspace atomically.  Do not call xwin_fullscreen here: that would
+		 * issue a synchronous repaint before EGL and the on_repaint callback
+		 * exist, which can spin forever when launched from xterm. */
+		g_windowedInfo = *xwin->xinfo;
+		g_windowedPrevious = xwin->xinfo_prev;
+		g_borderlessFullscreen = true;
+		PSGLOBAL(fullScreen) = TRUE;
+	}
 }
 
 // ---- skeleton platform API --------------------------------------------------
@@ -908,9 +950,9 @@ int main(int argc, char *argv[])
 	RwInt32 i;
 
 #ifdef __ewokos__
-	// Debug aid: distinguish silent crashes from clean exits.
-	setbuf(stdout, NULL);
-	setbuf(stderr, NULL);
+	/* Render at the original logical size and scale only during presentation;
+	 * this avoids allocating a full display-sized GPU target for GUI launches. */
+	setenv("RE3_NATIVE_RENDER_SIZE", "640x480", 1);
 	g_renderBenchmark = getenv("RE3_RENDER_BENCHMARK") != NULL;
 	/* RW emits many small native vertex draws. Waking seven threads for
 	 * each one costs more than evaluating them on the render thread on Q8B.
