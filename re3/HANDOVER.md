@@ -20,7 +20,7 @@
 | 文件 | 作用 |
 |---|---|
 | `Makefile` | 全量构建：src/*.cpp（排除 glfw/win skel、oal/miles 音频后端）+ librw(core+gl3+d3d stubs+ps2)+lodepng+glad，链 GLES_LIBS |
-| `src/skel/ewok/ewok.cpp` | **核心新文件（~900 行）**：EwokOS 平台骨架。libx 窗口生命周期、键位映射（keydef.h→rs* 码）、鼠标、游戏状态机（GS_START_UP→GS_INIT_ONCE→GS_INIT_FRONTEND→GS_FRONTEND→GS_INIT_PLAYING_GAME→GS_PLAYING_GAME）、stdout dup2 到 /tmp/re3.log、SIGSEGV handler、`ewok_get_x()/ewok_on_window_created()` 供 librw 回调 |
+| `src/skel/ewok/ewok.cpp` | **核心新文件（~900 行）**：EwokOS 平台骨架。libx 窗口生命周期、键位映射（keydef.h→rs* 码）、鼠标、游戏状态机（GS_START_UP→GS_INIT_ONCE→GS_INIT_FRONTEND→GS_FRONTEND→GS_INIT_PLAYING_GAME→GS_PLAYING_GAME）、SIGSEGV handler、`ewok_get_x()/ewok_on_window_created()` 供 librw 回调；标准输入输出保持由启动端继承 |
 | `src/core/config.h` | `__ewokos__` 配置块：NO_MOVIES、USE_UNNAMED_SEM（板子不支持 named semaphore，流式加载会挂）、关 EXTENDED_PIPELINES/NEW_RENDERER 等 |
 | `vendor/librw/src/gl/gl3device.cpp` | `LIBRW_EWOKOS` 分支：startEwok() 建 xwin+EGL context；`ewokGLGetString()` 返回 "OpenGL ES 2.0 EwokOS portablegl"（portablegl 自报 "0.101.0" 会让 glad 加载出全 NULL 函数表）；跳过 aniso 查询（引擎 wrapper 对扩展枚举会 GL_INVALID_ENUM） |
 | `vendor/librw/src/gl/ewokglprocs.c` | 纯 C 的 GL proc 解析表（130+ 项）。必须绕开 glad.h——它的 `#define glXxx glad_glXxx` 宏会把符号表项污染成 NULL 指针 |
@@ -78,7 +78,7 @@ rm /apps/re3/re3.tmp
 
 - 资产位置：`/data/gta3/{TEXT,data,models,neo,userfiles}`（SD 数据分区）；程序在 `/apps/re3/`
 - **启动**：必须用**前台 ssh 常驻**（`ssh root@... /apps/re3/re3`，本机侧 keep-alive）。`&` 后台 + 断开 ssh 会被杀
-- 日志：stdout/stderr 已 dup2 → `/tmp/re3.log`（**/tmp 是 ramfs，复位即丢**，要留存先 sftp get）
+- 日志：stdout/stderr 不再重定向，由终端、串口或 GUI 启动端自行接收
 - 抓屏：`/apps/screencap /tmp/x.bmp` → sftp get → 本机 `sips -z` 缩放查看
 
 ### 3.3 板子 shell 的坑
@@ -169,7 +169,7 @@ re3/librw (GLSL shader 源)
 ## 7. 快速验证清单（每次大改后）
 1. `gltest`（`/apps/gltest/gltest`）：应打印 `prog linked ok=1` + 每条 GLSL 的
    `PGLGPU: compile declined …no graphics pipeline port…`（q8b 上的预期行为）
-2. 启动 re3 → `/tmp/re3.log` 出现 `PGL RW GPU route adopted w=640 h=480` → 抓屏看渲染
+2. 启动 re3 → 在启动端输出中出现 `PGL RW GPU route adopted w=640 h=480` → 抓屏看渲染
 3. A/B：`cp /bin/ls /apps/rwoff` 后重启 re3 → 全 CPU 渲染应完全正确（基线）
 4. 抓屏对比：`/apps/screencap /tmp/g.png` → sftp get → 本机查看
 
@@ -177,6 +177,6 @@ re3/librw (GLSL shader 源)
 - 翻编译开关必清对象目录（§3.1 陈旧对象陷阱）
 - 校验产物用 `nm`/`strings`/大小，别信“链接成功”
 - 板子挂死 = ping 通 + sshd 超时；**永远别 kill -9 GPU 活跃的进程**，用 `/apps/rwdetach`
-- /tmp（含 re3.log、转储）是 ramfs——要带走的数据先 sftp get 再动板子
+- /tmp（含 GPU 转储）是 ramfs——要带走的数据先 sftp get 再动板子
 - expect 脚本对短输出常吞回显，重要结果落文件再 sftp 拉回
 - sftp 覆盖不截断 → 先 rm 再 put；执行位用 cp 占位法

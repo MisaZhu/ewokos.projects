@@ -10,8 +10,9 @@
 #
 # Rendering: librw gl3 in GLES2 mode over the EwokOS EGL/libGLESv2 stack
 # (portablegl; GPU-accelerated on machines with a real GL backend such as the
-# Raspberry Pi 5 V3D route). Audio: sampman_null (silent). Game data must be
-# laid out next to the binary (see README.md).
+# Raspberry Pi 5 V3D route). Audio: sampman_null (silent). On EwokOS, game
+# data is read from /data/gta3 when present; the executable remains under
+# /apps/re3 (see README.md).
 #
 # This needs the opengl project built first, so that libEGL/libGLESv2 and the
 # GLES2 headers are staged into the shared build_$(ARCH)/$(HW) tree

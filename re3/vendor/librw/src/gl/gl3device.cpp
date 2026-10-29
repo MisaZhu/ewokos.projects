@@ -1248,7 +1248,10 @@ getFramebufferRect(Raster *frameBuffer)
 #elif defined(LIBRW_EWOKOS)
 		{
 			xwin_t *xw = (xwin_t*)glGlobals.window;
-			if (xw && xw->xinfo) {
+			if (getenv("RE3_NATIVE_RENDER_SIZE") != nil) {
+				r.w = glGlobals.winWidth;
+				r.h = glGlobals.winHeight;
+			} else if (xw && xw->xinfo) {
 				r.w = xw->xinfo->wsr.w;
 				r.h = xw->xinfo->wsr.h;
 			} else {
@@ -1265,6 +1268,28 @@ getFramebufferRect(Raster *frameBuffer)
 	}
 	r.x = 0;
 	r.y = 0;
+
+#if defined(LIBRW_EWOKOS)
+	/* The game camera and HUD use the original 4:3 coordinate system.  Keep
+	 * the EGL backbuffer at the workspace size, but restrict RenderWare's
+	 * viewport to the largest 4:3 rectangle that fits without cropping.  The
+	 * viewport is centered in the display; pgl_Clear clears the complete
+	 * backbuffer before each frame, so any unused area remains black and
+	 * graph_blt presents it unchanged. */
+	if (r.w > 0 && r.h > 0) {
+		const int windowH = r.h;
+		int viewportW = r.w;
+		int viewportH = (int)(((long long)viewportW * 3) / 4);
+		if (viewportH > r.h) {
+			viewportH = r.h;
+			viewportW = (int)(((long long)viewportH * 4) / 3);
+		}
+		r.x = (r.w - viewportW) / 2;
+		r.y = (windowH - viewportH) / 2;
+		r.w = viewportW;
+		r.h = viewportH;
+	}
+#endif
 
 	// Got a subraster
 	if(frameBuffer != fb){
@@ -1717,6 +1742,8 @@ startEwok(void)
 	 * Use a borderless client surface by default; RE3_WINDOWED=1 retains the
 	 * decorated window for debugging and desktop use. */
 	int style = XWIN_STYLE_NO_FRAME | XWIN_STYLE_NO_TITLE | XWIN_STYLE_NO_RESIZE;
+	if (getenv("RE3_WINDOWED") == NULL)
+		style |= XWIN_STYLE_MAX;
 	if (getenv("RE3_WINDOWED") != NULL)
 		style = XWIN_STYLE_NORMAL;
 	xwin_t *win = xwin_open(ewok_get_x(), -1, 32, 32,

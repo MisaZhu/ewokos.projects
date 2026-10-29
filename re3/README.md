@@ -44,14 +44,16 @@ make -C projects/re3 ARCH=aarch64 HW=q8b
 Any ARCH/HW with a staged `system/build_$(ARCH)/$(HW)` SDK works in principle
 (aarch64 + q8b is the one exercised). Output lands in
 `system/build_$(ARCH)/$(HW)/rootfs/apps/re3/` with the binary and the
-`gamefiles/` data already laid out next to it.
+freely distributable `gamefiles/` data staged for packaging. On EwokOS, the
+runtime uses `/data/gta3/` as the game-data root when that directory exists;
+`/apps/re3/` is reserved for the executable.
 
 ## Installing game data
 
 The staged directory already contains everything upstream ships freely:
 `data/` (particle cfg, debug + freeroam scripts), `models/` (menu/particle/font
 TXDs), `TEXT/*.gxt`, `neo/`. From an original GTA III PC install, copy into the
-same directory (`/apps/re3` on the target):
+data root (`/data/gta3` on the target):
 
 - `models/gta3.img` and `models/gta3.dir` - the world/vehicle/ped archives
 - `anim/` - ped animation packages
@@ -63,14 +65,12 @@ same directory (`/apps/re3` on the target):
   to `main.scm` if you want to run without the original script)
 - `TEXT/american.gxt` etc. come from this tree already
 
-Save games/settings live in `userfiles/` next to the binary (created on first
-run).
+Save games/settings live in `/data/gta3/userfiles/` (created on first run).
 
 ## Running
 
 ```sh
-cd /apps/re3   # cwd must contain data/ and models/
-./re3
+/apps/re3/re3
 ```
 
 The window opens centered at 640x480, with its title bar inside the desktop.

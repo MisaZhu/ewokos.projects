@@ -53,6 +53,7 @@ typedef struct egl_surface {
     EGLint type;              /* EGL_WINDOW_BIT or EGL_PBUFFER_BIT */
     xwin_t *xwin;             /* NULL for pbuffers */
     EGLint w, h;
+    EGLint render_w, render_h;
     EGLint swap_interval;
     /* Set only for the duration of an eglSwapBuffers->xwin_repaint call.
      * libx's event thread runs xwin_retry_pending_presents() (which invokes
@@ -132,6 +133,17 @@ static int egl_direct_allowed(void)
     }
     return g_egl_direct_allowed;
 }
+
+static int egl_native_render_size(int *w, int *h)
+{
+    const char *v = getenv("RE3_NATIVE_RENDER_SIZE");
+    int rw, rh;
+    if (v == NULL || sscanf(v, "%dx%d", &rw, &rh) != 2 || rw <= 0 || rh <= 0)
+        return 0;
+    *w = rw;
+    *h = rh;
+    return 1;
+}
 static void egl_profile_report(unsigned long long now, int bw, int bh,
                                int dw, int dh, int shm)
 {
@@ -170,6 +182,7 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
     graph_t src;
     unsigned long long blit_start = 0;
     int direct_present = 0;
+    int dx = 0, dy = 0, dw, dh;
 
     if (xwin == NULL || g == NULL || g->buffer == NULL)
         return;
@@ -198,6 +211,23 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
     graph_init(&src, (const uint32_t *)bb, bw, bh);
     src.shm_id = gles_engine_backbuffer_shm();
     src.shm_contig = src.shm_id > 0;
+
+    /* RE3 renders at its logical size while the xwin workspace is fullscreen.
+     * Scale into the largest centered rectangle that fits and clear first so
+     * the unused letterbox/pillarbox area stays black. */
+    dw = g->w;
+    dh = g->h;
+    if (s->render_w > 0 && s->render_h > 0 &&
+            (s->render_w != g->w || s->render_h != g->h)) {
+        dh = (int)(((long long)dw * s->render_h) / s->render_w);
+        if (dh > g->h) {
+            dh = g->h;
+            dw = (int)(((long long)dh * s->render_w) / s->render_h);
+        }
+        dx = (g->w - dw) / 2;
+        dy = (g->h - dh) / 2;
+    }
+    graph_clear(g, 0xFF000000u);
     if (egl_profile_enabled())
         blit_start = egl_profile_us();
     /* fps_async normally copies ws_g to ws_g2 after this callback.  The GPU
@@ -205,7 +235,8 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
        straight into ws_g2 and avoid that second full-window copy.  If the
        compositor still owns ws_g2, retain the old ws_g path; xwin will mark
        the frame pending and retry it without dropping the picture. */
-    if (egl_direct_allowed() && xwin->xinfo != NULL &&
+    if (egl_direct_allowed() && s->render_w == g->w && s->render_h == g->h &&
+            xwin->xinfo != NULL &&
             xwin->xinfo->fps_async)
         direct_present = xwin_present_direct(xwin, &src);
     if (direct_present) {
@@ -218,7 +249,7 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
         /* The workspace now contains this frame, so a later async retry may
            safely publish ws_g if the compositor was busy. */
         xwin->direct_frame_valid = false;
-        graph_blt(&src, 0, 0, bw, bh, g, 0, 0, g->w, g->h);
+        graph_blt(&src, 0, 0, bw, bh, g, dx, dy, dw, dh);
     }
     if (blit_start)
         g_egl_blit_us += egl_profile_us() - blit_start;
@@ -234,9 +265,13 @@ static void egl_on_resize(xwin_t *xwin)
     h = xwin->xinfo->wsr.h;
     if (w <= 0 || h <= 0)
         return;
-    gles_engine_resize(w, h);
     s = (egl_surface_t *)xwin->data;
-    if (s != NULL) { s->w = w; s->h = h; }
+    if (s != NULL) {
+        s->w = w;
+        s->h = h;
+        if (s->render_w == w && s->render_h == h)
+            gles_engine_resize(w, h);
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -451,14 +486,17 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
     s->xwin = xwin;
     s->w = g.w;
     s->h = g.h;
+    s->render_w = g.w;
+    s->render_h = g.h;
+    egl_native_render_size(&s->render_w, &s->render_h);
     s->swap_interval = 1;
 
-    if (!gles_engine_init(g.w, g.h)) {
+    if (!gles_engine_init(s->render_w, s->render_h)) {
         free(s);
         set_err(EGL_BAD_ALLOC);
         return EGL_NO_SURFACE;
     }
-    gles_engine_resize(g.w, g.h);
+    gles_engine_resize(s->render_w, s->render_h);
 
     pthread_mutex_lock(&xwin->painting_lock);
     xwin->data = s;
@@ -484,6 +522,8 @@ EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLin
     s->xwin = NULL;
     s->w = w;
     s->h = h;
+    s->render_w = w;
+    s->render_h = h;
     if (!gles_engine_init(w, h)) { free(s); set_err(EGL_BAD_ALLOC); return EGL_NO_SURFACE; }
     gles_engine_resize(w, h);
     return (EGLSurface)s;
@@ -546,7 +586,7 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
     if (ctx == EGL_NO_CONTEXT) return set_err(EGL_BAD_CONTEXT);
 
     gles_engine_make_current();
-    gles_engine_viewport(0, 0, s->w, s->h);
+    gles_engine_viewport(0, 0, s->render_w, s->render_h);
     g_current_draw = s;
     g_current_ctx = (egl_context_t *)ctx;
     s->ctx = g_current_ctx;

@@ -1,6 +1,5 @@
-#line 1 "glcpp-lex.c"
 
-#line 3 "glcpp-lex.c"
+#line 2 "<stdout>"
 
 #define  YY_INT_ALIGNED short int
 
@@ -845,8 +844,8 @@ static const flex_int16_t yy_chk[588] =
 #define yymore() yymore_used_but_not_detected
 #define YY_MORE_ADJ 0
 #define YY_RESTORE_YY_MORE_OFFSET
-#line 1 "glcpp-lex.l"
-#line 2 "glcpp-lex.l"
+#line 1 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
+#line 2 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 /*
  * Copyright © 2010 Intel Corporation
  *
@@ -1013,8 +1012,8 @@ glcpp_lex_update_state_per_token (glcpp_parser_t *parser, int token)
 }
 
 
-#line 1016 "glcpp-lex.c"
-#line 178 "glcpp-lex.l"
+#line 1015 "<stdout>"
+#line 178 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 	/* Note: When adding any start conditions to this list, you must also
 	 * update the "Internal compiler error" catch-all rule near the end of
 	 * this file. */
@@ -1025,7 +1024,7 @@ match longer strings take priority over those matching shorter
 strings, we have to be careful to avoid OTHER matching and hiding
 something that CPP does care about. So we simply exclude all
 characters that appear in any other expressions. */
-#line 1028 "glcpp-lex.c"
+#line 1027 "<stdout>"
 
 #define INITIAL 0
 #define COMMENT 1
@@ -1319,7 +1318,7 @@ YY_DECL
 		}
 
 	{
-#line 208 "glcpp-lex.l"
+#line 208 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 
 
 	glcpp_parser_t *parser = yyextra;
@@ -1380,7 +1379,7 @@ YY_DECL
 	}
 
 	/* Single-line comments */
-#line 1383 "glcpp-lex.c"
+#line 1382 "<stdout>"
 
 	while ( /*CONSTCOND*/1 )		/* loops until end-of-file is reached */
 		{
@@ -1435,41 +1434,41 @@ do_action:	/* This label is used only to access EOF actions. */
 
 case 1:
 YY_RULE_SETUP
-#line 268 "glcpp-lex.l"
+#line 268 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 }
 	YY_BREAK
 /* Multi-line comments */
 case 2:
 YY_RULE_SETUP
-#line 272 "glcpp-lex.l"
+#line 272 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 { yy_push_state(COMMENT, yyscanner); }
 	YY_BREAK
 case 3:
 YY_RULE_SETUP
-#line 273 "glcpp-lex.l"
+#line 273 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 
 	YY_BREAK
 case 4:
 /* rule 4 can match eol */
 YY_RULE_SETUP
-#line 274 "glcpp-lex.l"
+#line 274 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 { yylineno++; yycolumn = 0; parser->commented_newlines++; }
 	YY_BREAK
 case 5:
 YY_RULE_SETUP
-#line 275 "glcpp-lex.l"
+#line 275 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 
 	YY_BREAK
 case 6:
 /* rule 6 can match eol */
 YY_RULE_SETUP
-#line 276 "glcpp-lex.l"
+#line 276 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 { yylineno++; yycolumn = 0; parser->commented_newlines++; }
 	YY_BREAK
 case 7:
 YY_RULE_SETUP
-#line 277 "glcpp-lex.l"
+#line 277 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	yy_pop_state(yyscanner);
 	/* In the <HASH> start condition, we don't want any SPACE token. */
@@ -1479,7 +1478,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 8:
 YY_RULE_SETUP
-#line 284 "glcpp-lex.l"
+#line 284 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 
 	/* If the '#' is the first non-whitespace, non-comment token on this
@@ -1498,7 +1497,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 9:
 YY_RULE_SETUP
-#line 300 "glcpp-lex.l"
+#line 300 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	yyextra->space_tokens = 0;
@@ -1521,7 +1520,7 @@ YY_LINENO_REWIND_TO(yy_cp - 1);
 yyg->yy_c_buf_p = yy_cp -= 1;
 YY_DO_BEFORE_ACTION; /* set up yytext again */
 YY_RULE_SETUP
-#line 315 "glcpp-lex.l"
+#line 315 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 }
@@ -1530,7 +1529,7 @@ YY_RULE_SETUP
 	 * Simply pass them through to the main compiler's lexer/parser. */
 case 11:
 YY_RULE_SETUP
-#line 321 "glcpp-lex.l"
+#line 321 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	RETURN_STRING_TOKEN (PRAGMA);
@@ -1538,7 +1537,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 12:
 YY_RULE_SETUP
-#line 326 "glcpp-lex.l"
+#line 326 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	RETURN_STRING_TOKEN (INCLUDE);
@@ -1546,7 +1545,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 13:
 YY_RULE_SETUP
-#line 331 "glcpp-lex.l"
+#line 331 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	RETURN_TOKEN (LINE);
@@ -1555,7 +1554,7 @@ YY_RULE_SETUP
 case 14:
 /* rule 14 can match eol */
 YY_RULE_SETUP
-#line 336 "glcpp-lex.l"
+#line 336 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	yyextra->space_tokens = 0;
@@ -1568,7 +1567,7 @@ YY_RULE_SETUP
 	 * even when we are otherwise skipping. */
 case 15:
 YY_RULE_SETUP
-#line 346 "glcpp-lex.l"
+#line 346 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (!yyextra->in_define) {
 		BEGIN INITIAL;
@@ -1580,7 +1579,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 16:
 YY_RULE_SETUP
-#line 355 "glcpp-lex.l"
+#line 355 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (!yyextra->in_define) {
 		BEGIN INITIAL;
@@ -1597,7 +1596,7 @@ YY_LINENO_REWIND_TO(yy_bp + 2);
 yyg->yy_c_buf_p = yy_cp = yy_bp + 2;
 YY_DO_BEFORE_ACTION; /* set up yytext again */
 YY_RULE_SETUP
-#line 364 "glcpp-lex.l"
+#line 364 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (!yyextra->in_define) {
 		BEGIN INITIAL;
@@ -1614,7 +1613,7 @@ YY_LINENO_REWIND_TO(yy_bp + 4);
 yyg->yy_c_buf_p = yy_cp = yy_bp + 4;
 YY_DO_BEFORE_ACTION; /* set up yytext again */
 YY_RULE_SETUP
-#line 373 "glcpp-lex.l"
+#line 373 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (!yyextra->in_define) {
 		BEGIN INITIAL;
@@ -1626,7 +1625,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 19:
 YY_RULE_SETUP
-#line 382 "glcpp-lex.l"
+#line 382 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (!yyextra->in_define) {
 		BEGIN INITIAL;
@@ -1637,7 +1636,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 20:
 YY_RULE_SETUP
-#line 390 "glcpp-lex.l"
+#line 390 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (!yyextra->in_define) {
 		BEGIN INITIAL;
@@ -1648,7 +1647,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 21:
 YY_RULE_SETUP
-#line 398 "glcpp-lex.l"
+#line 398 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	RETURN_STRING_TOKEN (ERROR_TOKEN);
@@ -1674,7 +1673,7 @@ YY_RULE_SETUP
 	 */
 case 22:
 YY_RULE_SETUP
-#line 421 "glcpp-lex.l"
+#line 421 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	yyextra->in_define = true;
 	if (!parser->skipping) {
@@ -1686,7 +1685,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 23:
 YY_RULE_SETUP
-#line 430 "glcpp-lex.l"
+#line 430 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	yyextra->space_tokens = 0;
@@ -1695,7 +1694,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 24:
 YY_RULE_SETUP
-#line 436 "glcpp-lex.l"
+#line 436 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	/* Nothing to do here. Importantly, don't leave the <HASH>
 	 * start condition, since it's legal to have space between the
@@ -1705,7 +1704,7 @@ YY_RULE_SETUP
 /* This will catch any non-directive garbage after a HASH */
 case 25:
 YY_RULE_SETUP
-#line 443 "glcpp-lex.l"
+#line 443 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (!parser->skipping) {
 		BEGIN INITIAL;
@@ -1719,7 +1718,7 @@ case 26:
 yyg->yy_c_buf_p = yy_cp -= 1;
 YY_DO_BEFORE_ACTION; /* set up yytext again */
 YY_RULE_SETUP
-#line 451 "glcpp-lex.l"
+#line 451 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	RETURN_STRING_TOKEN (FUNC_IDENTIFIER);
@@ -1728,7 +1727,7 @@ YY_RULE_SETUP
 /* An identifier not immediately followed by '(' */
 case 27:
 YY_RULE_SETUP
-#line 457 "glcpp-lex.l"
+#line 457 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	RETURN_STRING_TOKEN (OBJ_IDENTIFIER);
@@ -1737,7 +1736,7 @@ YY_RULE_SETUP
 /* Whitespace */
 case 28:
 YY_RULE_SETUP
-#line 463 "glcpp-lex.l"
+#line 463 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	/* Just ignore it. Nothing to do here. */
 }
@@ -1746,7 +1745,7 @@ YY_RULE_SETUP
 case 29:
 /* rule 29 can match eol */
 YY_RULE_SETUP
-#line 468 "glcpp-lex.l"
+#line 468 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	glcpp_error(yylloc, yyextra, "#define followed by a non-identifier: %s", yytext);
@@ -1757,7 +1756,7 @@ YY_RULE_SETUP
 	 * space. This is an error. */
 case 30:
 YY_RULE_SETUP
-#line 476 "glcpp-lex.l"
+#line 476 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	BEGIN INITIAL;
 	glcpp_error(yylloc, yyextra, "#define followed by a non-identifier: %s", yytext);
@@ -1766,98 +1765,98 @@ YY_RULE_SETUP
 	YY_BREAK
 case 31:
 YY_RULE_SETUP
-#line 482 "glcpp-lex.l"
+#line 482 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_STRING_TOKEN (INTEGER_STRING);
 }
 	YY_BREAK
 case 32:
 YY_RULE_SETUP
-#line 486 "glcpp-lex.l"
+#line 486 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_STRING_TOKEN (INTEGER_STRING);
 }
 	YY_BREAK
 case 33:
 YY_RULE_SETUP
-#line 490 "glcpp-lex.l"
+#line 490 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_STRING_TOKEN (INTEGER_STRING);
 }
 	YY_BREAK
 case 34:
 YY_RULE_SETUP
-#line 494 "glcpp-lex.l"
+#line 494 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (LEFT_SHIFT);
 }
 	YY_BREAK
 case 35:
 YY_RULE_SETUP
-#line 498 "glcpp-lex.l"
+#line 498 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (RIGHT_SHIFT);
 }
 	YY_BREAK
 case 36:
 YY_RULE_SETUP
-#line 502 "glcpp-lex.l"
+#line 502 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (LESS_OR_EQUAL);
 }
 	YY_BREAK
 case 37:
 YY_RULE_SETUP
-#line 506 "glcpp-lex.l"
+#line 506 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (GREATER_OR_EQUAL);
 }
 	YY_BREAK
 case 38:
 YY_RULE_SETUP
-#line 510 "glcpp-lex.l"
+#line 510 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (EQUAL);
 }
 	YY_BREAK
 case 39:
 YY_RULE_SETUP
-#line 514 "glcpp-lex.l"
+#line 514 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (NOT_EQUAL);
 }
 	YY_BREAK
 case 40:
 YY_RULE_SETUP
-#line 518 "glcpp-lex.l"
+#line 518 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (AND);
 }
 	YY_BREAK
 case 41:
 YY_RULE_SETUP
-#line 522 "glcpp-lex.l"
+#line 522 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (OR);
 }
 	YY_BREAK
 case 42:
 YY_RULE_SETUP
-#line 526 "glcpp-lex.l"
+#line 526 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (PLUS_PLUS);
 }
 	YY_BREAK
 case 43:
 YY_RULE_SETUP
-#line 530 "glcpp-lex.l"
+#line 530 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (MINUS_MINUS);
 }
 	YY_BREAK
 case 44:
 YY_RULE_SETUP
-#line 534 "glcpp-lex.l"
+#line 534 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (! parser->skipping) {
 		if (parser->is_gles)
@@ -1868,42 +1867,42 @@ YY_RULE_SETUP
 	YY_BREAK
 case 45:
 YY_RULE_SETUP
-#line 542 "glcpp-lex.l"
+#line 542 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (DEFINED);
 }
 	YY_BREAK
 case 46:
 YY_RULE_SETUP
-#line 546 "glcpp-lex.l"
+#line 546 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_STRING_TOKEN (IDENTIFIER);
 }
 	YY_BREAK
 case 47:
 YY_RULE_SETUP
-#line 550 "glcpp-lex.l"
+#line 550 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_STRING_TOKEN (OTHER);
 }
 	YY_BREAK
 case 48:
 YY_RULE_SETUP
-#line 554 "glcpp-lex.l"
+#line 554 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_TOKEN (yytext[0]);
 }
 	YY_BREAK
 case 49:
 YY_RULE_SETUP
-#line 558 "glcpp-lex.l"
+#line 558 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_STRING_TOKEN (OTHER);
 }
 	YY_BREAK
 case 50:
 YY_RULE_SETUP
-#line 562 "glcpp-lex.l"
+#line 562 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (yyextra->space_tokens) {
 		RETURN_TOKEN (SPACE);
@@ -1912,7 +1911,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 51:
 YY_RULE_SETUP
-#line 568 "glcpp-lex.l"
+#line 568 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	RETURN_STRING_TOKEN (PATH);
 }
@@ -1922,7 +1921,7 @@ YY_RULE_SETUP
 case 52:
 /* rule 52 can match eol */
 YY_RULE_SETUP
-#line 574 "glcpp-lex.l"
+#line 574 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (parser->commented_newlines) {
 		BEGIN NEWLINE_CATCHUP;
@@ -1941,7 +1940,7 @@ case YY_STATE_EOF(INITIAL):
 case YY_STATE_EOF(COMMENT):
 case YY_STATE_EOF(DEFINE):
 case YY_STATE_EOF(HASH):
-#line 588 "glcpp-lex.l"
+#line 588 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	if (YY_START == COMMENT)
 		glcpp_error(yylloc, yyextra, "Unterminated comment");
@@ -1958,7 +1957,7 @@ case YY_STATE_EOF(HASH):
 	 * of the preceding patterns to match that input. */
 case 53:
 YY_RULE_SETUP
-#line 603 "glcpp-lex.l"
+#line 603 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 {
 	glcpp_error(yylloc, yyextra, "Internal compiler error: Unexpected character: %s", yytext);
 
@@ -1974,10 +1973,10 @@ YY_RULE_SETUP
 	YY_BREAK
 case 54:
 YY_RULE_SETUP
-#line 616 "glcpp-lex.l"
+#line 616 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 YY_FATAL_ERROR( "flex scanner jammed" );
 	YY_BREAK
-#line 1980 "glcpp-lex.c"
+#line 1979 "<stdout>"
 case YY_STATE_EOF(DONE):
 case YY_STATE_EOF(NEWLINE_CATCHUP):
 case YY_STATE_EOF(NOT_REACHABLE):
@@ -3214,7 +3213,7 @@ void yyfree (void * ptr , yyscan_t yyscanner)
 
 #define YYTABLES_NAME "yytables"
 
-#line 616 "glcpp-lex.l"
+#line 616 "mesa/src/compiler/glsl/glcpp/glcpp-lex.l"
 
 
 void
