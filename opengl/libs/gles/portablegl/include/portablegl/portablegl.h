@@ -2960,6 +2960,9 @@ typedef struct glVertex
 	vec4 screen_space;
 	int clip_code;
 	int edge_flag;
+	GLboolean screen_space_valid;
+	GLboolean rw_projected_valid;
+	float rw_projected_x, rw_projected_y, rw_projected_z, rw_projected_iw;
 	float* vs_out;
 } glVertex;
 
@@ -3699,6 +3702,11 @@ typedef struct pgl_vertex
 	vec2 tex_coord;
 } pgl_vertex;
 
+/* Optional post-clip triangle observer.  Returning non-zero consumes the
+ * triangle and prevents the normal CPU rasterizer from drawing it. */
+typedef int (*pgl_triangle_callback)(const glVertex*, const glVertex*,
+                                     const glVertex*, void*);
+
 
 // TODO use ints like SDL or keep floats?
 typedef struct pgl_fill_data
@@ -3749,7 +3757,15 @@ PGLDEF void pglTextureImage3D(GLuint texture, GLint level, GLint internalformat,
 PGLDEF void pglGetBufferData(GLuint buffer, GLvoid** data);
 PGLDEF void pglGetTextureData(GLuint texture, GLvoid** data);
 
-GLvoid* pglGetBackBuffer(void);
+PGLDEF GLvoid* pglGetBackBuffer(void);
+typedef void (*pgl_vertex_executor)(int worker, float*, vec4*, Shader_Builtins*, void*);
+PGLDEF void pglSetVertexExecutor(pgl_vertex_executor fn, void *user);
+PGLDEF int pglVertexWorkerCount(void);
+PGLDEF void pglStopVertexWorkers(void);
+PGLDEF void pglSetTriangleCallback(pgl_triangle_callback fn, void *user);
+/* Post-clip collector that does not require screen_space. With culling off,
+ * runs before the viewport transform; returning zero still rasterizes normally. */
+PGLDEF void pglSetClipTriangleCallback(pgl_triangle_callback fn, void *user);
 PGLDEF void pglSetBackBuffer(GLvoid* backbuf, GLsizei w, GLsizei h, GLboolean user_owned);
 PGLDEF void pglSetTexBackBuffer(GLuint texture);
 

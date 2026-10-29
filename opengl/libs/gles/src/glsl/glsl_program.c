@@ -297,6 +297,35 @@ glsl_program *glsl_link(glsl_stage *vs, glsl_stage *fs, char *err, int errsz)
     return p;
 }
 
+void glsl_free_executor(glsl_program *p)
+{
+    if (!p) return;
+    glsl_vm_free(p);
+    free(p->vs_gstore); free(p->fs_gstore);
+    free(p->scratch); free(p->stack); free(p);
+}
+
+glsl_program *glsl_clone_executor(const glsl_program *src)
+{
+    glsl_program *p;
+    if (!src || !src->linked) return NULL;
+    p = (glsl_program *)malloc(sizeof *p);
+    if (!p) return NULL;
+    memcpy(p, src, sizeof *p);
+    p->vm_vs = p->vm_fs = NULL; p->vm_tried = 0;
+    p->vs_gstore = p->fs_gstore = p->scratch = p->stack = NULL;
+    p->scratch = (glsl_cell *)calloc(p->scratch_cap, sizeof(glsl_cell));
+    p->stack = (glsl_cell *)calloc(p->stack_cap, sizeof(glsl_cell));
+    if (p->vs_gcells) p->vs_gstore = (glsl_cell *)calloc(p->vs_gcells, sizeof(glsl_cell));
+    if (p->fs_gcells) p->fs_gstore = (glsl_cell *)calloc(p->fs_gcells, sizeof(glsl_cell));
+    if (!p->scratch || !p->stack || (p->vs_gcells && !p->vs_gstore) ||
+        (p->fs_gcells && !p->fs_gstore)) {
+        glsl_free_executor(p);
+        return NULL;
+    }
+    return p;
+}
+
 void glsl_free_program(glsl_program *p)
 {
     if (!p) return;

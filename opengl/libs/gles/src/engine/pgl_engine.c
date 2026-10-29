@@ -19,6 +19,9 @@
 #include <string.h>
 #ifdef PGL_G3D
 #include <stdlib.h>
+#include <math.h>
+#include <stdio.h>
+#include <time.h>
 #endif
 
 #include "portablegl/portablegl.h"
@@ -39,6 +42,94 @@ static int       g_inited = 0;
 static GLsizei   g_w = 0;
 static GLsizei   g_h = 0;
 
+#ifdef PGL_G3D
+static int g_profile = -1;
+static unsigned g_prof_submits;
+static unsigned g_prof_rw_small;
+static unsigned g_prof_rw_replay;
+static unsigned g_prof_rw_decline;
+static unsigned g_prof_native_programs;
+static unsigned g_prof_native_vertices;
+static unsigned g_prof_interp_vertices;
+static unsigned long long g_prof_submit_us;
+static unsigned long long g_prof_rw_collect_us, g_prof_rw_route_us;
+static unsigned g_prof_rw_tex_uploads;
+static unsigned long long g_prof_rw_tex_bytes;
+static unsigned g_prof_frames;
+static unsigned long long g_prof_epoch;
+static void rw_gpu_profile_window(void);
+static unsigned long long profile_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ull +
+           (unsigned long long)ts.tv_nsec / 1000ull;
+}
+static int profile_enabled(void)
+{
+    if (g_profile < 0) {
+        const char *v = getenv("PGL_PROFILE");
+        g_profile = v && atoi(v) != 0;
+    }
+    return g_profile;
+}
+static void profile_inc(unsigned *counter)
+{
+    if (profile_enabled())
+        /* These counters are diagnostics only.  They are touched for every
+         * vertex, including worker threads; a non-atomic diagnostic increment
+         * keeps the profile path from becoming the new CPU bottleneck. */
+        ++*counter;
+}
+static void profile_frame(void)
+{
+    unsigned long long now;
+    if (!profile_enabled()) return;
+    now = profile_us();
+    if (!g_prof_epoch) {
+        const char *rw = getenv("PGL_RW_GPU");
+        const char *batch = getenv("PGL_RW_BATCH");
+        const char *native = getenv("PGL_RW_NATIVE");
+        const char *native_exp = getenv("PGL_RW_NATIVE_EXPERIMENTAL");
+        const char *min_tris = getenv("PGL_RW_MIN_TRIS");
+        const char *min_pixels = getenv("PGL_RW_MIN_PIXELS");
+        const char *threads = getenv("PGL_VERTEX_THREADS");
+        const char *vertex_min = getenv("PGL_VERTEX_MIN");
+        const char *cache = getenv("PGL_VERTEX_CACHE");
+        printf("PGL_PROFILE config rw_gpu=%s rw_batch=%s rw_native=%s rw_native_experimental=%s rw_min_tris=%s rw_min_pixels=%s vertex_threads=%s vertex_min=%s vertex_cache=%s\n",
+               rw ? rw : "(unset)", batch ? batch : "(unset)",
+               native ? native : "(unset)", native_exp ? native_exp : "(unset)",
+               min_tris ? min_tris : "(unset)",
+               min_pixels ? min_pixels : "(unset)",
+               threads ? threads : "(unset)", vertex_min ? vertex_min : "(unset)",
+               cache ? cache : "(unset)");
+        fflush(stdout);
+        g_prof_epoch = now;
+    }
+    ++g_prof_frames;
+    if (now - g_prof_epoch < 5000000ull) return;
+    printf("PGL_PROFILE submits=%u/%.1fms rw_small=%u rw_replay=%u rw_decline=%u native_prog=%u native_vs=%u interp_vs=%u vertex_workers=%d frames=%u size=%dx%d fps=%.2f rw_route=%.1fms rw_collect=%.1fms window=%.1fms\n",
+           g_prof_submits, g_prof_submit_us / 1000.0, g_prof_rw_small,
+           g_prof_rw_replay, g_prof_rw_decline, g_prof_native_programs, g_prof_native_vertices,
+           g_prof_interp_vertices, pglVertexWorkerCount(), g_prof_frames, g_w, g_h,
+           (double)g_prof_frames * 1000000.0 / (double)(now-g_prof_epoch),
+           g_prof_rw_route_us/1000.0, g_prof_rw_collect_us/1000.0,
+           (now-g_prof_epoch)/1000.0);
+    printf("PGL_PROFILE rw_texture uploads=%u bytes=%llu\n",
+           g_prof_rw_tex_uploads, g_prof_rw_tex_bytes);
+    rw_gpu_profile_window();
+    fflush(stdout);
+    g_prof_epoch = now;
+    g_prof_submits = g_prof_rw_small = g_prof_rw_replay = g_prof_rw_decline = 0;
+    g_prof_native_programs = g_prof_native_vertices = g_prof_interp_vertices = 0;
+    g_prof_frames = 0;
+    g_prof_submit_us = 0;
+    g_prof_rw_collect_us = g_prof_rw_route_us = 0;
+    g_prof_rw_tex_uploads = 0;
+    g_prof_rw_tex_bytes = 0;
+}
+#endif
+
 /* Texture-unit -> bound texture name tracking.  portablegl's texture2D() takes
  * an explicit texture object name, but a GLES2 sampler2D uniform holds a texture
  * UNIT, so the interpreter's sampling callback resolves unit -> name here. */
@@ -48,6 +139,27 @@ static int    g_active_unit = 0;
 /* Direct 1:1 fullscreen textured-blit fast-path (defined below).  Returns 1
  * when it fully handled the draw, 0 to fall through to the interpreter. */
 static int cpu_try_direct_blit(GLenum mode, GLint first, GLsizei count);
+static void interp_registry_fini(void);
+
+#ifdef PGL_G3D
+static void rw_gpu_detach(void);
+static void rw_gpu_fini(void);
+static void rw_gpu_poll_controls(void);
+static int rw_gpu_shm(void);
+static void rw_gpu_texture_deleted(GEint n, const GEuint *names);
+static int rw_gpu_draw(GLenum mode, GLint first, GLsizei count,
+                       GLenum type, const void *indices);
+static void rw_gpu_legacy_flush(void);
+static int rw_gpu_allowed(void);
+#else
+static void rw_gpu_detach(void) { }
+static void rw_gpu_fini(void) { }
+static void rw_gpu_poll_controls(void) { }
+static int rw_gpu_shm(void) { return 0; }
+static int rw_gpu_flush(void) { return 1; }
+static void rw_gpu_texture_deleted(GEint n, const GEuint *names)
+{ (void)n; (void)names; }
+#endif
 
 #ifdef PGL_G3D
 /* Transparent V3D GPU bridge hooks (defined at the bottom of this TU, the only
@@ -67,11 +179,14 @@ int gles_engine_init(GEint w, GEint h)
     pix_t *back = NULL;   /* NULL => portablegl allocates the back buffer */
     if (g_inited)
         return 1;
+    pglSetTriangleCallback(NULL, NULL);
     if (!init_glContext(&g_ctx, &back, (GLsizei)w, (GLsizei)h))
         return 0;
     set_glContext(&g_ctx);
     g_w = w;
     g_h = h;
+    memset(g_tex_unit, 0, sizeof(g_tex_unit));
+    g_active_unit = 0;
     g_inited = 1;
     return 1;
 }
@@ -80,6 +195,11 @@ void gles_engine_fini(void)
 {
     if (!g_inited)
         return;
+    gles_engine_gpu_flush();
+    pglSetTriangleCallback(NULL, NULL);
+    pglStopVertexWorkers();
+    interp_registry_fini();
+    rw_gpu_fini();
     free_glContext(&g_ctx);
     g_inited = 0;
     g_w = g_h = 0;
@@ -102,6 +222,8 @@ int gles_engine_resize(GEint w, GEint h)
 {
     if (!g_inited)
         return 0;
+    gles_engine_gpu_flush();
+    rw_gpu_detach();
     if (!pglResizeFramebuffer((GLsizei)w, (GLsizei)h))
         return 0;
     g_w = w;
@@ -112,6 +234,8 @@ int gles_engine_resize(GEint w, GEint h)
 void *gles_engine_backbuffer(void)
 {
     gles_engine_gpu_flush();   /* land coalesced GPU draws before a blit/readback */
+    rw_gpu_poll_controls();
+    profile_frame();
     return pglGetBackBuffer();
 }
 
@@ -128,6 +252,8 @@ int gles_engine_bitdepth(void)
 
 int gles_engine_backbuffer_shm(void)
 {
+    int shm = rw_gpu_shm();
+    if (shm) return shm;
 #ifdef PGL_G3D
     /* Only while portablegl's back buffer IS the pgl_g3d target (pglGpuBegin
      * adopted it); a CPU-only app keeps its malloc back buffer and must stay
@@ -290,6 +416,30 @@ static const epair format_map[] = {
       GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2 },
     { GLES2_GL_COMPRESSED_RGBA8_ETC2_EAC, GL_COMPRESSED_RGBA8_ETC2_EAC },
 };
+
+/* RenderWare's GLES2 compatibility path still uses desktop sized internal
+ * formats (GL_RGB8/GL_RGBA8/GL_RGBA4/GL_RGB5_A1/GL_RGB565).  portablegl
+ * stores every 2D level in its canonical RGBA8 backing store and, like GLES2,
+ * accepts the unsized format as the upload contract.  Passing the desktop
+ * token through makes pgl_TexImage2D reject every upload with
+ * GL_INVALID_OPERATION (internalformat != format), turning texture work into
+ * repeated failed calls and leaving the GPU sampler with empty images.
+ * Normalize only these sized tokens; the external format and type still
+ * determine the actual unpack conversion.
+ */
+static unsigned gles_tex_internalformat(unsigned internalformat, unsigned format)
+{
+    switch (internalformat) {
+    case 0x8051u: /* GL_RGB8 */
+    case 0x8058u: /* GL_RGBA8 */
+    case 0x8056u: /* GL_RGBA4 */
+    case 0x8057u: /* GL_RGB5_A1 */
+    case 0x8D62u: /* GL_RGB565 */
+        return format;
+    default:
+        return internalformat;
+    }
+}
 
 static const epair type_map[] = {
     { GLES2_GL_UNSIGNED_BYTE,  GL_UNSIGNED_BYTE  },
@@ -725,6 +875,7 @@ void gles_engine_delete_textures(GEint n, const GEuint *t)
     GEint i;
     int unit;
     if (n < 0 || !t) { pgl_DeleteTextures(n, t); return; }
+    rw_gpu_texture_deleted(n, t);
     for (i = 0; i < n; ++i)
         for (unit = 0; unit < 32; ++unit)
             if (g_tex_unit[unit] == t[i]) g_tex_unit[unit] = 0;
@@ -794,10 +945,12 @@ void gles_engine_tex_image_2d(GEenum target, GEint level, GEint internalformat,
                               GEint w, GEint h, GEint border,
                               GEenum format, GEenum type, const void *data)
 {
+    unsigned mapped_format = EMAP(format_map, format);
     pgl_TexImage2D(EMAP(tex_target_map, target), level,
-                   (GLint)EMAP(format_map, (unsigned)internalformat),
+                   (GLint)gles_tex_internalformat(
+                       EMAP(format_map, (unsigned)internalformat), mapped_format),
                    w, h, border,
-                   EMAP(format_map, format), EMAP(type_map, type), data);
+                   mapped_format, EMAP(type_map, type), data);
 #ifdef PGL_G3D
     /* Mirror a 2D RGBA8 image into a GPU raster-texture slot so the textured
      * geometry kernel can sample it; the CPU interpreter keeps using the
@@ -1009,6 +1162,8 @@ void gles_engine_get_vertex_attrib_pointerv(GEuint index, GEenum pname, void **p
 void gles_engine_draw_arrays(GEenum mode, GEint first, GEint count)
 {
 #ifdef PGL_G3D
+    if (rw_gpu_draw(EMAP(prim_map, mode), first, count, 0, NULL))
+        return;
     /* Route an eligible draw onto the V3D geometry kernel; a 0 return means the
      * program is CPU-only (never compiled, declined, or a non-triangle mode) and
      * the interpreter draws it unchanged.  Inert off raspi5. */
@@ -1032,6 +1187,8 @@ void gles_engine_draw_arrays(GEenum mode, GEint first, GEint count)
 void gles_engine_draw_elements(GEenum mode, GEint count, GEenum type, const void *indices)
 {
 #ifdef PGL_G3D
+    if (rw_gpu_draw(EMAP(prim_map, mode), 0, count, EMAP(type_map, type), indices))
+        return;
     /* Colour-modulated textured indexed draw (imgui, cs_is_geom=4): tessellate
      * to a triangle list, stage pos+uv+colour at stride 10 and dispatch on the
      * QPU.  Returns 0 when not eligible or declined, falling through to the CPU
@@ -1061,6 +1218,35 @@ typedef struct {
     glsl_program  *gp;
     glsl_cell     *ublock;
     int            in_use;
+#ifdef PGL_G3D
+    glsl_program  *rw_executor[7]; /* generic VS executor clones */
+    int            rw_simple, rw_alpha_test, rw_uv, rw_color, rw_fog;
+    int            rw_sampler, rw_alpha, rw_fogcolor;
+    int            rw_uv1, rw_envcolor, rw_sampler1, rw_fx;
+    /* RenderWare vertex shaders have a small fixed family.  When the linked
+     * source hash matches one of those shaders, rw_simple.inc supplies a
+     * native C executor for the VS.  The generic GLSL executor remains the
+     * fallback for every unrecognised variant. */
+    int            rw_native_vs, rw_native_lit, rw_native_full_lights;
+    int            rw_runtime_lights;
+    int            rw_pos_loc, rw_normal_loc, rw_color_loc;
+    int            rw_weights_loc, rw_indices_loc, rw_tex0_loc, rw_tex1_loc;
+    int            rw_v_color, rw_v_tex0, rw_v_fog, rw_v_env, rw_v_tex1;
+    int            rw_u_xform, rw_u_world, rw_u_view, rw_u_proj;
+    int            rw_u_bones, rw_u_amb, rw_u_light_params, rw_u_light_pos;
+    int            rw_u_light_dir, rw_u_light_color, rw_u_mat, rw_u_surf;
+    int            rw_u_fog_data, rw_u_tex_matrix, rw_u_color_clamp;
+    int            rw_u_env_color;
+    float          rw_view_proj[16];
+    float          rw_cached_view[16];
+    float          rw_cached_proj[16];
+    int            rw_view_proj_cache_valid;
+    int            rw_view_proj_valid;
+    /* The unlit IM3D shader only needs P*V*World.  Build this product once
+     * per draw so each vertex does one matrix-vector multiply. */
+    float          rw_clip_matrix[16];
+    int            rw_clip_matrix_valid;
+#endif
     /* Native gouraud fast-path (see match_gouraud): when `gouraud` is set the
      * program runs on ff_gouraud_vert/ff_gouraud_frag instead of the tree-
      * walking interpreter, reading the MVP mat4 straight out of the uniform
@@ -1111,6 +1297,10 @@ typedef struct {
 
 static interp_entry  g_reg[GLES_MAX_INTERP];
 static interp_entry *g_active = NULL;
+#ifdef PGL_G3D
+#include "rw_simple.inc"
+#include "rw_gpu.inc"
+#endif
 
 static interp_entry *find_entry(GLuint id)
 {
@@ -1154,11 +1344,69 @@ static void interp_vert(float *vs_output, vec4 *vertex_attribs,
     int i, n;
     (void)uniforms;
     if (!e || !e->gp) return;
+#ifdef PGL_G3D
+    if (e->rw_native_vs) {
+        profile_inc(&g_prof_native_vertices);
+        rw_native_vertex(0, vs_output, vertex_attribs, builtins, e);
+        return;
+    }
+#endif
+#ifdef PGL_G3D
+    profile_inc(&g_prof_interp_vertices);
+#endif
     n = e->gp->nattr_components;
     if (n > GLSL_MAX_ATTRIBS) n = GLSL_MAX_ATTRIBS;
     for (i = 0; i < n; ++i) attribs[i] = &vertex_attribs[i].x;
     glsl_run_vertex(e->gp, attribs, n, e->ublock, bridge_tex_sample, e, vs_output,
                     (float *)&builtins->gl_Position, builtins->gl_InstanceID);
+}
+
+#ifdef PGL_G3D
+static void interp_parallel_vert(int worker, float *out, vec4 *attrs,
+                                 Shader_Builtins *b, void *user)
+{
+    interp_entry *e = (interp_entry *)user;
+    glsl_program *gp = e ? e->gp : NULL;
+    const float *attribs[GLSL_MAX_ATTRIBS];
+    int i, n;
+    if (!e || !gp) return;
+#ifdef PGL_G3D
+    if (e->rw_native_vs) {
+        profile_inc(&g_prof_native_vertices);
+        rw_native_vertex(worker, out, attrs, b, e);
+        return;
+    }
+#endif
+#ifdef PGL_G3D
+    profile_inc(&g_prof_interp_vertices);
+#endif
+    if (worker > 0) gp = e->rw_executor[worker - 1];
+    if (!gp) return;
+    n = gp->nattr_components;
+    if (n > GLSL_MAX_ATTRIBS) n = GLSL_MAX_ATTRIBS;
+    for (i = 0; i < n; ++i) attribs[i] = &attrs[i].x;
+    glsl_run_vertex(gp, attribs, n, e->ublock, bridge_tex_sample, e, out,
+                    (float *)&b->gl_Position, b->gl_InstanceID);
+}
+
+static void interp_free_executors(interp_entry *e)
+{
+    int i;
+    if (!e) return;
+    for (i = 0; i < 7; ++i) {
+        glsl_free_executor(e->rw_executor[i]);
+        e->rw_executor[i] = NULL;
+    }
+}
+#else
+static void interp_free_executors(interp_entry *e) { (void)e; }
+#endif
+
+static void interp_registry_fini(void)
+{
+    int i;
+    for (i = 0; i < GLES_MAX_INTERP; ++i)
+        interp_free_executors(&g_reg[i]);
 }
 
 static void interp_frag(float *fs_input, Shader_Builtins *builtins, void *uniforms)
@@ -1231,14 +1479,45 @@ static void ff_shadertoy_frag(float *fs_input, Shader_Builtins *builtins, void *
 void gles_engine_use_program(GEuint program)
 {
     gles_engine_gpu_flush();   /* drain the outgoing program's coalesced draws */
+    pglSetVertexExecutor(NULL, NULL);
     pgl_UseProgram(program);
     g_active = find_entry(program);
+#ifdef PGL_G3D
+    /* Any program whose VS callback is interp_vert can use the persistent
+     * worker pool.  The old rw_simple-only guard left custom RenderWare
+     * pipelines on one CPU core even though interp_parallel_vert already
+     * handles their generic GLSL executor.  Keep native fixed-function VS/FS
+     * callbacks on their original path because replacing those callbacks with
+     * the generic interpreter would change pixels. */
+    if (g_active && !g_active->gouraud && !g_active->lit_gouraud &&
+        !g_active->texblit && g_active->st_effect < 0) {
+        int i, complete = 1, requested = 8;
+        const char *threads = getenv("PGL_VERTEX_THREADS");
+        if (threads) requested = atoi(threads);
+        if (requested < 1) requested = 1;
+        if (requested > 8) requested = 8;
+        /* The caller executes worker 0; only clone the executors that can be
+         * reached by the configured worker pool. */
+        for (i = 0; i < requested - 1; ++i) {
+            if (!g_active->rw_executor[i])
+                g_active->rw_executor[i] = glsl_clone_executor(g_active->gp);
+            if (!g_active->rw_executor[i]) complete = 0;
+        }
+        if (complete) pglSetVertexExecutor(interp_parallel_vert, g_active);
+    }
+#endif
 }
 
 void gles_engine_delete_program(GEuint program)
 {
     interp_entry *e = find_entry(program);
-    if (e) { e->in_use = 0; if (g_active == e) g_active = NULL; }
+    gles_engine_gpu_flush();
+    if (e) {
+        if (g_active == e) pglSetVertexExecutor(NULL, NULL);
+        interp_free_executors(e);
+        e->in_use = 0;
+        if (g_active == e) g_active = NULL;
+    }
     pgl_DeleteProgram(program);
 }
 
@@ -1254,7 +1533,13 @@ GEbool gles_engine_program_executable(GEuint program)
 void gles_engine_release_interpreted_program(GEuint program)
 {
     interp_entry *e = find_entry(program);
-    if (e) { e->in_use = 0; if (g_active == e) g_active = NULL; }
+    gles_engine_gpu_flush();
+    if (e) {
+        if (g_active == e) pglSetVertexExecutor(NULL, NULL);
+        interp_free_executors(e);
+        e->in_use = 0;
+        if (g_active == e) g_active = NULL;
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -1711,6 +1996,7 @@ GEuint gles_engine_create_interpreted_program(struct glsl_program *gp,
     for (i = 0; i < GLES_MAX_INTERP; ++i)
         if (!g_reg[i].in_use) { e = &g_reg[i]; break; }
     if (!e) return 0;
+    memset(e, 0, sizeof(*e));
     n = gp->nvaryings * 4;
     if (n > GLSL_MAX_VARYINGS * 4) n = GLSL_MAX_VARYINGS * 4;
     for (i = 0; i < n; ++i) interp[i] = PGL_SMOOTH;
@@ -1994,6 +2280,13 @@ static int       g_force_cpu = 0;
  * It does NOT touch gpu_bringup()/g_gpu_ready, so the scene's GPU adoption is
  * unaffected.  Must be set before the render loop. */
 static int       g_force_cpu_raster = 0;
+
+/* The RenderWare Adreno route shares the context-wide CPU override switches
+ * with the existing fixed-kernel route. */
+static int rw_gpu_allowed(void)
+{
+    return !g_force_cpu && !g_force_cpu_raster;
+}
 
 /* texture-name -> raster-slot map for the textured kernel (PGL_G3D_MAX_TEX) */
 static GLuint  g_gpu_texname[PGL_G3D_MAX_TEX];
@@ -3252,6 +3545,21 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
         fs_src = g_gpu_ovr_fs;
         if (g_gpu_ovr_vs) vs_src = g_gpu_ovr_vs;
     }
+#ifdef PGL_G3D
+    rw_simple_link(pgl_id, fs_src);
+    /* RenderWare's native fragment contract is consumed by the ordered
+     * Adreno compute raster below.  It has no useful portablegl VS/FS
+     * graphics program to compile, and the Adreno backend intentionally has
+     * no graphics-pipeline port.  Avoid entering that compiler path for every
+     * RW shader: besides wasting startup CPU time, it used to print one
+     * "graphics pipeline port" decline per linked shader.  Other programs
+     * still take the normal fixed/fullscreen GPU probe. */
+    {
+        interp_entry *rw_ie = find_entry(pgl_id);
+        if (rw_ie && rw_ie->rw_simple)
+            return 0;
+    }
+#endif
     err[0] = '\0';
     prog = pgl_g3d_program_compile(vs_src, fs_src, err, (int)sizeof(err));
     if (prog == PGL_G3D_PROG_INVALID) {
@@ -3377,6 +3685,7 @@ void gles_engine_gpu_delete(GEuint pgl_id)
 
 void gles_engine_gpu_flush(void)
 {
+    rw_gpu_flush();
     /* Submit any draw the engine coalesced but has not yet dispatched (the GPU
      * path merges consecutive same-state draws into one mesh), then drain the
      * portablegl fixed-function batch, so nothing GPU-side is left pending
@@ -3386,6 +3695,20 @@ void gles_engine_gpu_flush(void)
         pgl_g3d_flush();
     }
 }
+#ifdef PGL_G3D
+static void rw_gpu_legacy_flush(void)
+{
+    /* A RenderWare draw must retire an earlier portablegl batch before it
+     * writes the shared framebuffer.  Most RE3 draws are already on the RW
+     * route, however, so calling pgl_g3d_flush() for every one of them just
+     * rechecks an empty staging queue.  Keep the ordering barrier only when
+     * there is an actual coalesced legacy batch to submit. */
+    if (g_gpu_ready && g_coalesce_active) {
+        gpu_coalesce_flush();
+        pgl_g3d_flush();
+    }
+}
+#endif
 
 int gles_engine_gpu_active(void)
 {

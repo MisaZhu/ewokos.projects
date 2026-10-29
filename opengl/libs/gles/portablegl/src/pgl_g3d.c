@@ -495,6 +495,12 @@ void pgl_g3d_flush(void)
 	if (!_enabled || _nverts == 0)
 		return;
 
+	/* Keep the declared byte span stable for the lifetime of each staging shm.
+	 * Older g2dd images cache an attach by shm id and do not refresh the
+	 * physical mapping when a later request advertises a shorter span.  The
+	 * same _pos shm is reused by the 3/6/10-float layouts below; advertising
+	 * the live prefix here can therefore make a subsequent layout read through
+	 * a stale short mapping, which shows up as clipped/garbled frames. */
 	pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, _nverts, 3, 1);
 	pos.phy = _pos_phy;
 	z = z_canvas();
@@ -609,11 +615,13 @@ void pgl_g3d_flush(void)
 			   leaves both 0 (single-layer record, unchanged). */
 			req.ctex_depth[u]       = (uint8_t)t->depth;
 			req.ctex_arrstride64[u] = t->arrstride64;
+#ifdef G2D_PGL_CTEX_SAMPLER_PACK
 			req.ctex_levels[u]      = (uint8_t)(t->levels ? t->levels : 1u);
 			req.ctex_sampler[u]     = G2D_PGL_CTEX_SAMPLER_PACK(
 			    _ctex_mag_filter[u] == PGL_G3D_TEX_FILTER_LINEAR,
 			    _ctex_min_filter[u] == PGL_G3D_TEX_FILTER_LINEAR,
 			    _ctex_mip_filter[u] == PGL_G3D_TEX_FILTER_LINEAR);
+#endif
 		}
 	}
 
@@ -1666,11 +1674,13 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 			   leaves both 0 (single-layer record, unchanged). */
 			req.ctex_depth[u]       = (uint8_t)t->depth;
 			req.ctex_arrstride64[u] = t->arrstride64;
+#ifdef G2D_PGL_CTEX_SAMPLER_PACK
 			req.ctex_levels[u]      = (uint8_t)(t->levels ? t->levels : 1u);
 			req.ctex_sampler[u]     = G2D_PGL_CTEX_SAMPLER_PACK(
 			    _ctex_mag_filter[u] == PGL_G3D_TEX_FILTER_LINEAR,
 			    _ctex_min_filter[u] == PGL_G3D_TEX_FILTER_LINEAR,
 			    _ctex_mip_filter[u] == PGL_G3D_TEX_FILTER_LINEAR);
+#endif
 		}
 	}
 

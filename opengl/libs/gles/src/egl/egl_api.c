@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <time.h>
 
 #include <x/xwin.h>
 #include <graph/graph.h>
@@ -88,6 +90,73 @@ static EGLint g_error = EGL_SUCCESS;
 static egl_surface_t *g_current_draw = NULL;
 static egl_context_t *g_current_ctx  = NULL;
 
+/* Present timing is deliberately diagnostic-only.  Keep the normal EGL path
+ * free of clock calls unless PGL_PROFILE is enabled; the profile output lets
+ * us separate engine dispatch from the final G2D/window handoff. */
+static int g_egl_profile = -1;
+static int g_egl_direct_allowed = -1;
+static unsigned long long g_egl_epoch;
+static unsigned g_egl_frames;
+static unsigned long long g_egl_swap_us;
+static unsigned long long g_egl_flush_us;
+static unsigned long long g_egl_repaint_us;
+static unsigned long long g_egl_blit_us;
+static unsigned g_egl_direct;
+static unsigned g_egl_fallback;
+static unsigned long long egl_profile_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ull +
+           (unsigned long long)ts.tv_nsec / 1000ull;
+}
+static int egl_profile_enabled(void)
+{
+    if (g_egl_profile < 0) {
+        const char *v = getenv("PGL_PROFILE");
+        g_egl_profile = v && atoi(v) != 0;
+    }
+    return g_egl_profile;
+}
+static int egl_direct_allowed(void)
+{
+    if (g_egl_direct_allowed < 0) {
+        const char *v = getenv("PGL_PRESENT_DIRECT");
+        /* Directly writing the fps_async handoff buffer is only safe when the
+         * matching xserverd/xwin implementation is present in the image.
+         * Keep the portable ws_g -> ws_g2 handoff as the default so an SD
+         * image with an older compositor cannot turn a valid frame into a
+         * black window.  The direct path remains available for an explicit
+         * board-side A/B run with PGL_PRESENT_DIRECT=1. */
+        g_egl_direct_allowed = v && atoi(v) != 0;
+    }
+    return g_egl_direct_allowed;
+}
+static void egl_profile_report(unsigned long long now, int bw, int bh,
+                               int dw, int dh, int shm)
+{
+    if (!egl_profile_enabled())
+        return;
+    if (!g_egl_epoch) {
+        g_egl_epoch = now;
+        printf("EGL_PROFILE present backbuffer=%dx%d window=%dx%d shm=%d direct_allowed=%d\n",
+               bw, bh, dw, dh, shm, egl_direct_allowed());
+        fflush(stdout);
+    }
+    ++g_egl_frames;
+    if (now - g_egl_epoch < 5000000ull)
+        return;
+    printf("EGL_PROFILE frames=%u swap=%.1fms flush=%.1fms repaint=%.1fms blit=%.1fms direct=%u fallback=%u\n",
+           g_egl_frames, g_egl_swap_us / 1000.0, g_egl_flush_us / 1000.0,
+           g_egl_repaint_us / 1000.0, g_egl_blit_us / 1000.0,
+           g_egl_direct, g_egl_fallback);
+    fflush(stdout);
+    g_egl_epoch = now;
+    g_egl_frames = 0;
+    g_egl_swap_us = g_egl_flush_us = g_egl_repaint_us = g_egl_blit_us = 0;
+    g_egl_direct = g_egl_fallback = 0;
+}
+
 static EGLBoolean set_err(EGLint e) { g_error = e; return EGL_FALSE; }
 
 /* ------------------------------------------------------------------ *
@@ -99,6 +168,8 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
     void  *bb;
     GEint  bw = 0, bh = 0;
     graph_t src;
+    unsigned long long blit_start = 0;
+    int direct_present = 0;
 
     if (xwin == NULL || g == NULL || g->buffer == NULL)
         return;
@@ -127,7 +198,30 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
     graph_init(&src, (const uint32_t *)bb, bw, bh);
     src.shm_id = gles_engine_backbuffer_shm();
     src.shm_contig = src.shm_id > 0;
-    graph_blt(&src, 0, 0, bw, bh, g, 0, 0, g->w, g->h);
+    if (egl_profile_enabled())
+        blit_start = egl_profile_us();
+    /* fps_async normally copies ws_g to ws_g2 after this callback.  The GPU
+       backbuffer is already a complete frame at this point, so publish it
+       straight into ws_g2 and avoid that second full-window copy.  If the
+       compositor still owns ws_g2, retain the old ws_g path; xwin will mark
+       the frame pending and retry it without dropping the picture. */
+    if (egl_direct_allowed() && xwin->xinfo != NULL &&
+            xwin->xinfo->fps_async)
+        direct_present = xwin_present_direct(xwin, &src);
+    if (direct_present) {
+        if (egl_profile_enabled())
+            ++g_egl_direct;
+    }
+    else {
+        if (egl_profile_enabled())
+            ++g_egl_fallback;
+        /* The workspace now contains this frame, so a later async retry may
+           safely publish ws_g if the compositor was busy. */
+        xwin->direct_frame_valid = false;
+        graph_blt(&src, 0, 0, bw, bh, g, 0, 0, g->w, g->h);
+    }
+    if (blit_start)
+        g_egl_blit_us += egl_profile_us() - blit_start;
 }
 
 static void egl_on_resize(xwin_t *xwin)
@@ -462,21 +556,42 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
 {
     egl_surface_t *s = (egl_surface_t *)surface;
+    unsigned long long swap_start = 0, flush_start = 0, repaint_start = 0;
+    unsigned long long now;
+    int bw = 0, bh = 0;
     if (dpy != (EGLDisplay)&g_display) return set_err(EGL_BAD_DISPLAY);
     if (s == NULL) return set_err(EGL_BAD_SURFACE);
     if (s->type == EGL_PBUFFER_BIT || s->xwin == NULL)
         return EGL_TRUE;   /* nothing to present */
+    if (egl_profile_enabled()) {
+        swap_start = egl_profile_us();
+        gles_engine_backbuffer_size(&bw, &bh);
+    }
     /* Drain any pending V3D GPU work into the adopted back buffer before the
      * blit (a no-op on non-PGL_G3D builds where the engine stub returns
      * immediately), so egl_on_repaint presents the fully rendered frame. */
+    if (swap_start)
+        flush_start = egl_profile_us();
     gles_engine_gpu_flush();
+    if (flush_start)
+        g_egl_flush_us += egl_profile_us() - flush_start;
     /* Present by requesting a repaint; xwin_repaint invokes egl_on_repaint,
      * which blits the engine back buffer into the window graph under the
      * painting lock.  frame_ready gates that blit so an async event-thread
      * retry never publishes a partial frame. */
     s->frame_ready = 1;
+    if (swap_start)
+        repaint_start = egl_profile_us();
     xwin_repaint(s->xwin);
+    if (repaint_start)
+        g_egl_repaint_us += egl_profile_us() - repaint_start;
     s->frame_ready = 0;
+    if (swap_start) {
+        now = egl_profile_us();
+        g_egl_swap_us += now - swap_start;
+        egl_profile_report(now, bw, bh, s->w, s->h,
+                           gles_engine_backbuffer_shm());
+    }
     return EGL_TRUE;
 }
 

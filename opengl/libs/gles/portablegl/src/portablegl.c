@@ -3520,6 +3520,22 @@ void cvec_free_glVertex(void* vec)
 
 
 static glContext* c;
+static pgl_triangle_callback pgl_tri_callback;
+static void *pgl_tri_callback_user;
+static int pgl_tri_clip_only;
+
+PGLDEF void pglSetTriangleCallback(pgl_triangle_callback fn, void *user)
+{
+    pgl_tri_callback = fn;
+    pgl_tri_callback_user = user;
+    pgl_tri_clip_only = 0;
+}
+
+PGLDEF void pglSetClipTriangleCallback(pgl_triangle_callback fn, void *user)
+{
+    pglSetTriangleCallback(fn, user);
+    pgl_tri_clip_only = fn != NULL;
+}
 
 /* ---- Built-in fixed-function shaders (declared in portablegl.h) -----------
  * Always compiled so a demo using them runs on the CPU rasterizer everywhere;
@@ -4424,7 +4440,9 @@ static vec4 get_v_attrib(glVertex_Attrib* v, GLsizei i)
     return tmpvec4;
 }
 
-// TODO Possibly split for optimization and future parallelization, prep all verts first then do all shader calls at once
+#include "pgl_vertex_pool.inc"
+
+// TODO Possibly split for optimization, prep all verts first then do all shader calls at once
 // Will need num_verts * vertex_attribs_vs[] space rather than a single attribute staging area...
 static void do_vertex(glVertex_Attrib* v, int* enabled, int num_enabled, int i, int vert)
 {
@@ -4438,6 +4456,8 @@ static void do_vertex(glVertex_Attrib* v, int* enabled, int num_enabled, int i, 
 
     c->glverts.a[vert].vs_out = vs_out;
     c->glverts.a[vert].clip_space = c->builtins.gl_Position;
+    c->glverts.a[vert].screen_space_valid = GL_FALSE;
+	 c->glverts.a[vert].rw_projected_valid = GL_FALSE;
 
     // no use setting here because of TRIANGLE_STRIP
     // and TRIANGLE_FAN. While I don't properly
@@ -4490,6 +4510,10 @@ static void vertex_stage(const GLvoid* indices, GLsizei count, GLsizei instance_
     c->builtins.gl_InstanceID = instance_id;
     c->builtins.gl_BaseInstance = base_instance;
     GLsizeiptr first = (GLsizeiptr)indices;
+
+    if (pgl_parallel_vertices(v, enabled, num_enabled, indices, count,
+                              use_elems_type))
+        return;
 
     if (!use_elems_type) {
         for (vert=0, i=first; i<first+count; ++i, ++vert) {
@@ -4607,7 +4631,11 @@ static void run_pipeline(GLenum mode, const GLvoid* indices, GLsizei count, GLsi
             if (c->glverts.a[i].clip_code & CLIPZ_MASK)
                 continue;
 
-            c->glverts.a[i].screen_space = mult_m4_v4(c->vp_mat, c->glverts.a[i].clip_space);
+            if (!c->glverts.a[i].screen_space_valid) {
+                c->glverts.a[i].screen_space =
+                    mult_m4_v4(c->vp_mat, c->glverts.a[i].clip_space);
+                c->glverts.a[i].screen_space_valid = GL_TRUE;
+            }
 
 #ifdef PGL_G3D
             /* GPU fast path: offload the point when eligible, otherwise flush
@@ -4790,8 +4818,10 @@ static void draw_line_clip(glVertex* v1, glVertex* v2)
     if (cc1 & cc2) {
         return;
     } else if ((cc1 | cc2) == 0) {
-        t1 = mult_m4_v4(c->vp_mat, p1);
-        t2 = mult_m4_v4(c->vp_mat, p2);
+        t1 = v1->screen_space_valid ? v1->screen_space :
+             mult_m4_v4(c->vp_mat, p1);
+        t2 = v2->screen_space_valid ? v2->screen_space :
+             mult_m4_v4(c->vp_mat, p2);
 
         hp1 = v4_to_v3h(t1);
         hp2 = v4_to_v3h(t2);
@@ -5567,17 +5597,48 @@ static void draw_triangle(glVertex* v0, glVertex* v1, glVertex* v2, unsigned int
 static void draw_triangle_final(glVertex* v0, glVertex* v1, glVertex* v2, unsigned int provoke)
 {
     int front_facing;
-    // Use batch vertex transformation to reduce function call overhead and improve cache locality
+    int callback_done = 0;
+    /* A clip-space collector projects the final corners itself. Keep culling
+     * on the established screen-space path and honor a declined callback. */
+    if (pgl_tri_clip_only && !c->cull_face) {
+        c->builtins.gl_FrontFacing = GL_TRUE;
+        if (pgl_tri_callback(v0, v1, v2, pgl_tri_callback_user))
+            return;
+        callback_done = 1;
+    }
+    /* Indexed vertex draws may have already transformed these shared corners
+     * while building the vertex cache. Clipped temporary vertices carry a
+     * false validity bit and still take the exact transform path here. */
+    if (!v0->screen_space_valid || !v1->screen_space_valid ||
+        !v2->screen_space_valid) {
 #if PGL_NEON_ENABLED
-    pgl_neon_transform_3vertices(&v0->screen_space, &v1->screen_space, &v2->screen_space,
-                                  c->vp_mat, v0->clip_space, v1->clip_space, v2->clip_space);
+        pgl_neon_transform_3vertices(&v0->screen_space, &v1->screen_space,
+                                      &v2->screen_space, c->vp_mat,
+                                      v0->clip_space, v1->clip_space,
+                                      v2->clip_space);
 #else
-    v0->screen_space = mult_m4_v4(c->vp_mat, v0->clip_space);
-    v1->screen_space = mult_m4_v4(c->vp_mat, v1->clip_space);
-    v2->screen_space = mult_m4_v4(c->vp_mat, v2->clip_space);
+        v0->screen_space = mult_m4_v4(c->vp_mat, v0->clip_space);
+        v1->screen_space = mult_m4_v4(c->vp_mat, v1->clip_space);
+        v2->screen_space = mult_m4_v4(c->vp_mat, v2->clip_space);
 #endif
+        v0->screen_space_valid = v1->screen_space_valid =
+            v2->screen_space_valid = GL_TRUE;
+    }
 
-    front_facing = is_front_facing(v0, v1, v2);
+    /* The RW GPU collector only needs the post-clip vertices and never reads
+     * gl_FrontFacing.  Most RW draws also have face culling disabled, so the
+     * winding calculation below would be pure CPU overhead for every
+     * collected triangle.  Keep the exact old path when culling is enabled,
+     * and retain the callback's normal return semantics so a future callback
+     * that declines a triangle still falls through to the CPU rasterizer. */
+    if (pgl_tri_callback && !c->cull_face && !callback_done) {
+        c->builtins.gl_FrontFacing = GL_TRUE;
+        if (pgl_tri_callback(v0, v1, v2, pgl_tri_callback_user))
+            return;
+        front_facing = is_front_facing(v0, v1, v2);
+    } else {
+        front_facing = is_front_facing(v0, v1, v2);
+    }
     if (c->cull_face) {
         if (c->cull_mode == GL_FRONT_AND_BACK)
             return;
@@ -5590,6 +5651,10 @@ static void draw_triangle_final(glVertex* v0, glVertex* v1, glVertex* v2, unsign
     }
 
     c->builtins.gl_FrontFacing = front_facing;
+
+    if (pgl_tri_callback && c->cull_face &&
+        pgl_tri_callback(v0, v1, v2, pgl_tri_callback_user))
+        return;
 
     // TODO when/if I get rid of pgl_PolygonMode support for FRONT
     // and BACK, this becomes a single function pointer, no branch
@@ -5657,6 +5722,8 @@ static inline void update_clip_pt(glVertex *q, glVertex *v0, glVertex *v1, float
         //nothing to do here unless I change that
     }
     
+    q->screen_space_valid = GL_FALSE;
+    q->rw_projected_valid = GL_FALSE;
     q->clip_code = gl_clipcode(q->clip_space);
     //q->clip_code = gl_clipcode(q->clip_space) & CLIPZ_MASK;
 }
@@ -6113,6 +6180,7 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
     }
 #else
     float perspective[GL_MAX_VERTEX_OUTPUT_COMPONENTS*3];
+    int ix_min = x_min;
     builtins.fs_input_dx = fs_input_dx;
     builtins.fs_input_dy = fs_input_dy;
     for (int i=0; i<vs_output_size; ++i) {
@@ -6123,12 +6191,19 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
 
     for (int iy = y_min; iy<iy_max; ++iy) {
         float y = iy + 0.5f;
+        /* The edge equations are affine in x.  Evaluate their first sample
+         * exactly for each row, then advance by the precomputed derivative;
+         * this removes three line_func() calls (and their repeated A*x+B*y
+         * multiplies) from every candidate pixel while preserving the exact
+         * row origin used by the reference rasterizer. */
+        float gamma_row = line_func(&l01, ix_min + 0.5f, y) / denom_l01_hp2;
+        float beta_row = line_func(&l20, ix_min + 0.5f, y) / denom_l20_hp1;
 
         for (int ix = x_min; ix<ix_max; ++ix) {
             float x = ix + 0.5f;
 
-            gamma = line_func(&l01, x, y) / denom_l01_hp2;
-            beta = line_func(&l20, x, y) / denom_l20_hp1;
+            gamma = gamma_row;
+            beta = beta_row;
             alpha = 1.0f - beta - gamma;
 
             if (alpha >= 0.0f && beta >= 0.0f && gamma >= 0.0f) {
@@ -6141,6 +6216,14 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
                     z = (z + 1.0f) * depth_scale_half + depth_near;
 
                     if (!fragdepth_or_discard && !fragment_processing(x, y, z)) {
+                        if (((ix - ix_min) & 31) == 31) {
+                            float next_x = (float)(ix + 1) + 0.5f;
+                            gamma_row = line_func(&l01, next_x, y) / denom_l01_hp2;
+                            beta_row = line_func(&l20, next_x, y) / denom_l20_hp1;
+                        } else {
+                            gamma_row += dgamma_dx;
+                            beta_row += dbeta_dx;
+                        }
                         continue;
                     }
 
@@ -6173,6 +6256,14 @@ static void draw_triangle_fill(glVertex* v0, glVertex* v1, glVertex* v2, unsigne
                         draw_pixel(builtins.gl_FragColor, x, y, builtins.gl_FragDepth, fragdepth_or_discard);
                     }
                 }
+            }
+            if (((ix - ix_min) & 31) == 31) {
+                float next_x = (float)(ix + 1) + 0.5f;
+                gamma_row = line_func(&l01, next_x, y) / denom_l01_hp2;
+                beta_row = line_func(&l20, next_x, y) / denom_l20_hp1;
+            } else {
+                gamma_row += dgamma_dx;
+                beta_row += dbeta_dx;
             }
         }
     }

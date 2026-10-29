@@ -276,6 +276,11 @@ typedef struct glsl_stage {
      * glsl_link keeps the stage pointers, so gp->fs->src_hash survives to the
      * matchers.  Inert everywhere else. */
     unsigned long long src_hash;
+    /* Original source retained for conservative engine-side contracts.  The
+     * GLES front-end already owns this text; keeping a stage-local copy lets
+     * fast paths distinguish active #define light variants when a build adds
+     * harmless whitespace or a different shader preamble. */
+    char *source;
     char err[GLSL_ERR_LEN];
     int  errored;
 } glsl_stage;
@@ -345,6 +350,8 @@ void glsl_free_stage(glsl_stage *st);
  * Takes ownership of vs/fs.  Returns NULL on error (message in *err). */
 glsl_program *glsl_link(glsl_stage *vs, glsl_stage *fs, char *err, int errsz);
 void glsl_free_program(glsl_program *p);
+glsl_program *glsl_clone_executor(const glsl_program *p);
+void glsl_free_executor(glsl_program *p);
 /* Free any VM-compiled form attached to p (defined in glsl_exec.c).  No-op if
  * none was compiled.  Called by glsl_free_program. */
 void glsl_vm_free(glsl_program *p);

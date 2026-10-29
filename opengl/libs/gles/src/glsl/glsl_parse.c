@@ -936,6 +936,21 @@ glsl_stage *glsl_compile_stage(const char *src, int is_vertex, char *err, int er
     if (!toks) return NULL;
 
     st = (glsl_stage *)xalloc(sizeof(glsl_stage));
+    if (!st) {
+        free(toks);
+        if (err && errsz) snprintf(err, errsz, "out of memory");
+        return NULL;
+    }
+    if (src) {
+        st->source = (char *)malloc(strlen(src) + 1);
+        if (!st->source) {
+            free(toks);
+            glsl_free_stage(st);
+            if (err && errsz) snprintf(err, errsz, "out of memory");
+            return NULL;
+        }
+        memcpy(st->source, src, strlen(src) + 1);
+    }
     st->is_vertex = is_vertex;
     st->main_idx = -1;
     st->src_hash = glsl_fnv1a_str(src);
@@ -995,5 +1010,6 @@ void glsl_free_stage(glsl_stage *st)
 {
     /* AST nodes are leaked into the stage arena; simple recursive free */
     if (!st) return;
+    free(st->source);
     free(st);
 }
