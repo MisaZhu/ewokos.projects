@@ -51,6 +51,14 @@ vulkan: opengl
 # and guarantees the archive exists before any consumer links it.
 opengl: imgui
 
+# re3 (see projects/re3/Makefile) compiles its librw gl3 backend against the
+# EGL/GLES2 headers and links libglcommon/libEGL/libGLESv2 that opengl stages
+# into build_$(ARCH)/$(HW).  Without this edge the parallel machine build starts
+# re3 before opengl has staged those, and it dies with "EGL/egl.h: No such file".
+# opengl is itself ordered after imgui above, so re3: opengl keeps the graph
+# cycle-free (same idiom as blender/opencl/vulkan).
+re3: opengl
+
 $(DIRS):
 	@$(MAKE) -C $@
 

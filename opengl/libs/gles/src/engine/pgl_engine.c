@@ -235,7 +235,9 @@ void *gles_engine_backbuffer(void)
 {
     gles_engine_gpu_flush();   /* land coalesced GPU draws before a blit/readback */
     rw_gpu_poll_controls();
-    profile_frame();
+#ifdef PGL_G3D
+    profile_frame();           /* profiling counters exist only on the GPU path */
+#endif
     return pglGetBackBuffer();
 }
 
