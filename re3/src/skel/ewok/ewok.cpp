@@ -488,14 +488,15 @@ ewok_on_window_created(xwin_t *xwin)
 	xwin->on_min = ewokOnMin;
 	xwin->on_show = ewokOnShow;
 	xwin->on_resize = ewokOnResize;
-	/* RE3 presents synchronously.  Set this before the first fullscreen
-	 * rebuild, rather than in psPostRWinit after EGL creation, so xserverd does
-	 * not allocate a second full-screen handoff canvas for a GUI-launched
-	 * process.  That transient allocation is enough to exhaust q8b's shared
-	 * graphics memory when launched from xlauncher or xterm. */
+	/* Set this before the first fullscreen rebuild.  Fullscreen GPU mode uses
+	 * xserverd's async handoff so the render thread is not parked while the
+	 * compositor scans out the previous frame.  RE3_FORCE_SYNC_PRESENT keeps
+	 * the old single-buffer handshake for low-memory/debug images. */
 	if (xwin->xinfo != nil) {
-		xwin->xinfo->fps_async_force_sync = true;
-		xwin->xinfo->fps_async = false;
+		bool forceSync = getenv("RE3_FORCE_SYNC_PRESENT") != nil ||
+			getenv("RE3_WINDOWED") != nil;
+		xwin->xinfo->fps_async_force_sync = forceSync;
+		xwin->xinfo->fps_async = !forceSync;
 	}
 
 	/* RE3 starts in fullscreen mode.  This must happen before EGL creates its

@@ -49,6 +49,12 @@ $(ARCH)/vkteapot.o: vkteapot.cpp teapot_data.h vkteapot_spirv.h
 	@mkdir -p $(ARCH)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+# Older incremental trees generated a dependency file for the former C
+# implementation (`vkteapot.c`).  Keep that stale prerequisite harmless long
+# enough for make to rebuild the object from the current C++ source; the
+# compiler then replaces the .d file with the correct dependency list.
+vkteapot.c:
+
 clean:
 	rm -rf $(ALL_ARCH_DIRS)
 	rm -f *.o

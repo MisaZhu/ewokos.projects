@@ -1548,6 +1548,47 @@ Render2dStuff(void)
 	POP_RENDERGROUP();
 }
 
+#if defined(__ewokos__) && defined(RW_GL3)
+/* Sample wall-clock frame time and draw it after the regular HUD. */
+static void
+RenderEwokFpsOverlay(void)
+{
+	static uint32 lastTick = 0;
+	static uint32 frames = 0;
+	static float fps = 0.0f;
+	uint32 now = (uint32)RsTimer();
+
+	if (lastTick == 0)
+		lastTick = now;
+	frames++;
+	uint32 elapsed = now - lastTick;
+	if (elapsed >= 500) {
+		fps = (float)frames * 1000.0f / (float)elapsed;
+		frames = 0;
+		lastTick = now;
+	}
+
+	char text[32];
+	wchar wtext[32];
+	snprintf(text, sizeof(text), "FPS: %.1f", fps);
+	AsciiToUnicode(text, wtext);
+
+	/* Render2dStuffAfterFade is followed by other 2D renderers (for example
+	 * the credits). Keep the overlay's font settings local to this draw. */
+	CFontDetails savedDetails = CFont::Details;
+	CFont::SetBackgroundOn();
+	CFont::SetBackgroundColor(CRGBA(0, 0, 0, 160));
+	CFont::SetScale(SCREEN_SCALE_X(0.45f), SCREEN_SCALE_Y(0.9f));
+	CFont::SetPropOn();
+	CFont::SetRightJustifyOn();
+	CFont::SetRightJustifyWrap(0.0f);
+	CFont::SetFontStyle(FONT_BANK);
+	CFont::SetColor(CRGBA(255, 255, 255, 255));
+	CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(8.0f), SCREEN_SCALE_Y(6.0f), wtext);
+	CFont::Details = savedDetails;
+}
+#endif
+
 void
 RenderMenus(void)
 {
@@ -1570,6 +1611,9 @@ Render2dStuffAfterFade(void)
 #endif
 
 	CHud::DrawAfterFade();
+#if defined(__ewokos__) && defined(RW_GL3)
+	RenderEwokFpsOverlay();
+#endif
 	CFont::DrawFonts();
 	POP_RENDERGROUP();
 }
