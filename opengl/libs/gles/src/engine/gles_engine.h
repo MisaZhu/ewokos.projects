@@ -65,6 +65,12 @@ void gles_engine_fini(void);
 void gles_engine_make_current(void);
 /* Resize the engine back buffer.  Returns 1 on success. */
 int  gles_engine_resize(GEint w, GEint h);
+/* Backend render-size alignment.  Writes the horizontal/vertical granularity
+ * the EGL layer must round the render size up to so the back buffer row stride
+ * satisfies the active backend's requirements.  Adreno A690 (g2d version 690)
+ * needs a 64-byte-aligned stride and reports *aw=32, *ah=8; every other backend
+ * reports *aw=1, *ah=1 (render size == window size, no alignment). */
+void gles_engine_render_align(GEint *aw, GEint *ah);
 
 /* Back-buffer accessors for the EGL swap.  At 32 bpp the pixels are packed
  * u32 0xAARRGGBB, byte-identical to EwokOS graph_t's argb layout, so

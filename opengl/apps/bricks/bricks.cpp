@@ -21,6 +21,8 @@
  *
  * Controls: hold the left mouse button and move to steer the paddle, or use the
  * left/right arrow keys; space or a click/tap after game over restarts; ESC quits.
+ * The window can be freely resized; the game adapts by rendering at the nearest
+ * aligned internal resolution and scaling to fit (GPU path stays active).
  */
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -99,6 +101,7 @@ static float g_time = 0.0f;
 static int   g_key_left = 0, g_key_right = 0, g_key_space = 0;
 static int   g_mdown = 0, g_restart_click = 0;
 static float g_mx = 0.0f;
+static int   g_win_w = 0, g_win_h = 0;   /* last known window (xwin) size */
 
 /* ------------------------------------------------------------------ *
  * Buffer A: swept-disk collision primitives (verbatim translations).
@@ -181,7 +184,10 @@ static void simulate_buffer_a(int iFrame, float iTime, float iTimeDelta, float r
                 /* paddle */
                 float oldPaddlePos = paddlePos;
                 if (g_mdown && g_mx >= 0.0f) {
-                    paddlePos = (-1.0f + 2.0f * g_mx / resX) * resX / resY;
+                    /* g_mx is in window pixels; map through the window width
+                       for correct normalisation when render size differs. */
+                    float norm_w = (g_win_w > 0) ? (float)g_win_w : resX;
+                    paddlePos = (-1.0f + 2.0f * g_mx / norm_w) * resX / resY;
                 } else {
                     float moveRight = g_key_right ? 1.0f : 0.0f;
                     float moveLeft  = g_key_left  ? 1.0f : 0.0f;
@@ -576,6 +582,8 @@ static xwin_t *g_win = NULL;
 static pix_t *bbufpix = NULL;
 static uint8_t *rgba_buf = NULL;
 static int width = 0, height = 0, buf_width = 0, buf_height = 0;
+static int g_rend_w = 0, g_rend_h = 0; /* aligned internal render size */
+static EGLConfig g_egl_cfg = NULL;
 static int g_fpslog = 0, g_result = 0;
 static uint32_t g_start_ms = 0, g_last_ms = 0, g_fps_ms = 0;
 static int g_fps_frames = 0;
@@ -735,6 +743,7 @@ static int init_egl(xwin_t *xwin)
     if (egl_dpy == EGL_NO_DISPLAY) return 0;
     if (!eglInitialize(egl_dpy, &major, &minor)) return 0;
     if (!eglChooseConfig(egl_dpy, cfg_attr, &cfg, 1, &ncfg) || ncfg < 1) return 0;
+    g_egl_cfg = cfg;
     egl_ctx = eglCreateContext(egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
     if (egl_ctx == EGL_NO_CONTEXT) return 0;
     egl_surf = eglCreateWindowSurface(egl_dpy, cfg, (EGLNativeWindowType)xwin, NULL);
@@ -755,6 +764,41 @@ static void draw_quad(GLuint prog)
     glDrawArrays(GL_TRIANGLES, 0, 6);
     glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(0);
+}
+
+/* Snap a window size up to the q8b Adreno fullscreen-compute alignment:
+   width to a multiple of 32 (so stride=w*4 is 128B, satisfying the 64B
+   requirement) and height to a multiple of 8 (local_size.y).  On raspi5/V3D
+   this is harmless (stride only needs 4B alignment). */
+static void aligned_render_size(int ww, int wh, int *rw, int *rh)
+{
+    *rw = (ww + 31) & ~31;
+    *rh = (wh + 7) & ~7;
+}
+
+/* Rebuild the EGL window surface with a new render size.  Returns 1 on
+   success, 0 if the new surface could not be created (old one is kept). */
+static int rebuild_surface(int rw, int rh)
+{
+    char env[32];
+    snprintf(env, sizeof(env), "%dx%d", rw, rh);
+    setenv("RE3_NATIVE_RENDER_SIZE", env, 1);
+
+    EGLSurface ns = eglCreateWindowSurface(egl_dpy, g_egl_cfg,
+                                           (EGLNativeWindowType)g_win, NULL);
+    if (ns == EGL_NO_SURFACE) return 0;
+    EGLSurface old = egl_surf;
+    egl_surf = ns;
+    if (!eglMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx)) {
+        egl_surf = old;
+        return 0;
+    }
+    if (old != EGL_NO_SURFACE) eglDestroySurface(egl_dpy, old);
+    g_rend_w = rw;
+    g_rend_h = rh;
+    /* Force buffer realloc to the new render dimensions. */
+    buf_width = 0; buf_height = 0;
+    return 1;
 }
 
 static int render_gpu(void)
@@ -799,11 +843,23 @@ static int render_gpu(void)
 
 static void render_frame(void)
 {
-    EGLint w = 0, h = 0;
-    eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
-    eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
-    if (w <= 0 || h <= 0) return;
-    if (!ensure_buffer(w, h)) return;
+    /* Detect window resize and rebuild the EGL surface with a new aligned
+       render size when needed.  The EGL present path then scales the
+       aligned render buffer into the actual window (aspect-preserving). */
+    EGLint ww = 0, wh = 0;
+    eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &ww);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &wh);
+    if (ww <= 0 || wh <= 0) return;
+    if ((int)ww != g_win_w || (int)wh != g_win_h) {
+        g_win_w = (int)ww; g_win_h = (int)wh;
+        int rw, rh;
+        aligned_render_size(g_win_w, g_win_h, &rw, &rh);
+        if (rw != g_rend_w || rh != g_rend_h)
+            rebuild_surface(rw, rh);
+    }
+    int rw = g_rend_w, rh = g_rend_h;
+    if (rw <= 0 || rh <= 0) return;
+    if (!ensure_buffer(rw, rh)) return;
 
     uint32_t now = kernel_tic_ms(0);
     if (g_last_ms == 0) g_last_ms = now;
@@ -922,9 +978,24 @@ int main(int argc, char **argv)
      * this is q8b-specific.  Snap the window up to a multiple of the compute
      * local_size (32x8): width*4 then becomes a multiple of 128 (64-byte
      * aligned) and the workgrid is exact, keeping the default on the GPU
-     * (600x400 -> 608x400). */
+     * (600x400 -> 608x400).
+     *
+     * After startup, if the user resizes the window the render_frame loop
+     * detects the new size and rebuilds the EGL surface with an aligned
+     * RE3_NATIVE_RENDER_SIZE; the EGL present path scales the aligned render
+     * buffer into the actual window, so the game adapts to any window size
+     * while keeping the GPU path alive. */
     win_w = (win_w + 31) & ~31;
     win_h = (win_h + 7) & ~7;
+
+    /* Set the aligned render size so the first EGL surface picks it up. */
+    {
+        char env[32];
+        snprintf(env, sizeof(env), "%dx%d", win_w, win_h);
+        setenv("RE3_NATIVE_RENDER_SIZE", env, 1);
+        g_rend_w = win_w;
+        g_rend_h = win_h;
+    }
 
     memset(&g_bufA, 0, sizeof(g_bufA));
     memset(&g_bufB, 0, sizeof(g_bufB));
@@ -947,7 +1018,8 @@ int main(int argc, char **argv)
         eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
         eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
         if (w <= 0 || h <= 0) { w = win_w; h = win_h; }
-        ensure_buffer(w, h);
+        g_win_w = (int)w; g_win_h = (int)h;
+        ensure_buffer(g_rend_w, g_rend_h);
     }
     if (fullscreen) xwin_fullscreen(g_win);
 

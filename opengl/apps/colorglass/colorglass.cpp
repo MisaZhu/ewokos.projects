@@ -300,8 +300,8 @@ static int init_egl(xwin_t* xwin)
 static void render_frame(void)
 {
     EGLint w = 0, h = 0;
-    eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
-    eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &w);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &h);
     if (w > 0 && h > 0 && (w != win_width || h != win_height)) {
         win_width = w; win_height = h;
     }

@@ -29,6 +29,11 @@
 
 static int win_width = 640;
 static int win_height = 480;
+// Actual window (screen) size.  win_width/win_height track the render size
+// (stride-aligned on q8b); the mouse arrives in window coords and is scaled
+// into render space for ImGui.
+static int scr_width = 640;
+static int scr_height = 480;
 
 static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
 static EGLSurface egl_surf = EGL_NO_SURFACE;
@@ -713,8 +718,10 @@ static void process_imgui_frame(void)
     // Update display size (in case of resize)
     io.DisplaySize = ImVec2((float)win_width, (float)win_height);
 
-    // Update mouse position
-    io.MousePos = ImVec2((float)mouse_x, (float)mouse_y);
+    // Update mouse position (mouse arrives in window coords; map into the
+    // possibly larger, stride-aligned render space ImGui draws in).
+    io.MousePos = ImVec2((float)mouse_x * (float)win_width / (float)scr_width,
+                         (float)mouse_y * (float)win_height / (float)scr_height);
 
     // Update mouse buttons
     io.MouseDown[0] = mouse_buttons[0]; // left
@@ -798,16 +805,22 @@ static void draw_gears(void)
 static void render_frame(void)
 {
     EGLint w = 0, h = 0;
+    EGLint rw = 0, rh = 0;
     uint32_t current_tic;
     float dt;
 
-    // Pick up a window resize: libEGL already resized the engine back buffer,
-    // we only mirror the new size into the viewport/projection and ImGui.
+    // Pick up a window resize: libEGL already resized the engine back buffer to
+    // the (stride-aligned) render size, so mirror that into the viewport /
+    // projection / ImGui DisplaySize while keeping the true window size for the
+    // mouse mapping.
     eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
     eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
-    if (w > 0 && h > 0 && (w != win_width || h != win_height)) {
-        win_width = w;
-        win_height = h;
+    if (w > 0 && h > 0) { scr_width = w; scr_height = h; }
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &rw);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &rh);
+    if (rw > 0 && rh > 0 && (rw != win_width || rh != win_height)) {
+        win_width = rw;
+        win_height = rh;
         perspective(projection_matrix, 60.0f,
                     (GLfloat)win_width / (GLfloat)win_height, 1.0f, 1024.0f);
     }

@@ -54,6 +54,12 @@ typedef struct egl_surface {
     xwin_t *xwin;             /* NULL for pbuffers */
     EGLint w, h;
     EGLint render_w, render_h;
+    /* Set when the app manages its own render size (RE3_NATIVE_RENDER_SIZE,
+     * e.g. bricks rebuilding an aligned surface).  In that mode the EGL layer
+     * never touches the engine on resize and never re-aligns; otherwise the
+     * render size tracks the window (aligned to the backend) and the engine is
+     * resized on every window resize. */
+    int native_render;
     EGLint swap_interval;
     /* Set only for the duration of an eglSwapBuffers->xwin_repaint call.
      * libx's event thread runs xwin_retry_pending_presents() (which invokes
@@ -266,11 +272,23 @@ static void egl_on_resize(xwin_t *xwin)
     if (w <= 0 || h <= 0)
         return;
     s = (egl_surface_t *)xwin->data;
-    if (s != NULL) {
-        s->w = w;
-        s->h = h;
-        if (s->render_w == w && s->render_h == h)
-            gles_engine_resize(w, h);
+    if (s == NULL)
+        return;
+    /* Always track the window size so EGL_WIDTH/EGL_HEIGHT report it (bricks and
+     * the app mouse mapping rely on the true window geometry). */
+    s->w = w;
+    s->h = h;
+    if (s->native_render)
+        return;   /* app owns the render size and rebuilds its own surface */
+    /* Ordinary apps: re-derive the backend-aligned render size and resize the
+     * engine back buffer so the GL viewport the app sets from
+     * EGL_RENDER_*_EWOK matches the surface it renders into. */
+    {
+        GEint aw = 1, ah = 1;
+        gles_engine_render_align(&aw, &ah);
+        s->render_w = (w + aw - 1) / aw * aw;
+        s->render_h = (h + ah - 1) / ah * ah;
+        gles_engine_resize(s->render_w, s->render_h);
     }
 }
 
@@ -488,7 +506,17 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
     s->h = g.h;
     s->render_w = g.w;
     s->render_h = g.h;
-    egl_native_render_size(&s->render_w, &s->render_h);
+    if (egl_native_render_size(&s->render_w, &s->render_h)) {
+        /* App manages its own (already aligned) render size. */
+        s->native_render = 1;
+    } else {
+        /* Ordinary app: align the initial render size to the backend so the
+         * first frame and every later resize share one geometry. */
+        GEint aw = 1, ah = 1;
+        gles_engine_render_align(&aw, &ah);
+        s->render_w = (g.w + aw - 1) / aw * aw;
+        s->render_h = (g.h + ah - 1) / ah * ah;
+    }
     s->swap_interval = 1;
 
     if (!gles_engine_init(s->render_w, s->render_h)) {
@@ -556,6 +584,8 @@ EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute,
     switch (attribute) {
     case EGL_WIDTH:  *value = s->w; break;
     case EGL_HEIGHT: *value = s->h; break;
+    case EGL_RENDER_WIDTH_EWOK:  *value = s->render_w; break;
+    case EGL_RENDER_HEIGHT_EWOK: *value = s->render_h; break;
     case EGL_CONFIG_ID: *value = g_configs[0].id; break;
     default: *value = 0; break;
     }

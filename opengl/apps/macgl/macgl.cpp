@@ -245,8 +245,10 @@ static void render(void *)
 {
     if (!current) return;
     EGLint w = 0, h = 0;
-    if (!eglQuerySurface(display, surface, EGL_WIDTH, &w) ||
-        !eglQuerySurface(display, surface, EGL_HEIGHT, &h) || w <= 0 || h <= 0) {
+    /* Query the render size (stride-aligned on q8b, == window elsewhere) so
+     * glViewport / iResolution / DisplaySize match the engine back buffer. */
+    if (!eglQuerySurface(display, surface, EGL_RENDER_WIDTH_EWOK, &w) ||
+        !eglQuerySurface(display, surface, EGL_RENDER_HEIGHT_EWOK, &h) || w <= 0 || h <= 0) {
         result = 1;
         xwin_close(window);
         return;

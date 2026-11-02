@@ -49,6 +49,9 @@
  *     at link and silently drops the program to the CPU)
  *   - loops with literal bounds (injected as decimal literals); every builtin
  *     used is in the engine's table
+ *   - the master clock is wrapped -- mod(iGlobalTime, LOOP_T) -- so no world
+ *     coordinate grows without bound; see LOOP_T below for why the V3D sin/cos
+ *     range reduction and the sine hash force this (progressive white specks)
  */
 
 #ifndef OCEAN_GLSL_H
@@ -115,6 +118,39 @@ const float SEA_HMAX = )GLSL";
     g += hmax_lit;
     g += R"GLSL(;
 
+/* ---- master loop period: bounds every time-derived world coordinate ----
+ * iGlobalTime grows without bound, and so does every coordinate derived from
+ * it -- camera z = iGlobalTime*1.5, seaTime = iGlobalTime*SEA_SPEED, and
+ * through them the arguments to sea_octave's sin/cos and to hash()'s
+ * fract(sin(dot(p,(127.1,311.7)))*43758.5453).  Two hardware limits then bite
+ * on the V3D GPU (raspi5/raspix):
+ *   1. ntq_fsincos (nir_to_vir.c) reduces sin/cos by round(x/pi) then a float32
+ *      subtract; for large |x| that subtract loses the fractional bits, so the
+ *      reduced argument quantises to ever-fewer levels.
+ *   2. hash() multiplies sin by 43758.5, amplifying that error ~4.4e4x, and at
+ *      |x| ~ 1e6 the float32 argument ITSELF has ulp ~0.06 (no reduction can
+ *      recover it).  The value-noise lattice then degenerates -- neighbouring
+ *      cells collapse to the same value -- so map_detailed()'s finite-difference
+ *      normals spike and specular pow(x,60) clamps scattered pixels to WHITE.
+ * The sea is fine at first and sprouts white specks only after enough runtime,
+ * exactly as the coordinates cross those thresholds.
+ *
+ * Wrapping the clock bounds every derived coordinate forever.  LOOP_T = 500*pi
+ * is the SHORTEST period that makes the wrap seamless for the dominant visible
+ * motion: over one loop the heading ang.z=time advances 150*pi (=2pi*75) and
+ * ang.x's sin(time*3) advances 450*pi (=2pi*225), while octave-0's travelling
+ * wave realigns in BOTH time (seaTime*0.16 -> 2pi*32) and space (the camera-z
+ * snap 750*pi*0.16 -> 2pi*60); octave-1's spatial phase realigns too (750*pi*
+ * 0.304 -> 2pi*114).  Only octave-1's temporal phase (2pi*60.8) and the
+ * value-noise chop lattice (non-integer snap) reshuffle -- both low-amplitude
+ * fine detail on a landmark-free chaotic sea, once per ~26 min, so invisible.
+ * Within the loop the largest hash argument stays ~1e6 where consecutive cells
+ * still differ by ~140 (>> the ~0.04 reduction quantum), i.e. non-degenerate.
+ * A side benefit: the CPU interpreter (accurate sinf) and the GPU now wrap to
+ * the SAME bounded clock, so the two paths stay pixel-identical at long runtime
+ * instead of diverging as the GPU alone degenerates. */
+const float LOOP_T = 1570.796327;   /* 500*pi seconds == 26.18 min */
+
 /* ---- value noise (bilinear hash lattice) ---- */
 float hash(vec2 p) {
     float h = dot(p, vec2(127.1, 311.7));
@@ -160,7 +196,7 @@ float sea_octave(vec2 uv, float choppy) {
  * octave_m = mat2(1.6,1.2,-1.2,1.6) is expanded as
  * uv' = vec2(dot(col0,uv), dot(col1,uv)). */
 float map(vec3 p) {
-    float seaTime = iGlobalTime * SEA_SPEED;
+    float seaTime = mod(iGlobalTime, LOOP_T) * SEA_SPEED;
     float freq   = SEA_FREQ;
     float amp    = SEA_HEIGHT;
     float choppy = SEA_CHOPPY;
@@ -183,7 +219,7 @@ float map(vec3 p) {
 
 /* Detailed height field used for the normal. */
 float map_detailed(vec3 p) {
-    float seaTime = iGlobalTime * SEA_SPEED;
+    float seaTime = mod(iGlobalTime, LOOP_T) * SEA_SPEED;
     float freq   = SEA_FREQ;
     float amp    = SEA_HEIGHT;
     float choppy = SEA_CHOPPY;
@@ -279,7 +315,7 @@ void main() {
     uv = uv * 2.0 - 1.0;
     uv = vec2(uv.x * (res.x / res.y), uv.y);
 
-    float time = iGlobalTime * 0.3;   /* camera clock (no iMouse here) */
+    float time = mod(iGlobalTime, LOOP_T) * 0.3;   /* camera clock (no iMouse here) */
 
     /* ray */
     vec3 ang = vec3(sin(time * 3.0) * 0.1, sin(time) * 0.2 + 0.3, time);

@@ -78,6 +78,11 @@ extern "C" void pgl_g3d_set_render_scale(int scale);
 /* Window dimensions (can be resized). */
 static int win_width  = 800;
 static int win_height = 600;
+/* Actual window (screen) size.  win_width/win_height track the render size,
+ * which on stride-aligning backends (q8b) is the window rounded up; the mouse
+ * arrives in window pixels and is mapped into render space for iMouse. */
+static int scr_width  = 800;
+static int scr_height = 600;
 
 /* Raymarch step budget.  The reference uses 450; with the hit polish
  * (bisect back onto the surface, near-surface exhaustion/cutoff shaded as
@@ -376,10 +381,16 @@ static int init_egl(xwin_t* xwin)
 static void render_frame(void)
 {
     EGLint w = 0, h = 0;
+    EGLint rw = 0, rh = 0;
     eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
     eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
-    if (w > 0 && h > 0 && (w != win_width || h != win_height)) {
-        win_width = w; win_height = h;
+    if (w > 0 && h > 0) { scr_width = w; scr_height = h; }
+    /* Drive glViewport / iResolution / DisplaySize from the render size so they
+     * match the surface the engine renders into (== window size off q8b). */
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &rw);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &rh);
+    if (rw > 0 && rh > 0 && (rw != win_width || rh != win_height)) {
+        win_width = rw; win_height = rh;
     }
     if (win_width <= 0) win_width = 1;
     if (win_height <= 0) win_height = 1;
@@ -399,8 +410,12 @@ static void render_frame(void)
 #endif
     float mw = win_width / sc;
     float mh = win_height / sc;
-    float mx = (g_mx < 0.0f) ? mw * 0.5f : g_mx / sc;
-    float my = (g_my < 0.0f) ? mh * 0.7f : g_my / sc;
+    /* g_mx/g_my arrive in window pixels; map into render space (iResolution
+     * before the internal compute downscale) then divide by the compute scale. */
+    float rx = (scr_width  > 0) ? (float)win_width  / (float)scr_width  : 1.0f;
+    float ry = (scr_height > 0) ? (float)win_height / (float)scr_height : 1.0f;
+    float mx = (g_mx < 0.0f) ? mw * 0.5f : (g_mx * rx) / sc;
+    float my = (g_my < 0.0f) ? mh * 0.7f : (g_my * ry) / sc;
 
     uint32_t t0 = tic_us();
     glViewport(0, 0, win_width, win_height);
@@ -485,7 +500,7 @@ static void on_event(xwin_t* xwin, xevent_t* ev)
             if (!g_mdown)
                 return;
             g_mx = (float)ev->value.mouse.x;
-            g_my = (float)(win_height - ev->value.mouse.y);
+            g_my = (float)(scr_height - ev->value.mouse.y);
         }
     }
 }

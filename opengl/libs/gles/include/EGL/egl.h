@@ -176,6 +176,11 @@ typedef int EGLNativeFileDescriptorKHR;
 #define EGL_OPENGL_ES_API               0x30A0
 #define EGL_OPENVG_API                  0x30A1
 
+/* EwokOS extension: query the internal render-buffer dimensions (which may
+   differ from the window dimensions when RE3_NATIVE_RENDER_SIZE is set). */
+#define EGL_RENDER_WIDTH_EWOK           0x3F00
+#define EGL_RENDER_HEIGHT_EWOK          0x3F01
+
 /* Special handles */
 #define EGL_DEFAULT_DISPLAY             EGL_CAST(EGLNativeDisplayType,0)
 #define EGL_NO_CONTEXT                  EGL_CAST(EGLContext,0)

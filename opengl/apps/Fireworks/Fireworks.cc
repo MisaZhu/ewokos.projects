@@ -588,8 +588,11 @@ static void render_frame(void)
 {
     EGLint w = 0, h = 0;
 
-    eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
-    eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
+    /* Query the render size (stride-aligned on q8b, == window elsewhere) so the
+     * CPU compositing buffer / glViewport / DisplaySize match the engine back
+     * buffer. */
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &w);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &h);
     if (w <= 0 || h <= 0) { w = WIDTH; h = HEIGHT; }
     if (!ensure_buffer(w, h))
         return;

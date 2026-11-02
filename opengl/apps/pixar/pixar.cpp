@@ -66,6 +66,11 @@ extern "C" uint32_t v3d_mesa_debug;
 
 static int win_width  = 800;
 static int win_height = 600;
+/* Actual window (screen) size.  win_width/win_height track the render size
+ * (stride-aligned on q8b); the mouse arrives in window pixels and is mapped
+ * into render space so the iMouse.xy / iResolution.xx remap stays consistent. */
+static int scr_width  = 800;
+static int scr_height = 600;
 
 /* March / soft-shadow step budgets.  Defaults match the reference exactly
  * (DISTMARCH_STEPS=48, SOFTSHADOW_STEPS=8).  argv "stepsN" / "shstepsN"
@@ -521,10 +526,16 @@ static int init_egl(xwin_t* xwin)
 static void render_frame(void)
 {
     EGLint w = 0, h = 0;
+    EGLint rw = 0, rh = 0;
     eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
     eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
-    if (w > 0 && h > 0 && (w != win_width || h != win_height)) {
-        win_width = w; win_height = h;
+    if (w > 0 && h > 0) { scr_width = w; scr_height = h; }
+    /* Drive glViewport / iResolution / DisplaySize from the render size so they
+     * match the surface the engine renders into (== window size off q8b). */
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &rw);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &rh);
+    if (rw > 0 && rh > 0 && (rw != win_width || rh != win_height)) {
+        win_width = rw; win_height = rh;
     }
     if (win_width <= 0) win_width = 1;
     if (win_height <= 0) win_height = 1;
@@ -535,9 +546,12 @@ static void render_frame(void)
 
     /* Default look pointer at window centre until the mouse has moved
      * (ShaderToy iMouse semantics; pose_update() applies the reference's
-     * iMouse.xy / iResolution.xx remap). */
-    float mx = (g_mx < 0.0f) ? (float)win_width  * 0.5f : g_mx;
-    float my = (g_my < 0.0f) ? (float)win_height * 0.5f : g_my;
+     * iMouse.xy / iResolution.xx remap).  Dragged g_mx/g_my arrive in window
+     * pixels and are mapped into render space to match win_width/win_height. */
+    float rx = (scr_width  > 0) ? (float)win_width  / (float)scr_width  : 1.0f;
+    float ry = (scr_height > 0) ? (float)win_height / (float)scr_height : 1.0f;
+    float mx = (g_mx < 0.0f) ? (float)win_width  * 0.5f : g_mx * rx;
+    float my = (g_my < 0.0f) ? (float)win_height * 0.5f : g_my * ry;
 
     glViewport(0, 0, win_width, win_height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -595,7 +609,7 @@ static void on_event(xwin_t* xwin, xevent_t* ev)
         }
         else if (ev->state == MOUSE_STATE_DRAG) {
             g_mx = (float)ev->value.mouse.x;
-            g_my = (float)(win_height - ev->value.mouse.y);
+            g_my = (float)(scr_height - ev->value.mouse.y);
         }
     }
 }

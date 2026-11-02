@@ -37,6 +37,11 @@
 
 static int win_width = 640;
 static int win_height = 480;
+/* Actual window (screen) size.  On backends that need stride alignment (q8b)
+ * win_width/win_height track the aligned *render* size while these track the
+ * window; the mouse arrives in window coords and is scaled into render space. */
+static int scr_width = 640;
+static int scr_height = 480;
 
 static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
 static EGLSurface egl_surf = EGL_NO_SURFACE;
@@ -462,7 +467,10 @@ static void process_imgui_frame(int gpu)
     ImGuiIO& io = ImGui::GetIO();
 
     io.DisplaySize  = ImVec2((float)win_width, (float)win_height);
-    io.MousePos     = ImVec2((float)mouse_x, (float)mouse_y);
+    /* Mouse arrives in window coordinates; map it into the (possibly larger,
+     * stride-aligned) render coordinate space ImGui draws in. */
+    io.MousePos     = ImVec2((float)mouse_x * (float)win_width / (float)scr_width,
+                             (float)mouse_y * (float)win_height / (float)scr_height);
     io.MouseDown[0] = mouse_buttons[0];
     io.MouseDown[1] = mouse_buttons[1];
     io.MouseDown[2] = mouse_buttons[2];
@@ -488,14 +496,20 @@ static void process_imgui_frame(int gpu)
 static void render_frame(void)
 {
     EGLint w = 0, h = 0;
+    EGLint rw = 0, rh = 0;
     uint32_t current_tic;
     float dt;
     int gpu;
 
     eglQuerySurface(egl_dpy, egl_surf, EGL_WIDTH, &w);
     eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
-    if (w > 0 && h > 0 && (w != win_width || h != win_height))
-        reshape(w, h);
+    if (w > 0 && h > 0) { scr_width = w; scr_height = h; }
+    /* Drive the GL viewport / projection from the render size so it matches the
+     * surface the engine actually renders into (== window size off q8b). */
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &rw);
+    eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &rh);
+    if (rw > 0 && rh > 0 && (rw != win_width || rh != win_height))
+        reshape(rw, rh);
 
     kernel_tic32(NULL, NULL, &current_tic);
     if (last_frame_tic == 0)

@@ -38,6 +38,10 @@ static GLuint texid[4];     /* A, B, C, D staged as CPU-uploaded ctex slots */
 static GLuint progImage;
 static GLuint quad;
 static int width = 800, height = 450;
+/* Render size (stride-aligned on q8b, == window elsewhere).  glViewport and
+ * iResolution follow this so they match the engine back buffer; the mouse UV
+ * normalization keeps using the window size (width/height). */
+static int rend_width = 800, rend_height = 450;
 static bool fpslog;
 static uint32_t start_time, fps_time;
 static int frames, fps_frames, result;
@@ -447,6 +451,15 @@ static void render(void *)
         return;
     }
     width = w; height = h;
+    /* Render size drives the GL viewport / iResolution so they match the engine
+     * back buffer; width/height stay the window size for the mouse UV math. */
+    {
+        EGLint rw = w, rh = h;
+        eglQuerySurface(display, surface, EGL_RENDER_WIDTH_EWOK, &rw);
+        eglQuerySurface(display, surface, EGL_RENDER_HEIGHT_EWOK, &rh);
+        if (rw <= 0 || rh <= 0) { rw = w; rh = h; }
+        rend_width = rw; rend_height = rh;
+    }
 
     uint32_t now = kernel_tic_ms(0);
     float time = (now - start_time) / 1000.0f;
@@ -454,13 +467,13 @@ static void render(void *)
     cpu_step();
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, width, height);
+    glViewport(0, 0, rend_width, rend_height);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
 
     glUseProgram(progImage);
     glUniform1f(glGetUniformLocation(progImage, "iTime"), time);
-    glUniform3f(glGetUniformLocation(progImage, "iResolution"), (float)width, (float)height, 1.0f);
+    glUniform3f(glGetUniformLocation(progImage, "iResolution"), (float)rend_width, (float)rend_height, 1.0f);
     glUniform4f(glGetUniformLocation(progImage, "iMouse"), mouse_cx, mouse_cy, 0, 0);
     glUniform1i(glGetUniformLocation(progImage, "iFrame"), frames);
 

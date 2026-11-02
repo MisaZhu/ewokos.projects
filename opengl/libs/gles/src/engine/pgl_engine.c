@@ -1304,6 +1304,26 @@ static interp_entry *g_active = NULL;
 #include "rw_gpu.inc"
 #endif
 
+void gles_engine_render_align(GEint *aw, GEint *ah)
+{
+#ifdef PGL_G3D
+    /* The Adreno A690 (g2d version 690) linear surface backing the fullscreen
+     * compute and geometry paths requires the framebuffer row stride (w*4 bytes)
+     * to be 64-byte aligned, i.e. w a multiple of 16.  Reporting *aw=32/*ah=8
+     * lets the EGL layer round the render size up to a stride that always
+     * satisfies that and matches the compute local_size (32x8); every other
+     * backend keeps render==window (*aw=*ah=1). */
+    uint32_t ver = 0;
+    if (g2d_get_version(&ver) == G2D_OK && ver == 690) {
+        *aw = 32;
+        *ah = 8;
+        return;
+    }
+#endif
+    *aw = 1;
+    *ah = 1;
+}
+
 static interp_entry *find_entry(GLuint id)
 {
     int i;
