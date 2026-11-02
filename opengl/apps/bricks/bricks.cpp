@@ -913,6 +913,19 @@ int main(int argc, char **argv)
         }
     }
 
+    /* The q8b Adreno fullscreen compute path renders straight into the window
+     * framebuffer with a row pitch fb_stride = width*4 that the GPU requires to
+     * be 64-byte aligned.  Unlike the geometry path it does NOT decline a
+     * misaligned stride -- it submits the dispatch and wedges: the 600-wide
+     * default (stride 2400, 2400 % 64 == 32) hangs with no frame printed at all.
+     * raspi5/V3D only needs 4-byte stride alignment, so pi5 is unaffected and
+     * this is q8b-specific.  Snap the window up to a multiple of the compute
+     * local_size (32x8): width*4 then becomes a multiple of 128 (64-byte
+     * aligned) and the workgrid is exact, keeping the default on the GPU
+     * (600x400 -> 608x400). */
+    win_w = (win_w + 31) & ~31;
+    win_h = (win_h + 7) & ~7;
+
     memset(&g_bufA, 0, sizeof(g_bufA));
     memset(&g_bufB, 0, sizeof(g_bufB));
 

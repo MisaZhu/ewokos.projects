@@ -425,14 +425,19 @@ GLboolean load_texture_cubemap_from_mem(GLubyte* image, int w, int h, GLenum min
         for (int i=0; i<6; i++) {
             glTexImage2D(cube[i], 0, GL_COMPRESSED_RGBA, w, h, 0,
                          GL_RGBA, GL_UNSIGNED_BYTE, &image[i*plane]);
+        }
 
-            if (min_filter == GL_LINEAR_MIPMAP_LINEAR ||
-                min_filter == GL_LINEAR_MIPMAP_NEAREST ||
-                min_filter == GL_NEAREST_MIPMAP_LINEAR ||
-                min_filter == GL_NEAREST_MIPMAP_NEAREST)
-            {
-                glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
-            }
+        /* Generate the mip chain ONCE, after all six faces are defined.  Doing
+           it inside the per-face loop runs it against a cube map that is still
+           incomplete (later faces not yet uploaded), raising INVALID_OPERATION
+           on every premature call; only the last iteration happened to succeed.
+           Mirrors the single glGenerateMipmap in load_texture2D_from_mem. */
+        if (min_filter == GL_LINEAR_MIPMAP_LINEAR ||
+            min_filter == GL_LINEAR_MIPMAP_NEAREST ||
+            min_filter == GL_NEAREST_MIPMAP_LINEAR ||
+            min_filter == GL_NEAREST_MIPMAP_NEAREST)
+        {
+            glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
         }
     } else {
         /* GLES2 has no buffer-mapping upload; copy each face explicitly. */

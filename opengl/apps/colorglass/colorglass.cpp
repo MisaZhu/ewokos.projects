@@ -14,11 +14,15 @@
  * original samples them:
  *   iChannel0 = Uffizi Gallery cubemap (6 faces, res/uffizi_0..5.jpg) on unit 0
  *   iChannel1 = Rock Tiles 2D texture  (res/rock_tiles.jpg)          on unit 1
- * On raspi5 (PGL_G3D) the engine would normally compile the shader to a VideoCore
- * VII compute kernel through the fullscreen-quad route, but a samplerCube input
- * is outside what the on-device fullscreen dispatcher accepts, so this effect
- * latches back to the CPU GLSL interpreter (which fully supports textureCube)
- * with identical pixels; glGpuActiveEWOK() reports the live route on the HUD.
+ * On a GPU target (raspi5 V3D, q8b Adreno) the engine compiles the shader to a
+ * compute kernel through the fullscreen-quad route and samples BOTH the cubemap
+ * and the 2D bump map on the GPU.  Both samplers use GL_LINEAR (no mipmapped
+ * min-filter): the q8b Adreno texture path stages a SINGLE mip level, so a
+ * mipmapped min-filter makes gpu_ctex_slot request a multi-level image that the
+ * layout/staging rejects, silently dropping the effect to the (unusably slow)
+ * CPU GLSL interpreter.  raspi5 V3D accepts mip chains, but GL_LINEAR is the
+ * portable choice that keeps this one source GPU-accelerated on both backends.
+ * glGpuActiveEWOK() reports the live route on the HUD.
  *
  * The HUD is a Dear ImGui window (same 16px TTF font, titled auto-resize panel,
  * FPS + colour-coded Renderer as waterdrop/grass).  ImGui rasterizes through a
@@ -186,10 +190,11 @@ static void init_quad(void)
 }
 
 /* Load the two bundled reference inputs.  The cubemap's six faces are uploaded
- * in +X,-X,+Y,-Y,+Z,-Z order (the engine loader's fixed mapping) with mipmap
- * filtering to match the reference sampler; vflip=false so no flip.  The Rock
- * Tiles bump map uses GL_REPEAT wrap (the reference's wrap=repeat) and a
- * vertical flip (the reference's vflip=true). */
+ * in +X,-X,+Y,-Y,+Z,-Z order (the engine loader's fixed mapping); vflip=false
+ * so no flip.  The Rock Tiles bump map uses GL_REPEAT wrap (the reference's
+ * wrap=repeat) and a vertical flip (the reference's vflip=true).  BOTH samplers
+ * use GL_LINEAR: q8b Adreno stages one mip level only, where a mipmapped
+ * min-filter would fail staging and drop the effect to the CPU (see header). */
 static void init_textures(void)
 {
     static const char* faces[6] = {
@@ -202,14 +207,14 @@ static void init_textures(void)
     };
     glGenTextures(1, &tex_cube);
     glBindTexture(GL_TEXTURE_CUBE_MAP, tex_cube);
-    if (!load_texture_cubemap(faces, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR,
+    if (!load_texture_cubemap(faces, GL_LINEAR, GL_LINEAR,
                               GL_FALSE, GL_FALSE))
         printf("colorglass: failed to load Uffizi cubemap\n");
 
     glGenTextures(1, &tex_rock);
     glBindTexture(GL_TEXTURE_2D, tex_rock);
     if (!load_texture2D("/apps/colorglass/res/rock_tiles.jpg",
-                        GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR, GL_REPEAT,
+                        GL_LINEAR, GL_LINEAR, GL_REPEAT,
                         GL_TRUE, GL_FALSE, NULL, NULL))
         printf("colorglass: failed to load rock_tiles.jpg\n");
 }
