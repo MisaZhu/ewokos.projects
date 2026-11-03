@@ -766,14 +766,19 @@ static void draw_quad(GLuint prog)
     glDisableVertexAttribArray(0);
 }
 
-/* Snap a window size up to the q8b Adreno fullscreen-compute alignment:
+/* Snap a window size up to the q8b Adreno fullscreen-compute alignment: the
    width to a multiple of 32 (so stride=w*4 is 128B, satisfying the 64B
-   requirement) and height to a multiple of 8 (local_size.y).  On raspi5/V3D
-   this is harmless (stride only needs 4B alignment). */
+   requirement and tiling local_size.x exactly).  The height is derived from the
+   aligned width and the window aspect ratio (ceil) rather than aligned to 8, so
+   EGL's aspect-preserving present blit fills the window with no letterbox bars;
+   the GPU dispatch ceil-rounds the workgroup grid and bounds-checks, so the
+   height needs no alignment.  On raspi5/V3D the width alignment is harmless
+   (stride only needs 4B) and the aspect-derived height tracks the window. */
 static void aligned_render_size(int ww, int wh, int *rw, int *rh)
 {
     *rw = (ww + 31) & ~31;
-    *rh = (wh + 7) & ~7;
+    *rh = (ww > 0) ? (int)(((long)(*rw) * wh + ww - 1) / ww) : wh;
+    if (*rh < 1) *rh = 1;
 }
 
 /* Rebuild the EGL window surface with a new render size.  Returns 1 on

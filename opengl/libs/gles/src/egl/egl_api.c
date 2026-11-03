@@ -284,10 +284,18 @@ static void egl_on_resize(xwin_t *xwin)
      * engine back buffer so the GL viewport the app sets from
      * EGL_RENDER_*_EWOK matches the surface it renders into. */
     {
-        GEint aw = 1, ah = 1;
-        gles_engine_render_align(&aw, &ah);
+        GEint aw = 1;
+        gles_engine_render_align(&aw);
         s->render_w = (w + aw - 1) / aw * aw;
-        s->render_h = (h + ah - 1) / ah * ah;
+        /* Derive the height from the aligned width and the window aspect ratio.
+         * egl_on_repaint's present blit preserves aspect, so an aspect-matched
+         * render size makes dh == window height and the image fills the window
+         * with no letterbox bars (ceil keeps the integer-scaled blit exact).
+         * The GPU dispatch ceil-rounds the workgroup grid and bounds-checks, so
+         * the height needs no alignment. */
+        s->render_h = (EGLint)(((long)s->render_w * h + w - 1) / w);
+        if (s->render_h < 1)
+            s->render_h = 1;
         gles_engine_resize(s->render_w, s->render_h);
     }
 }
@@ -510,12 +518,16 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
         /* App manages its own (already aligned) render size. */
         s->native_render = 1;
     } else {
-        /* Ordinary app: align the initial render size to the backend so the
-         * first frame and every later resize share one geometry. */
-        GEint aw = 1, ah = 1;
-        gles_engine_render_align(&aw, &ah);
+        /* Ordinary app: align the initial render width to the backend and
+         * derive the height from the window aspect ratio so the first frame and
+         * every later resize share one geometry that fills the window on the
+         * aspect-preserving present blit (no letterbox bars). */
+        GEint aw = 1;
+        gles_engine_render_align(&aw);
         s->render_w = (g.w + aw - 1) / aw * aw;
-        s->render_h = (g.h + ah - 1) / ah * ah;
+        s->render_h = (EGLint)(((long)s->render_w * g.h + g.w - 1) / g.w);
+        if (s->render_h < 1)
+            s->render_h = 1;
     }
     s->swap_interval = 1;
 

@@ -65,12 +65,17 @@ void gles_engine_fini(void);
 void gles_engine_make_current(void);
 /* Resize the engine back buffer.  Returns 1 on success. */
 int  gles_engine_resize(GEint w, GEint h);
-/* Backend render-size alignment.  Writes the horizontal/vertical granularity
- * the EGL layer must round the render size up to so the back buffer row stride
- * satisfies the active backend's requirements.  Adreno A690 (g2d version 690)
- * needs a 64-byte-aligned stride and reports *aw=32, *ah=8; every other backend
- * reports *aw=1, *ah=1 (render size == window size, no alignment). */
-void gles_engine_render_align(GEint *aw, GEint *ah);
+/* Backend render-WIDTH alignment.  Writes the horizontal granularity the EGL
+ * layer must round the render width up to so the back buffer row stride (w*4)
+ * satisfies the active backend.  Adreno A690 (g2d version 690) addresses linear
+ * surface rows at 64-byte granularity, so the width must be a multiple of 16;
+ * we report 32 to also tile the fullscreen-compute workgroup grid (local_size.x)
+ * exactly.  The height needs NO alignment (the dispatch ceil-rounds the grid and
+ * the shader bounds-checks), so the EGL layer derives the render height from the
+ * aligned width and the window aspect ratio to keep the aspect-preserving
+ * present blit filling the window with no letterbox bars.  Every other backend
+ * reports *aw=1 (render size == window size). */
+void gles_engine_render_align(GEint *aw);
 
 /* Back-buffer accessors for the EGL swap.  At 32 bpp the pixels are packed
  * u32 0xAARRGGBB, byte-identical to EwokOS graph_t's argb layout, so
