@@ -15,6 +15,7 @@
 #include <stdlib.h>
 
 #include <x/xwin.h>
+#include <x++/X.h>
 #include <ewoksys/keydef.h>
 #include <ewoksys/kernel_tic.h>
 #include <ewoksys/proc.h>
@@ -1346,6 +1347,7 @@ bool VideoInit(bool classic)
 		return false;
 	memset(x_context, 0, sizeof(x_t));
 	x_init(x_context, NULL);
+	const bool system_hidpi = Ewok::X::hidpiSize(128) > 128;
 	x_context->on_loop = xwin_loop;
 
 	xwin = xwin_open(x_context, -1, 32, 32, display_width, display_height, "Basilisk II", 0);
@@ -1375,7 +1377,12 @@ bool VideoInit(bool classic)
 		display_height = xwin->xinfo->wsr.h;
 	}
 
-	if(hidpi && display_width >= 1280) {
+	if (system_hidpi && !classic) {
+		// Match the 2x presentation with a half-resolution guest desktop so
+		// the aspect-fit scaler fills the screen instead of cropping it.
+		display_width /= 2;
+		display_height /= 2;
+	} else if(hidpi && display_width >= 1280) {
 		int dw = display_width * 2 / 3;
 		int dh = display_height * 2 / 3;
 		if(dw >= 480 &&	dh >= 320) {
