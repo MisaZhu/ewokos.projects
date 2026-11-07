@@ -11,6 +11,7 @@
 #ifdef VULKAN_GPU_BACKEND
 #include <g2dclient/g2dclient.h>
 #include <sys/shm.h>
+#include "vkclient.h"
 #endif
 
 static void release_sc_storage(vk_device_memory *mem)
@@ -134,6 +135,17 @@ static int create_sc_image(vk_swapchain *sc, uint32_t i)
     im->bpp = vk_format_bpp(sc->format);
     if (!im->bpp) im->bpp = 4;
     im->row_pitch = im->bpp * sc->width;
+#ifdef VULKAN_GPU_BACKEND
+    /* Keep the logical image extent unchanged, but give Adreno swapchain rows
+     * the 64-byte pitch required by its raster and first-frame clear paths.
+     * GPU draws can then target the shared image directly for the whole render
+     * pass; present crops the logical pixels using this explicit row pitch. */
+    if (im->bpp == 4u && sc->device->backend == &vk_backend_gpu) {
+        uint32_t canvas_w = vk_gfx_canvas_width(sc->width);
+        if (canvas_w >= sc->width)
+            im->row_pitch = im->bpp * canvas_w;
+    }
+#endif
     size = (VkDeviceSize)im->row_pitch * sc->height;
 
     mem = (vk_device_memory *)vk_obj_alloc(sizeof(vk_device_memory), VK_OBJ_DEVICE_MEMORY);

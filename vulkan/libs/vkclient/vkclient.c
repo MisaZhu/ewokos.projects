@@ -326,6 +326,18 @@ int32_t vk_gfx_program_upload(const void *blob, uint32_t size)
     return handle;
 }
 
+uint32_t vk_gfx_canvas_width(uint32_t fb_w)
+{
+    /* A690's linear framebuffer pitch and A2D clear both use 64-byte rows.
+     * Keep the logical viewport unchanged and pad only the GPU canvas. */
+    if (vkclient_gpu_version() == 690u) {
+        if (fb_w > UINT32_MAX - 15u)
+            return 0;
+        return (fb_w + 15u) & ~15u;
+    }
+    return fb_w;
+}
+
 void *vk_gfx_attr_stage(uint32_t nverts, uint32_t attr_stride)
 {
     uint32_t bytes;
@@ -348,7 +360,7 @@ int32_t vk_gfx_draw(int32_t prog_handle,
                     const vk_gfx_tex *tex, uint32_t ntex)
 {
     g2d_pgl_req_t req;
-    uint32_t host_pitch, fb_bytes, attr_bytes, unif_bytes;
+    uint32_t host_pitch, gpu_w, gpu_pitch, fb_bytes, attr_bytes, unif_bytes;
     uint32_t i, ntex_bound;
     int32_t  rc;
     int direct_fb;
@@ -363,13 +375,17 @@ int32_t vk_gfx_draw(int32_t prog_handle,
     host_pitch = fb_stride ? fb_stride : fb_w * 4u;
     if (host_pitch < fb_w * 4u)
         return G2D_ERR_FAILED;
-    fb_bytes   = fb_w * fb_h * 4u;          /* tight GPU framebuffer canvas */
+    gpu_w = vk_gfx_canvas_width(fb_w);
+    if (gpu_w < fb_w)
+        return G2D_ERR_FAILED;
+    gpu_pitch  = gpu_w * 4u;
+    fb_bytes   = gpu_pitch * fb_h;       /* tightly packed, possibly padded rows */
     attr_bytes = nverts * attr_stride * 4u;
     unif_bytes = num_unif * 4u;
-    direct_fb = (fb_shm > 0 && host_pitch == fb_w * 4u);
+    direct_fb = (fb_shm > 0 && host_pitch == gpu_pitch);
 
-    /* A shared swapchain image is itself the GPU destination.  Other images
-     * retain the persistent staging framebuffer and its host readback. */
+    /* A shared swapchain image with a GPU-compatible pitch is itself the GPU
+     * destination.  Other images retain staging and host readback. */
     if ((!direct_fb && !ensure_stage(&_fb, fb_bytes)) ||
         !ensure_stage(&_z,  fb_bytes) ||
         !ensure_stage(&_attr, attr_bytes))
@@ -384,7 +400,7 @@ int32_t vk_gfx_draw(int32_t prog_handle,
      * needed; otherwise stage the current attachment contents (a continuing draw
      * within a render pass) and let the depth surface persist untouched. */
     if (!first_frame && !direct_fb)
-        gfx_copy_rows(_fb.px, fb_w * 4u, fb_host, host_pitch,
+        gfx_copy_rows(_fb.px, gpu_pitch, fb_host, host_pitch,
                       fb_w * 4u, fb_h);
     if (attr_host != _attr.px)
         memcpy(_attr.px, attr_host, attr_bytes);
@@ -441,18 +457,18 @@ int32_t vk_gfx_draw(int32_t prog_handle,
      * zero values keep vc_pgl3d's fixed-function eligibility gates satisfied. */
     {
         g2d_canvas_t dst  = direct_fb
-            ? g2d_canvas(fb_shm,  fb_bytes, fb_w, fb_h, 1)
-            : g2d_canvas(_fb.shm, fb_bytes, fb_w, fb_h, 1);
+            ? g2d_canvas(fb_shm,  fb_bytes, gpu_w, fb_h, 1)
+            : g2d_canvas(_fb.shm, fb_bytes, gpu_w, fb_h, 1);
         g2d_canvas_t pos  = g2d_canvas(_attr.shm, attr_bytes, nverts, attr_stride, 1);
         g2d_canvas_t col  = g2d_canvas(0, 0, 0, 0, 0);
-        g2d_canvas_t zc   = g2d_canvas(_z.shm,    fb_bytes,   fb_w, fb_h, 1);
+        g2d_canvas_t zc   = g2d_canvas(_z.shm,    fb_bytes, gpu_w, fb_h, 1);
 
         g2d_pgl_draw_req_init(&req, dst, pos, col,
                               G2D_PGL_MODE_TRIANGLES, nverts,
-                              G2D_PGL_FMT_RGBA8, fb_w * 4u,
+                              G2D_PGL_FMT_RGBA8, gpu_pitch,
                               G2D_PGL_FS_SOLID, 0u, 0u,
                               G2D_PGL_DEPTH_NONE, 0u, G2D_PGL_CULL_NONE,
-                              zc, fb_w * 4u, (uint8_t)(first_frame ? 1 : 0),
+                              zc, gpu_pitch, (uint8_t)(first_frame ? 1 : 0),
                               clear_rgba, clear_z);
         g2d_pgl_draw_req_set_shader(&req, prog_handle,
                                     (num_unif > 0u) ? _unif.shm : 0,
@@ -481,7 +497,7 @@ int32_t vk_gfx_draw(int32_t prog_handle,
     if (rc == G2D_OK) {
         /* A direct swapchain target already holds the finished pixels. */
         if (!direct_fb)
-            gfx_copy_rows(fb_host, host_pitch, _fb.px, fb_w * 4u,
+            gfx_copy_rows(fb_host, host_pitch, _fb.px, gpu_pitch,
                           fb_w * 4u, fb_h);
     } else if (rc == G2D_ERR_TIMEOUT || rc == G2D_ERR_MMU_FAULT) {
         gfx_abandon_staging();

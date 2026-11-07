@@ -166,7 +166,8 @@ static VkDeviceSize image_size(const vk_image *im)
     VkDeviceSize s;
     uint32_t bpp = im->bpp ? im->bpp : vk_format_bpp(im->format);
     if (!bpp) return 0;
-    s = (VkDeviceSize)bpp * im->extent.width * im->extent.height * im->extent.depth;
+    s = (VkDeviceSize)(im->row_pitch ? im->row_pitch : bpp * im->extent.width) *
+        im->extent.height * im->extent.depth;
     s *= im->array_layers ? im->array_layers : 1;
     s *= im->mip_levels ? im->mip_levels : 1;
     return s;

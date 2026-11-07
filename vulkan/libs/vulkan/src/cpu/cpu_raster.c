@@ -542,7 +542,7 @@ static int setup_rt(vk_draw_ctx *dc, rt_state *rt)
         if (!rt->color[i]) return -1;
         rt->cfmt[i] = im->format;
         rt->cbpp[i] = im->bpp ? im->bpp : vk_format_bpp(im->format);
-        rt->cpitch[i] = rt->cbpp[i] * im->extent.width;
+        rt->cpitch[i] = im->row_pitch ? im->row_pitch : rt->cbpp[i] * im->extent.width;
         if (!rt->cbpp[i]) return -1;
         rt->width = im->extent.width;
         rt->height = im->extent.height;
@@ -553,7 +553,7 @@ static int setup_rt(vk_draw_ctx *dc, rt_state *rt)
         if (rt->depth) {
             rt->dfmt = im->format;
             rt->dbpp = im->bpp ? im->bpp : vk_format_bpp(im->format);
-            rt->dpitch = rt->dbpp * im->extent.width;
+            rt->dpitch = im->row_pitch ? im->row_pitch : rt->dbpp * im->extent.width;
         }
     }
     if (dc->rt_width) rt->width = dc->rt_width;

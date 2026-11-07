@@ -126,6 +126,13 @@ typedef struct vk_gfx_tex {
  * libvulkan's GPU graphics path off). */
 int32_t vk_gfx_program_upload(const void *blob, uint32_t size);
 
+/* Width of the GPU framebuffer canvas in pixels.  Adreno's linear framebuffer
+ * and first-frame clear require a 64-byte row pitch, so a logical width that is
+ * not a multiple of 16 is rendered into a wider canvas and copied back row by
+ * row.  The raster kernel's uFbStride uniform must use this value; uViewportWH
+ * and the host attachment keep the logical fb_w.  Other backends return fb_w. */
+uint32_t vk_gfx_canvas_width(uint32_t fb_w);
+
 /* Acquire the persistent attribute canvas for one draw.  The caller gathers
  * directly into the returned float stream and passes it back as attr_host to
  * vk_gfx_draw; this avoids a temporary heap stream and a second full copy.
@@ -142,8 +149,9 @@ void *vk_gfx_attr_stage(uint32_t nverts, uint32_t attr_stride);
  *                  writes (the caller picks the kernel's uFbSwizzle to agree).
  *   fb_w/fb_h    - render-target size in pixels.
  *   fb_stride    - fb_host row pitch in bytes (0 -> derive fb_w * 4).  The GPU
- *                  framebuffer canvas is always tightly packed (fb_w * 4), so a
- *                  pitched host attachment is copied row by row.
+ *                  framebuffer canvas uses vk_gfx_canvas_width(fb_w) * 4 as its
+ *                  pitch, so a pitched host attachment and any alignment padding
+ *                  are copied row by row.
  *   attr_host    - the gathered per-vertex attribute float stream, one vertex's
  *                  attributes contiguous, `attr_stride` FLOATS per vertex
  *                  (nverts * attr_stride * 4 bytes total).  A pointer returned

@@ -818,7 +818,7 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
     uint32_t *unif = NULL;
     vk_gfx_tex tex[VKCLIENT_MAX_TEX];
     VkViewport vp;
-    uint32_t cbpp, rt_w, rt_h, fb_stride, ntris, nverts, astride;
+    uint32_t cbpp, rt_w, rt_h, canvas_w, fb_stride, ntris, nverts, astride;
     uint32_t num_unif, ntex = 0, k, j, cull, frontcw, fbswz, blend_mode = 0, clear_rgba = 0;
     int bgra, depth_on, have_depth, first_frame = 0;
     float lox, loy, hix, hiy;
@@ -878,8 +878,13 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
     if (dc->rt_width)  rt_w = dc->rt_width;
     if (dc->rt_height) rt_h = dc->rt_height;
     if (!rt_w || !rt_h)        GFX_CPU();
-    fb_stride = cbpp * cim->extent.width;
+    fb_stride = cim->row_pitch ? cim->row_pitch : cbpp * cim->extent.width;
     if (fb_stride < rt_w * 4u) GFX_CPU();
+    /* Adreno needs a 64-byte framebuffer pitch even for the first-frame clear.
+     * Render non-aligned logical widths into a wider staging canvas instead of
+     * letting the daemon decline the whole draw to the CPU rasterizer. */
+    canvas_w = vk_gfx_canvas_width(rt_w);
+    if (canvas_w < rt_w) GFX_CPU();
 
     /* depth: the kernel arbitrates strict LESS + write, or is off.  A depth
      * attachment the CPU would actually test against (depth_test_enable && a
@@ -1140,7 +1145,7 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
         /* pass 2 raster uniforms (offset by the xform region) */
         v4[0] = gfx_f2u((float)rt_w); v4[1] = gfx_f2u((float)rt_h);
         gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uViewportWH", v4, 2);
-        v4[0] = rt_w;
+        v4[0] = canvas_w;
         gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uFbStride", v4, 1);
         v4[0] = 0u;
         gfx_pack(gp->rs_bindings, gp->nrs_bindings, rb, unif, "uTriFirst", v4, 1);

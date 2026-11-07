@@ -152,9 +152,12 @@ static void VKAPI_CALL teapot_present(void *user, const void *pixels,
     /* only the byte-identical B8G8R8A8 path is copied straight through */
     if (format != VK_FORMAT_B8G8R8A8_UNORM) return;
     if (!g || !g->buffer) return;
-    if (shm_id > 0) {
+    if (shm_id > 0 && (stride_bytes & 3u) == 0) {
         graph_t sg;
-        graph_init(&sg, (const uint32_t *)src, width, height);
+        /* The source canvas may have aligned rows wider than the logical image.
+         * Blit only width x height so G2D uses the padded source pitch while
+         * cropping the padding instead of falling back to a full CPU copy. */
+        graph_init(&sg, (const uint32_t *)src, stride_bytes / 4u, height);
         sg.shm_id = shm_id;
         sg.shm_contig = 1;
         graph_blt(&sg, 0, 0, width, height, g, 0, 0, g->w, g->h);
