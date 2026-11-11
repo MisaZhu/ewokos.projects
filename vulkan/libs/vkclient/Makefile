@@ -20,7 +20,7 @@ PRIV = $(BUILD_DIR)/lib/.vulkan_priv
 # $(SDK_DIR)/include (raspi5/raspix V3D CSD, q8b's Adreno 690 CS).  On a
 # CPU-only target this Makefile is a no-op (libvulkan.a stays the
 # software-device library).
-VK_GPU_HWS := raspi5 raspix q8b
+VK_GPU_HWS := raspi5 raspix 8gen3
 VULKAN_GPU :=
 ifeq ($(PGL_G3D),yes)
 ifneq ($(filter $(HW),$(VK_GPU_HWS)),)

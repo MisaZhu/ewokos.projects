@@ -9,7 +9,7 @@
  * integer reference, and then reports AP/DSP latency, throughput and effective
  * convolution throughput.
  *
- * Timing follows the rules used by machines/q8b/system/bin/npudemo:
+ * Timing follows the rules used by machines/qcom/8gen3/system/bin/npudemo:
  *   - AP intervals use the raw free-running CNTVCT_EL0 counter.
  *   - DSP intervals are the adapter's native.last_dsp_us (graphExecute only).
  *   - The checked FPS window also includes binding, output poisoning and

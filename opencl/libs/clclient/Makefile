@@ -21,7 +21,7 @@ PRIV = $(BUILD_DIR)/lib/.opencl_priv
 # PGL_G3D=yes but is not an OpenCL GPU target yet, so the HW filter keeps it --
 # and virt -- CPU-only, matching libs/opencl's gate exactly.  On a CPU-only
 # target this Makefile is a no-op (libOpenCL.a stays the Phase-1 CPU library).
-CL_GPU_HWS := raspi5 q8b
+CL_GPU_HWS := raspi5 8gen3
 OPENCL_GPU :=
 ifeq ($(PGL_G3D),yes)
 ifneq ($(filter $(HW),$(CL_GPU_HWS)),)

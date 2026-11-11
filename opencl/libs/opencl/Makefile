@@ -25,7 +25,7 @@ CFLAGS += -I../../include -Isrc -Isrc/clc
 #   - the private clclient transport + the on-device mesa compiler archives that
 #     projects/opengl stages under .gles_priv are ADDLIB-merged into libOpenCL.a,
 #     so an app still links only -lOpenCL (+ -lg2dclient -lewokstl -lcxx).
-CL_GPU_HWS := raspi5 q8b
+CL_GPU_HWS := raspi5 8gen3
 OPENCL_GPU :=
 ifeq ($(PGL_G3D),yes)
 ifneq ($(filter $(HW),$(CL_GPU_HWS)),)

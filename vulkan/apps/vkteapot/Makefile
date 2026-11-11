@@ -17,7 +17,7 @@ TASK_DIR = $(BUILD_DIR)/rootfs/apps/$(TASK)
 VULKAN_LIB = $(BUILD_DIR)/lib/libvulkan.a
 IMGUI_VK_LIB = $(BUILD_DIR)/lib/libimgui_vk.a
 
-VK_GPU_HWS := raspi5 raspix q8b
+VK_GPU_HWS := raspi5 raspix 8gen3
 VK_GPU_LIBS :=
 ifeq ($(PGL_G3D),yes)
 ifneq ($(filter $(HW),$(VK_GPU_HWS)),)

@@ -9,7 +9,7 @@
  * PGL_G3D_COMPILER_DIR (exported from machines/<hw>/system/make.inc):
  *
  *   machines/raspi5|raspix/system/libs/v3dcompiler    VideoCore V3D (NIR->QPU)
- *   machines/q8b/system/libs/adrenocompiler           Adreno (NIR->ir3)
+ *   machines/qcom/8gen3/system/libs/adrenocompiler           Adreno (NIR->ir3)
  *
  * The backend drives the frontend through pglcompiler_frontend.h, compiles
  * the resulting NIR with its own mesa backend, and packs the result into the

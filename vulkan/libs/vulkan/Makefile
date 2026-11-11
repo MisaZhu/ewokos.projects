@@ -23,7 +23,7 @@ CFLAGS += -I../../include -Isrc -Isrc/spirv
 #   - the private vkclient transport + the on-device mesa compiler archives that
 #     projects/opengl stages under .gles_priv are ADDLIB-merged into libvulkan.a,
 #     so an app still links only -lvulkan (+ -lg2dclient -lewokstl -lcxx).
-VK_GPU_HWS := raspi5 raspix q8b
+VK_GPU_HWS := raspi5 raspix 8gen3
 VULKAN_GPU :=
 ifeq ($(PGL_G3D),yes)
 ifneq ($(filter $(HW),$(VK_GPU_HWS)),)

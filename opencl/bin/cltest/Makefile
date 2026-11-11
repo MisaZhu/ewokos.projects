@@ -19,7 +19,7 @@ OPENCL_LIB = $(BUILD_DIR)/lib/libOpenCL.a
 # target keeps its exact link line (the extra archives would be unreferenced
 # no-ops there anyway).  Order mirrors the proven GLES app closure:
 # transport/STL before $(EWOK_LIBC), -lcxx last.
-CL_GPU_HWS := raspi5 q8b
+CL_GPU_HWS := raspi5 8gen3
 OPENCL_GPU_LIBS :=
 OPENCL_GPU_CXX :=
 ifeq ($(PGL_G3D),yes)

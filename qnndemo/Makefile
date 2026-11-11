@@ -9,7 +9,7 @@ RES_FILES = $(wildcard res/*)
 OBJS = $(ARCH)/src/qnndemo.o
 
 # qnn_core.h / qnn_htp_ext.h are installed into the SDK include dir by
-# machines/q8b/system/libs/adrenonpu.  The link group resolves the
+# machines/qcom/8gen3/system/libs/adrenonpu.  The link group resolves the
 # libadrenonpu -> openlibm/ewoksys/libc references regardless of order.
 CFLAGS += -I $(BUILD_DIR)/include
 QNNDEMO_LIBS = --start-group -ladrenonpu -lopenlibm -lewoksys -lc -lgloss --end-group

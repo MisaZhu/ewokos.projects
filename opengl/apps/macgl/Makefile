@@ -8,7 +8,7 @@ TASK_OBJS = $(ARCH)/macgl.$(HW).o
 CXXFLAGS += -I$(SDK_DIR)/include -I$(SDK_DIR)/include/imgui -fno-threadsafe-statics
 GLES_LIBS = $(SDK_DIR)/lib/libimgui_gles.a $(SDK_DIR)/lib/libEGL.a $(SDK_DIR)/lib/libGLESv2.a
 SYSTEM_LIBS = $(foreach lib,ewoksys ewokstl x++ x font graph widget++ cxx,$(SDK_DIR)/lib/lib$(lib).a)
-# q8b exports PGL_G3D=yes too (machines/q8b/system/make.inc: Adreno a6xx
+# q8b exports PGL_G3D=yes too (machines/qcom/8gen3/system/make.inc: Adreno a6xx
 # backend), so its libGLESv2 auto-detects macgl's passthrough-VS +
 # gl_FragCoord-FS quad as a fullscreen effect and GPU-compiles it (see
 # pgl_engine.c is_fullscreen).  If the APP is built WITHOUT -DPGL_G3D it hands
@@ -20,7 +20,7 @@ SYSTEM_LIBS = $(foreach lib,ewoksys ewokstl x++ x font graph widget++ cxx,$(SDK_
 # raspi5 (interpreter macgl_fs_glsl + GPU macgl_gpu_fs_glsl + macglData atlas);
 # the q8b fullscreen-compute kernel stages that REPEAT/linear RGBA8 texture and
 # declines to the (correct) interpreter if it ever cannot.
-GPU_HWS := raspi5 raspix q8b
+GPU_HWS := raspi5 raspix 8gen3
 ifeq ($(PGL_G3D),yes)
 ifneq ($(filter $(HW),$(GPU_HWS)),)
 CXXFLAGS += -DPGL_G3D

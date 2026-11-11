@@ -11,7 +11,7 @@ GUI_TARGET = $(GUI_DIR)/$(GUI_TASK)
 
 # The installer links the machine BSP directly: the q8b backend drives the
 # SDCC2 card and the M.2 NVMe through the user-space drivers that
-# machines/q8b/system/libs/bsp stages into $(SDK_DIR).  No filesystem daemon
+# machines/qcom/8gen3/system/libs/bsp stages into $(SDK_DIR).  No filesystem daemon
 # is involved; every copy is raw-sector IO, same model as sdupdate/espwrite.
 CORE_OBJS = $(ARCH)/src/gpt.o \
 	$(ARCH)/src/copy.o \

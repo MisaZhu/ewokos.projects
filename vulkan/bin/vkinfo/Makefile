@@ -16,7 +16,7 @@ VULKAN_LIB = $(BUILD_DIR)/lib/libvulkan.a
 # the g2d transport and the C++ runtime mesa needs.  Gated on the same
 # PGL_G3D=yes + VK-GPU-HW condition libs/vulkan uses, so a CPU-only target keeps
 # its exact link line.
-VK_GPU_HWS := raspi5 raspix q8b
+VK_GPU_HWS := raspi5 raspix 8gen3
 VK_GPU_LIBS :=
 VK_GPU_CXX :=
 ifeq ($(PGL_G3D),yes)

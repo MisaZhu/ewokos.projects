@@ -11,7 +11,7 @@ TASK_OBJS = $(ARCH)/vktest.o
 TASK_DIR = $(BUILD_DIR)/rootfs/bin
 VULKAN_LIB = $(BUILD_DIR)/lib/libvulkan.a
 
-VK_GPU_HWS := raspi5 raspix q8b
+VK_GPU_HWS := raspi5 raspix 8gen3
 VK_GPU_LIBS :=
 VK_GPU_CXX :=
 ifeq ($(PGL_G3D),yes)
