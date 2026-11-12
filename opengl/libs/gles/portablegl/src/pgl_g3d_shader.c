@@ -60,11 +60,11 @@
  *   [xs_num_bindings 4B][xs_bindings ...]
  *   [xs_uniform_blob_dwords 4B][xs_local_size 12B]
  *   [flags: is_geom geom_model geom_tex geom_texcol geom_inst geom_inst_lit
- *           geom_tpw  -- 7 * 4B]
+ *           geom_color geom_tpw  -- 8 * 4B]
  * ------------------------------------------------------------------------- */
 #define PGL_DISK_CACHE_DIR   "/tmp/pgl_shader_cache"
 #define PGL_DISK_CACHE_MAGIC 0x434C4750u  /* 'P','G','L','C' */
-#define PGL_DISK_CACHE_VER   1u
+#define PGL_DISK_CACHE_VER   5u   /* texcol raster: CAS-retried blend RMW */
 
 typedef struct {
 	int      used;
@@ -100,6 +100,12 @@ typedef struct {
 	   geom_xform_instlit_cs_glsl - 40-float per-instance records carrying
 	   emissive + alpha and the engine demo's full lighting model. */
 	int      geom_inst_lit;
+	/* COLOUR flavour (uMVP-only VS with no uNormalMat): the xform kernel is
+	   geom_xform_color_cs_glsl - attr1 is a precomputed per-vertex colour
+	   copied through, alpha forced 1.0.  pgl_g3d_draw_mesh_compiled honours
+	   the draw's blend/depth-mask/cull state for this variant (and
+	   inst_lit) so additive particle draws composite on the GPU. */
+	int      geom_color;
 	int      geom_tpw;
 	struct pglc_program prog;
 	/* Two-pass geometry rasterizer: the VERTEX-TRANSFORM kernel (pass 1) is
@@ -199,7 +205,7 @@ static int cache_load(prog_entry_t* e, uint32_t gpu_ver, uint64_t h64)
 	uint32_t cs_ubd, xs_ubd;
 	uint32_t cs_ls[3], xs_ls[3];
 	uint32_t cs_nb, xs_nb;
-	uint32_t flags[7];
+	uint32_t flags[8];
 
 	cache_path(path, sizeof(path), gpu_ver, h64);
 	fp = fopen(path, "rb");
@@ -241,7 +247,7 @@ static int cache_load(prog_entry_t* e, uint32_t gpu_ver, uint64_t h64)
 	if (fread(xs_ls, 4, 3, fp) != 3) goto fail;
 
 	/* flags */
-	if (fread(flags, 4, 7, fp) != 7) goto fail;
+	if (fread(flags, 4, 8, fp) != 8) goto fail;
 	fclose(fp);
 
 	/* Populate the entry.  The pglc_program stages get their uniform
@@ -276,7 +282,8 @@ static int cache_load(prog_entry_t* e, uint32_t gpu_ver, uint64_t h64)
 	e->geom_texcol   = flags[3];
 	e->geom_inst     = flags[4];
 	e->geom_inst_lit = flags[5];
-	e->geom_tpw      = flags[6];
+	e->geom_color    = flags[6];
+	e->geom_tpw      = flags[7];
 	return 1;
 
 fail:
@@ -296,7 +303,7 @@ static void cache_store(const prog_entry_t* e, uint32_t gpu_ver, uint64_t h64,
 	FILE* fp;
 	uint32_t magic = PGL_DISK_CACHE_MAGIC, ver = PGL_DISK_CACHE_VER;
 	uint32_t cs_nb, xs_nb, cs_ubd, xs_ubd;
-	uint32_t flags[7];
+	uint32_t flags[8];
 	const struct pglc_stage* cs = &e->prog.stage[PGLC_STAGE_COMPUTE];
 	const struct pglc_stage* xs = &e->xform_prog.stage[PGLC_STAGE_COMPUTE];
 
@@ -334,8 +341,9 @@ static void cache_store(const prog_entry_t* e, uint32_t gpu_ver, uint64_t h64,
 	flags[3] = (uint32_t)e->geom_texcol;
 	flags[4] = (uint32_t)e->geom_inst;
 	flags[5] = (uint32_t)e->geom_inst_lit;
-	flags[6] = (uint32_t)e->geom_tpw;
-	fwrite(flags, 4, 7, fp);
+	flags[6] = (uint32_t)e->geom_color;
+	flags[7] = (uint32_t)e->geom_tpw;
+	fwrite(flags, 4, 8, fp);
 	fclose(fp);
 }
 
@@ -359,6 +367,8 @@ static void entry_clear(prog_entry_t* e)
 	e->geom_texcol = 0;
 	e->geom_inst = 0;
 	e->geom_inst_lit = 0;
+	e->geom_color = 0;
+	e->geom_tpw = 0;
 	e->used = 0;
 }
 
@@ -585,6 +595,7 @@ pgl_g3d_prog pgl_g3d_program_compile(const char* vert_glsl, const char* frag_gls
 				_progs[slot].geom_texcol = v_texcol;
 				_progs[slot].geom_inst = v_inst || v_inst_lit;
 				_progs[slot].geom_inst_lit = v_inst_lit;
+				_progs[slot].geom_color = v_color;
 				_progs[slot].geom_tpw = v_tpw;
 				_progs[slot].geom_model = v_model;
 			} else if (errlog && errsz > 0) {
@@ -741,6 +752,14 @@ int pgl_g3d_shader_geom_inst_lit(pgl_g3d_prog p)
 	if (!pgl_g3d_program_valid(p))
 		return 0;
 	return _progs[p].geom_inst_lit &&
+	       _progs[p].prog.stage[PGLC_STAGE_COMPUTE].code_words != 0;
+}
+
+int pgl_g3d_shader_geom_color(pgl_g3d_prog p)
+{
+	if (!pgl_g3d_program_valid(p))
+		return 0;
+	return _progs[p].geom_color &&
 	       _progs[p].prog.stage[PGLC_STAGE_COMPUTE].code_words != 0;
 }
 

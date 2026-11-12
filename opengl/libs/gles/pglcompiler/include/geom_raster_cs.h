@@ -179,6 +179,13 @@ static const char geom_xform_color_cs_glsl[] =
 "uniform mat4 uMVP;\n"
 "uniform vec2 uViewportWH;\n"
 "uniform int  uVertCount;\n"
+"/* 1 = attribute 1 carries a per-vertex ALPHA (binding 2 staged at a 4-float\n"
+"   colour stride) and the vout record must carry it through for the raster\n"
+"   kernel's blend equation; 0 = the historical RGB-only stride-3 layout with\n"
+"   alpha forced to 1.0 (opaque / premultiplied-additive draws).  Patched per\n"
+"   draw by name from pgl_g3d_draw_mesh_compiled; other xform kernels do not\n"
+"   declare it, so the patch is a no-op for them. */\n"
+"uniform int  uColAlpha;\n"
 "\n"
 "void main()\n"
 "{\n"
@@ -194,7 +201,8 @@ static const char geom_xform_color_cs_glsl[] =
 "    float iw = (c.w > 0.0) ? (1.0 / c.w) : 0.0;   /* clip sentinel */\n"
 "    vec2 s = vec2((c.x * iw * 0.5 + 0.5) * W.x, (0.5 - c.y * iw * 0.5) * W.y);\n"
 "    float z = c.z * iw * 0.5 + 0.5;\n"
-"    vec3 col = (c.w > 0.0) ? vec3(vcol[v*3+0], vcol[v*3+1], vcol[v*3+2])\n"
+"    int cs = (uColAlpha != 0) ? 4 : 3;\n"
+"    vec3 col = (c.w > 0.0) ? vec3(vcol[v*cs+0], vcol[v*cs+1], vcol[v*cs+2])\n"
 "                           : vec3(0.0);\n"
 "\n"
 "    vout[v*8+0] = s.x;\n"
@@ -204,7 +212,7 @@ static const char geom_xform_color_cs_glsl[] =
 "    vout[v*8+4] = col.r;\n"
 "    vout[v*8+5] = col.g;\n"
 "    vout[v*8+6] = col.b;\n"
-"    vout[v*8+7] = 1.0;\n"
+"    vout[v*8+7] = (uColAlpha != 0) ? vcol[v*4+3] : 1.0;\n"
 "}\n";
 
 /* ---- Pass 2: gouraud rasterizer (ONE LANE PER TRIANGLE) ------------------
@@ -230,9 +238,13 @@ static const char geom_xform_color_cs_glsl[] =
  *               1 = SRC_ALPHA/ONE_MINUS_SRC_ALPHA, 2 = SRC_ALPHA/ONE;
  *               blended modes read-modify-write the fb word with the
  *               per-vertex alpha carried in vout[i*8+7] (the xform kernels
- *               write the material/instance alpha there).  Blended draws must
- *               NOT be coalesced across overlapping geometry: lanes run in
- *               parallel, so painter's order only holds BETWEEN dispatches.
+ *               write the material/instance alpha there).  The blend RMW is a
+ *               CAS loop, so overlapping triangles inside ONE dispatch compose
+ *               atomically instead of losing each other's contribution: the
+ *               additive equation (2) is order-independent even with its
+ *               per-step clamp, while the SRC_ALPHA equation (1) remains
+ *               order-dependent across racing lanes exactly as painter's
+ *               order is between dispatches.
  *   uDepthWrite 1 = atomicMin test-and-write (the historical behaviour),
  *               0 = test-only against the existing depth (glDepthMask(FALSE)).
  *               The depth function is fixed LESS, matching atomicMin.
@@ -381,17 +393,27 @@ static const char geom_raster_cs_glsl[] =
 "        } else {\n"
 "            float al = (bary.x * al0 * iw0 + bary.y * al1 * iw1 +\n"
 "                        bary.z * al2 * iw2) * rw;\n"
-"            uint dw = fb[idx];\n"
-"            vec3 dc = vec3(float((dw >> 16) & 255u),\n"
-"                           float((dw >>  8) & 255u),\n"
-"                           float( dw        & 255u)) / 255.0;\n"
 "            vec3 sc = clamp(col, 0.0, 1.0);\n"
 "            float sa = clamp(al, 0.0, 1.0);\n"
-"            vec3 oc = (uBlendMode == 2) ? (dc + sc * sa)\n"
-"                                        : (sc * sa + dc * (1.0 - sa));\n"
-"            vec3 cc = clamp(oc, 0.0, 1.0) * 255.0 + 0.5;\n"
-"            uvec3 u = uvec3(cc);\n"
-"            fb[idx] = (255u << 24) | (u.r << 16) | (u.g << 8) | u.b;\n"
+"            /* CAS-retried blend RMW (see the header comment above): racing\n"
+"             * lanes from overlapping triangles recompute the blend on the\n"
+"             * fresh word instead of overwriting each other's contribution.\n"
+"             * The packed word's alpha byte is forced 255 either way, so the\n"
+"             * compare is only perturbed by RGB contention. */\n"
+"            uint dw = fb[idx];\n"
+"            while (true) {\n"
+"                vec3 dc = vec3(float((dw >> 16) & 255u),\n"
+"                               float((dw >>  8) & 255u),\n"
+"                               float( dw        & 255u)) / 255.0;\n"
+"                vec3 oc = (uBlendMode == 2) ? (dc + sc * sa)\n"
+"                                            : (sc * sa + dc * (1.0 - sa));\n"
+"                vec3 cc = clamp(oc, 0.0, 1.0) * 255.0 + 0.5;\n"
+"                uvec3 u = uvec3(cc);\n"
+"                uint nw = (255u << 24) | (u.r << 16) | (u.g << 8) | u.b;\n"
+"                uint old = atomicCompSwap(fb[idx], dw, nw);\n"
+"                if (old == dw) break;\n"
+"                dw = old;\n"
+"            }\n"
 "        }\n"
 "    }\n"
 "    }\n"
@@ -804,9 +826,13 @@ static const char geom_xform_texcol_cs_glsl[] =
  *     ONE_MINUS_SRC_ALPHA, ONE, ONE_MINUS_SRC_ALPHA): with dst = fb[idx], RGB
  *     is src.rgb*src.a + dst.rgb*(1-src.a) and ALPHA is src.a*1 +
  *     dst.a*(1-src.a) (the alpha source factor is ONE, not SRC_ALPHA), then
- *     repacked and written.  This is a read-modify-write, but imgui's half-open
- *     edge rule gives every covered pixel to exactly one triangle, so a single
- *     draw command's triangles do not race on the same fb word;
+ *     repacked and written.  imgui's half-open edge rule alone guarantees a
+ *     single draw's triangles never race on one fb word, but an overlapping
+ *     particle scene's quads DO, so the write is a CAS-retried blend RMW
+ *     (the colour raster kernel's OVER pattern): a racing lane recomputes the
+ *     blend on the fresh word instead of overwriting the other lane's
+ *     contribution.  For same-colour dots the over blend is commutative, so
+ *     any resolved order yields the painter's pixels;
  *   - NO DEPTH: imgui disables the depth test, so this variant skips the
  *     atomicMin / depth write entirely (binding 2 stays bound but unused);
  *   - SCISSOR: uScissor = (x, y, w, h) in fb row space (y down); w/h <= 0
@@ -937,17 +963,25 @@ static const char geom_raster_texcol_cs_glsl[] =
 "        vec4 texel = mix(mix(q00, q10, ax), mix(q01, q11, ax), ay);\n"
 "\n"
 "        vec4 src = texel * vc;   /* colour modulation */\n"
-"        int idx = py * uFbStride + px;\n"
-"        vec4 dst = unpack(fb[idx]);\n"
 "        float sa = clamp(src.a, 0.0, 1.0);\n"
+"        int idx = py * uFbStride + px;\n"
 "        /* RGB: SRC_ALPHA / ONE_MINUS_SRC_ALPHA.  A: ONE / ONE_MINUS_SRC_ALPHA\n"
-"           (imgui's glBlendFuncSeparate uses GL_ONE for the alpha source). */\n"
-"        vec3 outrgb = src.rgb * sa + dst.rgb * (1.0 - sa);\n"
-"        float outa = sa + dst.a * (1.0 - sa);\n"
-"\n"
-"        uvec3 u = uvec3(clamp(outrgb, 0.0, 1.0) * 255.0 + 0.5);\n"
-"        uint a8 = uint(clamp(outa, 0.0, 1.0) * 255.0 + 0.5);\n"
-"        fb[idx] = (a8 << 24) | (u.r << 16) | (u.g << 8) | u.b;\n"
+"           (imgui's glBlendFuncSeparate uses GL_ONE for the alpha source).\n"
+"           CAS-retried blend RMW (see the header comment): overlapping quads\n"
+"           from a particle scene race on the same fb word, so the blend is\n"
+"           recomputed on the fresh word until the swap sticks. */\n"
+"        uint dw = fb[idx];\n"
+"        while (true) {\n"
+"            vec4 dst = unpack(dw);\n"
+"            vec3 outrgb = src.rgb * sa + dst.rgb * (1.0 - sa);\n"
+"            float outa = sa + dst.a * (1.0 - sa);\n"
+"            uvec3 u = uvec3(clamp(outrgb, 0.0, 1.0) * 255.0 + 0.5);\n"
+"            uint a8 = uint(clamp(outa, 0.0, 1.0) * 255.0 + 0.5);\n"
+"            uint nw = (a8 << 24) | (u.r << 16) | (u.g << 8) | u.b;\n"
+"            uint old = atomicCompSwap(fb[idx], dw, nw);\n"
+"            if (old == dw) break;\n"
+"            dw = old;\n"
+"        }\n"
 "    }\n"
 "    }\n"
 "}\n";

@@ -1,33 +1,57 @@
 /*
  * Fireworks demo for EwokOS.
  *
- * A CPU particle system: rockets launch, explode, and their glowing debris
- * falls under gravity.  Every particle is composited (alpha-blended radial glow
- * + dotted velocity trail) into an in-memory ARGB framebuffer exactly as the
- * original did.
+ * A GPU particle system: rockets launch, explode, and their glowing debris
+ * falls under gravity.  The particle physics and the DOT PROFILE below are
+ * unchanged from the original CPU version; what changed is the DRAWING.
+ * Instead of compositing every particle per-pixel into an in-memory ARGB
+ * framebuffer and blitting it as a fullscreen textured quad, the exact same
+ * pixels are emitted as GPU geometry: ONE textured quad per glow dot.
  *
- * Presentation was rewritten off SDL2 + a portablegl scratch buffer onto the
- * standard EGL + GLES2 front end (libs/gles): the composited framebuffer is
- * uploaded each frame as a texture and drawn as a fullscreen quad by libGLESv2,
- * and libEGL owns the window surface, present and resize.  The particle physics
- * and the per-pixel drawing below are unchanged, so the visuals are identical.
+ *  - Each glow dot is the painter's 5x5 profile baked into a tiny RGBA8
+ *    texture atlas (white RGB, profile in alpha): the bright 3x3 core plus
+ *    the ring pixels at 1.0 / 0.85 / 0.35 / 0.275 / 0.20 and the rocket's
+ *    13-pixel head disc in a second tile.  The quad is anchored to the same
+ *    integer pixel the painter's (int) casts chose, and the 1:1 ortho uMVP
+ *    lands each of its 5x5 pixel centres on the exact texel centre, so the
+ *    kernel's bilinear fetch degrades to an exact texel lookup.
+ *
+ *  - The compositing is the painter's exact SRC_ALPHA / ONE_MINUS_SRC_ALPHA
+ *    "over" blend of straight (non-premultiplied) colours with real alpha:
+ *    the texcol raster kernel evaluates src = texel * vColor, so a vertex
+ *    colour (r, g, b, dot_alpha) over a white profile yields the painter's
+ *    per-pixel equation rgb * (profile_a * dot_a) + dst * (1 - ...).  The
+ *    kernel's CAS-retried blend RMW resolves overlapping dots (burst cores,
+ *    crossing trails) without losing contributions.  The CPU interpreter
+ *    reproduces the same blend, so both routes are pixel-identical.
+ *
+ *  - Particles draw their original dotted velocity trails (a dot every
+ *    3.5 px along the half-length of the speed-scaled tail segment, the
+ *    head bright and the tail dim), and rockets draw the original
+ *    13-pixel head disc plus the 12-dot launch trail.  Rockets emit
+ *    first and particles on top, matching the painter's draw order.
+ *
+ * On PGL_G3D targets the shader pair has the exact imgui texcol shape
+ * (gl_FragColor = vColor * texture2D(uTexture, vUV)), which the engine
+ * routes through the one-workgroup-per-triangle texcol raster kernel -
+ * NO per-tile binning of the whole triangle list, which is what keeps a
+ * dense frame's GPU time near zero; without a GPU it runs on the CPU
+ * interpreter with identical pixels.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <time.h>
 #include <math.h>
 
 #include <unistd.h>
-#include <ewoksys/proc.h>
 #include <ewoksys/keydef.h>
 #include <ewoksys/kernel_tic.h>
-#include <ewoksys/timer.h>
 #include <ewoksys/klog.h>
 #include <x/x.h>
 #include <x/xwin.h>
-#include <graph/graph.h>
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -40,6 +64,18 @@
 #define HEIGHT 768
 #define MAX_PARTICLES 5000
 #define MAX_FIREWORKS 5
+
+/* PGL_G3D_MAX_VERTS: the engine's per-glDrawElements ceiling on the texcol
+ * route (20480 expanded vertices, one per index).  One draw with more indices
+ * silently falls back to the CPU interpreter, so the per-frame quad list is
+ * submitted in chunks no larger than this: 6 indices per quad -> 3413 quads
+ * per draw (20478 indices). */
+#define GPU_CHUNK_VERTS 20480
+#define QUADS_PER_CHUNK (GPU_CHUNK_VERTS / 6)
+/* Per-frame emission ceiling: one 4-vertex quad per dot, capped at 200K
+ * quads (800K verts, 1.2M indices).  At impossible overloads the last trail
+ * dots are simply skipped instead of overflowing the stream. */
+#define MAX_QUADS 200000
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -64,19 +100,25 @@ typedef struct {
     int active;
 } Firework;
 
-// Global variables
+/* Interleaved quad vertex: position (top-down pixel coords), profile-atlas
+ * uv, straight (non-premultiplied) rgb + per-dot alpha.  Layout matches the
+ * texcol staging contract: attr0 = pos vec2, attr1 = uv vec2, attr2 = rgba. */
+typedef struct {
+    float x, y;
+    float u, v;
+    float r, g, b, a;
+} FWVert;
+
+/* Global variables
+ */
 static EGLDisplay egl_dpy = EGL_NO_DISPLAY;
 static EGLSurface egl_surf = EGL_NO_SURFACE;
 static EGLContext egl_ctx = EGL_NO_CONTEXT;
 
-static GLuint program = 0, quad_vbo = 0, texture = 0;
-static GLint loc_tex = -1;
+static GLuint program = 0, vbo = 0, ibo = 0, atlas = 0;
+static GLint loc_mvp = -1, loc_tex = -1;
 
 static int screen_width = WIDTH, screen_height = HEIGHT;
-
-/* CPU compositing target: 0xAARRGGBB words, converted to RGBA8 for upload. */
-static uint32_t* bbufpix = NULL;
-static uint8_t*  rgba_buf = NULL;
 
 Particle particles[MAX_PARTICLES];
 int num_particles = 0;
@@ -84,21 +126,34 @@ int num_particles = 0;
 Firework fireworks[MAX_FIREWORKS];
 int next_firework_time = 0;
 
-static const char *quad_vs =
-    "attribute vec2 aPos;\n"
+/* The imgui texcol pair: on PGL_G3D targets the engine detects
+ * gl_FragColor = vColor * texture2D(uTexture, vUV) and routes the draw
+ * through the one-workgroup-per-triangle texcol raster kernel, which
+ * multiplies the profile texel by the interpolated vertex colour and
+ * over-blends with SRC_ALPHA - the painter's exact per-pixel equation.  The
+ * CPU interpreter compiles the same sources for the fallback with identical
+ * pixels.  The ortho uMVP maps pixel (x, y) - y down, matching the top-down
+ * screen coordinates the particles use - to NDC. */
+static const char *part_vs =
+    "attribute vec2 aPosition;\n"
     "attribute vec2 aUV;\n"
+    "attribute vec4 aColor;\n"
+    "uniform mat4 uMVP;\n"
     "varying vec2 vUV;\n"
+    "varying vec4 vColor;\n"
     "void main() {\n"
     "    vUV = aUV;\n"
-    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+    "    vColor = aColor;\n"
+    "    gl_Position = uMVP * vec4(aPosition, 0.0, 1.0);\n"
     "}\n";
 
-static const char *quad_fs =
+static const char *part_fs =
     "precision mediump float;\n"
     "varying vec2 vUV;\n"
-    "uniform sampler2D uTex0;\n"
+    "varying vec4 vColor;\n"
+    "uniform sampler2D uTexture;\n"
     "void main() {\n"
-    "    gl_FragColor = texture2D(uTex0, vUV);\n"
+    "    gl_FragColor = vColor * texture2D(uTexture, vUV);\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *src)
@@ -119,35 +174,95 @@ static GLuint compile_shader(GLenum type, const char *src)
     return sh;
 }
 
-/* Fullscreen quad (two triangles) in clip space.  Texture row 0 maps to the top
- * of the window, matching the top-down screen coordinates the particles use. */
-static const GLfloat quad_verts[] = {
-    /* x,    y,    u,   v */
-    -1.0f,  1.0f, 0.0f, 0.0f,
-    -1.0f, -1.0f, 0.0f, 1.0f,
-     1.0f,  1.0f, 1.0f, 0.0f,
-    -1.0f, -1.0f, 0.0f, 1.0f,
-     1.0f, -1.0f, 1.0f, 1.0f,
-     1.0f,  1.0f, 1.0f, 0.0f,
-};
+/* Per-frame quad scratch: 4 FWVert per dot, glBufferData'd to the particle
+ * VBO once per frame. */
+static FWVert* vertbuf = NULL;
 
 static void init_imgui(void);
+
+/* ---- The two baked profiles ----------------------------------------------
+ * The painter composited each glow dot as its 5x5 pixel profile in a fixed
+ * sequence of axis-aligned pixel runs.  Baking that sequence into texture
+ * alphas reproduces it pixel-exactly, including two quirks of the painter's
+ * run order:
+ *   - the four AXIS pixels at distance 2 are redrawn by the d3 runs, so
+ *     their final alpha is the sequential over-blend 0.35 over 0.275 =
+ *     0.35 + 0.275*(1-0.35) = 0.52875;
+ *   - the four DIAGONAL pixels at distance 2 are never painted (holes).
+ * The rocket head is the painter's 13-pixel disc (dx^2+dy^2 <= 4, alpha =
+ * (255 - 40*dist)/255). */
+
+/* Head disc profile, rows dy = -2..2 (row 0 = top), cols dx = -2..2:
+ * 1.0 centre, 215/255 ring 1, 175/255 diagonal ring 2, 95/255 axis ring 2. */
+static const float head_prof[25] = {
+    0.0f,        95.0f/255.0f,  0.0f,        95.0f/255.0f,  0.0f,
+    95.0f/255.0f, 175.0f/255.0f, 215.0f/255.0f, 175.0f/255.0f, 95.0f/255.0f,
+    0.0f,        215.0f/255.0f, 1.0f,        215.0f/255.0f, 0.0f,
+    95.0f/255.0f, 175.0f/255.0f, 215.0f/255.0f, 175.0f/255.0f, 95.0f/255.0f,
+    0.0f,        95.0f/255.0f,  0.0f,        95.0f/255.0f,  0.0f,
+};
+
+/* Glow dot profile (same row order): 1.0 centre, 0.85 ring 1, 0.35/0.52875
+ * ring 2, 0.275 ring 3, 0.20 ring 4, holes on the diagonal ring-2 pixels. */
+static const float dot_prof[25] = {
+    0.20f,  0.275f,  0.52875f, 0.275f,  0.20f,
+    0.275f, 0.0f,    0.85f,    0.0f,    0.275f,
+    0.52875f, 0.85f, 1.0f,     0.85f,   0.52875f,
+    0.275f, 0.0f,    0.85f,    0.0f,    0.275f,
+    0.20f,  0.275f,  0.52875f, 0.275f,  0.20f,
+};
+
+/* Atlas v origin of each 5-row tile (atlas is 5 wide x 11 tall: head rows
+ * 0-4, dot rows 5-9, row 10 padding).  The texcol kernel maps a quad's
+ * pixel-centre samples to exact texel centres when uv spans [top, top+5/11]
+ * over a 5-px quad, so the bilinear fetch degrades to an exact lookup. */
+#define ATLAS_W 5
+#define ATLAS_H 11
+#define HEAD_TOP (0.0f)
+#define DOT_TOP  (5.0f / (float)ATLAS_H)
+
+/* Build the 5x11 profile atlas as a tightly packed RGBA8 image: white RGB,
+ * profile in alpha (the kernel's src = texel * vColor then puts the profile
+ * on the blend's source alpha). */
+static void build_atlas(unsigned char out[ATLAS_W * ATLAS_H * 4])
+{
+    int row, col;
+    memset(out, 0, (size_t)ATLAS_W * ATLAS_H * 4);
+    for (row = 0; row < 5; row++) {
+        for (col = 0; col < 5; col++) {
+            int k = row * 5 + col;
+            unsigned char ha = (unsigned char)(head_prof[k] * 255.0f + 0.5f);
+            unsigned char da = (unsigned char)(dot_prof[k] * 255.0f + 0.5f);
+            unsigned char *hp = out + ((size_t)row * ATLAS_W + col) * 4;
+            unsigned char *dp = out + ((size_t)(row + 5) * ATLAS_W + col) * 4;
+            hp[0] = 255; hp[1] = 255; hp[2] = 255; hp[3] = ha;
+            dp[0] = 255; dp[1] = 255; dp[2] = 255; dp[3] = da;
+        }
+    }
+}
 
 static void init_gl(void)
 {
     GLuint vs, fs;
     GLint ok = 0;
+    unsigned char *atlas_pix;
+    GLuint *indices;
+    int q;
 
     glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
 
-    vs = compile_shader(GL_VERTEX_SHADER, quad_vs);
-    fs = compile_shader(GL_FRAGMENT_SHADER, quad_fs);
+    vs = compile_shader(GL_VERTEX_SHADER, part_vs);
+    fs = compile_shader(GL_FRAGMENT_SHADER, part_fs);
     program = glCreateProgram();
     glAttachShader(program, vs);
     glAttachShader(program, fs);
-    glBindAttribLocation(program, 0, "aPos");
+    /* Pin the attribute slots: the GPU staging contract reads attr0 =
+     * position (vec2), attr1 = uv (vec2), attr2 = colour (vec4). */
+    glBindAttribLocation(program, 0, "aPosition");
     glBindAttribLocation(program, 1, "aUV");
+    glBindAttribLocation(program, 2, "aColor");
     glLinkProgram(program);
     glGetProgramiv(program, GL_LINK_STATUS, &ok);
     if (!ok) {
@@ -158,51 +273,54 @@ static void init_gl(void)
     }
     glDeleteShader(vs);
     glDeleteShader(fs);
-    glUseProgram(program);
 
-    loc_tex = glGetUniformLocation(program, "uTex0");
+    loc_mvp = glGetUniformLocation(program, "uMVP");
+    loc_tex = glGetUniformLocation(program, "uTexture");
 
-    glGenBuffers(1, &quad_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_STATIC_DRAW);
+    glGenBuffers(1, &vbo);
+    glGenBuffers(1, &ibo);
 
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    /* Profile atlas on texture unit 0: RGBA8 upload also registers the
+     * engine's raster texture slot (gpu_on_texture), which the texcol draw
+     * route stages for the kernel. */
+    glGenTextures(1, &atlas);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, atlas);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    atlas_pix = (unsigned char *)malloc((size_t)ATLAS_W * ATLAS_H * 4);
+    if (atlas_pix) {
+        build_atlas(atlas_pix);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ATLAS_W, ATLAS_H, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, atlas_pix);
+        free(atlas_pix);
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glUniform1i(loc_tex, 0);
+
+    /* Fixed index pattern: quad q -> verts q*4+0..3, two triangles.  Built
+     * once for the whole MAX_QUADS stream; each frame draws only the used
+     * prefix. */
+    indices = (GLuint *)malloc((size_t)MAX_QUADS * 6 * sizeof(GLuint));
+    if (indices) {
+        for (q = 0; q < MAX_QUADS; q++) {
+            GLuint b = (GLuint)q * 4;
+            indices[q * 6 + 0] = b + 0;
+            indices[q * 6 + 1] = b + 1;
+            indices[q * 6 + 2] = b + 2;
+            indices[q * 6 + 3] = b + 0;
+            indices[q * 6 + 4] = b + 2;
+            indices[q * 6 + 5] = b + 3;
+        }
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     (GLsizeiptr)MAX_QUADS * 6 * sizeof(GLuint),
+                     indices, GL_STATIC_DRAW);
+        free(indices);
+    }
 
     init_imgui();
-}
-
-/* (Re)allocate the CPU compositing buffers and the texture storage for a new
- * window size. */
-static int ensure_buffer(int w, int h)
-{
-    if (w <= 0 || h <= 0)
-        return 0;
-    if (bbufpix != NULL && w == screen_width && h == screen_height)
-        return 1;
-
-    free(bbufpix);
-    free(rgba_buf);
-    bbufpix = (uint32_t*)malloc((size_t)w * h * sizeof(uint32_t));
-    rgba_buf = (uint8_t*)malloc((size_t)w * h * 4);
-    if (bbufpix == NULL || rgba_buf == NULL) {
-        free(bbufpix); free(rgba_buf);
-        bbufpix = NULL; rgba_buf = NULL;
-        return 0;
-    }
-    screen_width = w;
-    screen_height = h;
-
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, NULL);
-    glViewport(0, 0, w, h);
-    return 1;
 }
 
 float random_float(float min, float max) {
@@ -367,103 +485,104 @@ void update_particles() {
     }
 }
 
-// Draw pixel
-void set_pixel(int x, int y, uint32_t color) {
-    if (x >= 0 && x < screen_width && y >= 0 && y < screen_height) {
-        bbufpix[y * screen_width + x] = color;
+/* ---- GPU geometry emission ----------------------------------------------
+ * The original CPU painter composited each glow dot as a 5x5 pixel profile
+ * (a bright core plus ring pixels at 0.85 / 0.35 / 0.275 / 0.20 alpha,
+ * brightness boosted 1.5x), blended one pixel at a time with an exact
+ * 8-bit "over" equation col*a + dst*(1-a).  The GPU reproduces the SAME
+ * pixels by emitting ONE textured quad per dot: the painter's per-pixel
+ * profile is baked into the atlas alpha channel, and the vertex colour
+ * carries (boosted rgb, dot alpha), so the kernel's src = texel * vColor
+ * + SRC_ALPHA over blend evaluate the painter's per-pixel equation exactly:
+ *
+ *   out = rgb * (profile_a * dot_a) + dst * (1 - profile_a * dot_a)
+ *
+ * The quad corners sit on integer pixel coordinates around the same
+ * integer pixel the painter's (int) casts chose, and the 1:1 ortho lands
+ * each of the 5x5 pixel centres on the exact texel centre, so the kernel's
+ * bilinear fetch degrades to an exact texel lookup. */
+
+/* Append one glow-dot quad (4 verts, 6 indices) to the stream.  `vtop` is
+ * the atlas v of the profile tile's top row; the colour is straight
+ * (non-premultiplied) with a real per-vertex alpha: the kernel's over blend
+ * does the premultiplication.  Returns 0 when the stream is full. */
+static int emit_dot_quad(float x, float y, float r, float g, float b,
+                         float alpha, float vtop, FWVert* vs, int* nq)
+{
+    int X = (int)x;
+    int Y = (int)y;
+    float x0 = (float)(X - 2), x1 = (float)(X + 3);
+    float y0 = (float)(Y - 2), y1 = (float)(Y + 3);
+    float v0 = vtop, v1 = vtop + 5.0f / (float)ATLAS_H;
+    FWVert q[4];
+
+    if (*nq >= MAX_QUADS) return 0;
+
+    q[0].x = x0; q[0].y = y0; q[0].u = 0.0f; q[0].v = v0;
+    q[1].x = x1; q[1].y = y0; q[1].u = 1.0f; q[1].v = v0;
+    q[2].x = x1; q[2].y = y1; q[2].u = 1.0f; q[2].v = v1;
+    q[3].x = x0; q[3].y = y1; q[3].u = 0.0f; q[3].v = v1;
+    for (int i = 0; i < 4; i++) {
+        q[i].r = r; q[i].g = g; q[i].b = b; q[i].a = alpha;
     }
+    memcpy(vs + (size_t)*nq * 4, q, sizeof(q));
+    (*nq)++;
+    return 1;
 }
 
-// Draw pixel with alpha blending
-void blend_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
-    if (x < 0 || x >= screen_width || y < 0 || y >= screen_height) return;
-
-    long idx = (long)y * screen_width + x;
-    uint32_t dst = bbufpix[idx];
-
-    uint8_t dstR = (dst >> 16) & 0xFF;
-    uint8_t dstG = (dst >> 8) & 0xFF;
-    uint8_t dstB = dst & 0xFF;
-
-    uint8_t outR = (r * a + dstR * (255 - a)) / 255;
-    uint8_t outG = (g * a + dstG * (255 - a)) / 255;
-    uint8_t outB = (b * a + dstB * (255 - a)) / 255;
-
-    bbufpix[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
+/* Emit one glow dot at pixel (x, y) - the painter's exact 5x5 profile.
+ * Returns 0 when the stream is full.  One quad (4 verts) per dot. */
+static int emit_glow_dot(float x, float y, float r, float g, float b,
+                         float alpha, FWVert* vs, int* nq)
+{
+    if (alpha <= 0.0f) return 1;
+    /* Increase brightness (the CPU painter's 1.5x boost); the quad anchors
+     * on the same integer pixel the painter's (int) casts chose. */
+    float br = fminf(1.0f, r * 1.5f);
+    float bg = fminf(1.0f, g * 1.5f);
+    float bb = fminf(1.0f, b * 1.5f);
+    return emit_dot_quad(x, y, br, bg, bb, alpha, DOT_TOP, vs, nq);
 }
 
-// Draw glowing pixel - larger and brighter
-void draw_glow_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b, float alpha) {
-    if (alpha <= 0) return;
+// Emit all rockets: the painter's 13-pixel head disc plus the 12-dot
+// launch trail.  Drawn BEFORE the particles (the painter's order), so
+// particles over-blend on top of any overlapping rocket pixels.
+static int emit_fireworks(FWVert* vs, int* nq) {
+    for (int i = 0; i < MAX_FIREWORKS; i++) {
+        Firework* fw = &fireworks[i];
+        if (!fw->active) continue;
 
-    // Increase brightness
-    uint8_t bright_r = (uint8_t)fminf(255, r * 1.5f);
-    uint8_t bright_g = (uint8_t)fminf(255, g * 1.5f);
-    uint8_t bright_b = (uint8_t)fminf(255, b * 1.5f);
+        /* Rocket head: the baked 13-pixel disc profile (dx^2+dy^2 <= 4,
+         * alpha = 255 - 40*dist).  NOT brightness-boosted (the painter
+         * only boosted the glow dots). */
+        if (!emit_dot_quad(fw->x, fw->y, fw->r, fw->g, fw->b, 1.0f,
+                           HEAD_TOP, vs, nq))
+            return 0;
 
-    uint8_t a = (uint8_t)(alpha * 255);
-
-    // Center point - larger 3x3
-    for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            float factor = (dx == 0 && dy == 0) ? 1.0f : 0.85f;
-            blend_pixel(x+dx, y+dy, bright_r, bright_g, bright_b, (uint8_t)(a * factor));
+        /* Rocket dotted trail: 12 glow dots 0.8 frames apart behind the
+         * head, alpha = (200 - 15*j) / 255. */
+        for (int j = 1; j <= 12; j++) {
+            float t = j * 0.8f;
+            float tx = fw->x - fw->vx * t;
+            float ty = fw->y - fw->vy * t;
+            float alpha = (float)(200 - j * 15) / 255.0f;
+            if (!emit_glow_dot(tx, ty, fw->r, fw->g, fw->b, alpha, vs, nq))
+                return 0;
         }
     }
-
-    // Surrounding glow - larger 5x5 area
-    uint8_t glow_a = a / 2;
-    for (int dy = -2; dy <= 2; dy++) {
-        for (int dx = -2; dx <= 2; dx++) {
-            if (abs(dx) <= 1 && abs(dy) <= 1) continue; // Skip center 3x3
-            float factor = 1.0f - (abs(dx) + abs(dy)) * 0.15f;
-            if (factor > 0) {
-                blend_pixel(x+dx, y+dy, bright_r, bright_g, bright_b, (uint8_t)(glow_a * factor));
-            }
-        }
-    }
+    return 1;
 }
 
-// Draw dotted trail effect - longer trail
-void draw_dotted_trail(float x0, float y0, float x1, float y1,
-                       uint8_t r, uint8_t g, uint8_t b, float alpha) {
-    float dx = x1 - x0;
-    float dy = y1 - y0;
-    float dist = sqrtf(dx * dx + dy * dy);
-
-    if (dist < 1.0f) {
-        draw_glow_pixel((int)x0, (int)y0, r, g, b, alpha);
-        return;
-    }
-
-    // Dot spacing - one dot every 3-4 pixels, larger grain
-    float dot_spacing = 3.5f;
-    int num_dots = (int)(dist / dot_spacing);
-    if (num_dots < 1) num_dots = 1;
-    if (num_dots > 30) num_dots = 30; // cap the max number of dots
-
-    for (int i = 0; i <= num_dots; i++) {
-        float t = (float)i / num_dots;
-        float x = x0 + dx * t;
-        float y = y0 + dy * t;
-
-        // Head bright, tail dim, but tail is brighter (obvious trail)
-        float dot_alpha = alpha * (0.6f + 0.4f * (1.0f - t));
-        if (dot_alpha > 0.05f) {
-            draw_glow_pixel((int)x, (int)y, r, g, b, dot_alpha);
-        }
-    }
-}
-
-// Draw all particles - dotted firework effect, independent of screen ratio
-void draw_particles() {
-    if (!bbufpix) return;
-
+// Emit all particles - the painter's dotted velocity trails: the trail
+// segment reaches half the speed-scaled length (clamped 3..18 px) behind
+// the particle, dotted every 3.5 px, the head dot bright and the tail dim.
+static int emit_particles(FWVert* vs, int* nq) {
     for (int i = 0; i < num_particles; i++) {
         Particle* p = &particles[i];
         if (!p->active) continue;
 
-        // Calculate trail - only related to velocity, independent of screen ratio
+        /* Trail length follows speed only (3 px per unit speed, clamped),
+         * direction opposite the velocity - the original constants. */
         float speed = sqrtf(p->vx * p->vx + p->vy * p->vy);
         float tail_len = speed * 3.0f;
         if (tail_len > 18.0f) tail_len = 18.0f;
@@ -471,65 +590,48 @@ void draw_particles() {
 
         float x0 = p->x;
         float y0 = p->y;
-        // Trail direction is opposite to velocity direction, maintaining isotropy
         float x1 = p->x - p->vx * tail_len * 0.5f;
         float y1 = p->y - p->vy * tail_len * 0.5f;
 
-        uint8_t r = (uint8_t)(p->r * 255 * p->brightness);
-        uint8_t g = (uint8_t)(p->g * 255 * p->brightness);
-        uint8_t b = (uint8_t)(p->b * 255 * p->brightness);
+        float r = p->r * p->brightness;
+        float g = p->g * p->brightness;
+        float b = p->b * p->brightness;
 
-        // Draw dotted trail
-        draw_dotted_trail(x0, y0, x1, y1, r, g, b, p->life);
-    }
-}
+        float dx = x1 - x0;
+        float dy = y1 - y0;
+        float dist = sqrtf(dx * dx + dy * dy);
 
-// Draw all rockets
-void draw_fireworks() {
-    if (!bbufpix) return;
+        if (dist < 1.0f) {
+            if (!emit_glow_dot(x0, y0, r, g, b, p->life, vs, nq))
+                return 0;
+            continue;
+        }
 
-    for (int i = 0; i < MAX_FIREWORKS; i++) {
-        Firework* fw = &fireworks[i];
-        if (!fw->active) continue;
+        /* One dot every 3.5 px along the segment, capped at 30 gaps. */
+        int num_dots = (int)(dist / 3.5f);
+        if (num_dots < 1) num_dots = 1;
+        if (num_dots > 30) num_dots = 30;
 
-        int px = (int)fw->x;
-        int py = (int)fw->y;
-
-        uint8_t r = (uint8_t)(fw->r * 255);
-        uint8_t g = (uint8_t)(fw->g * 255);
-        uint8_t b = (uint8_t)(fw->b * 255);
-
-        // Rocket head glow
-        for (int dy = -2; dy <= 2; dy++) {
-            for (int dx = -2; dx <= 2; dx++) {
-                int dist = dx*dx + dy*dy;
-                if (dist <= 4) {
-                    uint8_t alpha = 255 - dist * 40;
-                    blend_pixel(px + dx, py + dy, r, g, b, alpha);
-                }
+        for (int d = 0; d <= num_dots; d++) {
+            float t = (float)d / num_dots;
+            float x = x0 + dx * t;
+            float y = y0 + dy * t;
+            /* Head bright, tail dim, but tail stays obvious. */
+            float dot_alpha = p->life * (0.6f + 0.4f * (1.0f - t));
+            if (dot_alpha > 0.05f) {
+                if (!emit_glow_dot(x, y, r, g, b, dot_alpha, vs, nq))
+                    return 0;
             }
         }
-
-        // Rocket dotted trail
-        for (int j = 1; j <= 12; j++) {
-            float t = j * 0.8f;
-            int tx = (int)(fw->x - fw->vx * t);
-            int ty = (int)(fw->y - fw->vy * t);
-            uint8_t alpha = (uint8_t)(200 - j * 15);
-            draw_glow_pixel(tx, ty, r, g, b, alpha / 255.0f);
-        }
     }
+    return 1;
 }
-
-/* Composite one animation frame into bbufpix, upload it and present it as a
- * fullscreen textured quad. */
-static int frame_count = 0;
 
 /* ------------------------------------------------------------------ *
  * Dear ImGui overlay: the FPS / GPU-vs-CPU readout as a small read-only
  * ImGui window drawn on top of the fireworks, the same overlay glmatrix
  * uses.  ImGui is C++ and renders through the GLES2 backend after the
- * fullscreen quad.  The HUD is display-only, so no xwin input is
+ * particle pass.  The HUD is display-only, so no xwin input is
  * forwarded to it and the window is marked NoInputs; ESC still quits.
  * ------------------------------------------------------------------ */
 static int fps = 0;
@@ -561,9 +663,9 @@ static void init_imgui(void)
 }
 
 /* Build one ImGui frame: lay out the read-only stats window.  `gpu` is the
- * route the quad program used this frame, queried while it was bound.  The
- * HUD is display-only (FPS / Renderer), so no input is forwarded to ImGui
- * and the window is marked NoInputs. */
+ * route the particle program used this frame, queried while it was bound.
+ * The HUD is display-only (FPS / Renderer), so no input is forwarded to
+ * ImGui and the window is marked NoInputs. */
 static void process_imgui_frame(int gpu)
 {
     ImGuiIO& io = ImGui::GetIO();
@@ -584,18 +686,24 @@ static void process_imgui_frame(int gpu)
     ImGui::End();
 }
 
+static int frame_count = 0;
+
+/* Composite one animation frame: emit every glow dot as ONE textured quad,
+ * clear the back buffer to black and over-blend the quads in emission
+ * order, then draw the ImGui HUD on top and present. */
 static void render_frame(void)
 {
     EGLint w = 0, h = 0;
+    int nquad = 0;
 
-    /* Query the render size (stride-aligned on q8b, == window elsewhere) so the
-     * CPU compositing buffer / glViewport / DisplaySize match the engine back
+    /* Query the render size (stride-aligned on q8b, == window elsewhere) so
+     * the ortho uMVP / glViewport / DisplaySize match the engine back
      * buffer. */
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &w);
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &h);
     if (w <= 0 || h <= 0) { w = WIDTH; h = HEIGHT; }
-    if (!ensure_buffer(w, h))
-        return;
+    screen_width = w;
+    screen_height = h;
 
     // Random launch timing, no need to wait for previous to finish
     if (frame_count >= next_firework_time) {
@@ -607,48 +715,82 @@ static void render_frame(void)
     update_fireworks();
     update_particles();
 
-    // Clear the CPU framebuffer to opaque black, then composite the show.
-    long total_pixels = (long)screen_width * screen_height;
-    for (long i = 0; i < total_pixels; ++i)
-        bbufpix[i] = 0xFF000000;
-
-    draw_fireworks();
-    draw_particles();
-
-    // Convert 0xAARRGGBB words to tightly-packed RGBA8 for the texture upload.
-    for (long i = 0; i < total_pixels; ++i) {
-        uint32_t px = bbufpix[i];
-        rgba_buf[i * 4 + 0] = (px >> 16) & 0xFF;   /* r */
-        rgba_buf[i * 4 + 1] = (px >> 8)  & 0xFF;   /* g */
-        rgba_buf[i * 4 + 2] = px & 0xFF;           /* b */
-        rgba_buf[i * 4 + 3] = (px >> 24) & 0xFF;   /* a */
-    }
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, screen_width, screen_height,
-                    GL_RGBA, GL_UNSIGNED_BYTE, rgba_buf);
-
+    /* Re-assert every state cap per frame: ImGui's GLES2 backend installs its
+     * own blend/scissor state while rendering the HUD and does not fully
+     * restore it.  Scissor and the colour mask must be default at glClear,
+     * or the engine pins the frame's clear (and with it the whole frame) to
+     * the CPU path. */
+    glViewport(0, 0, w, h);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    /* Over compositing: the painter's exact equation col*a + dst*(1-a) with
+     * straight colours and real per-vertex alpha.  The texcol kernel's
+     * fixed blend IS the imgui BlendFuncSeparate shape the engine's route
+     * gate requires: SRC_ALPHA/ONE_MINUS_SRC_ALPHA on RGB and
+     * ONE/ONE_MINUS_SRC_ALPHA on alpha; the CPU interpreter uses the same
+     * factors for identical pixels. */
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
-    /* Re-bind the quad program every frame: ImGui_ImplGLES2_RenderDrawData
-     * binds its own program and (unlike the viewport / enable caps) does not
-     * restore GL_CURRENT_PROGRAM, so without this the quad would draw through
-     * ImGui's shader from the second frame on and the show would vanish. */
     glUseProgram(program);
-    glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), 0);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
-                          (void*)(2 * sizeof(GLfloat)));
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
-    glDisableVertexAttribArray(1);
-    glDisableVertexAttribArray(0);
+    {
+        /* Column-major ortho: pixel (x, y), y down -> NDC. */
+        float m[16] = {
+            2.0f / (float)w, 0.0f,           0.0f, 0.0f,
+            0.0f,           -2.0f / (float)h, 0.0f, 0.0f,
+            0.0f,           0.0f,           1.0f, 0.0f,
+           -1.0f,           1.0f,           0.0f, 1.0f,
+        };
+        glUniformMatrix4fv(loc_mvp, 1, GL_FALSE, m);
+        if (loc_tex >= 0) glUniform1i(loc_tex, 0);
+    }
+    /* The texcol draw route stages the texture bound to unit 0. */
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, atlas);
 
-    /* Query the GPU/CPU route while the quad program is still bound, then draw
-     * the ImGui stats window on top (same overlay as glmatrix). */
+    if (!vertbuf)
+        vertbuf = (FWVert*)malloc((size_t)MAX_QUADS * 4 * sizeof(FWVert));
+    if (vertbuf) {
+        nquad = 0;
+        emit_fireworks(vertbuf, &nquad);
+        emit_particles(vertbuf, &nquad);
+    }
+
+    if (nquad > 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nquad * 4 * sizeof(FWVert),
+                     vertbuf, GL_STREAM_DRAW);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(FWVert),
+                              (void*)offsetof(FWVert, x));
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(FWVert),
+                              (void*)offsetof(FWVert, u));
+        glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(FWVert),
+                              (void*)offsetof(FWVert, r));
+        glEnableVertexAttribArray(0);
+        glEnableVertexAttribArray(1);
+        glEnableVertexAttribArray(2);
+
+        /* Submit in <= QUADS_PER_CHUNK chunks (the engine's per-draw cap is
+         * 20480 expanded vertices, one per index; 6 indices per quad). */
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        for (int q = 0; q < nquad; q += QUADS_PER_CHUNK) {
+            int nq = nquad - q;
+            if (nq > QUADS_PER_CHUNK) nq = QUADS_PER_CHUNK;
+            glDrawElements(GL_TRIANGLES, nq * 6, GL_UNSIGNED_INT,
+                           (void*)((size_t)q * 6 * sizeof(GLuint)));
+        }
+        glDisableVertexAttribArray(2);
+        glDisableVertexAttribArray(1);
+        glDisableVertexAttribArray(0);
+    }
+
+    /* Query the GPU/CPU route while the particle program is still bound, then
+     * draw the ImGui stats window on top (same overlay as glmatrix). */
     int gpu = glGpuActiveEWOK();
     process_imgui_frame(gpu);
     ImGui::Render();
@@ -727,15 +869,12 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    /* This app composites the show on the CPU and blits it as a fullscreen
-     * textured quad; it is never GPU-eligible.  Pin the context to the CPU
-     * rasteriser BEFORE init_gl links the ImGui overlay (a GPU-eligible uMVP
-     * program): otherwise the engine would adopt the uncached GPU render target
-     * as the back buffer, splitting the frame between the CPU blit and ImGui's
-     * GPU dispatch so the fireworks disappear.  With this, ImGui too draws
-     * through the CPU interpreter into the same cached buffer. */
-    glForceCpuEWOK();
-
+    /* The particle program has the engine's texcol shape (gl_FragColor =
+     * vColor * texture2D(uTexture, vUV)), so on a PGL_G3D platform the whole
+     * show (particles + ImGui overlay) draws on the GPU through the
+     * one-workgroup-per-triangle texcol kernel; on the CPU-only platforms
+     * the interpreter reproduces it pixel-identically.  No glForceCpuEWOK:
+     * that pin was for the old CPU-composited blit. */
     init_gl();
 
     xwin_set_visible(xwin, true);
@@ -750,7 +889,6 @@ int main(int argc, char** argv)
     eglDestroyContext(egl_dpy, egl_ctx);
     eglTerminate(egl_dpy);
 
-    free(bbufpix);
-    free(rgba_buf);
+    free(vertbuf);
     return 0;
 }

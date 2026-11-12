@@ -2213,6 +2213,10 @@ static int cpu_try_direct_blit(GLenum mode, GLint first, GLsizei count)
 #ifdef PGL_G3D
 
 #define GPU_STAGING_STRIDE 6   /* pos.xyz + (normal.xyz | u,v,pad) */
+/* Per-vertex-alpha COLOUR staging (cs_is_geom colour route, SRC_ALPHA over):
+ * pos.xyz + colour rgba.  Kept on its own buffer so the stride-6 gouraud/tex
+ * staging and its cross-draw coalescing stay untouched. */
+#define GPU_COLORA_STRIDE  7
 /* Colour-modulated textured (imgui, cs_is_geom=4) interleaved stride:
  * pos.xyz + (u,v) + rgba + pad.  A separate constant so the gouraud/tex
  * stride-6 staging and its cross-draw coalescing stay untouched. */
@@ -2261,6 +2265,12 @@ typedef struct {
                                     at staging element 6 + one 40-float record per
                                     draw), and the raster kernel honours the app's
                                     blend/depth-mask/cull state. */
+    int           color;         /* COLOUR xform kernel attached (uMVP-only
+                                    gouraud shape, attr1 = per-vertex colour,
+                                    alpha forced 1.0): the raster kernel honours
+                                    the draw's blend/depth-mask/cull state, so
+                                    an additive (SRC_ALPHA/ONE) draw composites
+                                    on the GPU with premultiplied vertex colours. */
     int           cpu_latched;   /* a dispatch declined: stay on the CPU  */
     int           unif_resolved;
     int           in_use;
@@ -2331,6 +2341,12 @@ static GLuint  g_gpu_ctexgen[PGL_G3D_MAX_TEX][PGL_TEXTURE_FACES][PGL_MAX_MIP_LEV
 /* one reusable interleaved staging buffer (grown on demand) */
 static float  *g_gpu_stage = NULL;
 static int     g_gpu_stage_cap = 0;   /* in vertices */
+
+/* Separate stride-7 staging for the per-vertex-alpha COLOUR route (pos.xyz +
+ * colour rgba).  Never coalesced: one dispatch per draw, so it does not share
+ * g_gpu_stage. */
+static float  *g_gpu_colora = NULL;
+static int     g_gpu_colora_cap = 0;  /* in vertices */
 
 /* Separate stride-10 staging for the colour-modulated textured (indexed) route.
  * Indexed draws are never coalesced (one imgui command = one dispatch), so it
@@ -2556,6 +2572,17 @@ static int gpu_tcol_reserve(int nverts)
     return 1;
 }
 
+/* Grow the stride-7 per-vertex-alpha colour staging to nverts vertices. */
+static int gpu_colora_reserve(int nverts)
+{
+    if (g_gpu_colora && nverts <= g_gpu_colora_cap) return 1;
+    free(g_gpu_colora);
+    g_gpu_colora = (float *)malloc((size_t)nverts * GPU_COLORA_STRIDE * sizeof(float));
+    if (!g_gpu_colora) { g_gpu_colora_cap = 0; return 0; }
+    g_gpu_colora_cap = nverts;
+    return 1;
+}
+
 /* read ncomp floats of one GL_FLOAT vertex attribute for buffer vertex vi */
 static int gpu_read_attrib(const glVertex_Attrib *v, GLsizei vi, float *out, int ncomp)
 {
@@ -2626,6 +2653,65 @@ static int gpu_stage_tri(gpu_stage *st, const glVertex_Attrib *a0,
         if (st->stride >= GPU_INST_STRIDE) dst[6] = st->inst;
     }
     st->n += 3;
+    return 1;
+}
+
+/* Append one triangle to the stride-7 per-vertex-alpha colour staging:
+ * pos.xyz + colour rgba.  A 3-component colour attribute still qualifies with
+ * an implied alpha of 1.0 (GL default), so the tessellation never faults on
+ * an RGB-only app; the blend gate in gpu_try_draw_arrays restricts this path
+ * to draws whose equation actually needs the alpha. */
+static int gpu_stage_tri_colora(gpu_stage *st, const glVertex_Attrib *a0,
+                                const glVertex_Attrib *a1,
+                                GLsizei i0, GLsizei i1, GLsizei i2)
+{
+    GLsizei idx[3];
+    float p[3], q[4], *dst;
+    int k;
+    if (st->n + 3 > st->cap) return 0;
+    idx[0] = i0; idx[1] = i1; idx[2] = i2;
+    for (k = 0; k < 3; ++k) {
+        dst = st->v + (size_t)(st->n + k) * GPU_COLORA_STRIDE;
+        if (!gpu_read_attrib(a0, idx[k], p, 3)) return 0;
+        dst[0] = p[0]; dst[1] = p[1]; dst[2] = p[2];
+        if (a1->size >= 4) {
+            if (!gpu_read_attrib(a1, idx[k], q, 4)) return 0;
+        } else {
+            if (!gpu_read_attrib(a1, idx[k], q, 3)) return 0;
+            q[3] = 1.0f;
+        }
+        dst[3] = q[0]; dst[4] = q[1]; dst[5] = q[2]; dst[6] = q[3];
+    }
+    st->n += 3;
+    return 1;
+}
+
+/* Tessellate [first, first+count) of `mode` into the stride-7 per-vertex-alpha
+ * colour staging, mirroring gpu_tessellate's winding exactly. */
+static int gpu_tessellate_colora(gpu_stage *st, GLenum mode, GLint first,
+                                 GLsizei count, const glVertex_Attrib *va)
+{
+    GLsizei i;
+    if (mode == GL_TRIANGLES) {
+        for (i = 0; i < count - 2; i += 3)
+            if (!gpu_stage_tri_colora(st, &va[0], &va[1],
+                                      (GLsizei)(first+i), (GLsizei)(first+i+1),
+                                      (GLsizei)(first+i+2))) return 0;
+    } else if (mode == GL_TRIANGLE_STRIP) {
+        GLsizei a = 0, b = 1; int toggle = 0;
+        for (i = 2; i < count; ++i) {
+            if (!gpu_stage_tri_colora(st, &va[0], &va[1],
+                                      (GLsizei)(first+a), (GLsizei)(first+b),
+                                      (GLsizei)(first+i))) return 0;
+            if (!toggle) a = i; else b = i;
+            toggle = !toggle;
+        }
+    } else { /* GL_TRIANGLE_FAN */
+        for (i = 2; i < count; ++i)
+            if (!gpu_stage_tri_colora(st, &va[0], &va[1],
+                                      (GLsizei)first, (GLsizei)(first+i-1),
+                                      (GLsizei)(first+i))) return 0;
+    }
     return 1;
 }
 
@@ -3148,6 +3234,7 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
     GLsizei nout, i;
     int key_match, base;
     int blend;
+    int cola;   /* SRC_ALPHA-over colour draw with a 4-component colour attrib */
 
     gpu_bringup();
     if (!g_gpu_ready) return 0;
@@ -3167,19 +3254,18 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
      * tessellated here at GPU_STAGING_STRIDE. */
     if (e->texcol) return 0;
 
-    /* Blend eligibility.  The INSTANCED-LIT raster kernel implements opaque /
-     * SRC_ALPHA / additive blending, so an engine draw whose equation maps to a
-     * PGL_G3D_BLEND_* code stays on the GPU.  Any other equation - or ANY blend
-     * on the plain gouraud/tex kernels, which still cannot blend - drains the
-     * open batch first (painter's order across the GPU->CPU handover), then
-     * declines to the interpreter which reproduces the blend exactly. */
+    /* Blend eligibility.  The INSTANCED-LIT and COLOUR raster kernels implement
+     * opaque / SRC_ALPHA / additive blending, so an engine draw whose equation
+     * maps to a PGL_G3D_BLEND_* code stays on the GPU.  The COLOUR kernel forces
+     * per-vertex alpha to 1.0 by default, so it takes OPAQUE (blend disabled)
+     * and ADDITIVE (dc + sc*sa, the premultiplied fireworks path) on the plain
+     * RGB stream; SRC_ALPHA-over additionally requires a 4-component colour
+     * attribute, which drives the per-vertex-alpha (uColAlpha) stride-7 path
+     * below.  Any other equation - or ANY blend on the plain gouraud/tex
+     * kernels, which still cannot blend - drains the open batch first
+     * (painter's order across the GPU->CPU handover), then declines to the
+     * interpreter which reproduces the blend exactly. */
     blend = gpu_blend_code();
-    if (e->inst_lit) {
-        if (blend < 0) { gpu_coalesce_flush(); return 0; }
-    } else if (!gpu_blend_geom_ok()) {
-        gpu_coalesce_flush(); return 0;
-    }
-
     /* the fixed kernels rasterise triangles only */
     if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP && mode != GL_TRIANGLE_FAN)
         return 0;
@@ -3190,6 +3276,25 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
     if (!va[0].enabled || va[0].type != GL_FLOAT || va[0].size < 3) return 0;
     if (!va[1].enabled || va[1].type != GL_FLOAT) return 0;
     if (va[1].size < (e->textured ? 2 : 3)) return 0;
+    cola = e->color && !e->textured && blend == PGL_G3D_BLEND_ALPHA &&
+           va[1].size >= 4;
+
+    if (e->inst_lit) {
+        if (blend < 0) { gpu_coalesce_flush(); return 0; }
+    } else if (e->color) {
+        /* SRC_ALPHA-over without a 4-component colour attribute cannot carry
+         * the per-vertex alpha the kernel would blend with (it would
+         * composite at alpha 1.0): keep such draws on the interpreter. */
+        if (blend == PGL_G3D_BLEND_ALPHA && !cola) {
+            gpu_coalesce_flush(); return 0;
+        }
+        if (blend != PGL_G3D_BLEND_OPAQUE && blend != PGL_G3D_BLEND_ADD &&
+            blend != PGL_G3D_BLEND_ALPHA) {
+            gpu_coalesce_flush(); return 0;
+        }
+    } else if (!gpu_blend_geom_ok()) {
+        gpu_coalesce_flush(); return 0;
+    }
 
     nout = (mode == GL_TRIANGLES) ? (count / 3) * 3 : (count - 2) * 3;
     if (nout < 3 || (GLuint)nout > PGL_G3D_MAX_VERTS) return 0;
@@ -3234,6 +3339,30 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
                                                (uint32_t)nout, GPU_STAGING_STRIDE,
                                                depth, mask, cull);
         if (!ok) { e->cpu_latched = 1; return 0; }   /* declined: latch CPU + fall through */
+        return 1;
+    }
+
+    /* Per-vertex-alpha colour route (SRC_ALPHA-over with a 4-component colour
+     * attribute): one stride-7 dispatch per draw, never coalesced - the
+     * stride-6 shared staging has no alpha slot and the blend order across
+     * dispatches is the submission order, exactly like the CPU interpreter's
+     * per-draw painter order. */
+    if (cola) {
+        gpu_coalesce_flush();
+        if (!g_gpu_ready) return 0;
+        if (!gpu_colora_reserve(nout)) return 0;
+        st.v = g_gpu_colora; st.n = 0; st.cap = nout;
+        st.stride = GPU_COLORA_STRIDE; st.inst = 0.0f;
+        if (!gpu_tessellate_colora(&st, mode, first, count, va)) return 0;
+        if (st.n != nout) return 0;   /* defensive: tessellation/staging mismatch */
+        pgl_g3d_set_shader_program(e->prog);
+        pgl_g3d_set_uniforms(blob, PGL_G3D_MAX_UNIF);
+        pgl_g3d_set_blend(blend);
+        if (!pgl_g3d_draw_interleaved_compiled_color(
+                 e->prog, g_gpu_colora, (uint32_t)nout, GPU_COLORA_STRIDE,
+                 depth, mask, cull)) {
+            e->cpu_latched = 1; return 0;
+        }
         return 1;
     }
 
@@ -3679,6 +3808,7 @@ GEuint gles_engine_gpu_link(GEuint pgl_id, const char *vs_src, const char *fs_sr
      * MVP/normal/material/emissive ride the per-instance record), so it does NOT
      * expose uMVP and must be recognised here rather than by the koff[0] test. */
     e->inst_lit = pgl_g3d_shader_geom_inst_lit(prog);
+    e->color = pgl_g3d_shader_geom_color(prog);
     e->eligible = 0;
     for (i = 0; i < GPU_NUNIF; ++i) {
         nc = 0;

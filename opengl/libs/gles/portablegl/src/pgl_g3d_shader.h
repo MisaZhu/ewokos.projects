@@ -95,6 +95,14 @@ int pgl_g3d_shader_geom_tex(pgl_g3d_prog p);
  * and writing no depth.  Serialised as cs_is_geom = 4. */
 int pgl_g3d_shader_geom_texcol(pgl_g3d_prog p);
 
+/* Non-zero when p's geom kernel is the COLOUR variant
+ * (geom_xform_color_cs_glsl, attached when the app VS transforms by uMVP but
+ * declares NO uNormalMat and the FS samples no texture): attr1 is a
+ * precomputed per-vertex colour copied through pass 1 (alpha forced 1.0), so
+ * the shared gouraud raster kernel's uBlendMode/uDepthWrite/uCullSign are
+ * honoured for it exactly as for the instanced-lit variant. */
+int pgl_g3d_shader_geom_color(pgl_g3d_prog p);
+
 /* Non-zero when p's geom kernel is the INSTANCED variant
  * (geom_xform_inst_cs_glsl, attached when the app VS carries the
  * PGL_G3D_INSTANCED marker): pass 1 reads a per-vertex instance index from

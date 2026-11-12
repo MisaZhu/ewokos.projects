@@ -50,8 +50,10 @@
 #define PGL_G3D_UV_BYTES  (PGL_G3D_MAX_VERTS * 3u * 4u)
 /* WS4 compiled-mesh normal staging: float3 per vertex (12-byte stride), the
    attribute-1 (normal) array a 2-attribute compiled mesh draw re-stages into.
-   Modelled exactly like pos so the driver reuses the proven float3 record. */
-#define PGL_G3D_NRM_BYTES (PGL_G3D_MAX_VERTS * 3u * 4u)
+   Modelled exactly like pos so the driver reuses the proven float3 record.
+   Sized for the COLOUR variant's per-vertex-alpha layout (float4, 16-byte
+   stride, uColAlpha=1) as the widest attribute-1 record it ever holds. */
+#define PGL_G3D_NRM_BYTES (PGL_G3D_MAX_VERTS * 4u * 4u)
 /* WS4: per-draw GL uniform blob staged for the daemon's QUNIFORM interpreter
    (u32 words, CPU-read; count matches PGL_G3D_MAX_UNIF in the public header). */
 #define PGL_G3D_UNIF_BYTES (PGL_G3D_MAX_UNIF * 4u)
@@ -163,6 +165,13 @@ typedef struct {
 	const float* packed;
 	uint32_t packed_stride;
 	int      instanced;
+	/* Per-vertex-alpha COLOUR variant: packed_a borrows the same interleaved
+	   stream as packed (pos.xyz at 0, colour rgba at 3) with the alpha passed
+	   through to the xform kernel's uColAlpha; col_a is set only by
+	   pgl_g3d_draw_interleaved_compiled_color. */
+	const float* packed_a;
+	uint32_t packed_a_stride;
+	int      col_a;
 } pgl_g3d_mesh_slot_t;
 #define PGL_G3D_MAX_MESH 8
 static pgl_g3d_mesh_slot_t _mesh[PGL_G3D_MAX_MESH];
@@ -1296,6 +1305,13 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 	int geom_tex;
 	int geom_texcol;
 	int geom_inst;
+	int geom_color;
+	/* Per-vertex-alpha COLOUR draw: the borrowed packed stream carries rgba
+	   colours and the xform kernel's uColAlpha is patched to 1. */
+	int cola;
+	/* Pixel-owned launch window computed in the geom branch (the request
+	   init memsets the struct, so it is carried over after the init). */
+	int32_t win_x = 0, win_y = 0, win_w = 0, win_h = 0;
 
 	if (!_enabled)
 		return 0;
@@ -1339,6 +1355,13 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 	geom_texcol = geom && pgl_g3d_shader_geom_texcol(prog);
 	geom_tex = geom && !geom_texcol && pgl_g3d_shader_geom_tex(prog);
 	geom_inst = geom && pgl_g3d_shader_geom_inst(prog);
+	geom_color = geom && !geom_texcol && !geom_tex && !geom_inst &&
+	             pgl_g3d_shader_geom_color(prog);
+	/* Per-vertex-alpha colour draw: only the colour route's xform kernel
+	   declares uColAlpha, and only a borrowed packed stream (the
+	   pgl_g3d_draw_interleaved_compiled_color layout) carries the alpha. */
+	cola = geom_color && m->col_a && m->packed != NULL &&
+	       m->packed_a != NULL && m->packed_a_stride >= 7u;
 	/* Re-stage the sub-range into the fixed _pos/_nrm staging, re-based to
 	   vertex 0, in the layout the program's kernel reads.  This is a plain copy
 	   into NOCACHE shm every draw, by design: the slot owns no GPU segment (see
@@ -1422,12 +1445,20 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 				const float* src = m->packed +
 				                   (size_t)(first + v) * m->packed_stride;
 				memcpy(_pos + (size_t)v * 3u, src, 3u * sizeof(float));
-				memcpy(_nrm + (size_t)v * 3u, src + 3, 3u * sizeof(float));
+				if (cola) {
+					/* per-vertex-alpha colour record: rgba stride 4 */
+					memcpy(_nrm + (size_t)v * 4u, src + 3,
+					       4u * sizeof(float));
+				} else {
+					memcpy(_nrm + (size_t)v * 3u, src + 3,
+					       3u * sizeof(float));
+				}
 			}
 		} else {
 			/* gouraud: both streams are already tight float3, so the sub-range is
 			   a straight copy (NEON memcpy, not a scalar per-float store loop into
-			   NOCACHE memory). */
+			   NOCACHE memory).  cola never reaches here: it requires the borrowed
+			   packed view, which this branch does not use. */
 			memcpy(_pos, m->pos + (size_t)first * 3u, (size_t)count * 12u);
 			memcpy(_nrm, m->nrm + (size_t)first * 3u, (size_t)count * 12u);
 		}
@@ -1462,7 +1493,9 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 		pos.phy = _pos_phy;
 	} else {
 		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 3, 1);
-		col = g2d_canvas(_nrm_shm, PGL_G3D_NRM_BYTES, count, 3, 1);
+		/* cola widens the attribute-1 record to float4 (rgba) so the colour
+		   xform kernel can carry the per-vertex alpha through. */
+		col = g2d_canvas(_nrm_shm, PGL_G3D_NRM_BYTES, count, cola ? 4 : 3, 1);
 		col.phy = _nrm_phy;
 		pos.phy = _pos_phy;
 	}
@@ -1540,24 +1573,43 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 		one[0] = count;
 		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 		                             "uVertCount", one, 1u);
+		/* Per-vertex alpha opt-in: 1 = this draw's attribute-1 records are
+		   rgba (stride 4) and the xform must carry the alpha into vout; 0 =
+		   the historical RGB stride-3 with alpha forced to 1.0.  Only the
+		   colour xform declares the uniform; every other kernel ignores the
+		   patch. */
+		one[0] = cola ? 1u : 0u;
+		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+		                             "uColAlpha", one, 1u);
 		/* Per-draw render state for the gouraud raster kernel (uBlendMode /
-		   uDepthWrite / uCullSign).  The INSTANCED-LIT/gouraud route honours
-		   the app's blend, depth-mask and cull state so translucent shells and
-		   additive glows composite on the GPU.  EVERY OTHER route is pinned to
-		   the historical hardcoded behaviour (opaque overwrite, always depth-
-		   write, no cull) so teapot/gears/texcol pixels are byte-identical to
-		   before these uniforms existed - those kernels either declare none of
-		   them (textured/texcol: the patch is a no-op) or, for the plain gouraud
+		   uDepthWrite / uCullSign).  The INSTANCED-LIT and COLOUR routes honour
+		   the app's blend, depth-mask and cull state so translucent shells,
+		   additive glows and fireworks-style particle bursts composite on the
+		   GPU.  EVERY OTHER route is pinned to the historical hardcoded
+		   behaviour (opaque overwrite, always depth-write, no cull) so
+		   teapot/gears/texcol pixels are byte-identical to before these
+		   uniforms existed - those kernels either declare none of them
+		   (textured/texcol: the patch is a no-op) or, for the plain gouraud
 		   kernel, would otherwise start culling/blending they never did. */
 		{
 			int inst_lit = pgl_g3d_shader_geom_inst_lit(prog);
-			one[0] = inst_lit ? (uint32_t)_blend_mode : PGL_G3D_BLEND_OPAQUE;
+			int color = pgl_g3d_shader_geom_color(prog);
+			int stateful = inst_lit || color;
+			one[0] = stateful ? (uint32_t)_blend_mode : PGL_G3D_BLEND_OPAQUE;
 			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 			                             "uBlendMode", one, 1u);
-			one[0] = inst_lit ? (depth_mask ? 1u : 0u) : 1u;
+			one[0] = stateful ? (depth_mask ? 1u : 0u) : 1u;
+			/* A depth-test-OFF colour draw must not write depth: the frame's
+			   first dispatch far-clears the surface, and with uDepthWrite the
+			   kernel's atomicMin would reject later fragments of the same
+			   dispatch against depths written by earlier ones (lost pixels for
+			   depth-less compositing like fireworks).  Test-only against the
+			   far-cleared surface passes every fragment. */
+			if (color && depth_func == PGL_G3D_DEPTH_NONE)
+				one[0] = 0u;
 			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 			                             "uDepthWrite", one, 1u);
-			one[0] = inst_lit ? pgl_g3d_cull_sign(cull) : 0u;
+			one[0] = stateful ? pgl_g3d_cull_sign(cull) : 0u;
 			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 			                             "uCullSign", one, 1u);
 		}
@@ -1574,6 +1626,76 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 			sc[3] = (uint32_t)_scissor_h;
 			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 			                             "uScissor", sc, 4u);
+		}
+		/* Q8B pixel-owned raster kernels launch one workgroup per 16x16
+		   screen tile: a small fireworks burst covering a few hundred pixels
+		   would still touch every pixel of the framebuffer.  When the raster
+		   kernel declares uDispatchOffset (that route only), compute this
+		   sub-range's conservative projected bounding box from the staged
+		   vertices and the staged uMVP, and confine the launch grid to it.
+		   The math mirrors the xform kernels' screen mapping EXACTLY
+		   (c = uMVP*vec4(p,1); iw = 1/c.w; s = (c.xy*iw*0.5±0.5)*WH), so a
+		   small margin absorbs only rounding/FMA differences.  Vertices with
+		   c.w<=0 are skipped - the kernel drops their triangles (iw sentinel)
+		   - and the window is clamped to the framebuffer, because the daemon
+		   rejects any rectangle outside it.  The patch is name-resolved: on
+		   back ends whose kernels lack the uniform it writes nothing and the
+		   ext fields stay zero (full-frame fallback). */
+		if (!geom_texcol && !geom_inst) {
+			uint32_t nc = 0;
+			int koff = pgl_g3d_shader_uniform_dword(prog, "uMVP", &nc);
+			int stride = geom_tex ? 6 : 3;
+			if (koff >= 0 && nc >= 16u &&
+			    (uint32_t)koff + 16u <= (uint32_t)_unif_count) {
+				const float* m = (const float*)&_unif[koff];
+				float x0 = fw, y0 = fh, x1 = 0.0f, y1 = 0.0f;
+				for (v = 0; v < count; v++) {
+					float px = _pos[(size_t)v * (size_t)stride + 0u];
+					float py = _pos[(size_t)v * (size_t)stride + 1u];
+					float pz = _pos[(size_t)v * (size_t)stride + 2u];
+					float cw = m[3]*px + m[7]*py + m[11]*pz + m[15];
+					float iw, sx, sy;
+					if (cw <= 0.0f)
+						continue;
+					iw = 1.0f / cw;
+					sx = ((m[0]*px + m[4]*py + m[8]*pz + m[12])*iw*0.5f +
+					      0.5f) * fw;
+					sy = (0.5f -
+					      (m[1]*px + m[5]*py + m[9]*pz + m[13])*iw*0.5f) * fh;
+					if (sx < x0) x0 = sx;
+					if (sy < y0) y0 = sy;
+					if (sx > x1) x1 = sx;
+					if (sy > y1) y1 = sy;
+				}
+				x0 -= 2.0f; y0 -= 2.0f; x1 += 2.0f; y1 += 2.0f;
+				if (x0 < 0.0f) x0 = 0.0f;
+				if (y0 < 0.0f) y0 = 0.0f;
+				if (x1 > fw) x1 = fw;
+				if (y1 > fh) y1 = fh;
+				{
+					uint32_t win[2];
+					int partial = (x1 > x0 && y1 > y0 &&
+					               (x0 > 0.0f || y0 > 0.0f ||
+					                x1 < fw || y1 < fh));
+					/* The kernel ALWAYS adds uDispatchOffset, so a
+					   full-frame launch needs it patched to zero: a
+					   stale blob word would shift every pixel. */
+					win[0] = partial ? (uint32_t)x0 : 0u;
+					win[1] = partial ? (uint32_t)y0 : 0u;
+					if (pgl_g3d_shader_patch_uniform(prog, _unif,
+					                                 PGL_G3D_MAX_UNIF,
+					                                 "uDispatchOffset",
+					                                 win, 2u) != 0u &&
+					    partial) {
+						win_x = (int32_t)win[0];
+						win_y = (int32_t)win[1];
+						win_w = (int32_t)((uint32_t)(x1 + 0.999f) -
+						                  win[0]);
+						win_h = (int32_t)((uint32_t)(y1 + 0.999f) -
+						                  win[1]);
+					}
+				}
+			}
 		}
 		/* The daemon splits the blob at the program's cs2_uniform_blob_dwords,
 		   so it must receive the FULL concatenated span [xform | raster] even
@@ -1612,6 +1734,16 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 	   covers any per-draw kernel words the geom branch just patched beyond
 	   the app-staged count. */
 	g2d_pgl_draw_req_set_shader(&req, dh, _unif_shm, unif_n, 1);
+
+	/* Carry the geom branch's pixel-owned launch window into the request
+	   (the init above memsets, so it must be filled after).  Top-left
+	   origin, clamped to the framebuffer, so the daemon accepts it. */
+	if (win_w > 0 && win_h > 0) {
+		req.ext.dispatch_x = win_x;
+		req.ext.dispatch_y = win_y;
+		req.ext.dispatch_w = win_w;
+		req.ext.dispatch_h = win_h;
+	}
 
 	/* WS4 sampler bindings: identical marshalling to flush() above, so a
 	   compiled-mesh draw whose FS samples a texture binds its ctex units
@@ -1738,6 +1870,36 @@ int pgl_g3d_draw_interleaved_compiled(pgl_g3d_prog prog,
 	memset(&m, 0, sizeof(m));
 	m.packed = interleaved;
 	m.packed_stride = stride_floats;
+	m.nverts = nverts;
+	return draw_mesh_compiled_slot(prog, &m, 0, nverts,
+	                               depth_func, depth_mask, cull);
+}
+
+int pgl_g3d_draw_interleaved_compiled_color(pgl_g3d_prog prog,
+                                            const float* interleaved,
+                                            uint32_t nverts,
+                                            uint32_t stride_floats,
+                                            uint32_t depth_func,
+                                            uint32_t depth_mask,
+                                            uint32_t cull)
+{
+	pgl_g3d_mesh_slot_t m;
+
+	if (interleaved == NULL || nverts == 0 || !pgl_g3d_program_valid(prog))
+		return 0;
+	/* pos.xyz at 0, colour rgba at 3 (the alpha rides element 6). */
+	if (stride_floats < 7u)
+		return 0;
+
+	/* Same borrowed view as pgl_g3d_draw_interleaved_compiled, plus the
+	   col_a marker that turns on the uColAlpha patch and the stride-4
+	   attribute-1 staging in the draw path. */
+	memset(&m, 0, sizeof(m));
+	m.packed = interleaved;
+	m.packed_stride = stride_floats;
+	m.packed_a = interleaved;
+	m.packed_a_stride = stride_floats;
+	m.col_a = 1;
 	m.nverts = nverts;
 	return draw_mesh_compiled_slot(prog, &m, 0, nverts,
 	                               depth_func, depth_mask, cull);

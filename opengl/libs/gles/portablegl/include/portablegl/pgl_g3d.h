@@ -393,6 +393,15 @@ int  pgl_g3d_shader_geom_inst(pgl_g3d_prog p);
    when the compute stage is present and is that variant. */
 int  pgl_g3d_shader_geom_inst_lit(pgl_g3d_prog p);
 
+/* Report whether program p attached the COLOUR geometry xform kernel
+   (geom_xform_color_cs_glsl: a mesh VS transforming by uMVP with no
+   uNormalMat, attr1 = a precomputed per-vertex colour passed through with
+   alpha forced 1.0).  Returns 1 only when the compute stage is present and
+   is that variant.  pgl_g3d_draw_mesh_compiled honours the draw's blend /
+   depth-mask / cull state for this variant, so an additive SRC_ALPHA/ONE
+   draw composites on the GPU exactly as it would through the interpreter. */
+int  pgl_g3d_shader_geom_color(pgl_g3d_prog p);
+
 /* Add one triangle of the active compiled program to the current batch:
    n0/n1/n2 are the clip-space positions (NDC xyz, 3 floats each).  Requires an
    active program (pgl_g3d_set_shader_program) whose daemon upload succeeds;
@@ -586,6 +595,21 @@ int  pgl_g3d_draw_interleaved_compiled(pgl_g3d_prog prog,
                                        uint32_t nverts, uint32_t stride_floats,
                                        uint32_t depth_func, uint32_t depth_mask,
                                        uint32_t cull);
+
+/* Per-vertex-alpha COLOUR variant of pgl_g3d_draw_interleaved_compiled for
+   the colour geometry route (a uMVP-only VS with no uNormalMat, no texture).
+   The stream is pos.xyz at 0 and colour rgba at 3 (stride >= 7); the alpha is
+   carried through the xform kernel (uColAlpha=1) into the raster kernel's
+   blend equation, so glBlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA) composites
+   exactly like the CPU interpreter.  Drawn with any other program the alpha
+   is ignored and the stream reads as the plain RGB layout. */
+int  pgl_g3d_draw_interleaved_compiled_color(pgl_g3d_prog prog,
+                                             const float* interleaved,
+                                             uint32_t nverts,
+                                             uint32_t stride_floats,
+                                             uint32_t depth_func,
+                                             uint32_t depth_mask,
+                                             uint32_t cull);
 
 #ifdef __cplusplus
 }

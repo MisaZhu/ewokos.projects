@@ -26,7 +26,7 @@
 
 #define WIDTH 640
 #define HEIGHT 480
-#define FONT_SIZE 14
+#define FONT_SIZE x_hidpi_size(14)
 #define FONT_PATH "/usr/system/fonts/Hack-Regular.ttf"
 #define MAX_WIDTH 3840
 #define MAX_HEIGHT 2160
