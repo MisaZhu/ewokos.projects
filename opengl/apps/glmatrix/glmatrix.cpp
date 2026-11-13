@@ -69,23 +69,17 @@ static EGLContext egl_ctx = EGL_NO_CONTEXT;
 #define GLYPH_PX     8
 #define NGLYPH_SET   72          /* distinct procedural marks            */
 
-#define NCOL         80          /* columns across X                     */
+#define NCOL         14          /* columns across X                     */
 #define NDEPTH       4           /* layers across Z (depth)              */
 #define NCOLS        (NCOL * NDEPTH)
-#define MAXTRAIL     128
+#define MAXTRAIL     16
 
-#define SPACE_X      0.35f       /* column spacing: kept > GLYPH_SIZE (0.31) so neighbours stay distinct, and 79*0.35=27.6 ~ the frustum width so the field spans the whole screen instead of leaving black margins */
+#define SPACE_X      1.45f
 #define SPACE_Z      2.80f
-#define GY           0.35f       /* world distance between glyphs in a col (just above GLYPH_SIZE so a trail reads continuous) */
-#define YTOP         24.00f      /* sim field top: taller than the longest trail (128*GY=44.8) so a long streak can fall all the way through and reset below the field instead of re-triggering every frame */
-#define YBOT        (-24.00f)
-/* Render cull band: only glyphs inside this vertical reach are actually on
- * screen (the frustum shows roughly +/-9.5 world units).  The sim field above
- * is deliberately taller so long trails fall smoothly; culling the DRAW to the
- * band keeps the doubled trails from emitting ~2x off-screen vertices. */
-#define VIS_YTOP     10.00f
-#define VIS_YBOT    (-10.00f)
-#define GLYPH_SIZE   0.31f       /* world/eye size of one glyph billboard (half size) */
+#define GY           0.85f       /* world distance between glyphs in a col */
+#define YTOP         9.00f
+#define YBOT        (-9.00f)
+#define GLYPH_SIZE   0.62f       /* world/eye size of one glyph billboard */
 
 #define CAM_DIST     15.0f
 #define CAM_FOV      55.0f
@@ -94,7 +88,7 @@ static EGLContext egl_ctx = EGL_NO_CONTEXT;
 #define FOG_NEAR     8.0f
 #define FOG_FAR      30.0f
 
-#define MAXVERTS     560000      /* scratch capacity (vertices)          */
+#define MAXVERTS     40000       /* scratch capacity (vertices)          */
 
 /* ------------------------------------------------------------------ *
  * Small deterministic PRNG (xorshift32) - used for the glyph set and
@@ -193,7 +187,7 @@ static float g_time = 0.0f;
 
 static void reset_column(int c)
 {
-    g_trail[c] = xrnd_range(96, 128);
+    g_trail[c] = xrnd_range(6, 13);
     g_speed[c] = 3.5f + xrndf() * 4.0f;              /* world units / sec */
     g_head[c]  = YTOP + xrndf() * 6.0f;              /* restart above top */
 }
@@ -207,7 +201,7 @@ static void build_state(void)
             c = j * NCOL + i;
             g_colx[c] = ((float)i - (float)(NCOL - 1) * 0.5f) * SPACE_X;
             g_colz[c] = ((float)(NDEPTH - 1) * 0.5f - (float)j) * SPACE_Z;
-            g_trail[c] = xrnd_range(96, 128);
+            g_trail[c] = xrnd_range(6, 13);
             g_speed[c] = 3.5f + xrndf() * 4.0f;
             /* Spread initial heads through the field so rain is populated
              * on the first frame instead of falling in unison. */
@@ -528,7 +522,7 @@ static void draw_rain(void)
         for (k = 0; k < g_trail[c]; ++k) {
             float wy = g_head[c] - (float)k * GY;
             float ep[3], dist, fog, b, wave, cr, cg, cb;
-            if (wy < VIS_YBOT || wy > VIS_YTOP) continue;
+            if (wy < YBOT - 0.5f || wy > YTOP + 0.5f) continue;
 
             xform_point(model_view, g_colx[c], wy, g_colz[c], ep);
             dist = -ep[2];
@@ -543,10 +537,8 @@ static void draw_rain(void)
             if (k == 0) {                                  /* bright leader  */
                 cr = 0.70f; cg = 1.00f; cb = 0.82f;
             } else {                                        /* fading green  */
-                float t = (float)k / (float)g_trail[c];
-                float t2 = t * t;
-                b = 1.0f - t2 * t2;   /* quartic taper: brightness holds across most of the (doubled) trail and only fades near the tail, so the lit rain reads far longer than the old linear/quadratic ramp */
-                if (b < 0.06f) b = 0.06f;
+                b = 1.0f - (float)k / (float)g_trail[c];
+                if (b < 0.05f) b = 0.05f;
                 cr = 0.10f * b; cg = 0.95f * b; cb = 0.30f * b;
             }
             cr *= fog; cg *= fog * wave; cb *= fog;
