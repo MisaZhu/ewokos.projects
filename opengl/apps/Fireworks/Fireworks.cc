@@ -803,8 +803,20 @@ static void render_frame(void)
 
 static void on_event(xwin_t* xwin, xevent_t* ev)
 {
-    if (ev->type == XEVT_IM && ev->state == XIM_STATE_PRESS && ev->value.im.value == KEY_ESC)
-        xwin_close(xwin);
+    /* Any key press or mouse button press quits, matching glmatrix: a
+     * screensaver-style demo should exit on the first sign of user activity
+     * (xscreensaver's "any key or button" gesture).  The ImGui HUD is
+     * read-only (FPS / Renderer) so it has no interaction to preserve.  Only
+     * the initial mouse DOWN (not a DRAG continuation) triggers the exit so a
+     * press-and-move does not race xwin_close against further motion. */
+    if (ev->type == XEVT_IM) {
+        if (ev->state == XIM_STATE_PRESS)
+            xwin_close(xwin);
+    }
+    else if (ev->type == XEVT_MOUSE) {
+        if (ev->state == MOUSE_STATE_DOWN)
+            xwin_close(xwin);
+    }
 }
 
 static void loop(void* p)
@@ -877,6 +889,7 @@ int main(int argc, char** argv)
      * that pin was for the old CPU-composited blit. */
     init_gl();
 
+    xwin_fullscreen(xwin);
     xwin_set_visible(xwin, true);
     x_run(&x, xwin);
 
