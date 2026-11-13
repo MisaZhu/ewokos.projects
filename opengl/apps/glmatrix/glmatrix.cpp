@@ -69,17 +69,21 @@ static EGLContext egl_ctx = EGL_NO_CONTEXT;
 #define GLYPH_PX     8
 #define NGLYPH_SET   72          /* distinct procedural marks            */
 
-#define NCOL         14          /* columns across X                     */
+#define NCOL         28          /* columns across X (2x github baseline 14) */
 #define NDEPTH       4           /* layers across Z (depth)              */
 #define NCOLS        (NCOL * NDEPTH)
-#define MAXTRAIL     16
+#define MAXTRAIL     24
 
-#define SPACE_X      1.45f
+#define SPACE_X      0.725f      /* halved from baseline 1.45 so 2x columns fill the same field width; 0.725 > GLYPH_SIZE 0.62 keeps neighbours distinct (no wall) */
 #define SPACE_Z      2.80f
 #define GY           0.85f       /* world distance between glyphs in a col */
-#define YTOP         9.00f
-#define YBOT        (-9.00f)
-#define GLYPH_SIZE   0.62f       /* world/eye size of one glyph billboard */
+#define YTOP         14.00f      /* sim field raised from baseline +/-9 so the doubled trail (26*GY=22.1) fits without re-triggering reset every frame */
+#define YBOT        (-14.00f)
+/* Draw cull band, same visible reach as the baseline (+/-9.5): the sim field
+ * above is taller only to give the doubled-length trails room to fall. */
+#define VIS_YTOP     9.50f
+#define VIS_YBOT    (-9.50f)
+#define GLYPH_SIZE   0.44f     /* smaller than github baseline 0.62 ("font too big"); still < SPACE_X 0.725 and GY 0.85 so glyphs stay separated */
 
 #define CAM_DIST     15.0f
 #define CAM_FOV      55.0f
@@ -88,7 +92,7 @@ static EGLContext egl_ctx = EGL_NO_CONTEXT;
 #define FOG_NEAR     8.0f
 #define FOG_FAR      30.0f
 
-#define MAXVERTS     40000       /* scratch capacity (vertices)          */
+#define MAXVERTS     80000       /* scratch capacity (vertices)          */
 
 /* ------------------------------------------------------------------ *
  * Small deterministic PRNG (xorshift32) - used for the glyph set and
@@ -187,7 +191,7 @@ static float g_time = 0.0f;
 
 static void reset_column(int c)
 {
-    g_trail[c] = xrnd_range(6, 13);
+    g_trail[c] = xrnd_range(12, 26);   /* 2x github baseline (6,13) */
     g_speed[c] = 3.5f + xrndf() * 4.0f;              /* world units / sec */
     g_head[c]  = YTOP + xrndf() * 6.0f;              /* restart above top */
 }
@@ -201,7 +205,7 @@ static void build_state(void)
             c = j * NCOL + i;
             g_colx[c] = ((float)i - (float)(NCOL - 1) * 0.5f) * SPACE_X;
             g_colz[c] = ((float)(NDEPTH - 1) * 0.5f - (float)j) * SPACE_Z;
-            g_trail[c] = xrnd_range(6, 13);
+            g_trail[c] = xrnd_range(12, 26);   /* 2x github baseline (6,13) */
             g_speed[c] = 3.5f + xrndf() * 4.0f;
             /* Spread initial heads through the field so rain is populated
              * on the first frame instead of falling in unison. */
@@ -522,7 +526,7 @@ static void draw_rain(void)
         for (k = 0; k < g_trail[c]; ++k) {
             float wy = g_head[c] - (float)k * GY;
             float ep[3], dist, fog, b, wave, cr, cg, cb;
-            if (wy < YBOT - 0.5f || wy > YTOP + 0.5f) continue;
+            if (wy < VIS_YBOT || wy > VIS_YTOP) continue;
 
             xform_point(model_view, g_colx[c], wy, g_colz[c], ep);
             dist = -ep[2];
