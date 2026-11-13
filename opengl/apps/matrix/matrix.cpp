@@ -325,7 +325,7 @@ struct Column {
         if (y - length * FONT_SIZE > height) {
             reset();
         }
-        if (rand() % 3 == 0) {
+        if (rand() % 3 != 0) {   /* mutate twice as often as before (2/3 of frames) */
             size_t char_count = strlen(MATRIX_CHARS);
             if (char_count == 0) char_count = 1;
 
