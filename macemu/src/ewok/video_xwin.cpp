@@ -1378,10 +1378,13 @@ bool VideoInit(bool classic)
 	}
 
 	if (system_hidpi && !classic) {
-		// Match the 2x presentation with a half-resolution guest desktop so
-		// the aspect-fit scaler fills the screen instead of cropping it.
-		display_width /= 2;
-		display_height /= 2;
+		// Match the system's hidpi presentation with a reduced-resolution
+		// guest desktop so the aspect-fit scaler fills the screen instead
+		// of cropping it.  x_init() above refreshed the theme cache, so
+		// x_hidpi_scale() holds the server's configured factor (1..4).
+		float hidpi_scale = x_hidpi_scale();
+		display_width = (int)(display_width / hidpi_scale);
+		display_height = (int)(display_height / hidpi_scale);
 	} else if(hidpi && display_width >= 1280) {
 		int dw = display_width * 2 / 3;
 		int dh = display_height * 2 / 3;
