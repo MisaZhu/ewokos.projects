@@ -94,7 +94,7 @@ nx11x_screen_init(int *pxres, int *pyres)
 
 	_xserv_pid = dev_get_pid("/dev/x");
 	if (_xserv_pid < 0) {
-		klog("nx11: no xserver (/dev/x)\n");
+		slog("nx11: no xserver (/dev/x)\n");
 		return 0;
 	}
 
@@ -102,14 +102,14 @@ nx11x_screen_init(int *pxres, int *pyres)
 
 	memset(&scr, 0, sizeof(scr));
 	if (x_screen_info(&scr, _disp_index) != 0 || scr.size.w <= 0 || scr.size.h <= 0) {
-		klog("nx11: cannot query screen info\n");
+		slog("nx11: cannot query screen info\n");
 		return 0;
 	}
 
 	/* shm-backed so graph_blt can hand the mirror copy to g2d*/
 	_vfb = graph_new_shm(scr.size.w, scr.size.h);
 	if (_vfb == NULL || _vfb->buffer == NULL) {
-		klog("nx11: cannot allocate %dx%d virtual screen\n", scr.size.w, scr.size.h);
+		slog("nx11: cannot allocate %dx%d virtual screen\n", scr.size.w, scr.size.h);
 		return 0;
 	}
 	graph_clear(_vfb, argb(0, 0, 0, 0));
@@ -465,7 +465,7 @@ nx11x_win_realize(void *p)
 	nw->xwin = xwin_open(&_xctx, _disp_index, x, y, w, h, title, nx11x_style(wp));
 	nw->syncing = 0;
 	if (nw->xwin == NULL) {
-		klog("nx11: xwin_open failed for window %d\n", wp->id);
+		slog("nx11: xwin_open failed for window %d\n", wp->id);
 		return;
 	}
 

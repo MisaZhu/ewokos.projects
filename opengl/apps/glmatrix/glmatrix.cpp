@@ -397,7 +397,7 @@ static GLuint compile_shader(GLenum type, const char *src)
     if (!ok) {
         char log[512];
         glGetShaderInfoLog(sh, sizeof(log), NULL, log);
-        klog("glmatrix: shader compile failed: %s\n", log);
+        slog("glmatrix: shader compile failed: %s\n", log);
         glDeleteShader(sh);
         return 0;
     }
@@ -610,7 +610,7 @@ static void init_gl(void)
     if (!ok) {
         char log[512];
         glGetProgramInfoLog(program, sizeof(log), NULL, log);
-        klog("glmatrix: program link failed: %s\n", log);
+        slog("glmatrix: program link failed: %s\n", log);
         return;
     }
     glDeleteShader(vs);
@@ -622,7 +622,7 @@ static void init_gl(void)
     attr_color = glGetAttribLocation(program, "aColor");
     loc_mvp    = glGetUniformLocation(program, "uMVP");
     if (attr_pos < 0 || attr_color < 0) {
-        klog("glmatrix: attribute location query failed\n");
+        slog("glmatrix: attribute location query failed\n");
         return;
     }
 

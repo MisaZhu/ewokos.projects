@@ -603,7 +603,7 @@ static GLuint compile_shader(GLenum type, const char *src)
     if (!ok) {
         char log[512];
         glGetShaderInfoLog(sh, sizeof(log), NULL, log);
-        klog("teapot: shader compile failed: %s\n", log);
+        slog("teapot: shader compile failed: %s\n", log);
         glDeleteShader(sh);
         return 0;
     }
@@ -713,7 +713,7 @@ static void init_teapot(void)
     if (!ok) {
         char log[512];
         glGetProgramInfoLog(program, sizeof(log), NULL, log);
-        klog("teapot: program link failed: %s\n", log);
+        slog("teapot: program link failed: %s\n", log);
         return;
     }
     glDeleteShader(vs);
@@ -726,7 +726,7 @@ static void init_teapot(void)
     attr_pos   = glGetAttribLocation(program, "aPosition");
     attr_color = glGetAttribLocation(program, "aColor");
     if (attr_pos < 0 || attr_color < 0) {
-        klog("teapot: attribute location query failed\n");
+        slog("teapot: attribute location query failed\n");
         return;
     }
 

@@ -309,7 +309,7 @@ LOCALPROC ICT_DoCurrentTasks(void)
             } else if (ICTwhen[i] == NextiCount) {
                 ICTactive &= ~ (1 << i);
 #ifdef _VIA_Debug
-                klog("doing task %d, %d\n", NextiCount, i);
+                slog("doing task %d, %d\n", NextiCount, i);
 #endif
                 ICT_DoTask(i);
 
@@ -343,7 +343,7 @@ LOCALFUNC ui5b ICT_DoGetNext(ui5b maxn)
                 /* at this point d must be > 0 */
                 if (d < v) {
 #ifdef _VIA_Debug
-                    klog("coming task %d, %d, %d\n",
+                    slog("coming task %d, %d, %d\n",
                         NextiCount, i, d);
 #endif
                     v = d;

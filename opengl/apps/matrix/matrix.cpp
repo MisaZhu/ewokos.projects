@@ -420,7 +420,7 @@ static GLuint compile_shader(GLenum type, const char *src)
     if (!ok) {
         char log[512];
         glGetShaderInfoLog(sh, sizeof(log), NULL, log);
-        klog("matrix: shader compile failed: %s\n", log);
+        slog("matrix: shader compile failed: %s\n", log);
         glDeleteShader(sh);
         return 0;
     }
@@ -754,7 +754,7 @@ static void init_gl()
     if (!ok) {
         char log[512];
         glGetProgramInfoLog(program, sizeof(log), NULL, log);
-        klog("matrix: program link failed: %s\n", log);
+        slog("matrix: program link failed: %s\n", log);
         return;
     }
     glDeleteShader(vs);
@@ -938,7 +938,7 @@ int load_font() {
             return 1;
         }
     }
-    klog("matrix: failed to load any font, rendering will stay blank\n");
+    slog("matrix: failed to load any font, rendering will stay blank\n");
     return 0;
 }
 

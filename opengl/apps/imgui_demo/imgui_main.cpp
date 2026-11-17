@@ -172,7 +172,7 @@ static GLuint compile_shader(GLenum type, const char *src)
     if (!ok) {
         char log[512];
         glGetShaderInfoLog(sh, sizeof(log), NULL, log);
-        klog("imgui_demo: shader compile failed: %s\n", log);
+        slog("imgui_demo: shader compile failed: %s\n", log);
         glDeleteShader(sh);
         return 0;
     }
@@ -563,7 +563,7 @@ static void init_gears(void)
     if (!ok) {
         char log[512];
         glGetProgramInfoLog(gear_program, sizeof(log), NULL, log);
-        klog("imgui_demo: gear program link failed: %s\n", log);
+        slog("imgui_demo: gear program link failed: %s\n", log);
         return;
     }
     glDeleteShader(vs);

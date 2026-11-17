@@ -1719,7 +1719,7 @@ GLOBALPROC ICT_add(int taskid, ui5b n)
     ui5b when = NextiCount - x + n;
 
 #ifdef _VIA_Debug
-    klog("ICT_add: %d, %d, %d\n", when, taskid, n);
+    slog("ICT_add: %d, %d, %d\n", when, taskid, n);
 #endif
     InsertICT(taskid, when);
 

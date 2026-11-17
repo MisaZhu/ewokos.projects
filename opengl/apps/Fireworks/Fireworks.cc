@@ -167,7 +167,7 @@ static GLuint compile_shader(GLenum type, const char *src)
     if (!ok) {
         char log[512];
         glGetShaderInfoLog(sh, sizeof(log), NULL, log);
-        klog("Fireworks: shader compile failed: %s\n", log);
+        slog("Fireworks: shader compile failed: %s\n", log);
         glDeleteShader(sh);
         return 0;
     }
@@ -268,7 +268,7 @@ static void init_gl(void)
     if (!ok) {
         char log[512];
         glGetProgramInfoLog(program, sizeof(log), NULL, log);
-        klog("Fireworks: program link failed: %s\n", log);
+        slog("Fireworks: program link failed: %s\n", log);
         return;
     }
     glDeleteShader(vs);

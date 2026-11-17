@@ -719,7 +719,7 @@ GLOBALPROC VIA1_DoTimer1Check(void)
                 ui5b NewTemp = VIA1_D.T1C_F; /* Get Timer 1 Counter */
                 ui5b NewTimer;
 #ifdef _VIA_Debug
-                klog("posting Timer1Check, %d, %d\n",
+                slog("posting Timer1Check, %d, %d\n",
                     Temp, GetCuriCount());
 #endif
                 if (NewTemp == 0) {
@@ -796,7 +796,7 @@ GLOBALPROC VIA1_DoTimer2Check(void)
             } else {
                 ui5b NewTimer;
 #ifdef _VIA_Debug
-                klog("posting Timer2Check, %d, %d\n",
+                slog("posting Timer2Check, %d, %d\n",
                     Temp, GetCuriCount());
 #endif
                 if (NewTemp == 0) {
@@ -964,7 +964,7 @@ GLOBALFUNC ui5b VIA1_Access(ui5b Data, blnr WriteMem, CPTR addr)
             break;
         case kSR:
 #ifdef _VIA_Debug
-            klog("VIA1_D.SR: %d, %d, %d\n",
+            slog("VIA1_D.SR: %d, %d, %d\n",
                 WriteMem, ((VIA1_D.ACR & 0x1C) >> 2), Data);
 #endif
             if (WriteMem) {
@@ -979,7 +979,7 @@ GLOBALFUNC ui5b VIA1_Access(ui5b Data, blnr WriteMem, CPTR addr)
                         ReportAbnormal("VIA shift mode 6, non zero");
                     } else {
 #ifdef _VIA_Debug
-                        klog("posting Foo2Task\n");
+                        slog("posting Foo2Task\n");
 #endif
                         if (VIA1_iCB2 != 0) {
                             VIA1_iCB2 = 0;

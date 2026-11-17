@@ -149,11 +149,11 @@ GLOBALPROC DoKybd_ReceiveEndCommand(void)
     } else {
         KybdState = kKybdStateIdle;
 #ifdef _VIA_Debug
-        klog("enter DoKybd_ReceiveEndCommand\n");
+        slog("enter DoKybd_ReceiveEndCommand\n");
 #endif
         if (HaveKeyBoardResult) {
 #ifdef _VIA_Debug
-            klog("HaveKeyBoardResult: %d\n", KeyBoardResult);
+            slog("HaveKeyBoardResult: %d\n", KeyBoardResult);
 #endif
             HaveKeyBoardResult = falseblnr;
             KYBD_ShiftOutData(KeyBoardResult);
@@ -169,7 +169,7 @@ GLOBALPROC Kybd_DataLineChngNtfy(void)
             if (VIA1_iCB2 == 0) {
                 KybdState = kKybdStateRecievingCommand;
 #ifdef _VIA_Debug
-                klog("posting kICT_Kybd_ReceiveCommand\n");
+                slog("posting kICT_Kybd_ReceiveCommand\n");
 #endif
                 ICT_add(kICT_Kybd_ReceiveCommand,
                     6800UL * kCycleScale / 64 * kMyClockMult);

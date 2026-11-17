@@ -1916,7 +1916,7 @@ LOCALFUNC blnr MySound_Init(void)
     if (!TheSoundBuffer) {
         // If buffer allocation fails, continue without sound
         HaveSoundOut = falseblnr;
-        klog("MySound_Init: Failed to allocate sound buffer\n");
+        slog("MySound_Init: Failed to allocate sound buffer\n");
         return falseblnr;
     }
 
