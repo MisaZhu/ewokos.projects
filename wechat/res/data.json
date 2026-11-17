@@ -1,0 +1,57 @@
+{
+	"self": {
+		"id": "me",
+		"nickname": "我",
+		"remark": "",
+		"avatar": "avatar_me.png",
+		"color": "#07C160"
+	},
+	"contacts": [
+		{"id": "zhangsan", "nickname": "张三", "remark": "", "avatar": "avatar_zhangsan.png", "color": "#4A90D9"},
+		{"id": "lisi", "nickname": "李四", "remark": "", "avatar": "avatar_lisi.png", "color": "#E6A23C"},
+		{"id": "wangwu", "nickname": "王五", "remark": "老王", "avatar": "avatar_wangwu.png", "color": "#9B59B6"},
+		{"id": "family", "nickname": "相亲相爱一家人", "remark": "", "avatar": "avatar_family.png", "color": "#E74C3C"},
+		{"id": "file_helper", "nickname": "文件传输助手", "remark": "", "avatar": "avatar_file.png", "color": "#2C7BE5"},
+		{"id": "xiaoming", "nickname": "小明", "remark": "", "avatar": "", "color": "#16A085"},
+		{"id": "xiaohong", "nickname": "小红", "remark": "", "avatar": "", "color": "#D35400"}
+	],
+	"sessions": [
+		{
+			"talker": "zhangsan",
+			"unread": 0,
+			"messages": [
+				{"type": "text", "text": "周末去爬山怎么样？天气预报说是晴天。", "sender": "zhangsan", "ago": 7200},
+				{"type": "text", "text": "好主意！几点出发？", "sender": "me", "ago": 7100},
+				{"type": "text", "text": "早上八点吧，山脚下集合。", "sender": "zhangsan", "ago": 7000},
+				{"type": "image", "text": "photo_mountain.png", "sender": "zhangsan", "ago": 6900},
+				{"type": "text", "text": "这是上次去拍的，风景特别棒，发你看看。", "sender": "zhangsan", "ago": 6890},
+				{"type": "text", "text": "哇，太美了！这次一定要多拍几张。", "sender": "me", "ago": 6800}
+			]
+		},
+		{
+			"talker": "family",
+			"unread": 2,
+			"messages": [
+				{"type": "text", "text": "晚上回家吃饭吗？", "sender": "family", "ago": 3600},
+				{"type": "text", "text": "今天炖了汤，早点回来。", "sender": "family", "ago": 3500}
+			]
+		},
+		{
+			"talker": "lisi",
+			"unread": 0,
+			"messages": [
+				{"type": "text", "text": "项目文档我发你邮箱了，记得查收。", "sender": "lisi", "ago": 86400},
+				{"type": "text", "text": "收到，我看完给你反馈。", "sender": "me", "ago": 86300},
+				{"type": "image", "text": "photo_city.png", "sender": "lisi", "ago": 86200},
+				{"type": "text", "text": "出差拍的夜景，分享给你。", "sender": "lisi", "ago": 86190}
+			]
+		},
+		{
+			"talker": "file_helper",
+			"unread": 0,
+			"messages": [
+				{"type": "text", "text": "（演示）文件传输助手：可以在这里给自己发消息。", "sender": "file_helper", "ago": 172800}
+			]
+		}
+	]
+}
