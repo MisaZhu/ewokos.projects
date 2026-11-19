@@ -60,7 +60,7 @@ extern "C" {
 /* Maximum vertices stageable in ONE GPU dispatch (sizing the fixed pos/col/uv/
    normal staging and the per-draw sub-range cap).  Must be >= the g2dclient
    G2D_PGL_MAX_VERTS / back-end VC_PGL3D_MAX_VERTS protocol caps so a draw the
-   client stages is never rejected downstream.  Kept large enough (20480) that
+   client stages is never rejected downstream.  Kept large enough (32768) that
    a whole rigid mesh - e.g. the 19200-vertex Utah teapot - fits in a SINGLE
    dispatch: every dispatch pays a large fixed cost (a whole-surface L2
    clean+invalidate of the colour+depth targets, a CSD_DONE IRQ wait, five
@@ -68,7 +68,7 @@ extern "C" {
    the triangle count, so splitting one mesh across many small dispatches makes
    the GPU path slower than the CPU rasterizer.  Callers drawing a mesh larger
    than this must split it into contiguous sub-ranges themselves. */
-#define PGL_G3D_MAX_VERTS 20480u
+#define PGL_G3D_MAX_VERTS 32768u
 
 /* Depth-function codes, value-identical to the g2dclient G2D_PGL_DEPTH_*
    protocol set.  NONE disables the depth test; all eight GL compare functions

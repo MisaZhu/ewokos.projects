@@ -2927,7 +2927,11 @@ static void gpu_coalesce_flush(void)
          * 6 - as ONE transient interleaved dispatch. */
         if (!pgl_g3d_set_instances(g_inst_rec,
                                    (uint32_t)g_inst_rec_n * GPU_INST_REC)) {
-            if (g_coalesce_entry) g_coalesce_entry->cpu_latched = 1;
+            if (g_coalesce_entry) {
+                slog("PGLGPU: cpu_latched prog=%d reason=inst-staging n=%d\n",
+                     g_coalesce_prog, g_coalesce_n);
+                g_coalesce_entry->cpu_latched = 1;
+            }
             g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0;
             return;
         }
@@ -2941,7 +2945,11 @@ static void gpu_coalesce_flush(void)
                  GPU_STAGING_STRIDE, g_coalesce_depth, g_coalesce_mask,
                  g_coalesce_cull);
     }
-    if (!ok && g_coalesce_entry) g_coalesce_entry->cpu_latched = 1;
+    if (!ok && g_coalesce_entry) {
+        slog("PGLGPU: cpu_latched prog=%d reason=coalesce-flush n=%d inst=%d\n",
+             g_coalesce_prog, g_coalesce_n, g_coalesce_inst);
+        g_coalesce_entry->cpu_latched = 1;
+    }
     g_coalesce_active = 0; g_coalesce_n = 0; g_inst_rec_n = 0;
 }
 
@@ -3197,6 +3205,7 @@ static int gpu_try_fullscreen(gpu_entry *e, GLenum mode, GLint first, GLsizei co
      * caller redraw the whole frame on the interpreter. */
     if (!pgl_g3d_batch_tri_compiled(qa, qb, qc,
                                     PGL_G3D_DEPTH_NONE, 0u, PGL_G3D_CULL_NONE, NULL)) {
+        slog("PGLGPU: cpu_latched prog=%d reason=fullscreen-batch\n", e->prog);
         e->cpu_latched = 1;
         return 0;
     }
@@ -3204,6 +3213,8 @@ static int gpu_try_fullscreen(gpu_entry *e, GLenum mode, GLint first, GLsizei co
                                PGL_G3D_DEPTH_NONE, 0u, PGL_G3D_CULL_NONE, NULL);
     pgl_g3d_flush();
     if (pgl_g3d_program_declined(e->prog) || !pgl_g3d_enabled()) {
+        slog("PGLGPU: cpu_latched prog=%d reason=fullscreen-flush declined=%d enabled=%d\n",
+             e->prog, pgl_g3d_program_declined(e->prog), pgl_g3d_enabled());
         e->cpu_latched = 1;
         return 0;
     }
@@ -3338,7 +3349,10 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
         ok = pgl_g3d_draw_interleaved_compiled(e->prog, g_gpu_stage,
                                                (uint32_t)nout, GPU_STAGING_STRIDE,
                                                depth, mask, cull);
-        if (!ok) { e->cpu_latched = 1; return 0; }   /* declined: latch CPU + fall through */
+        if (!ok) {
+            slog("PGLGPU: cpu_latched prog=%d reason=tex-draw n=%d\n", e->prog, nout);
+            e->cpu_latched = 1; return 0;   /* declined: latch CPU + fall through */
+        }
         return 1;
     }
 
@@ -3361,6 +3375,7 @@ static int gpu_try_draw_arrays(GLenum mode, GLint first, GLsizei count)
         if (!pgl_g3d_draw_interleaved_compiled_color(
                  e->prog, g_gpu_colora, (uint32_t)nout, GPU_COLORA_STRIDE,
                  depth, mask, cull)) {
+            slog("PGLGPU: cpu_latched prog=%d reason=colora-draw n=%d\n", e->prog, nout);
             e->cpu_latched = 1; return 0;
         }
         return 1;
@@ -3527,7 +3542,10 @@ static int gpu_try_draw_elements_textured(gpu_entry *e, GLenum mode, GLsizei cou
     ok = pgl_g3d_draw_interleaved_compiled(e->prog, g_gpu_stage,
                                            (uint32_t)nout, GPU_STAGING_STRIDE,
                                            depth, mask, cull);
-    if (!ok) { e->cpu_latched = 1; return 0; }   /* declined: latch CPU + fall through */
+    if (!ok) {
+        slog("PGLGPU: cpu_latched prog=%d reason=tex-elem n=%d\n", e->prog, nout);
+        e->cpu_latched = 1; return 0;   /* declined: latch CPU + fall through */
+    }
     return 1;
 }
 
@@ -3647,7 +3665,10 @@ static int gpu_try_draw_elements(GLenum mode, GLsizei count, GLenum type,
     ok = pgl_g3d_draw_interleaved_compiled(e->prog, g_gpu_tcol,
                                            (uint32_t)nout, GPU_TEXCOL_STRIDE,
                                            depth, mask, cull);
-    if (!ok) { e->cpu_latched = 1; return 0; }   /* declined: latch CPU + fall through */
+    if (!ok) {
+        slog("PGLGPU: cpu_latched prog=%d reason=texcol-elem n=%d\n", e->prog, nout);
+        e->cpu_latched = 1; return 0;   /* declined: latch CPU + fall through */
+    }
     return 1;
 }
 

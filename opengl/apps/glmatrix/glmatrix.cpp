@@ -191,7 +191,12 @@ static float g_time = 0.0f;
 
 static void reset_column(int c)
 {
-    g_trail[c] = xrnd_range(12, 26);   /* 2x github baseline (6,13) */
+    /* Clamp to MAXTRAIL: g_cellglyph/g_cellflick are sized NCOLS*MAXTRAIL and
+     * indexed c*MAXTRAIL+k with k < g_trail[c]; a trail of 25/26 (the old
+     * xrnd_range(12,26) upper bound) wrote past the cell arrays into the
+     * adjacent globals (g_time, then the GL program handle), which silently
+     * broke glUseProgram and blacked out the rain mid-session. */
+    g_trail[c] = xrnd_range(12, MAXTRAIL);
     g_speed[c] = 3.5f + xrndf() * 4.0f;              /* world units / sec */
     g_head[c]  = YTOP + xrndf() * 6.0f;              /* restart above top */
 }
@@ -205,7 +210,7 @@ static void build_state(void)
             c = j * NCOL + i;
             g_colx[c] = ((float)i - (float)(NCOL - 1) * 0.5f) * SPACE_X;
             g_colz[c] = ((float)(NDEPTH - 1) * 0.5f - (float)j) * SPACE_Z;
-            g_trail[c] = xrnd_range(12, 26);   /* 2x github baseline (6,13) */
+            g_trail[c] = xrnd_range(12, MAXTRAIL);   /* <= MAXTRAIL: cell array bound */
             g_speed[c] = 3.5f + xrndf() * 4.0f;
             /* Spread initial heads through the field so rain is populated
              * on the first frame instead of falling in unison. */
@@ -554,6 +559,18 @@ static void draw_rain(void)
         if (nvert + 6 > MAXVERTS) break;
     }
 
+    /* Forensic heartbeat: every ~5s of app time log the rain vertex count and
+     * the live GPU/CPU route so a black-screen event can be correlated with
+     * the engine's latch diagnostics in /dev/log. */
+    {
+        static float next_hb = 5.0f;
+        if (g_time >= next_hb) {
+            next_hb = g_time + 5.0f;
+            slog("glmatrix: hb t=%.1f nvert=%d gpu=%d\n",
+                 g_time, nvert, glGpuActiveEWOK() ? 1 : 0);
+        }
+    }
+
     if (nvert == 0) { glDisable(GL_DEPTH_TEST); return; }
 
     glBindBuffer(GL_ARRAY_BUFFER, g_posvbo);
@@ -571,14 +588,14 @@ static void draw_rain(void)
     glEnableVertexAttribArray((GLuint)attr_color);
 
     /* The V3D geometry staging buffer caps a single draw at PGL_G3D_MAX_VERTS
-     * (20480); a larger glDrawArrays is silently declined to the CPU interpreter
+     * (32768); a larger glDrawArrays is silently declined to the CPU interpreter
      * (see gpu_try_draw_arrays).  A full frame of run-length glyphs can exceed
-     * that, so submit it in <=20478-vertex chunks (a multiple of 6, so a chunk
+     * that, so submit it in <=32766-vertex chunks (a multiple of 6, so a chunk
      * border never splits a billboard quad).  Consecutive same-state chunks
      * coalesce on the GPU and flush per staging capacity, keeping the rain
      * hardware-drawn instead of falling back to the software rasteriser. */
     {
-        const int CHUNK = 20478;
+        const int CHUNK = 32766;
         int off = 0;
         while (off < nvert) {
             int c = nvert - off;

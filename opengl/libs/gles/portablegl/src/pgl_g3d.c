@@ -27,6 +27,11 @@
 #include <stdlib.h>
 #include "pgl_g3d_shader.h"   /* private bridge: pgl_g3d_shader_upload/_daemon_handle */
 #include <pglcompiler.h>      /* pglc_tex_layout_2d / pglc_tex_store_2d (GPU-layout uploads) */
+#ifdef __ewokos__
+#include <ewoksys/klog.h>     /* slog: sticky-latch forensics into /dev/log */
+#else
+#define slog(...) ((void)0)
+#endif
 
 /* PGL_G3D_MAX_VERTS (the one-dispatch vertex cap and staging size) is defined
    in the public pgl_g3d.h so apps can split an over-cap mesh into sub-ranges. */
@@ -681,10 +686,15 @@ void pgl_g3d_flush(void)
 		   specific to this program: latch only the program so other effects
 		   and the fixed-function path keep the GPU.  Anything else (a real
 		   dispatch failure/timeout) latches the GPU off: never replay. */
-		if (compiled && res == G2D_ERR_NOT_SUPPORTED)
+		if (compiled && res == G2D_ERR_NOT_SUPPORTED) {
+			slog("PGLG3D: batch DECLINE prog=%d res=%d nverts=%u -> program latch\n",
+			     _batch_prog, res, _nverts);
 			pgl_g3d_shader_mark_declined(_batch_prog);
-		else
+		} else {
+			slog("PGLG3D: batch FAIL prog=%d res=%d compiled=%d nverts=%u -> GPU OFF\n",
+			     _batch_prog, res, compiled, _nverts);
 			_enabled = 0;
+		}
 	} else
 		_first_frame = 0;   /* this frame's clear has been consumed */
 }
@@ -1339,8 +1349,11 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 	   a declined upload keeps THIS draw on the CPU rasterizer without latching
 	   the whole GPU off). */
 	dh = pgl_g3d_shader_upload(prog);
-	if (dh < 0)
+	if (dh < 0) {
+		slog("PGLG3D: mesh upload DECLINE prog=%d dh=%d count=%u -> CPU draw\n",
+		     prog, dh, count);
 		return 0;
+	}
 
 	/* drain any pending batch first so painter's order holds, then re-stage
 	   this sub-range into the fixed base-phy pos/normal GPU staging. */
@@ -1524,7 +1537,7 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 	geom_inst = geom && pgl_g3d_shader_geom_inst(prog);
 	unif_n = _unif_count;
 	if (geom) {
-		uint32_t one[1], wh[2], span;
+		uint32_t one[1], wh[2], cells[2], span;
 		float fw = (float)_w, fh = (float)_h;
 		if (geom_tex || geom_texcol) {
 			/* Textured variant: attr1 carries (u,v,0) per vertex and the
@@ -1573,6 +1586,14 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 		one[0] = count;
 		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 		                             "uVertCount", one, 1u);
+		/* Coarse-bin cell grid of the FULL framebuffer (64x64-pixel cells),
+		   matching the daemon's bin prepass extents.  Only the VERSION 8
+		   binned rasters declare uBinCells; every other kernel ignores the
+		   patch (patch_region returns 0 for an undeclared name). */
+		cells[0] = ((uint32_t)_w + 63u) / 64u;
+		cells[1] = ((uint32_t)_h + 63u) / 64u;
+		pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
+		                             "uBinCells", cells, 2u);
 		/* Per-vertex alpha opt-in: 1 = this draw's attribute-1 records are
 		   rgba (stride 4) and the xform must carry the alpha into vout; 0 =
 		   the historical RGB stride-3 with alpha forced to 1.0.  Only the
@@ -1823,6 +1844,8 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 		   latch only the program so other effects and the fixed-function path
 		   keep the GPU.  Anything else (a real dispatch failure/timeout) latches
 		   the GPU off: never replay.  Mirrors flush()'s handling. */
+		slog("PGLG3D: mesh draw FAIL prog=%d res=%d count=%u ff=%d win=%d,%d,%d,%d\n",
+		     prog, res, count, (int)_first_frame, win_x, win_y, win_w, win_h);
 		if (res == G2D_ERR_NOT_SUPPORTED)
 			pgl_g3d_shader_mark_declined(prog);
 		else
@@ -2193,6 +2216,7 @@ int pgl_g3d_clear(uint32_t rgba8)
 	                       (uint32_t)_w * 4u, rgba8, 0);
 	res = g2d_pgl_clear(&req);
 	if (res != G2D_OK) {
+		slog("PGLG3D: clear FAIL res=%d -> GPU OFF\n", res);
 		_enabled = 0;
 		return 0;
 	}
@@ -2365,6 +2389,7 @@ int pgl_g3d_resize(int w, int h)
 	if (_z)  { g2d_shm_free(_z);  _z = NULL; }
 	_fb_cap = 0;
 	if (!alloc_target(w, h, fb_grow_capacity((uint32_t)w * (uint32_t)h))) {
+		slog("PGLG3D: resize alloc FAIL wh=%dx%d -> GPU OFF\n", w, h);
 		_enabled = 0;
 		return 0;
 	}

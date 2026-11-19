@@ -64,7 +64,7 @@
  * ------------------------------------------------------------------------- */
 #define PGL_DISK_CACHE_DIR   "/tmp/pgl_shader_cache"
 #define PGL_DISK_CACHE_MAGIC 0x434C4750u  /* 'P','G','L','C' */
-#define PGL_DISK_CACHE_VER   5u   /* texcol raster: CAS-retried blend RMW */
+#define PGL_DISK_CACHE_VER   6u   /* VERSION 8 binned rasters: bin SSBO + uBinCells */
 
 typedef struct {
 	int      used;
