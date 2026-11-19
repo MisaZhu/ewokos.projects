@@ -43,43 +43,6 @@
 #include "compiler/glsl_types.h"
 #include "pipe/p_screen.h"
 
-/* TEMPORARY crash forensics (see gl_nir_linker.c NIRDBG): coarse breadcrumbs
- * across the frontend compile pipeline so ONE device run shows whether the
- * data-abort is in the pair or compute compile, and which step.  Remove once
- * the offending NIR pass is fixed. */
-#include <ewoksys/klog.h>
-#define FEDBG(fmt, ...) ((void)0)
-
-/* TEMPORARY compile-phase wall-clock probe, twin of vir.c/nir_to_vir.c: same
- * /tmp/v3dc.log so the frontend steps (builtin init / parse / link / lower)
- * interleave with the backend strategy attempts in ONE timeline.  The city
- * faithful port spends >75s before the first backend record, so the frontend
- * is where the remaining wall time hides.  Remove once the hotspot is fixed. */
-#include <time.h>
-#include <stdio.h>
-#include <stdarg.h>
-static double v3ct_now(void)
-{
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
-}
-static void v3ct_log(const char *fmt, ...)
-{
-   static FILE *f = NULL;
-   va_list ap;
-   if (!f)
-      f = fopen("/tmp/v3dc.log", "a");
-   if (!f)
-      return;
-   fprintf(f, "[%8.1f] ", v3ct_now());
-   va_start(ap, fmt);
-   vfprintf(f, fmt, ap);
-   va_end(ap);
-   fputc('\n', f);
-   fflush(f);
-}
-
 #include "pglcompiler_frontend.h"   /* include/ is on the -I path */
 
 struct pglc_fe_shaders {
@@ -755,10 +718,8 @@ pglc_fe_compile_glsl(const char *vert_src, const char *frag_src,
    }
 
    /* Link to a single program, producing the IO-lowered linked NIR. */
-   FEDBG("pair: link_program enter");
    if (!link_program(sh, log, logsz))
       goto fail;
-   FEDBG("pair: link_program done");
 
    {
       nir_shader *vs_nir = pglc_fe_nir(sh, PGLC_STAGE_VERTEX);
@@ -777,7 +738,6 @@ pglc_fe_compile_glsl(const char *vert_src, const char *frag_src,
       lower_uniforms_and_samplers(fs_nir, prog);
    }
 
-   FEDBG("pair: SUCCESS");
    *out = sh;
    return true;
 
@@ -921,14 +881,8 @@ pglc_fe_compile_compute(const char *cs_src,
       return false;
    }
 
-   /* declared up front: the fail goto below must not cross initialisations */
-   double _t_sh = 0, _t_cs = 0, _t_lk = 0, _t_u = 0, _t_b = 0;
-   double _t_shx = 0, _t_csx = 0, _t_lkx = 0, _t_ux = 0, _t_bx = 0;
-
    /* Compute requires GLSL ES 3.10 (glsl_parser_extras: is_version(430, 310)). */
-   _t_shx = v3ct_now();
    struct pglc_fe_shaders *sh = shaders_create(310, true, opts, log, logsz);
-   _t_sh = v3ct_now() - _t_shx;
    if (!sh)
       return false;
    struct gl_context *ctx = sh->ctx;
@@ -936,25 +890,15 @@ pglc_fe_compile_compute(const char *cs_src,
 
    struct gl_shader *cs =
       standalone_add_shader_source(ctx, prog, GL_COMPUTE_SHADER, cs_src);
-   FEDBG("cs: compile_shader enter");
-   _t_csx = v3ct_now();
    _mesa_glsl_compile_shader(ctx, cs, NULL, false, false, true);
-   _t_cs = v3ct_now() - _t_csx;
-   v3ct_log("fe shaders_create=%.0f compile_shader=%.0f", _t_sh, _t_cs);
-   FEDBG("cs: compile_shader done status=%d", (int)cs->CompileStatus);
    if (!cs->CompileStatus) {
       pglc_fe_log_append(log, logsz, "compute shader:\n");
       pglc_fe_log_append(log, logsz, cs->InfoLog);
       goto fail;
    }
 
-   FEDBG("cs: link_program enter");
-   _t_lkx = v3ct_now();
    if (!link_program(sh, log, logsz))
       goto fail;
-   _t_lk = v3ct_now() - _t_lkx;
-   v3ct_log("fe link_program(inline+opts+lower) ms=%.0f", _t_lk);
-   FEDBG("cs: link_program done");
 
    {
       nir_shader *cs_nir = pglc_fe_nir(sh, PGLC_STAGE_COMPUTE);
@@ -965,27 +909,16 @@ pglc_fe_compile_compute(const char *cs_src,
       }
 
       /* Same default-block uniform + sampler lowering as the graphics path. */
-      FEDBG("cs: lower_uniforms enter");
-      _t_ux = v3ct_now();
       lower_uniforms_and_samplers(cs_nir, prog);
-      _t_u = v3ct_now() - _t_ux;
-      v3ct_log("fe lower_uniforms ms=%.0f", _t_u);
-      FEDBG("cs: lower_uniforms done");
 
       /* SSBO: the GLSL link path leaves the SSBO blocks as nir_var_mem_ssbo
        * deref chains (gl_nir_linker never calls this itself -- upstream does it
        * in st_glsl_to_nir).  gl_nir_lower_buffers rewrites them to
        * load/store_ssbo(block_index, byte_offset); block_index is the LINKED
        * index, see pglc_fe_ssbo_binding() for the remap the backend must apply. */
-      FEDBG("cs: lower_buffers enter");
-      _t_bx = v3ct_now();
       gl_nir_lower_buffers(cs_nir, prog);
-      _t_b = v3ct_now() - _t_bx;
-      v3ct_log("fe lower_buffers ms=%.0f", _t_b);
-      FEDBG("cs: lower_buffers done");
    }
 
-   FEDBG("cs: SUCCESS");
    *out = sh;
    return true;
 
