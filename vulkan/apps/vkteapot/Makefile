@@ -13,7 +13,7 @@ LDFLAGS += -L $(BUILD_DIR)/lib
 
 TASK = vkteapot
 TASK_OBJS = $(ARCH)/vkteapot.o
-TASK_DIR = $(BUILD_DIR)/rootfs/apps/$(TASK)
+TASK_DIR = $(BUILD_DIR)/rootfs/apps/vulkan/$(TASK)
 VULKAN_LIB = $(BUILD_DIR)/lib/libvulkan.a
 IMGUI_VK_LIB = $(BUILD_DIR)/lib/libimgui_vk.a
 

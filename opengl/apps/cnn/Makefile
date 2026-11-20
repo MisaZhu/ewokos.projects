@@ -3,7 +3,7 @@ include $(PROJS_ROOT_DIR)/make.inc
 .DEFAULT_GOAL := all
 
 TASK = cnn
-TASK_DIR = $(SDK_DIR)/rootfs/apps/$(TASK)
+TASK_DIR = $(SDK_DIR)/rootfs/apps/opengl/$(TASK)
 TASK_OBJS = $(ARCH)/cnn.$(HW).o
 CXXFLAGS += -I$(SDK_DIR)/include -fno-threadsafe-statics
 GLES_LIBS = $(SDK_DIR)/lib/libEGL.a $(SDK_DIR)/lib/libGLESv2.a

@@ -3,7 +3,7 @@ include $(PROJS_ROOT_DIR)/make.inc
 .DEFAULT_GOAL := all
 
 TASK = tuner
-TASK_DIR = $(SDK_DIR)/rootfs/apps/$(TASK)
+TASK_DIR = $(SDK_DIR)/rootfs/apps/opengl/$(TASK)
 TASK_OUT = $(TASK_DIR)/$(TASK)
 TUNER_VALIDATE ?= 0
 # Isolate objects across the GPU and CPU SDKs.

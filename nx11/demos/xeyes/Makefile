@@ -3,7 +3,7 @@ include $(PROJS_ROOT_DIR)/make.inc
 
 TASK = xeyes
 TASK_OBJS = $(ARCH)/xeyes.o
-BUILD_DIR = $(SDK_DIR)/rootfs/apps/$(TASK)
+BUILD_DIR = $(SDK_DIR)/rootfs/apps/x11/$(TASK)
 
 ## <X11/Xlib.h> and <nano-X.h> both resolve from the namespaced install dir
 CFLAGS += -I $(SDK_DIR)/include/nx11

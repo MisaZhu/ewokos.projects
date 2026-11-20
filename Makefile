@@ -4,9 +4,7 @@ DIRS = macemu \
 	opengl \
 	opencl \
 	blender \
-	doom \
-	cards \
-	mine \
+	games \
 	vulkan \
 	imgui
 #	video saver minivmac nx11 re3

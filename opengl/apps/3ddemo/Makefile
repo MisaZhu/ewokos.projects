@@ -23,7 +23,7 @@ GLES_LIBS = $(EXTRA_LIBS_DIR)/lib/libimgui_gles.a \
 	$(EXTRA_LIBS_DIR)/lib/libGLESv2.a
 
 TASK = 3ddemo
-TASK_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)/rootfs/apps/$(TASK)
+TASK_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)/rootfs/apps/opengl/$(TASK)
 
 all: $(TASK)
 

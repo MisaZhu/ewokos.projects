@@ -1,10 +1,10 @@
-PROJS_ROOT_DIR=..
+PROJS_ROOT_DIR=../..
 include $(PROJS_ROOT_DIR)/make.inc
 
 TASK_OBJS = $(ARCH)/cards.o
 
 TASK = cards
-BUILD_DIR = $(SDK_DIR)/rootfs/apps/$(TASK)
+BUILD_DIR = $(SDK_DIR)/rootfs/apps/games/$(TASK)
 
 all: $(TASK)
 

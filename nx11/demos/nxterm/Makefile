@@ -3,7 +3,7 @@ include $(PROJS_ROOT_DIR)/make.inc
 
 TASK = nxterm
 TASK_OBJS = $(ARCH)/nxterm.o
-BUILD_DIR = $(SDK_DIR)/rootfs/apps/$(TASK)
+BUILD_DIR = $(SDK_DIR)/rootfs/apps/x11/$(TASK)
 
 ## the nano-X headers are installed namespaced under include/nx11
 CFLAGS += -I $(SDK_DIR)/include/nx11
