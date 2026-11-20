@@ -1356,10 +1356,20 @@ struct Render {
 
 	void setClipRect(const grect_t& r) {
 		gs().clip = r;
+		/* graph_set_clip() intersects with the canvas and an empty result
+		 * leaves clip.w/h == 0, which every graph primitive reads as "no clip"
+		 * (everything draws). An empty clip is tracked by hidden() instead. */
 		if(r.w <= 0 || r.h <= 0)
-			graph_set_clip(g, -1, -1, 1, 1);
+			graph_set_clip(g, 0, 0, g->w, g->h);
 		else
 			graph_set_clip(g, r.x, r.y, r.w, r.h);
+	}
+
+	/* current clip region is empty: nothing may be painted */
+	bool hidden() {
+		const grect_t& c = gs().clip;
+		if(c.w <= 0 || c.h <= 0) return true;
+		return c.x >= g->w || c.y >= g->h || c.x + c.w <= 0 || c.y + c.h <= 0;
 	}
 
 	uint32_t blend(uint32_t c, double a) {
@@ -1532,7 +1542,7 @@ struct Render {
 	struct Cross { double x; int dir; };
 
 	void fillPath(bool eo) {
-		if(path.empty()) return;
+		if(path.empty() || hidden()) return;
 		double m[6];
 		memcpy(m, gs().ctm, sizeof(m));
 		grect_t bb;
@@ -1604,7 +1614,7 @@ struct Render {
 	}
 
 	void strokePath() {
-		if(path.empty()) return;
+		if(path.empty() || hidden()) return;
 		double m[6];
 		memcpy(m, gs().ctm, sizeof(m));
 		double scale = sqrt(fabs(mdet(m)));
@@ -1669,6 +1679,7 @@ struct Render {
 		PdfFont* f = t.font;
 		if(f == NULL || f->ft == NULL) return;
 		double th = t.tz / 100.0;
+		bool hide = hidden();
 		size_t i = 0;
 		while(i < s.size()) {
 			uint32_t code;
@@ -1701,7 +1712,7 @@ struct Render {
 				else if(code < 32) uni = 0;
 			}
 			double tx = (w0 * 0.001 * t.fs + t.tc + ((code == 32 && !f->twoByte) ? t.tw : 0)) * th;
-			if(t.tr != 3 && uni >= 32) {
+			if(t.tr != 3 && uni >= 32 && !hide) {
 				double trm[6] = {t.fs*th, 0, 0, t.fs, 0, t.ts};
 				double m1[6], m2[6];
 				mmul(trm, t.tm, m1);
@@ -1747,12 +1758,16 @@ void Render::drawImage(const Obj& dict) {
 	int iw = (int)dict.getNum("Width", 0);
 	int ih = (int)dict.getNum("Height", 0);
 	if(iw <= 0 || ih <= 0 || iw > 8192 || ih > 8192) return;
+	if(hidden()) return;
 	int bpc = (int)dict.getNum("BitsPerComponent", 8);
 	bool mask = dict.getNum("ImageMask", 0) != 0;
 	if(mask) bpc = 1;
 
 	vector<uint8_t> samples;
 	graph_t* img = NULL;
+	/* img pixels are stored straight into img->buffer: graph_pixel() blends
+	 * (and drops alpha-0 writes entirely), so it cannot build an alpha plane */
+	bool alpha = false;
 	bool dct = isImageFilter(dict);
 	if(dct) {
 		if(dict.t != O_STREAM) return;
@@ -1773,6 +1788,14 @@ void Render::drawImage(const Obj& dict) {
 		img = graph_new(NULL, iw, ih);
 		if(img == NULL) return;
 		graph_clear(img, 0xffffffff);
+		uint32_t* px = img->buffer;
+		bool maskInv = false;
+		if(mask) {
+			alpha = true;
+			const Obj* dec = dict.get("Decode");
+			maskInv = dec != NULL && dec->t == O_ARR && dec->a.size() >= 2 &&
+				doc->resolve(dec->a[0]).num() > 0.5;
+		}
 		int stride = (iw * ncomp * bpc + 7) / 8;
 		for(int y = 0; y < ih; y++) {
 			const uint8_t* row = samples.data() + (size_t)y * stride;
@@ -1800,17 +1823,10 @@ void Render::drawImage(const Obj& dict) {
 					for(int c = 0; c < ncomp; c++) v[c] = 0.5;
 				}
 				if(mask) {
-					bool on = v[0] != 0;
-					const Obj* dec = dict.get("Decode");
-					if(dec != NULL && dec->t == O_ARR && dec->a.size() >= 2 &&
-							doc->resolve(dec->a[0]).num() > 0.5)
-						on = !on;
-					if(on) {
-						uint32_t fc2 = gs().fill;
-						graph_pixel(img, x, y, 0xff000000 | (fc2 & 0xffffff));
-					}
-					else
-						graph_pixel(img, x, y, 0x00000000);
+					/* stencil: sample 0 paints with the fill colour */
+					bool on = (v[0] == 0) != maskInv;
+					px[(size_t)y * iw + x] = on ?
+						(0xff000000 | (gs().fill & 0xffffff)) : 0x00000000;
 					continue;
 				}
 				if(cs.kind == 3) {
@@ -1819,13 +1835,13 @@ void Render::drawImage(const Obj& dict) {
 					iv.push_back(idx);
 					uint32_t c;
 					colorFrom(cs, iv, c);
-					graph_pixel(img, x, y, c);
+					px[(size_t)y * iw + x] = c | 0xff000000;
 					continue;
 				}
 				vector<double> vv(v, v + ncomp);
 				uint32_t c;
 				colorFrom(cs, vv, c);
-				graph_pixel(img, x, y, c);
+				px[(size_t)y * iw + x] = c | 0xff000000;
 			}
 		}
 		/* soft mask */
@@ -1838,15 +1854,19 @@ void Render::drawImage(const Obj& dict) {
 				int sh = (int)smd.getNum("Height", ih);
 				int sbpc = (int)smd.getNum("BitsPerComponent", 8);
 				int sstride = (sw * sbpc + 7) / 8;
-				for(int y = 0; y < ih && y < sh; y++) {
-					for(int x = 0; x < iw && x < sw; x++) {
-						int sx = x * sw / iw, sy = y * sh / ih;
-						size_t off = (size_t)sy * sstride + (sx * sbpc / 8);
-						if(off >= sd.size()) continue;
-						uint8_t a = (sbpc == 8) ? sd[off] :
-							((sd[off] >> (7 - (sx & 7))) & 1) * 255;
-						uint32_t p = graph_get_pixel(img, x, y);
-						graph_pixel(img, x, y, (p & 0xffffff) | ((uint32_t)a << 24));
+				if(sw > 0 && sh > 0) {
+					alpha = true;
+					for(int y = 0; y < ih; y++) {
+						int sy = y * sh / ih;
+						for(int x = 0; x < iw; x++) {
+							int sx = x * sw / iw;
+							size_t off = (size_t)sy * sstride + (sx * sbpc / 8);
+							if(off >= sd.size()) continue;
+							uint8_t a = (sbpc == 8) ? sd[off] :
+								((sd[off] >> (7 - (sx & 7))) & 1) * 255;
+							uint32_t& p = px[(size_t)y * iw + x];
+							p = (p & 0xffffff) | ((uint32_t)a << 24);
+						}
 					}
 				}
 			}
@@ -1860,13 +1880,22 @@ void Render::drawImage(const Obj& dict) {
 	mpoint(m, 0, 0, &x00, &y00);
 	mpoint(m, 1, 0, &x10, &y10);
 	mpoint(m, 0, 1, &x01, &y01);
-	if(fabs(m[1]) < 1e-6 && fabs(m[2]) < 1e-6) {
-		int dx = (int)(x00 < x10 ? x00 : x10);
-		int dy = (int)(y00 < y01 ? y00 : y01);
-		int dw = (int)fabs(x10 - x00);
-		int dh = (int)fabs(y01 - y00);
-		if(dw > 0 && dh > 0)
-			graph_blt(img, 0, 0, img->w, img->h, g, dx, dy, dw, dh);
+	if(fabs(m[1]) < 1e-6 && fabs(m[2]) < 1e-6 && m[0] > 0 && m[3] < 0) {
+		/* upright, axis-aligned (the common case): scale the whole image onto
+		 * its device rect. graph_blt() never scales - it copies the top-left
+		 * min(src,dst) corner 1:1 - so the fit variants are required here. */
+		int dx = (int)floor(x00 + 0.5);
+		int dy = (int)floor(y01 + 0.5);
+		int dw = (int)floor(x10 + 0.5) - dx;
+		int dh = (int)floor(y00 + 0.5) - dy;
+		if(dw < 1) dw = 1;
+		if(dh < 1) dh = 1;
+		if(dw <= 16384 && dh <= 16384) {
+			if(alpha)
+				graph_blt_fit_alpha(img, 0, 0, img->w, img->h, g, dx, dy, dw, dh, 255);
+			else
+				graph_blt_fit(img, 0, 0, img->w, img->h, g, dx, dy, dw, dh);
+		}
 	}
 	else {
 		double det = mdet(m);

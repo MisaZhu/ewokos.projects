@@ -1,6 +1,7 @@
 #include "reader.h"
 #include "txtbook.h"
 #include "pdf.h"
+#include "ui.h"
 #include <x++/X.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,31 +38,14 @@ static string elide(font_t* font, int size, const string& s, int maxW) {
 	return "\xE2\x80\xA6";
 }
 
+/* toolbar capsules share one padding; centring lives in ui.cc */
 static int pillW(font_t* font, const char* text, int size) {
-	uint32_t tw = 0, th = 0;
-	font_text_size(text, font, size, &tw, &th);
-	return (int)tw + X::hidpiSize(22);
-}
-
-/* Vertical centering must use the font's real line height (ascender+descender),
- * not the requested pixel size: the glyph box is taller than `size`, so sizing
- * with `size` pushes every label below the optical middle of its bar/pill. */
-static int vcenter(int boxY, int boxH, font_t* font, const char* text, int size) {
-	uint32_t tw = 0, th = 0;
-	font_text_size(text, font, size, &tw, &th);
-	if(th == 0) th = (uint32_t)size;
-	return boxY + (boxH - (int)th)/2;
+	return pillWidth(font, text, size, X::hidpiSize(11));
 }
 
 static grect_t pill(graph_t* g, font_t* font, const char* text, int size,
 		int x, int y, int h, uint32_t bg, uint32_t ink, uint32_t border) {
-	grect_t r = {x, y, pillW(font, text, size), h};
-	graph_fill_round(g, r.x, r.y, r.w, r.h, h/2, bg);
-	if(border != 0)
-		graph_round(g, r.x, r.y, r.w, r.h, h/2, 1, border);
-	graph_draw_text_font(g, r.x + X::hidpiSize(11), vcenter(r.y, h, font, text, size),
-			text, font, size, ink);
-	return r;
+	return drawPill(g, font, text, size, x, y, h, X::hidpiSize(11), bg, ink, border);
 }
 
 ReaderWidget::ReaderWidget(Store* store, Preloader* pre) {
@@ -369,7 +353,7 @@ void ReaderWidget::drawSlot(graph_t* g, font_t* font, const Palette& p,
 			uint32_t tw = 0, th = 0;
 			font_text_size(msg, font, fs, &tw, &th);
 			graph_draw_text_font(g, x + (_pageW - (int)tw)/2,
-					vcenter(y, _pageH, font, msg, fs), msg, font, fs, p.faint);
+					textTop(font, fs, y, _pageH), msg, font, fs, p.faint);
 		}
 	}
 }
@@ -440,7 +424,7 @@ void ReaderWidget::drawBars(graph_t* g, XTheme* theme, const grect_t& r,
 		uint32_t w = 0, h = 0;
 		font_text_size(title.c_str(), font, ts, &w, &h);
 		graph_draw_text_font(g, tx0 + (tx1 - tx0 - (int)w)/2,
-				vcenter(r.y, topH, font, title.c_str(), ts), title.c_str(), font, ts, p.barInk);
+				textTop(font, ts, r.y, topH), title.c_str(), font, ts, p.barInk);
 	}
 
 	/* ---- bottom bar: progress rail ---- */
@@ -472,7 +456,7 @@ void ReaderWidget::drawBars(graph_t* g, XTheme* theme, const grect_t& r,
 	uint32_t lw = 0, lh = 0, rw = 0, rh = 0;
 	font_text_size(left.c_str(), font, fs, &lw, &lh);
 	font_text_size(right.c_str(), font, fs, &rw, &rh);
-	int ly = vcenter(by0, botH, font, left.c_str(), fs);
+	int ly = textTop(font, fs, by0, botH);
 	graph_draw_text_font(g, r.x + X::hidpiSize(16), ly, left.c_str(),
 			font, fs, p.barInk);
 	graph_draw_text_font(g, r.x + r.w - X::hidpiSize(16) - (int)rw, ly,
@@ -521,7 +505,7 @@ void ReaderWidget::onRepaint(graph_t* g, XTheme* theme, const grect_t& r) {
 		uint32_t tw = 0, th = 0;
 		font_text_size(msg, font, fs, &tw, &th);
 		graph_draw_text_font(g, r.x + (r.w - (int)tw)/2,
-				vcenter(r.y, r.h, font, msg, fs), msg, font, fs, p.faint);
+				textTop(font, fs, r.y, r.h), msg, font, fs, p.faint);
 		drawBars(g, theme, r, p);
 		graph_unset_clip(g);
 		return;

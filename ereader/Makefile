@@ -6,6 +6,7 @@ BUILD_DIR = $(SDK_DIR)/rootfs/apps/$(TASK)
 
 TASK_OBJS = $(ARCH)/ereader.o \
 	$(ARCH)/src/common.o \
+	$(ARCH)/src/ui.o \
 	$(ARCH)/src/book.o \
 	$(ARCH)/src/txtbook.o \
 	$(ARCH)/src/pdf.o \

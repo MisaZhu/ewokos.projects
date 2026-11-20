@@ -1,4 +1,5 @@
 #include "shelf.h"
+#include "ui.h"
 #include <x++/X.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,10 +169,9 @@ void ShelfWidget::drawCover(graph_t* g, XTheme* theme, const BookItem& it,
 	font_text_size(badge, font, bs, &bw, &bh);
 	int bx = fx + (fw - (int)bw - X::hidpiSize(10))/2;
 	int by = c.y + c.h - X::hidpiSize(28);
-	graph_fill_round(g, bx, by, (int)bw + X::hidpiSize(10), bs + X::hidpiSize(6),
-			X::hidpiSize(3), hue.dark);
-	graph_draw_text_font(g, bx + X::hidpiSize(5), by + X::hidpiSize(3), badge,
-			font, bs, hue.light);
+	grect_t br = {bx, by, (int)bw + X::hidpiSize(10), bs + X::hidpiSize(6)};
+	graph_fill_round(g, br.x, br.y, br.w, br.h, X::hidpiSize(3), hue.dark);
+	drawLabel(g, font, badge, bs, br, hue.light);
 
 	if(hover)
 		graph_fill_round(g, c.x, c.y, c.w, c.h, rad, 0x1affffff);
@@ -230,36 +230,19 @@ void ShelfWidget::onRepaint(graph_t* g, XTheme* theme, const grect_t& r) {
 	int bh = X::hidpiSize(30), by = r.y + X::hidpiSize(20);
 	int bs = X::hidpiSize(12);
 	int bx = r.x + r.w - margin;
+	int pad = X::hidpiSize(11), gap = X::hidpiSize(10);
 	const char* tname = themeName(_store->settings.theme);
 	string tl = fmt("主题·%s", tname);
-	uint32_t tw = 0, th = 0;
-	font_text_size(tl.c_str(), font, bs, &tw, &th);
-	_themeBtn.w = (int)tw + X::hidpiSize(22); _themeBtn.h = bh;
-	_themeBtn.x = bx - _themeBtn.w; _themeBtn.y = by;
-	graph_fill_round(g, _themeBtn.x, _themeBtn.y, _themeBtn.w, _themeBtn.h,
-			bh/2, p.bar);
-	graph_round(g, _themeBtn.x, _themeBtn.y, _themeBtn.w, _themeBtn.h, bh/2, 1, p.line);
-	graph_draw_text_font(g, _themeBtn.x + X::hidpiSize(11),
-			_themeBtn.y + (bh - X::hidpiSize(12))/2, tl.c_str(), font, bs, p.barInk);
-	bx = _themeBtn.x - X::hidpiSize(10);
+	_themeBtn = drawPill(g, font, tl.c_str(), bs,
+			bx - pillWidth(font, tl.c_str(), bs, pad), by, bh, pad, p.bar, p.barInk, p.line);
+	bx = _themeBtn.x - gap;
 
-	font_text_size("刷新", font, bs, &tw, &th);
-	_refreshBtn.w = (int)tw + X::hidpiSize(22); _refreshBtn.h = bh;
-	_refreshBtn.x = bx - _refreshBtn.w; _refreshBtn.y = by;
-	graph_fill_round(g, _refreshBtn.x, _refreshBtn.y, _refreshBtn.w, _refreshBtn.h,
-			bh/2, p.bar);
-	graph_round(g, _refreshBtn.x, _refreshBtn.y, _refreshBtn.w, _refreshBtn.h, bh/2, 1, p.line);
-	graph_draw_text_font(g, _refreshBtn.x + X::hidpiSize(11),
-			_refreshBtn.y + (bh - X::hidpiSize(12))/2, "刷新", font, bs, p.barInk);
-	bx = _refreshBtn.x - X::hidpiSize(10);
+	_refreshBtn = drawPill(g, font, "刷新", bs,
+			bx - pillWidth(font, "刷新", bs, pad), by, bh, pad, p.bar, p.barInk, p.line);
+	bx = _refreshBtn.x - gap;
 
-	font_text_size("导入书籍", font, bs, &tw, &th);
-	_importBtn.w = (int)tw + X::hidpiSize(22); _importBtn.h = bh;
-	_importBtn.x = bx - _importBtn.w; _importBtn.y = by;
-	graph_fill_round(g, _importBtn.x, _importBtn.y, _importBtn.w, _importBtn.h,
-			bh/2, p.accent);
-	graph_draw_text_font(g, _importBtn.x + X::hidpiSize(11),
-			_importBtn.y + (bh - X::hidpiSize(12))/2, "导入书籍", font, bs, 0xff2a2118);
+	_importBtn = drawPill(g, font, "导入书籍", bs,
+			bx - pillWidth(font, "导入书籍", bs, pad), by, bh, pad, p.accent, 0xff2a2118, 0);
 
 	graph_fill_rect(g, r.x, r.y + headerH - 1, r.w, 1, p.line);
 
@@ -293,15 +276,10 @@ void ShelfWidget::onRepaint(graph_t* g, XTheme* theme, const grect_t& r) {
 		graph_draw_text_font(g, cx - (int)w2/2, cy + bh2/2 + X::hidpiSize(52), t2,
 				font, X::hidpiSize(12), p.faint);
 		const char* t3 = "导入书籍";
-		uint32_t w3 = 0, h3 = 0;
-		font_text_size(t3, font, bs, &w3, &h3);
-		_emptyBtn.w = (int)w3 + X::hidpiSize(36); _emptyBtn.h = X::hidpiSize(36);
-		_emptyBtn.x = cx - _emptyBtn.w/2;
-		_emptyBtn.y = cy + bh2/2 + X::hidpiSize(80);
-		graph_fill_round(g, _emptyBtn.x, _emptyBtn.y, _emptyBtn.w, _emptyBtn.h,
-				_emptyBtn.h/2, p.accent);
-		graph_draw_text_font(g, _emptyBtn.x + X::hidpiSize(18),
-				_emptyBtn.y + (_emptyBtn.h - X::hidpiSize(12))/2, t3, font, bs, 0xff2a2118);
+		int epad = X::hidpiSize(18);
+		_emptyBtn = drawPill(g, font, t3, bs,
+				cx - pillWidth(font, t3, bs, epad)/2, cy + bh2/2 + X::hidpiSize(80),
+				X::hidpiSize(36), epad, p.accent, 0xff2a2118, 0);
 		graph_unset_clip(g);
 		return;
 	}
