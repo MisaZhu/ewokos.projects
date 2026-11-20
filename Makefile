@@ -9,7 +9,7 @@ DIRS = macemu \
 	mine \
 	vulkan \
 	imgui
-#	previous video saver minivmac nx11 re3
+#	video saver minivmac nx11 re3
 
 # qt needs the Qt tree that projects/qt/build.sh produces; if it is missing for
 # the current ARCH/HW, qt's Makefile now runs build.sh automatically and then
