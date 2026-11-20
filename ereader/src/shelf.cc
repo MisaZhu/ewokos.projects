@@ -28,10 +28,12 @@ ShelfWidget::ShelfWidget(Store* store) {
 	_wcacheSize = 0;
 	openFunc = NULL;
 	importFunc = NULL;
+	exitFunc = NULL;
 	funcArg = NULL;
 	memset(&_importBtn, 0, sizeof(grect_t));
 	memset(&_refreshBtn, 0, sizeof(grect_t));
 	memset(&_themeBtn, 0, sizeof(grect_t));
+	memset(&_exitBtn, 0, sizeof(grect_t));
 	memset(&_emptyBtn, 0, sizeof(grect_t));
 }
 
@@ -231,6 +233,10 @@ void ShelfWidget::onRepaint(graph_t* g, XTheme* theme, const grect_t& r) {
 	int bs = X::hidpiSize(12);
 	int bx = r.x + r.w - margin;
 	int pad = X::hidpiSize(11), gap = X::hidpiSize(10);
+	_exitBtn = drawPill(g, font, "退出", bs,
+			bx - pillWidth(font, "退出", bs, pad), by, bh, pad, p.bar, p.barInk, p.line);
+	bx = _exitBtn.x - gap;
+
 	const char* tname = themeName(_store->settings.theme);
 	string tl = fmt("主题·%s", tname);
 	_themeBtn = drawPill(g, font, tl.c_str(), bs,
@@ -385,6 +391,11 @@ bool ShelfWidget::onMouse(xevent_t* ev) {
 		}
 		if(check_in_rect(pos.x, pos.y, &_refreshBtn)) {
 			refresh();
+			return true;
+		}
+		if(check_in_rect(pos.x, pos.y, &_exitBtn)) {
+			if(exitFunc != NULL)
+				exitFunc(funcArg);
 			return true;
 		}
 		if(check_in_rect(pos.x, pos.y, &_themeBtn)) {

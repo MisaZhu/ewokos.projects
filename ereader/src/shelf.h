@@ -21,6 +21,7 @@ struct BookItem {
 class ShelfWidget : public Widget {
 public:
 	typedef void (*ActionFunc)(const string& fname, void* arg);
+		typedef void (*ExitFunc)(void* arg);
 
 private:
 	Store* _store;
@@ -34,7 +35,7 @@ private:
 	int _wcacheSize;
 
 	/* hit rects rebuilt every paint */
-	grect_t _importBtn, _refreshBtn, _themeBtn, _emptyBtn;
+	grect_t _importBtn, _refreshBtn, _themeBtn, _exitBtn, _emptyBtn;
 	vector<grect_t> _covers;
 
 	int  measure(font_t* font, int size, uint32_t cp);
@@ -54,6 +55,7 @@ protected:
 public:
 	ActionFunc openFunc;
 	ActionFunc importFunc;
+	ExitFunc exitFunc;
 	void* funcArg;
 
 	ShelfWidget(Store* store);

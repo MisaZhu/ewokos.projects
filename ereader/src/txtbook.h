@@ -57,6 +57,7 @@ public:
 
 	bool open();
 	int  pageCount();
+	bool layoutMore();
 	graph_t* renderPage(int idx, int w, int h, uint32_t ink);
 	string title() { return _title; }
 	bool isTxt() { return true; }

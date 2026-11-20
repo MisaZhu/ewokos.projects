@@ -45,7 +45,7 @@ uint32_t strHash(const string& s);
 
 /* ---- settings + per-book progress, persisted as JSON ------------------ */
 struct Settings {
-	int fontSize;   /* px, 12..40          */
+	int fontSize;   /* logical px, 12..40 (hidpi-scaled when rendering) */
 	int theme;      /* THEME_*             */
 	int lineGap;    /* line height percent */
 	string shelfDir;
