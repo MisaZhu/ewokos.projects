@@ -6,7 +6,8 @@ DIRS = macemu \
 	blender \
 	games \
 	vulkan \
-	imgui
+	imgui \
+	ereader
 #	video saver minivmac nx11 re3
 
 # qt needs the Qt tree that projects/qt/build.sh produces; if it is missing for
