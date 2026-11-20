@@ -1,6 +1,7 @@
 DIRS = doom \
 	cards \
-	mine
+	mine \
+	sdl_tetris
 
 all: $(DIRS)
 
