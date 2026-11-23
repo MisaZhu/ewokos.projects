@@ -79,6 +79,13 @@ static void onShelfImport(const string& fname, void* arg) {
 	((ReaderWin*)arg)->importBooks();
 }
 
+static void onShelfExit(void* arg) {
+	/* ends widgetXRun; main() then stops the preloader and unwinds */
+	X* x = ((ReaderWin*)arg)->getX();
+	if(x != NULL)
+		x->terminate();
+}
+
 static void onReaderBack(void* arg) {
 	((ReaderWin*)arg)->showShelf();
 }
@@ -99,6 +106,7 @@ int main(int argc, char** argv) {
 	win.shelf = new ShelfWidget(&win.store);
 	win.shelf->openFunc = onShelfOpen;
 	win.shelf->importFunc = onShelfImport;
+	win.shelf->exitFunc = onShelfExit;
 	win.shelf->funcArg = &win;
 	root->add(win.shelf);
 
@@ -111,7 +119,7 @@ int main(int argc, char** argv) {
 	win.shelf->refresh();
 	root->focus(win.shelf);
 
-	win.open(&x, -1, -1, -1, 0, 0, "ereader", XWIN_STYLE_NORMAL);
+	win.open(&x, -1, -1, -1, 0, 0, "ereader", XWIN_STYLE_NORMAL, false);
 	/* CJK-capable face for all widget text (titles, dialogs, bars) */
 	win.getTheme()->loadSystem();
 	win.getTheme()->setFont("system-cn", win.getTheme()->basic.fontSize);
@@ -124,6 +132,9 @@ int main(int argc, char** argv) {
 		for(int i = 2; i < argc; i++) { path += " "; path += argv[i]; }
 		win.openReader(path.c_str());
 	}
+
+	win.fullscreen();
+	win.setVisible(true);
 
 	widgetXRun(&x, &win);
 	win.pre.stop();

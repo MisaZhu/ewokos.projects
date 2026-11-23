@@ -424,16 +424,20 @@ static void init_quad(void)
  * the ~200-500 px floor footprint the demo renders. */
 static void init_textures(void)
 {
+    /* Resolve against the executable's own dir (<app-dir>/res/) so the load
+     * survives install-layout moves (x_get_res_name, as X::getResFullName). */
+    char path[256];
+
     glGenTextures(1, &tex_noise_small);
     glBindTexture(GL_TEXTURE_2D, tex_noise_small);
-    if (!load_texture2D("/apps/pixar/res/gray_noise_small.png",
+    if (!load_texture2D(x_get_res_name("gray_noise_small.png", path, sizeof(path)),
                         GL_NEAREST, GL_NEAREST, GL_REPEAT,
                         GL_FALSE, GL_FALSE, NULL, NULL))
         printf("pixar: failed to load gray_noise_small.png\n");
 
     glGenTextures(1, &tex_wood);
     glBindTexture(GL_TEXTURE_2D, tex_wood);
-    if (!load_texture2D("/apps/pixar/res/wood.jpg",
+    if (!load_texture2D(x_get_res_name("wood.jpg", path, sizeof(path)),
                         GL_LINEAR, GL_LINEAR, GL_REPEAT,
                         GL_TRUE, GL_FALSE, NULL, NULL))
         printf("pixar: failed to load wood.jpg\n");

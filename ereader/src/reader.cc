@@ -60,6 +60,15 @@ ReaderWidget::ReaderWidget(Store* store, Preloader* pre) {
 	_pageH = 0;
 	_lastCount = -2;
 	_lastGen = 0;
+	_shownEpoch = 0;
+	_newEpoch = 0;
+	_holdEpoch = 0;
+	_oldCount = 0;
+	_keepPage = 0;
+	_hold[0] = NULL;
+	_hold[1] = NULL;
+	_holdPage[0] = -1;
+	_holdPage[1] = -1;
 	_toolbar = true;
 	_anim = false;
 	_animFrom = 0;
@@ -147,6 +156,7 @@ void ReaderWidget::openBook(const string& fname) {
 	_toolbar = true;
 	_anim = false;
 	_open = true;
+	abortTransition(false);
 
 	Book* b;
 	if(_pdf) {
@@ -154,17 +164,19 @@ void ReaderWidget::openBook(const string& fname) {
 	}
 	else {
 		TxtBook* t = new TxtBook(fname);
-		t->setFontSize(_store->settings.fontSize);
+		t->setFontSize(X::hidpiSize(_store->settings.fontSize));
 		t->setLineGap(_store->settings.lineGap);
 		b = t;
 	}
 	_pre->setBook(b);
+	_shownEpoch = _pre->epoch();
 	update();
 }
 
 void ReaderWidget::closeBook() {
 	if(!_open)
 		return;
+	abortTransition(false);
 	saveProgress();
 	_open = false;
 	_pre->setBook(NULL);
@@ -174,18 +186,77 @@ void ReaderWidget::closeBook() {
 }
 
 /* font size change: rebuild the txt book on the worker (the UI never
-   touches a live Book pointer), keeping the reading position */
+   touches a live Book pointer), keeping the reading position. The old
+   pages stay on screen completely unchanged (held against cache
+   eviction) until the new font's spread is fully rendered, then the
+   whole view swaps in a single repaint: no blank flash, no dissolve. */
 void ReaderWidget::rebuildBook() {
 	int keep = firstPage(_spread);
 	TxtBook* t = new TxtBook(_fname);
-	t->setFontSize(_store->settings.fontSize);
+	t->setFontSize(X::hidpiSize(_store->settings.fontSize));
 	t->setLineGap(_store->settings.lineGap);
 	_pre->setBook(t);
-	_spread = spreadOf(keep);
-	_lastCount = -2;
+	uint64_t ne = _pre->epoch();
+	if(_newEpoch != 0) {
+		/* still waiting: same held base, retarget the wait */
+		_newEpoch = ne;
+		_keepPage = keep;
+	}
+	else {
+		startTransition(ne, keep);
+	}
 	_anim = false;
 	requestPages();
 	update();
+}
+
+void ReaderWidget::releaseHolds() {
+	for(int i = 0; i < 2; i++) {
+		if(_hold[i] != NULL)
+			_pre->release(_hold[i]);
+		_hold[i] = NULL;
+		_holdPage[i] = -1;
+	}
+	_holdEpoch = 0;
+}
+
+void ReaderWidget::startTransition(uint64_t newEpoch, int keepPage) {
+	_keepPage = keepPage;
+	_oldCount = _lastCount;
+	_holdEpoch = _shownEpoch;
+	uint32_t ink = palette(_store->settings.theme).ink;
+	int l, r;
+	spreadPages(_spread, l, r);
+	int pages[2] = {l, r};
+	for(int i = 0; i < 2; i++) {
+		_holdPage[i] = pages[i];
+		_hold[i] = NULL;
+		if(pages[i] >= 0 && (_oldCount <= 0 || pages[i] < _oldCount))
+			_hold[i] = _pre->acquire(pages[i], _pageW, _pageH, ink, _holdEpoch);
+	}
+	_newEpoch = newEpoch;
+}
+
+void ReaderWidget::abortTransition(bool commit) {
+	releaseHolds();
+	if(commit && _newEpoch != 0)
+		_shownEpoch = _newEpoch;
+	_newEpoch = 0;
+}
+
+bool ReaderWidget::spreadReady(uint64_t epoch, int count, int spread) {
+	int l, r;
+	spreadPages(spread, l, r);
+	int pages[2] = {l, r};
+	uint32_t ink = palette(_store->settings.theme).ink;
+	for(int i = 0; i < 2; i++) {
+		int pg = pages[i];
+		if(pg < 0 || pg >= count)
+			continue;
+		if(!_pre->hasPage(pg, _pageW, _pageH, ink, epoch))
+			return false;
+	}
+	return true;
 }
 
 void ReaderWidget::changeFontSize(int delta) {
@@ -202,6 +273,7 @@ void ReaderWidget::changeFontSize(int delta) {
 }
 
 void ReaderWidget::cycleTheme() {
+	abortTransition(false);
 	_store->settings.theme = (_store->settings.theme + 1) % THEME_COUNT;
 	_store->save();
 	_pre->clear();
@@ -223,6 +295,7 @@ void ReaderWidget::applyGeometry(const grect_t& r) {
 	if(pw < 64) pw = 64;
 	if(pw == _pageW && ph == _pageH && two == _two && _pageW > 0)
 		return;
+	abortTransition(true);
 	int keep = (_pageW > 0) ? firstPage(_spread) : _pendingPage;
 	_two = two;
 	_pageW = pw;
@@ -240,6 +313,7 @@ void ReaderWidget::requestPages() {
 		return;
 	int count = _lastCount > 0 ? _lastCount : 0;
 	uint32_t ink = palette(_store->settings.theme).ink;
+	uint64_t eq = _newEpoch != 0 ? _newEpoch : _shownEpoch;
 	vector<PageReq> reqs;
 	/* current spread first, then the one ahead, then the one behind */
 	int order[3] = {_spread, _spread + 1, _spread - 1};
@@ -261,7 +335,7 @@ void ReaderWidget::requestPages() {
 				if(reqs[i].page == pg) { dup = true; break; }
 			if(dup)
 				continue;
-			PageReq q = {pg, _pageW, _pageH, ink};
+			PageReq q = {pg, _pageW, _pageH, ink, eq};
 			reqs.push_back(q);
 		}
 	}
@@ -278,6 +352,10 @@ void ReaderWidget::gotoSpread(int s, bool animate) {
 		s = 0;
 	if(s == _spread)
 		return;
+	if(_newEpoch != 0) {
+		/* follow the reader: re-anchor the pending swap */
+		_keepPage = firstPage(s);
+	}
 	if(animate) {
 		_animFrom = _spread;
 		_animDir = (s > _spread) ? 1 : -1;
@@ -314,6 +392,8 @@ void ReaderWidget::seekTo(int x) {
 		page = _lastCount - 1;
 	int s = spreadOf(page);
 	if(s != _spread) {
+		if(_newEpoch != 0)
+			_keepPage = firstPage(s);
 		_spread = s;
 		_anim = false;
 		requestPages();
@@ -329,7 +409,7 @@ void ReaderWidget::drawPaper(graph_t* g, const Palette& p, int x, int y) {
 }
 
 void ReaderWidget::drawSlot(graph_t* g, font_t* font, const Palette& p,
-		int page, int x, int y) {
+		int page, int x, int y, uint64_t epoch) {
 	drawPaper(g, p, x, y);
 	if(page < 0 || (_lastCount > 0 && page >= _lastCount)) {
 		/* blank leaf facing the first page: quiet bookplate */
@@ -338,28 +418,40 @@ void ReaderWidget::drawSlot(graph_t* g, font_t* font, const Palette& p,
 				2, 1, p.line);
 		return;
 	}
-	graph_t* pg = _pre->acquire(page, _pageW, _pageH, p.ink);
+	/* held pages are already borrowed: blit without re-acquiring */
+	graph_t* pg = NULL;
+	bool held = false;
+	if(epoch == _holdEpoch) {
+		for(int i = 0; i < 2; i++) {
+			if(_hold[i] != NULL && _holdPage[i] == page) {
+				pg = _hold[i];
+				held = true;
+				break;
+			}
+		}
+	}
+	if(pg == NULL)
+		pg = _pre->acquire(page, _pageW, _pageH, p.ink, epoch);
 	if(pg != NULL) {
 		if(_pdf)
 			graph_blt(pg, 0, 0, _pageW, _pageH, g, x, y, _pageW, _pageH);
 		else
 			graph_blt_alpha(pg, 0, 0, _pageW, _pageH, g, x, y, _pageW, _pageH, 255);
-		_pre->release(pg);
+		if(!held)
+			_pre->release(pg);
 	}
 	else {
 		if(font != NULL) {
 			const char* msg = (_lastCount < 0) ? "排版中…" : "渲染中…";
 			int fs = X::hidpiSize(12);
-			uint32_t tw = 0, th = 0;
-			font_text_size(msg, font, fs, &tw, &th);
-			graph_draw_text_font(g, x + (_pageW - (int)tw)/2,
-					textTop(font, fs, y, _pageH), msg, font, fs, p.faint);
+			graph_draw_text_font_align(g, x, y, _pageW, _pageH,
+					msg, font, fs, p.faint, FONT_ALIGN_CENTER);
 		}
 	}
 }
 
 void ReaderWidget::drawSpread(graph_t* g, font_t* font, const Palette& p,
-		const grect_t& content, int spread, int offsetX) {
+		const grect_t& content, int spread, int offsetX, uint64_t epoch) {
 	int margin = X::hidpiSize(20);
 	int gutter = X::hidpiSize(16);
 	int y0 = content.y + margin;
@@ -368,15 +460,15 @@ void ReaderWidget::drawSpread(graph_t* g, font_t* font, const Palette& p,
 	if(_two) {
 		int total = _pageW*2 + gutter;
 		int x0 = content.x + (content.w - total)/2 + offsetX;
-		drawSlot(g, font, p, l, x0, y0);
-		drawSlot(g, font, p, rr, x0 + _pageW + gutter, y0);
+		drawSlot(g, font, p, l, x0, y0, epoch);
+		drawSlot(g, font, p, rr, x0 + _pageW + gutter, y0, epoch);
 		/* spine shadow between the two leaves */
 		graph_fill_rect(g, x0 + _pageW, y0, gutter, _pageH, 0x10000000);
 		graph_fill_rect(g, x0 + _pageW + gutter/2, y0, 1, _pageH, 0x22000000);
 	}
 	else {
 		int x0 = content.x + (content.w - _pageW)/2 + offsetX;
-		drawSlot(g, font, p, l, x0, y0);
+		drawSlot(g, font, p, l, x0, y0, epoch);
 	}
 }
 
@@ -421,10 +513,8 @@ void ReaderWidget::drawBars(graph_t* g, XTheme* theme, const grect_t& r,
 	int tx1 = leftmost - X::hidpiSize(16);
 	if(tx1 > tx0) {
 		string title = elide(font, ts, _title, tx1 - tx0);
-		uint32_t w = 0, h = 0;
-		font_text_size(title.c_str(), font, ts, &w, &h);
-		graph_draw_text_font(g, tx0 + (tx1 - tx0 - (int)w)/2,
-				textTop(font, ts, r.y, topH), title.c_str(), font, ts, p.barInk);
+		graph_draw_text_font_align(g, tx0, r.y, tx1 - tx0, topH,
+				title.c_str(), font, ts, p.barInk, FONT_ALIGN_CENTER);
 	}
 
 	/* ---- bottom bar: progress rail ---- */
@@ -432,7 +522,9 @@ void ReaderWidget::drawBars(graph_t* g, XTheme* theme, const grect_t& r,
 	graph_fill_rect(g, r.x, by0, r.w, botH, p.bar);
 	graph_fill_rect(g, r.x, by0, r.w, 1, p.line);
 	int fs = X::hidpiSize(11);
-	int count = _lastCount;
+	/* while waiting for the new font's renders the bars keep the old
+	   pagination so nothing on screen jumps before the swap */
+	int count = (_newEpoch != 0) ? _oldCount : _lastCount;
 	string left, right;
 	if(count > 0) {
 		if(_two) {
@@ -456,11 +548,10 @@ void ReaderWidget::drawBars(graph_t* g, XTheme* theme, const grect_t& r,
 	uint32_t lw = 0, lh = 0, rw = 0, rh = 0;
 	font_text_size(left.c_str(), font, fs, &lw, &lh);
 	font_text_size(right.c_str(), font, fs, &rw, &rh);
-	int ly = textTop(font, fs, by0, botH);
-	graph_draw_text_font(g, r.x + X::hidpiSize(16), ly, left.c_str(),
-			font, fs, p.barInk);
-	graph_draw_text_font(g, r.x + r.w - X::hidpiSize(16) - (int)rw, ly,
-			right.c_str(), font, fs, p.barInk);
+	graph_draw_text_font_align(g, r.x + X::hidpiSize(16), by0, (int)lw, botH,
+			left.c_str(), font, fs, p.barInk, FONT_ALIGN_LEFT|FONT_ALIGN_V_CENTER);
+	graph_draw_text_font_align(g, r.x + r.w - X::hidpiSize(16) - (int)rw, by0, (int)rw, botH,
+			right.c_str(), font, fs, p.barInk, FONT_ALIGN_LEFT|FONT_ALIGN_V_CENTER);
 
 	_seekX0 = X::hidpiSize(16) + (int)lw + X::hidpiSize(18);
 	_seekX1 = r.w - X::hidpiSize(16) - (int)rw - X::hidpiSize(18);
@@ -499,13 +590,11 @@ void ReaderWidget::onRepaint(graph_t* g, XTheme* theme, const grect_t& r) {
 	grect_t content = {r.x, r.y + topBarH(), r.w, r.h - topBarH() - botBarH()};
 	font_t* font = theme->getFont();
 
-	if(!_pre->bookReady()) {
+	if(!_pre->bookReady() && _newEpoch == 0) {
 		const char* msg = "正在打开书籍…";
 		int fs = X::hidpiSize(15);
-		uint32_t tw = 0, th = 0;
-		font_text_size(msg, font, fs, &tw, &th);
-		graph_draw_text_font(g, r.x + (r.w - (int)tw)/2,
-				textTop(font, fs, r.y, r.h), msg, font, fs, p.faint);
+		graph_draw_text_font_align(g, r.x, r.y, r.w, r.h,
+				msg, font, fs, p.faint, FONT_ALIGN_CENTER);
 		drawBars(g, theme, r, p);
 		graph_unset_clip(g);
 		return;
@@ -528,16 +617,18 @@ void ReaderWidget::onRepaint(graph_t* g, XTheme* theme, const grect_t& r) {
 	}
 
 	graph_set_clip(g, content.x, content.y, content.w, content.h);
+	/* during a font-size swap the held old pages stay on screen
+	   unchanged; the new epoch appears in one full repaint at commit */
 	if(_anim) {
 		double t = (double)_animStep / (double)ANIM_STEPS;
 		double inv = 1.0 - t;
 		double e = 1.0 - inv*inv*inv; /* ease-out cubic */
 		int shift = (int)(e * content.w);
-		drawSpread(g, font, p, content, _animFrom, -_animDir*shift);
-		drawSpread(g, font, p, content, _spread, _animDir*(content.w - shift));
+		drawSpread(g, font, p, content, _animFrom, -_animDir*shift, _shownEpoch);
+		drawSpread(g, font, p, content, _spread, _animDir*(content.w - shift), _shownEpoch);
 	}
 	else {
-		drawSpread(g, font, p, content, _spread, 0);
+		drawSpread(g, font, p, content, _spread, 0, _shownEpoch);
 	}
 	graph_unset_clip(g);
 
@@ -551,6 +642,48 @@ void ReaderWidget::onTimer(uint32_t timerFPS, uint32_t timerSteps) {
 	if(!isVisible() || !_open)
 		return;
 	bool changed = false;
+	if(_anim) {
+		_animStep++;
+		if(_animStep >= ANIM_STEPS)
+			_anim = false;
+		changed = true;
+	}
+	if(_newEpoch != 0) {
+		/* waiting: screen stays frozen on the held old pages */
+		if(_pre->bookReady()) {
+			int nc = _pre->pageCount();
+			if(nc == 0) {
+				/* new book failed to open: drop to the error screen */
+				abortTransition(false);
+				_lastCount = 0;
+				changed = true;
+			}
+			else {
+				/* nc may still be -1 (whole-book layout running in
+				   background): swap as soon as the visible spread
+				   is rendered, never wait for the total count */
+				int s = spreadOf(_keepPage);
+				if(nc > 0 && s > maxSpread(nc))
+					s = maxSpread(nc);
+				int readyCount = nc > 0 ? nc : 0x7fffffff;
+				if(spreadReady(_newEpoch, readyCount, s)) {
+					/* commit: one full repaint at the new font size */
+					_spread = s;
+					_lastCount = nc;
+					_shownEpoch = _newEpoch;
+					releaseHolds();
+					_newEpoch = 0;
+					_anim = false;
+					requestPages();
+					saveProgress();
+					changed = true;
+				}
+			}
+		}
+		if(changed)
+			update();
+		return;
+	}
 	uint64_t gen = _pre->cacheGen();
 	if(gen != _lastGen) {
 		_lastGen = gen;
@@ -562,12 +695,6 @@ void ReaderWidget::onTimer(uint32_t timerFPS, uint32_t timerSteps) {
 		if(count > 0 && _spread > maxSpread(count))
 			_spread = maxSpread(count);
 		requestPages();
-		changed = true;
-	}
-	if(_anim) {
-		_animStep++;
-		if(_animStep >= ANIM_STEPS)
-			_anim = false;
 		changed = true;
 	}
 	if(changed)

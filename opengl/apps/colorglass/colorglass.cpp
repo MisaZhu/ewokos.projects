@@ -197,14 +197,15 @@ static void init_quad(void)
  * min-filter would fail staging and drop the effect to the CPU (see header). */
 static void init_textures(void)
 {
-    static const char* faces[6] = {
-        "/apps/colorglass/res/uffizi_0.jpg",
-        "/apps/colorglass/res/uffizi_1.jpg",
-        "/apps/colorglass/res/uffizi_2.jpg",
-        "/apps/colorglass/res/uffizi_3.jpg",
-        "/apps/colorglass/res/uffizi_4.jpg",
-        "/apps/colorglass/res/uffizi_5.jpg"
-    };
+    /* Resolve against the executable's own dir (<app-dir>/res/) so the load
+     * survives install-layout moves (x_get_res_name, as X::getResFullName). */
+    static char paths[7][256];
+    const char* faces[6];
+    for (int i = 0; i < 6; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "uffizi_%d.jpg", i);
+        faces[i] = x_get_res_name(name, paths[i], sizeof(paths[i]));
+    }
     glGenTextures(1, &tex_cube);
     glBindTexture(GL_TEXTURE_CUBE_MAP, tex_cube);
     if (!load_texture_cubemap(faces, GL_LINEAR, GL_LINEAR,
@@ -213,7 +214,7 @@ static void init_textures(void)
 
     glGenTextures(1, &tex_rock);
     glBindTexture(GL_TEXTURE_2D, tex_rock);
-    if (!load_texture2D("/apps/colorglass/res/rock_tiles.jpg",
+    if (!load_texture2D(x_get_res_name("rock_tiles.jpg", paths[6], sizeof(paths[6])),
                         GL_LINEAR, GL_LINEAR, GL_REPEAT,
                         GL_TRUE, GL_FALSE, NULL, NULL))
         printf("colorglass: failed to load rock_tiles.jpg\n");

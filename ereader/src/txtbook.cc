@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ewoksys/vfs.h>
+#include <x++/X.h>
+
+using namespace Ewok;
 
 namespace er {
 
@@ -10,7 +13,7 @@ TxtBook::TxtBook(const string& fname) {
 	_title = stripExt(baseName(fname));
 	pthread_mutex_init(&_mtx, NULL);
 	_font = NULL;
-	_fontSize = 18;
+	_fontSize = X::hidpiSize(18);
 	_lineGap = 150;
 	_layoutW = 0;
 	_layoutH = 0;
@@ -92,8 +95,11 @@ void TxtBook::resetLayout() {
 }
 
 void TxtBook::setFontSize(int px) {
+	/* px is physical: callers pass hidpi-scaled logical sizes, so the
+	   upper bound scales with the display too */
 	if(px < 12) px = 12;
-	if(px > 40) px = 40;
+	int maxPx = X::hidpiSize(40);
+	if(px > maxPx) px = maxPx;
 	pthread_mutex_lock(&_mtx);
 	if(px != _fontSize) {
 		_fontSize = px;

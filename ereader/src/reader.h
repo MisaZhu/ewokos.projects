@@ -34,6 +34,17 @@ private:
 	int _lastCount;
 	uint64_t _lastGen;
 
+	/* flash-free font-size swap: keep blitting the old epoch's pages
+	   (held against eviction) completely unchanged until the new
+	   epoch's spread is fully rendered, then swap in one full repaint */
+	uint64_t _shownEpoch;  /* epoch of the pages currently drawn   */
+	uint64_t _newEpoch;    /* epoch awaited (0 = idle)             */
+	uint64_t _holdEpoch;   /* epoch the held pages belong to       */
+	int _oldCount;         /* bar count frozen while waiting       */
+	int _keepPage;         /* reading position to re-apply at swap */
+	graph_t* _hold[2];     /* borrowed old pages, eviction-proof   */
+	int _holdPage[2];
+
 	bool _toolbar;
 
 	/* slide animation */
@@ -58,15 +69,20 @@ private:
 	void applyGeometry(const grect_t& r);
 	void requestPages();
 	void rebuildBook();
+	void releaseHolds();
+	void startTransition(uint64_t newEpoch, int keepPage);
+	void abortTransition(bool commit);
+	bool spreadReady(uint64_t epoch, int count, int spread);
 	void gotoSpread(int s, bool animate);
 	void turn(int dir);
 	void seekTo(int x);
 	void changeFontSize(int delta);
 	void cycleTheme();
 	void drawPaper(graph_t* g, const Palette& p, int x, int y);
-	void drawSlot(graph_t* g, font_t* font, const Palette& p, int page, int x, int y);
+	void drawSlot(graph_t* g, font_t* font, const Palette& p, int page, int x, int y,
+			uint64_t epoch);
 	void drawSpread(graph_t* g, font_t* font, const Palette& p,
-			const grect_t& content, int spread, int offsetX);
+			const grect_t& content, int spread, int offsetX, uint64_t epoch);
 	void drawBars(graph_t* g, XTheme* theme, const grect_t& r, const Palette& p);
 
 protected:

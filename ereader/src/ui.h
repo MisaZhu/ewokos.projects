@@ -6,12 +6,10 @@
 
 namespace er {
 
-/* y to hand to graph_draw_text_font() so the glyph ink (not the line box)
- * sits on the vertical middle of [boxY, boxY+boxH) */
-int textTop(font_t* font, int size, int boxY, int boxH);
+/* label width via font_text_size */
 int textWidth(font_t* font, const char* text, int size);
 
-/* label centred both ways inside a rect */
+/* label centred both ways inside a rect (libfont ink-measured alignment) */
 void drawLabel(graph_t* g, font_t* font, const char* text, int size,
 		const grect_t& box, uint32_t ink);
 

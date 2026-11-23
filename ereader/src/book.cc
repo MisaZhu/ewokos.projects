@@ -32,8 +32,8 @@ void PageCache::evict() {
 	}
 }
 
-graph_t* PageCache::acquire(int page, int w, int h, uint32_t ink) {
-	PageKey k = {page, w, h, ink};
+graph_t* PageCache::acquire(int page, int w, int h, uint32_t ink, uint64_t epoch) {
+	PageKey k = {epoch, page, w, h, ink};
 	pthread_mutex_lock(&_lock);
 	map<PageKey, PageEntry>::iterator it = _map.find(k);
 	graph_t* g = NULL;
@@ -64,10 +64,10 @@ void PageCache::release(graph_t* g) {
 	pthread_mutex_unlock(&_lock);
 }
 
-void PageCache::put(int page, int w, int h, uint32_t ink, graph_t* g) {
+void PageCache::put(int page, int w, int h, uint32_t ink, uint64_t epoch, graph_t* g) {
 	if(g == NULL)
 		return;
-	PageKey k = {page, w, h, ink};
+	PageKey k = {epoch, page, w, h, ink};
 	pthread_mutex_lock(&_lock);
 	map<PageKey, PageEntry>::iterator it = _map.find(k);
 	if(it != _map.end()) {
@@ -91,8 +91,8 @@ void PageCache::put(int page, int w, int h, uint32_t ink, graph_t* g) {
 	pthread_mutex_unlock(&_lock);
 }
 
-bool PageCache::has(int page, int w, int h, uint32_t ink) {
-	PageKey k = {page, w, h, ink};
+bool PageCache::has(int page, int w, int h, uint32_t ink, uint64_t epoch) {
+	PageKey k = {epoch, page, w, h, ink};
 	pthread_mutex_lock(&_lock);
 	map<PageKey, PageEntry>::iterator it = _map.find(k);
 	bool r = it != _map.end() && !it->second.dead;
@@ -127,7 +127,9 @@ Preloader::Preloader() {
 	_pending = NULL;
 	_closeReq = false;
 	_opened = false;
+	_openOk = false;
 	_gen = 0;
+	_epoch = 0;
 	_cacheGen = 0;
 }
 
@@ -188,7 +190,10 @@ void Preloader::loop() {
 				_book = _pending;
 				_pending = NULL;
 				_opened = false;
-				_cache.clear();
+				_openOk = false;
+				/* epoch already bumped by setBook; old-epoch pages stay
+				   cached so the UI can keep showing them until the new
+				   ones are ready */
 				_cacheGen++;
 			}
 			if(_book != NULL && !_opened) {
@@ -198,6 +203,7 @@ void Preloader::loop() {
 				pthread_mutex_lock(&_mtx);
 				if(_book == b) {
 					_opened = true;
+					_openOk = ok;
 					if(!ok) { /* keep the shell; pageCount stays 0 */ }
 					_cacheGen++;
 				}
@@ -214,7 +220,7 @@ void Preloader::loop() {
 				const PageReq& r = _want[i];
 				if(r.page < 0)
 					continue;
-				if(!_cache.has(r.page, r.w, r.h, r.ink)) {
+				if(!_cache.has(r.page, r.w, r.h, r.ink, r.epoch)) {
 					job = r;
 					haveJob = true;
 					break;
@@ -225,7 +231,7 @@ void Preloader::loop() {
 		if(!haveJob) {
 			/* no page wanted: paginate towards EOF in small chunks so the
 			   total count settles; jobs preempt at every chunk boundary */
-			if(_book != NULL && _opened) {
+			if(_book != NULL && _opened && _openOk) {
 				Book* b = _book;
 				int pc0 = b->pageCount();
 				pthread_mutex_unlock(&_mtx);
@@ -248,7 +254,7 @@ void Preloader::loop() {
 		graph_t* g = b->renderPage(job.page, job.w, job.h, job.ink);
 		pthread_mutex_lock(&_mtx);
 		if(_book == b && _gen == jobGen && g != NULL) {
-			_cache.put(job.page, job.w, job.h, job.ink, g);
+			_cache.put(job.page, job.w, job.h, job.ink, job.epoch, g);
 			_cacheGen++;
 			g = NULL;
 		}
@@ -268,6 +274,8 @@ void Preloader::setBook(Book* b) {
 	_pending = b;
 	if(b == NULL)
 		_closeReq = true;
+	else
+		_epoch++; /* new render identity, visible to the caller at once */
 	_gen++;
 	_want.clear();
 	pthread_cond_signal(&_cond);
@@ -283,9 +291,20 @@ bool Preloader::bookReady() {
 
 int Preloader::pageCount() {
 	pthread_mutex_lock(&_mtx);
-	int n = (_book != NULL && _opened) ? _book->pageCount() : 0;
+	int n = (_book != NULL && _opened && _openOk) ? _book->pageCount() : 0;
 	pthread_mutex_unlock(&_mtx);
 	return n;
+}
+
+uint64_t Preloader::epoch() {
+	pthread_mutex_lock(&_mtx);
+	uint64_t e = _epoch;
+	pthread_mutex_unlock(&_mtx);
+	return e;
+}
+
+bool Preloader::hasPage(int page, int w, int h, uint32_t ink, uint64_t epoch) {
+	return _cache.has(page, w, h, ink, epoch);
 }
 
 void Preloader::request(const vector<PageReq>& reqs) {
@@ -305,8 +324,8 @@ void Preloader::clear() {
 	pthread_mutex_unlock(&_mtx);
 }
 
-graph_t* Preloader::acquire(int page, int w, int h, uint32_t ink) {
-	return _cache.acquire(page, w, h, ink);
+graph_t* Preloader::acquire(int page, int w, int h, uint32_t ink, uint64_t epoch) {
+	return _cache.acquire(page, w, h, ink, epoch);
 }
 
 void Preloader::release(graph_t* g) {
