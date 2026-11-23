@@ -274,16 +274,20 @@ static void init_quad(void)
  * on-device compiled sampler (TMU bilinear), so texB needs a single tap. */
 static void init_textures(void)
 {
+    /* Resolve against the executable's own dir (<app-dir>/res/) so the load
+     * survives install-layout moves (x_get_res_name, as X::getResFullName). */
+    char path[256];
+
     glGenTextures(1, &tex_noise_small);
     glBindTexture(GL_TEXTURE_2D, tex_noise_small);
-    if (!load_texture2D("/apps/grass/res/gray_noise_small.png",
+    if (!load_texture2D(x_get_res_name("gray_noise_small.png", path, sizeof(path)),
                         GL_LINEAR, GL_LINEAR, GL_REPEAT,
                         GL_FALSE, GL_FALSE, NULL, NULL))
         printf("grass: failed to load gray_noise_small.png\n");
 
     glGenTextures(1, &tex_noise_med);
     glBindTexture(GL_TEXTURE_2D, tex_noise_med);
-    if (!load_texture2D("/apps/grass/res/rgba_noise_medium.png",
+    if (!load_texture2D(x_get_res_name("rgba_noise_medium.png", path, sizeof(path)),
                         GL_LINEAR, GL_LINEAR, GL_REPEAT,
                         GL_FALSE, GL_FALSE, NULL, NULL))
         printf("grass: failed to load rgba_noise_medium.png\n");
