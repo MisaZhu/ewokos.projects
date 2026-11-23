@@ -215,7 +215,7 @@ void Preloader::loop() {
 		PageReq job;
 		bool haveJob = false;
 		uint64_t jobGen = _gen;
-		if(_book != NULL && _opened) {
+		if(_book != NULL && _opened && _openOk) {
 			for(size_t i = 0; i < _want.size(); i++) {
 				const PageReq& r = _want[i];
 				if(r.page < 0)
@@ -258,6 +258,13 @@ void Preloader::loop() {
 			_cacheGen++;
 			g = NULL;
 		}
+		else if(_book == b && _gen == jobGen) {
+			/* unrenderable page: drop the request, or this loop would
+			   spin on it forever without ever sleeping */
+			for(size_t i = 0; i < _want.size(); i++)
+				if(_want[i].page == job.page && _want[i].epoch == job.epoch)
+					_want[i].page = -1;
+		}
 		if(g != NULL)
 			graph_free(g); /* stale result */
 	}
@@ -284,14 +291,17 @@ void Preloader::setBook(Book* b) {
 
 bool Preloader::bookReady() {
 	pthread_mutex_lock(&_mtx);
-	bool r = _book != NULL && _opened;
+	/* a hand-off the worker has not taken yet is not ready: the book it
+	   still holds is the previous one */
+	bool r = _pending == NULL && !_closeReq && _book != NULL && _opened;
 	pthread_mutex_unlock(&_mtx);
 	return r;
 }
 
 int Preloader::pageCount() {
 	pthread_mutex_lock(&_mtx);
-	int n = (_book != NULL && _opened && _openOk) ? _book->pageCount() : 0;
+	int n = (_pending == NULL && !_closeReq && _book != NULL && _opened && _openOk) ?
+			_book->pageCount() : 0;
 	pthread_mutex_unlock(&_mtx);
 	return n;
 }

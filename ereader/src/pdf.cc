@@ -31,8 +31,9 @@ struct Obj {
 	vector<pair<string, Obj> > d;
 	const uint8_t* raw;       /* O_STREAM: unfiltered bytes       */
 	int rawLen;
+	int onum, ogen;           /* owning indirect object (crypto key) */
 
-	Obj() : t(O_NULL), i(0), r(0), raw(NULL), rawLen(0) { }
+	Obj() : t(O_NULL), i(0), r(0), raw(NULL), rawLen(0), onum(0), ogen(0) { }
 
 	bool isNum() const { return t == O_INT || t == O_REAL; }
 	double num() const {
@@ -53,6 +54,10 @@ struct Obj {
 	string getName(const char* k) const {
 		const Obj* o = get(k);
 		return (o != NULL && o->t == O_NAME) ? o->s : string();
+	}
+	string getStr(const char* k) const {
+		const Obj* o = get(k);
+		return (o != NULL && o->t == O_STR) ? o->s : string();
 	}
 };
 
@@ -380,6 +385,396 @@ static bool runLengthDecode(const uint8_t* in, int n, vector<uint8_t>& out) {
 	return true;
 }
 
+/* ====================== standard security handler =====================
+   Empty-user-password documents (the common "restricted" PDFs): derive
+   the file key from the trailer, verify U, then RC4/AESV2-decrypt every
+   string and stream with its per-object key. Self-contained MD5/RC4/AES
+   so the reader needs no crypto service on the device. */
+struct Md5 {
+	uint32_t h[4];
+	uint64_t len;
+	uint8_t blk[64];
+	int fill;
+	Md5() { reset(); }
+	void reset() {
+		h[0]=0x67452301; h[1]=0xefcdab89; h[2]=0x98badcfe; h[3]=0x10325476;
+		len = 0; fill = 0;
+	}
+	static uint32_t rol(uint32_t x, int c) { return (x << c) | (x >> (32-c)); }
+	void block(const uint8_t* p) {
+		static const uint32_t K[64] = {
+			0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+			0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+			0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+			0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+			0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+			0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+			0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+			0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391 };
+		static const int S[64] = {
+			7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+			5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+			4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+			6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21 };
+		uint32_t m[16];
+		for(int i = 0; i < 16; i++)
+			m[i] = (uint32_t)p[i*4] | ((uint32_t)p[i*4+1]<<8) |
+				((uint32_t)p[i*4+2]<<16) | ((uint32_t)p[i*4+3]<<24);
+		uint32_t a=h[0], b=h[1], c=h[2], d=h[3];
+		for(int i = 0; i < 64; i++) {
+			uint32_t f; int g;
+			if(i < 16)      { f = (b & c) | (~b & d); g = i; }
+			else if(i < 32) { f = (d & b) | (~d & c); g = (5*i+1) & 15; }
+			else if(i < 48) { f = b ^ c ^ d;          g = (3*i+5) & 15; }
+			else            { f = c ^ (b | ~d);       g = (7*i) & 15; }
+			uint32_t tmp = d; d = c; c = b;
+			b = b + rol(a + f + K[i] + m[g], S[i]);
+			a = tmp;
+		}
+		h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d;
+	}
+	void update(const uint8_t* p, int n) {
+		len += (uint64_t)n;
+		while(n > 0) {
+			int take = 64 - fill;
+			if(take > n) take = n;
+			memcpy(blk + fill, p, take);
+			fill += take; p += take; n -= take;
+			if(fill == 64) { block(blk); fill = 0; }
+		}
+	}
+	void final(uint8_t out[16]) {
+		uint64_t bits = len * 8;
+		uint8_t pad = 0x80;
+		update(&pad, 1);
+		pad = 0;
+		while(fill != 56) update(&pad, 1);
+		uint8_t lb[8];
+		for(int i = 0; i < 8; i++) lb[i] = (uint8_t)(bits >> (8*i));
+		update(lb, 8);
+		for(int i = 0; i < 4; i++)
+			for(int k = 0; k < 4; k++)
+				out[i*4+k] = (uint8_t)(h[i] >> (8*k));
+	}
+};
+
+static void md5Buf(const uint8_t* p, int n, uint8_t out[16]) {
+	Md5 m; m.update(p, n); m.final(out);
+}
+
+static void rc4Crypt(const uint8_t* key, int kn, uint8_t* data, int n) {
+	uint8_t s[256];
+	for(int i = 0; i < 256; i++) s[i] = (uint8_t)i;
+	int j = 0;
+	for(int i = 0; i < 256; i++) {
+		j = (j + s[i] + key[i % kn]) & 255;
+		uint8_t t = s[i]; s[i] = s[j]; s[j] = t;
+	}
+	int i = 0; j = 0;
+	for(int k = 0; k < n; k++) {
+		i = (i + 1) & 255;
+		j = (j + s[i]) & 255;
+		uint8_t t = s[i]; s[i] = s[j]; s[j] = t;
+		data[k] ^= s[(s[i] + s[j]) & 255];
+	}
+}
+
+/* AES-128 (encrypt for the U check, decrypt for streams) */
+static const uint8_t AES_SBOX[256] = {
+	0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+	0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+	0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+	0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+	0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+	0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+	0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+	0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+	0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+	0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+	0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+	0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+	0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+	0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+	0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+	0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16 };
+static uint8_t AES_RSBOX[256];
+static bool aesTablesInit = false;
+static void aesInit() {
+	if(aesTablesInit) return;
+	for(int i = 0; i < 256; i++) AES_RSBOX[AES_SBOX[i]] = (uint8_t)i;
+	aesTablesInit = true;
+}
+static uint8_t xtime(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0)); }
+static uint8_t gmul(uint8_t a, uint8_t b) {
+	uint8_t r = 0;
+	for(int i = 0; i < 8; i++) {
+		if(b & 1) r ^= a;
+		b >>= 1;
+		a = xtime(a);
+	}
+	return r;
+}
+static void aesExpand(const uint8_t key[16], uint8_t rk[176]) {
+	memcpy(rk, key, 16);
+	uint8_t rcon = 1;
+	for(int i = 16; i < 176; i += 4) {
+		uint8_t t[4];
+		memcpy(t, rk + i - 4, 4);
+		if(i % 16 == 0) {
+			uint8_t tmp = t[0];
+			t[0] = AES_SBOX[t[1]] ^ rcon; t[1] = AES_SBOX[t[2]];
+			t[2] = AES_SBOX[t[3]]; t[3] = AES_SBOX[tmp];
+			rcon = xtime(rcon);
+		}
+		for(int k = 0; k < 4; k++) rk[i+k] = rk[i-16+k] ^ t[k];
+	}
+}
+static void aesEncBlock(const uint8_t rk[176], uint8_t b[16]) {
+	for(int k = 0; k < 16; k++) b[k] ^= rk[k];
+	for(int round = 1; round <= 10; round++) {
+		for(int k = 0; k < 16; k++) b[k] = AES_SBOX[b[k]];
+		uint8_t t;
+		t=b[1]; b[1]=b[5]; b[5]=b[9]; b[9]=b[13]; b[13]=t;
+		t=b[2]; b[2]=b[10]; b[10]=t; t=b[6]; b[6]=b[14]; b[14]=t;
+		t=b[15]; b[15]=b[11]; b[11]=b[7]; b[7]=b[3]; b[3]=t;
+		if(round < 10) {
+			for(int c = 0; c < 4; c++) {
+				uint8_t* p = b + c*4;
+				uint8_t a0=p[0], a1=p[1], a2=p[2], a3=p[3];
+				p[0] = xtime(a0) ^ (xtime(a1)^a1) ^ a2 ^ a3;
+				p[1] = a0 ^ xtime(a1) ^ (xtime(a2)^a2) ^ a3;
+				p[2] = a0 ^ a1 ^ xtime(a2) ^ (xtime(a3)^a3);
+				p[3] = (xtime(a0)^a0) ^ a1 ^ a2 ^ xtime(a3);
+			}
+		}
+		for(int k = 0; k < 16; k++) b[k] ^= rk[round*16+k];
+	}
+}
+static void aesDecBlock(const uint8_t rk[176], uint8_t b[16]) {
+	for(int k = 0; k < 16; k++) b[k] ^= rk[160+k];
+	for(int round = 9; round >= 0; round--) {
+		uint8_t t;
+		t=b[13]; b[13]=b[9]; b[9]=b[5]; b[5]=b[1]; b[1]=t;
+		t=b[10]; b[10]=b[2]; b[2]=t; t=b[14]; b[14]=b[6]; b[6]=t;
+		t=b[3]; b[3]=b[7]; b[7]=b[11]; b[11]=b[15]; b[15]=t;
+		for(int k = 0; k < 16; k++) b[k] = AES_RSBOX[b[k]];
+		for(int k = 0; k < 16; k++) b[k] ^= rk[round*16+k];
+		if(round > 0) {
+			for(int c = 0; c < 4; c++) {
+				uint8_t* p = b + c*4;
+				uint8_t a0=p[0], a1=p[1], a2=p[2], a3=p[3];
+				p[0] = gmul(a0,14) ^ gmul(a1,11) ^ gmul(a2,13) ^ gmul(a3,9);
+				p[1] = gmul(a0,9) ^ gmul(a1,14) ^ gmul(a2,11) ^ gmul(a3,13);
+				p[2] = gmul(a0,13) ^ gmul(a1,9) ^ gmul(a2,14) ^ gmul(a3,11);
+				p[3] = gmul(a0,11) ^ gmul(a1,13) ^ gmul(a2,9) ^ gmul(a3,14);
+			}
+		}
+	}
+}
+/* AES-128-CBC decrypt; first 16 bytes of in are the IV, PKCS#7 stripped */
+static bool aesCbcDecrypt(const uint8_t key[16], const uint8_t* in, int n,
+		vector<uint8_t>& out) {
+	if(n < 32 || (n & 15) != 0) return false;
+	aesInit();
+	uint8_t rk[176];
+	aesExpand(key, rk);
+	out.resize(n - 16);
+	uint8_t prev[16];
+	memcpy(prev, in, 16);
+	for(int off = 16; off < n; off += 16) {
+		uint8_t b[16];
+		memcpy(b, in + off, 16);
+		uint8_t ct[16];
+		memcpy(ct, b, 16);
+		aesDecBlock(rk, b);
+		for(int k = 0; k < 16; k++) b[k] ^= prev[k];
+		memcpy(out.data() + off - 16, b, 16);
+		memcpy(prev, ct, 16);
+	}
+	int pad = out.empty() ? 0 : out.back();
+	if(pad >= 1 && pad <= 16 && pad <= (int)out.size())
+		out.resize(out.size() - pad);
+	return true;
+}
+
+static const uint8_t PDF_PAD[32] = {
+	0x28,0xBF,0x4E,0x5E,0x4E,0x75,0x8A,0x41,0x64,0x00,0x4E,0x56,0xFF,0xFA,0x01,0x08,
+	0x2E,0x2E,0x00,0xB6,0xD0,0x68,0x3E,0x80,0x2F,0x0C,0xA9,0xFE,0x64,0x53,0x69,0x7A };
+
+/* ===================== CCITT Group 4 (fax) decoder =====================
+   Scanned books store pages as 1-bit G4 images. Self-contained decoder
+   producing packed MSB-first rows (0 = white, 1 = black). */
+struct G4Bits {
+	const uint8_t* p;
+	int n, pos;
+	G4Bits(const uint8_t* p_, int n_) : p(p_), n(n_), pos(0) { }
+	int bit() {
+		if(pos >= n * 8) return -1;
+		int b = (p[pos >> 3] >> (7 - (pos & 7))) & 1;
+		pos++;
+		return b;
+	}
+	int peek(int k) {
+		if(pos + k > n * 8) return -1;
+		int v = 0;
+		for(int i = 0; i < k; i++) v = (v << 1) | ((p[(pos+i) >> 3] >> (7 - ((pos+i) & 7))) & 1);
+		return v;
+	}
+};
+struct G4Code { uint16_t code; uint8_t len; uint16_t val; };
+/* vertical mode: value = delta + 3; codes V0=1, VL1=010, VR1=011,
+   VL2=000010, VR2=000011, VL3=0000010, VR3=0000011 */
+static const G4Code G4_V[7] = {
+	{0x1,1,3},{0x2,3,2},{0x3,3,4},{0x2,6,1},{0x3,6,5},{0x2,7,0},{0x3,7,6}
+};
+static const G4Code G4_WT[64] = {
+	{0x35,8,0},{0x7,6,1},{0x7,4,2},{0x8,4,3},{0xB,4,4},{0xC,4,5},{0xE,4,6},{0xF,4,7},
+	{0x13,5,8},{0x14,5,9},{0x7,5,10},{0x8,5,11},{0x8,6,12},{0x3,6,13},{0x34,6,14},{0x35,6,15},
+	{0x2A,6,16},{0x2B,6,17},{0x27,7,18},{0xC,7,19},{0x8,7,20},{0x17,7,21},{0x3,7,22},{0x4,7,23},
+	{0x28,7,24},{0x2B,7,25},{0x13,7,26},{0x24,7,27},{0x18,7,28},{0x2,8,29},{0x3,8,30},{0x1A,8,31},
+	{0x1B,8,32},{0x12,8,33},{0x13,8,34},{0x14,8,35},{0x15,8,36},{0x16,8,37},{0x17,8,38},{0x28,8,39},
+	{0x29,8,40},{0x2A,8,41},{0x2B,8,42},{0x2C,8,43},{0x2D,8,44},{0x4,8,45},{0x5,8,46},{0xA,8,47},
+	{0xB,8,48},{0x52,8,49},{0x53,8,50},{0x54,8,51},{0x55,8,52},{0x24,8,53},{0x25,8,54},{0x58,8,55},
+	{0x59,8,56},{0x5A,8,57},{0x5B,8,58},{0x4A,8,59},{0x4B,8,60},{0x32,8,61},{0x33,8,62},{0x34,8,63}
+};
+static const G4Code G4_BT[64] = {
+	{0x37,10,0},{0x2,3,1},{0x3,2,2},{0x2,2,3},{0x3,3,4},{0x3,4,5},{0x2,4,6},{0x3,5,7},
+	{0x5,6,8},{0x4,6,9},{0x4,7,10},{0x5,7,11},{0x7,7,12},{0x4,8,13},{0x7,8,14},{0x18,9,15},
+	{0x17,10,16},{0x18,10,17},{0x8,10,18},{0x67,11,19},{0x68,11,20},{0x6C,11,21},{0x37,11,22},{0x28,11,23},
+	{0x17,11,24},{0x18,11,25},{0xCA,12,26},{0xCB,12,27},{0xCC,12,28},{0xCD,12,29},{0x68,12,30},{0x69,12,31},
+	{0x6A,12,32},{0x6B,12,33},{0xD2,12,34},{0xD3,12,35},{0xD4,12,36},{0xD5,12,37},{0xD6,12,38},{0xD7,12,39},
+	{0x6C,12,40},{0x6D,12,41},{0xDA,12,42},{0xDB,12,43},{0x54,12,44},{0x55,12,45},{0x56,12,46},{0x57,12,47},
+	{0x64,12,48},{0x65,12,49},{0x52,12,50},{0x53,12,51},{0x24,12,52},{0x37,12,53},{0x38,12,54},{0x27,12,55},
+	{0x28,12,56},{0x58,12,57},{0x59,12,58},{0x2B,12,59},{0x2C,12,60},{0x5A,12,61},{0x66,12,62},{0x67,12,63}
+};
+static const G4Code G4_WM[40] = {
+	{0x1B,5,64},{0x12,5,128},{0x17,6,192},{0x37,7,256},{0x36,8,320},{0x37,8,384},{0x64,8,448},{0x65,8,512},
+	{0x68,8,576},{0x67,8,640},{0xCC,9,704},{0xCD,9,768},{0xD2,9,832},{0xD3,9,896},{0xD4,9,960},{0xD5,9,1024},
+	{0xD6,9,1088},{0xD7,9,1152},{0xD8,9,1216},{0xD9,9,1280},{0xDA,9,1344},{0xDB,9,1408},{0x98,9,1472},{0x99,9,1536},
+	{0x9A,9,1600},{0x18,6,1664},{0x9B,9,1728},{0x8,11,1792},{0xC,11,1856},{0xD,11,1920},{0x12,12,1984},{0x13,12,2048},
+	{0x14,12,2112},{0x15,12,2176},{0x16,12,2240},{0x17,12,2304},{0x1C,12,2368},{0x1D,12,2432},{0x1E,12,2496},{0x1F,12,2560}
+};
+static const G4Code G4_BM[40] = {
+	{0xF,10,64},{0xC8,12,128},{0xC9,12,192},{0x5B,12,256},{0x33,12,320},{0x34,12,384},{0x35,12,448},{0x6C,13,512},
+	{0x6D,13,576},{0x4A,13,640},{0x4B,13,704},{0x4C,13,768},{0x4D,13,832},{0x72,13,896},{0x73,13,960},{0x74,13,1024},
+	{0x75,13,1088},{0x76,13,1152},{0x77,13,1216},{0x52,13,1280},{0x53,13,1344},{0x54,13,1408},{0x55,13,1472},{0x5A,13,1536},
+	{0x5B,13,1600},{0x64,13,1664},{0x65,13,1728},{0x8,11,1792},{0xC,11,1856},{0xD,11,1920},{0x12,12,1984},{0x13,12,2048},
+	{0x14,12,2112},{0x15,12,2176},{0x16,12,2240},{0x17,12,2304},{0x1C,12,2368},{0x1D,12,2432},{0x1E,12,2496},{0x1F,12,2560}
+};
+static int g4Run(G4Bits& br, const G4Code* term, const G4Code* makeup) {
+	int total = 0;
+	for(;;) {
+		int run = -1;
+		for(int k = 2; k <= 13 && run < 0; k++) {
+			int v = br.peek(k);
+			if(v < 0) return -1;
+			for(int i = 0; i < 64; i++)
+				if(term[i].len == k && term[i].code == v) { run = term[i].val; br.pos += k; break; }
+			if(run < 0)
+				for(int i = 0; i < 40; i++)
+					if(makeup[i].len == k && makeup[i].code == v) { run = makeup[i].val; br.pos += k; break; }
+		}
+		if(run < 0) return -1;
+		total += run;
+		if(run < 64) return total;
+		if(total > 100000) return -1;
+	}
+}
+static bool ccittG4Decode(const uint8_t* in, int n, int w, int h,
+		bool blackIs1, vector<uint8_t>& out) {
+#ifdef G4_DEBUG
+#define G4FAIL(msg) do { fprintf(stderr, "G4 fail y=%d a0=%d color=%d bitpos=%d: %s\n", y, a0, color, br.pos, msg); return false; } while(0)
+#else
+#define G4FAIL(msg) return false
+#endif
+	if(w <= 0 || h <= 0 || w > 8192 || h > 8192) return false;
+	int stride = (w + 7) / 8;
+	out.assign((size_t)stride * h, 0);
+	G4Bits br(in, n);
+	vector<int> ref, cur;
+	/* imaginary b->w change at w; real changes alternate w->b first, so
+	   the trailing sentinel must keep odd-index = b->w parity */
+	ref.push_back(w);
+	for(int y = 0; y < h; y++) {
+		cur.clear();
+		int a0 = -1, color = 0;
+		uint8_t* row = out.data() + (size_t)y * stride;
+		for(int guard = 0; guard < w * 4 + 64; guard++) {
+			/* b1: first ref change of the current colour right of a0;
+			   b2: the next one after b1 */
+			size_t bi = 0;
+			while(bi < ref.size() && ref[bi] <= a0) bi++;
+			/* changes alternate w->b (even index), b->w (odd index);
+			   b1 must be a change to the colour opposite to a0's */
+			if(color == 0 && bi < ref.size() && (bi & 1) == 1) bi++;
+			if(color == 1 && bi < ref.size() && (bi & 1) == 0) bi++;
+			int b1 = (bi < ref.size()) ? ref[bi] : w;
+			int b2 = (bi + 1 < ref.size()) ? ref[bi+1] : w;
+			if(br.peek(1) < 0) G4FAIL("eof");
+			/* mode codes: V0=1 VR1=011 VL1=010 H=001 P=0001,
+			   V2/V3 are 6/7 bits */
+			int d = 0;
+			bool vert = false;
+			for(int i = 0; i < 7 && !vert; i++)
+				if(br.peek(G4_V[i].len) == G4_V[i].code) {
+					d = G4_V[i].val - 3;
+					br.pos += G4_V[i].len;
+					vert = true;
+				}
+			if(vert) {
+				int a1 = b1 + d;
+				if(a1 > w) a1 = w;
+				if(a1 < 0 || a1 < a0) G4FAIL("vrange");
+				if(color == 1)
+					for(int x = (a0 < 0 ? 0 : a0); x < a1; x++)
+						row[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
+				if(a1 < w) cur.push_back(a1);
+				a0 = a1;
+				color ^= 1;
+			}
+			else {
+				if(br.peek(4) == 1) { /* pass */
+					br.pos += 4;
+					if(color == 1)
+						for(int x = (a0 < 0 ? 0 : a0); x < b2; x++)
+							row[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
+					a0 = b2;
+				}
+				else if(br.peek(3) == 1) { /* horizontal */
+					br.pos += 3;
+					int r1 = g4Run(br, color ? G4_BT : G4_WT, color ? G4_BM : G4_WM);
+					int r2 = g4Run(br, color ? G4_WT : G4_BT, color ? G4_WM : G4_BM);
+					if(r1 < 0 || r2 < 0) G4FAIL("hrun");
+					int a1 = (a0 < 0 ? 0 : a0) + r1;
+					int a2 = a1 + r2;
+					if(a1 > w || a2 > w) G4FAIL("hrange");
+					{
+						/* the black run is the first one only when a0 is black */
+						int x0 = color ? (a0 < 0 ? 0 : a0) : a1;
+						int x1 = color ? a1 : a2;
+						for(int x = x0; x < x1; x++)
+							row[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
+					}
+					if(a1 < w) cur.push_back(a1);
+					if(a2 < w) cur.push_back(a2);
+					a0 = a2;
+				}
+				else G4FAIL("mode");
+			}
+			if(a0 >= w) break;
+		}
+		if(a0 < w && color == 1)
+			for(int x = (a0 < 0 ? 0 : a0); x < w; x++)
+				row[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
+		if(blackIs1)
+			for(int k = 0; k < stride; k++) row[k] = (uint8_t)~row[k];
+		ref.swap(cur);
+		ref.push_back(w);
+	}
+#undef G4FAIL
+	return true;
+}
+
 /* ============================== document ============================== */
 struct XE {
 	int type;   /* 0 free, 1 plain, 2 in objstm */
@@ -398,8 +793,16 @@ struct PdfDoc {
 	Obj trailer;
 	vector<Obj> pages;
 	bool encrypted;
+	/* standard security handler state (empty user password) */
+	bool decOn;
+	bool decAes;      /* AESV2 vs RC4 */
+	int keyLen;
+	uint8_t key[16];
+	int encNum;       /* Encrypt dict object: its strings stay plaintext */
+	int saltMode;     /* object-key variant: -1 unknown, 0 standard, 1 "sAlT" */
 
-	PdfDoc() : buf(NULL), size(0), encrypted(false) { trailer.t = O_DICT; }
+	PdfDoc() : buf(NULL), size(0), encrypted(false), decOn(false),
+		decAes(false), keyLen(0), encNum(-1), saltMode(-1) { trailer.t = O_DICT; }
 
 	Obj resolve(const Obj& o, int depth = 0) {
 		if(o.t != O_REF || depth > 32) return o;
@@ -418,6 +821,8 @@ struct PdfDoc {
 			lx.number(); lx.skip(); lx.number(); lx.skip();
 			if(!lx.kw("obj")) { objs[num] = o; return o; }
 			o = lx.parse(0);
+			o.onum = num; o.ogen = xe->second.gen;
+			if(decOn && num != encNum) decryptStrings(o, num, xe->second.gen);
 			lx.skip();
 			if(lx.kw("stream")) {
 				if(lx.p < size && buf[lx.p] == 13) lx.p++;
@@ -470,9 +875,7 @@ struct PdfDoc {
 		return o;
 	}
 
-	bool decode(const Obj& stm, vector<uint8_t>& out) {
-		if(stm.t != O_STREAM || stm.raw == NULL) return false;
-		out.assign((uint8_t*)stm.raw, (uint8_t*)stm.raw + stm.rawLen);
+	bool applyFilters(const Obj& stm, vector<uint8_t>& out) {
 		const Obj* filter = stm.get("Filter");
 		const Obj* parms = stm.get("DecodeParms");
 		if(parms == NULL) parms = stm.get("DP");
@@ -512,11 +915,58 @@ struct PdfDoc {
 				/* keep compressed bytes; image path decodes them */
 				return true;
 			}
+			else if(fn == "CCITTFaxDecode" || fn == "CCF") {
+				int k = (int)pm.getNum("K", 0);
+				if(k >= 0) return false; /* G3 1-D/2-D: rare, unsupported */
+				int cols = (int)pm.getNum("Columns", 1728);
+				int rows = (int)pm.getNum("Rows", 0);
+				bool blackIs1 = pm.getNum("BlackIs1", 0) != 0;
+				if(rows <= 0) rows = (int)stm.getNum("Height", 0);
+				ok = ccittG4Decode(out.data(), (int)out.size(), cols, rows,
+						blackIs1, next);
+			}
 			else return false; /* unsupported filter */
 			if(!ok) return false;
 			out.swap(next);
 		}
 		return true;
+	}
+
+	/* true when the stream's first filter can tell plaintext from garbage
+	   (image data such as DCT "decodes" from anything) */
+	bool filtersVerify(const Obj& stm) {
+		const Obj* f = stm.get("Filter");
+		if(f == NULL) return false;
+		Obj r = resolve(*f);
+		if(r.t == O_ARR && !r.a.empty()) r = resolve(r.a[0]);
+		return r.t == O_NAME && (r.s == "FlateDecode" || r.s == "Fl");
+	}
+
+	bool decode(const Obj& stm, vector<uint8_t>& out) {
+		if(stm.t != O_STREAM || stm.raw == NULL) return false;
+		out.assign((uint8_t*)stm.raw, (uint8_t*)stm.raw + stm.rawLen);
+		if(decOn && stm.onum != encNum) {
+			/* some tools declare AESV2 but encrypt with the AESV3 "sAlT"
+			   object-key derivation; retry the salted key like qpdf does.
+			   The variant is document-wide: learn it from the first stream
+			   that verifies, then use it first for everything else */
+			bool verify = filtersVerify(stm);
+			for(int pass = 0; pass < 2; pass++) {
+				bool salt = (saltMode == 1) != (pass == 1);
+				if(salt && !decAes) continue;
+				vector<uint8_t> plain;
+				if(!decryptData(stm.onum, stm.ogen, out, plain, salt)) continue;
+				if(applyFilters(stm, plain)) {
+					if(verify) saltMode = salt ? 1 : 0;
+					out.swap(plain);
+					return true;
+				}
+			}
+			/* some re-saved PDFs mix encrypted and plaintext objects;
+			   fall back to the raw bytes when decryption yields garbage */
+			out.assign((uint8_t*)stm.raw, (uint8_t*)stm.raw + stm.rawLen);
+		}
+		return applyFilters(stm, out);
 	}
 
 	int64_t readBE(const uint8_t* p, int w) {
@@ -525,11 +975,143 @@ struct PdfDoc {
 		return v;
 	}
 
+	/* ---- standard security handler, empty user password ---- */
+	void objKey(int num, int gen, uint8_t ok[16], int& okn, bool salt) {
+		uint8_t tmp[36];
+		memcpy(tmp, key, keyLen);
+		tmp[keyLen]   = (uint8_t)(num & 0xff);
+		tmp[keyLen+1] = (uint8_t)((num >> 8) & 0xff);
+		tmp[keyLen+2] = (uint8_t)((num >> 16) & 0xff);
+		tmp[keyLen+3] = (uint8_t)(gen & 0xff);
+		tmp[keyLen+4] = (uint8_t)((gen >> 8) & 0xff);
+		int n = keyLen + 5;
+		if(salt) {
+			memcpy(tmp + n, "sAlT", 4);
+			n += 4;
+		}
+		uint8_t h[16];
+		md5Buf(tmp, n, h);
+		okn = keyLen + 5;
+		if(okn > 16) okn = 16;
+		if(decAes) okn = 16;
+		memcpy(ok, h, okn);
+	}
+
+	bool decryptData(int num, int gen, const vector<uint8_t>& in,
+			vector<uint8_t>& out, bool salt = false) {
+		uint8_t ok[16]; int okn;
+		objKey(num, gen, ok, okn, salt);
+		if(decAes)
+			return aesCbcDecrypt(ok, in.data(), (int)in.size(), out);
+		out = in;
+		if(!out.empty())
+			rc4Crypt(ok, okn, out.data(), (int)out.size());
+		return true;
+	}
+
+	void decryptStrings(Obj& o, int num, int gen) {
+		if(o.t == O_STR) {
+			vector<uint8_t> in(o.s.begin(), o.s.end()), out;
+			if(decryptData(num, gen, in, out)) {
+				string ns(out.empty() ? "" : (const char*)out.data(), out.size());
+				o.s = ns;
+			}
+		}
+		for(size_t i = 0; i < o.a.size(); i++) decryptStrings(o.a[i], num, gen);
+		for(size_t i = 0; i < o.d.size(); i++) decryptStrings(o.d[i].second, num, gen);
+	}
+
+	/* locate "num gen obj" by linear scan: needed when the xref itself is
+	   an encrypted stream, so pass 1 has no entries to resolve through */
+	Obj scanObj(int num) {
+		Obj o;
+		char pfx[24];
+		int pn = snprintf(pfx, sizeof(pfx), "%d ", num);
+		for(int i = 0; i + pn + 8 < size; i++) {
+			if(buf[i] != (uint8_t)pfx[0]) continue;
+			if(memcmp(buf + i, pfx, pn) != 0) continue;
+			if(i > 0 && !ws(buf[i-1]) && buf[i-1] != '>') continue;
+			Lex lx(buf, size, i);
+			lx.number(); lx.skip();
+			Obj g = lx.number(); lx.skip();
+			if(!lx.kw("obj")) continue;
+			o = lx.parse(0);
+			o.onum = num; o.ogen = (int)g.i;
+			return o;
+		}
+		return o;
+	}
+
+	bool setupKey(const Obj& enc, const string& id0) {
+		if(enc.getName("Filter") != "Standard") return false;
+		int R = (int)enc.getNum("R", 0);
+		int V = (int)enc.getNum("V", 0);
+		if(R < 2 || R > 4 || (V != 1 && V != 2 && V != 4)) return false;
+		string O = enc.getStr("O"), U = enc.getStr("U");
+		if(O.size() < 32 || U.size() < 32) return false;
+		int32_t P = (int32_t)enc.getNum("P", 0);
+		keyLen = (R == 2) ? 5 : (int)enc.getNum("Length", 40)/8;
+		if(keyLen < 5 || keyLen > 16) return false;
+		decAes = false;
+		if(V == 4) {
+			const Obj* cf = enc.get("CF");
+			const Obj* sf = enc.get("StmF");
+			string cfn = (sf != NULL && sf->t == O_NAME) ? sf->s : "";
+			if(cf != NULL && cf->t == O_DICT) {
+				const Obj* e = cf->get(cfn.c_str());
+				if(e != NULL && e->t == O_DICT) {
+					string cfm = e->getName("CFM");
+					if(cfm == "AESV2") decAes = true;
+					else if(cfm != "V2" && cfm != "None") return false;
+				}
+			}
+		}
+		/* algorithm 2: file key from the empty user password */
+		uint8_t pad[128];
+		int pn = 0;
+		memcpy(pad + pn, PDF_PAD, 32); pn += 32;
+		memcpy(pad + pn, O.data(), 32); pn += 32;
+		pad[pn++] = (uint8_t)(P & 0xff);
+		pad[pn++] = (uint8_t)((P >> 8) & 0xff);
+		pad[pn++] = (uint8_t)((P >> 16) & 0xff);
+		pad[pn++] = (uint8_t)((P >> 24) & 0xff);
+		memcpy(pad + pn, id0.data(), id0.size()); pn += (int)id0.size();
+		uint8_t h[16];
+		md5Buf(pad, pn, h);
+		if(R >= 3) {
+			for(int i = 0; i < 50; i++) md5Buf(h, keyLen, h);
+		}
+		memcpy(key, h, keyLen);
+		/* algorithm 5 (R>=3) / 4 (R2): verify the empty password against U */
+		Md5 m;
+		m.update(PDF_PAD, 32);
+		m.update((const uint8_t*)id0.data(), (int)id0.size());
+		uint8_t uh[16];
+		m.final(uh);
+		uint8_t u[32];
+		if(R == 2) {
+			memcpy(u, uh, 16);
+			rc4Crypt(key, keyLen, u, 16);
+			return memcmp(u, U.data(), 16) == 0;
+		}
+		rc4Crypt(key, keyLen, uh, 16);
+		for(int i = 1; i <= 19; i++) {
+			uint8_t k2[16];
+			for(int k = 0; k < keyLen; k++) k2[k] = key[k] ^ (uint8_t)i;
+			rc4Crypt(k2, keyLen, uh, 16);
+		}
+		memcpy(u, uh, 16);
+		memset(u + 16, 0, 16);
+		return memcmp(u, U.data(), 16) == 0;
+	}
+
 	void loadXrefStream(int off, Obj& local) {
 		Lex lx(buf, size, off);
-		lx.skip(); lx.number(); lx.skip(); lx.number(); lx.skip();
+		lx.skip();
+		Obj no = lx.number(); lx.skip(); lx.number(); lx.skip();
 		if(!lx.kw("obj")) return;
 		Obj o = lx.parse(0);
+		o.onum = (int)no.i; o.ogen = 0;
 		lx.skip();
 		if(!lx.kw("stream")) return;
 		if(lx.p < size && buf[lx.p] == 13) lx.p++;
@@ -684,7 +1266,27 @@ struct PdfDoc {
 		}
 		if(off < 0) return false;
 		loadXrefChain(off, 0);
-		if(trailer.get("Encrypt") != NULL) { encrypted = true; return false; }
+		const Obj* encRef = trailer.get("Encrypt");
+		if(encRef != NULL) {
+			encrypted = true;
+			/* pass 1 ran without crypto (the xref stream itself may be
+			   encrypted): derive the key from the plaintext trailer, then
+			   re-read the whole xref chain with decryption enabled */
+			Obj enc = resolve(*encRef);
+			if(enc.t != O_DICT && encRef->t == O_REF)
+				enc = scanObj((int)encRef->i); /* encrypted xref: no entries yet */
+			const Obj* id = trailer.get("ID");
+			string id0;
+			if(id != NULL && id->t == O_ARR && !id->a.empty() && id->a[0].t == O_STR)
+				id0 = id->a[0].s;
+			if(enc.t != O_DICT || !setupKey(enc, id0)) return false;
+			if(encRef->t == O_REF) encNum = (int)encRef->i;
+			xref.clear();
+			objs.clear();
+			trailer.d.clear();
+			decOn = true;
+			loadXrefChain(off, 0);
+		}
 		const Obj* rootRef = trailer.get("Root");
 		if(rootRef == NULL) return false;
 		Obj root = resolve(*rootRef);
@@ -1745,6 +2347,8 @@ struct Render {
 static bool isImageFilter(const Obj& dict) {
 	const Obj* f = dict.get("Filter");
 	if(f == NULL) return false;
+	/* CCITT is decoded to raw 1-bit samples by applyFilters, so it takes
+	   the generic sample path, not the jpeg path */
 	if(f->t == O_NAME) return f->s == "DCTDecode" || f->s == "JPXDecode";
 	if(f->t == O_ARR) {
 		for(size_t i = 0; i < f->a.size(); i++)
@@ -2251,12 +2855,22 @@ PdfBook::~PdfBook() {
 
 bool PdfBook::open() {
 	_p->data = vfs_readfile(_fname.c_str(), &_p->size);
-	if(_p->data == NULL)
+	if(_p->data == NULL) {
+		printf("ereader: read failed: %s\n", _fname.c_str());
 		return false;
+	}
 	_p->fc.sysFont = font_new("system-cn", true);
-	if(_p->fc.sysFont == NULL)
+	if(_p->fc.sysFont == NULL) {
+		printf("ereader: no system font\n");
 		return false;
+	}
 	_p->ok = _p->doc.load(_p->data, _p->size);
+	if(!_p->ok) {
+		printf("ereader: pdf parse failed: %s\n", _fname.c_str());
+		/* nothing will ever be rendered: do not sit on the whole file */
+		free(_p->data);
+		_p->data = NULL;
+	}
 	_p->count = _p->ok ? (int)_p->doc.pages.size() : 0;
 	return _p->ok;
 }
