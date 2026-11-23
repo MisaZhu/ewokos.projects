@@ -920,22 +920,20 @@ static void *tcp_recv_func(void *arg)
 		t->thread_done = true;
 		return NULL;
 	}
-	t->connected = true;
 	/* Guest data queued before connect() finished (e.g. the HTTP GET in
-	 * the ACK that completed the guest-side handshake): forward it now.
-	 * write() happens with the lock dropped; it travels through netd's
-	 * write_state worker and may take a while.                        */
+	 * the ACK that completed the guest-side handshake): flush it to the
+	 * socket now, then CLEAR sbuf -- it is the server->guest send buffer
+	 * and must not retain guest bytes, or tcp_pump_locked would echo them
+	 * back to the guest.  The lock is held across the flush so no
+	 * post-connect guest data can reorder ahead of these buffered bytes;
+	 * connected is set only after sbuf is empty.                      */
 	int boot_len = t->s_tail_off - t->s_una_off;
-	uint8_t boot_buf[2048];
-	if (boot_len > 0 && boot_len <= (int)sizeof(boot_buf))
-		memcpy(boot_buf, t->sbuf + t->s_una_off, boot_len);
 	int fd = t->fd;
-	pthread_mutex_unlock(&t->lock);
 	if (boot_len > 0 && fd >= 0)
-		write(fd, boot_buf, boot_len);
-	pthread_mutex_lock(&t->lock);
+		write(fd, t->sbuf + t->s_una_off, boot_len);
+	t->s_una_off = t->s_nxt_off = t->s_tail_off = 0;
+	t->connected = true;
 	if (!t->active) {
-		fd = t->fd;
 		t->fd = -1;
 		pthread_mutex_unlock(&t->lock);
 		if (fd >= 0)
@@ -1151,28 +1149,27 @@ static void forward_tcp(const uint8_t *ip_pkt, int ip_len)
 	    (int32_t)(ack - (t->our_isn + 1)) == 0)
 		t->state = TCP_ESTABLISHED;
 
-	/* Guest data -> real socket.
-	 * Queue into sbuf even while connect() is still in flight: the
-	 * guest's ACK+GET commonly beats our real connect() completion, and
-	 * dropping it (while ACKing the guest) leaves the server silent
-	 * forever. tcp_recv_func drains sbuf to the socket after connect.
-	 * write() itself is issued with the session lock held -- it goes
-	 * through netd's write_state slot so it does not collide with the
-	 * recv thread's armed recv(), and the lock keeps sbuf stable.    */
+	/* Guest data -> real socket.  sbuf is the SERVER->guest send buffer
+	 * (filled by the recv thread, drained by tcp_pump_locked); guest bytes
+	 * must never land in it or they get echoed back to the guest.  Once
+	 * connected, write the payload straight to the socket.  While connect()
+	 * is still in flight, buffer it in sbuf for the boot flush in
+	 * tcp_recv_func (the guest's ACK+GET commonly beats our real connect()
+	 * completion; dropping it leaves the server silent forever).
+	 * write() is issued with the session lock held -- it goes through
+	 * netd's write_state slot so it does not collide with the recv
+	 * thread's armed recv().                                          */
 	int wr_len = 0;
-	uint8_t wr_buf[1520];
+	const uint8_t *wr_ptr = NULL;
 	if (plen > 0) {
 		if ((int32_t)(seq - t->rcv_nxt) == 0) {
 			t->rcv_nxt += plen;
-			if (t->s_tail_off + plen <= (int)sizeof(t->sbuf)) {
+			if (t->connected) {
+				wr_ptr = payload;
+				wr_len = plen;
+			} else if (t->s_tail_off + plen <= (int)sizeof(t->sbuf)) {
 				memcpy(t->sbuf + t->s_tail_off, payload, plen);
 				t->s_tail_off += plen;
-			}
-			if (t->connected) {
-				wr_len = t->s_tail_off - t->s_una_off;
-				if (wr_len > (int)sizeof(wr_buf))
-					wr_len = sizeof(wr_buf);
-				memcpy(wr_buf, t->sbuf + t->s_una_off, wr_len);
 			}
 		}
 		emit_tcp(t, TH_ACK, NULL, 0, t->snd_nxt);
@@ -1195,10 +1192,10 @@ static void forward_tcp(const uint8_t *ip_pkt, int ip_len)
 		}
 	}
 
-	/* Write queued guest->server bytes on the real socket.  fd is -1
-	 * once the recv thread has torn the session down.               */
+	/* Write guest->server bytes on the real socket.  fd is -1 once the
+	 * recv thread has torn the session down.                        */
 	if (wr_len > 0 && t->fd >= 0)
-		write(t->fd, wr_buf, wr_len);
+		write(t->fd, wr_ptr, wr_len);
 
 	pthread_mutex_unlock(&t->lock);
 }
