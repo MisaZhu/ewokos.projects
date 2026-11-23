@@ -223,6 +223,22 @@ void Preloader::loop() {
 		}
 
 		if(!haveJob) {
+			/* no page wanted: paginate towards EOF in small chunks so the
+			   total count settles; jobs preempt at every chunk boundary */
+			if(_book != NULL && _opened) {
+				Book* b = _book;
+				int pc0 = b->pageCount();
+				pthread_mutex_unlock(&_mtx);
+				bool more = b->layoutIdle();
+				pthread_mutex_lock(&_mtx);
+				if(_book != b)
+					continue;
+				if(more) {
+					if(b->pageCount() != pc0)
+						_cacheGen++;
+					continue;
+				}
+			}
 			pthread_cond_wait(&_cond, &_mtx);
 			continue;
 		}
@@ -244,18 +260,17 @@ void Preloader::loop() {
 
 void Preloader::setBook(Book* b) {
 	pthread_mutex_lock(&_mtx);
+	/* let a long render on the outgoing book bail out at its next check */
+	if(_book != NULL)
+		_book->abort();
+	if(_pending != NULL)
+		delete _pending; /* superseded hand-off never taken by the worker */
 	_pending = b;
 	if(b == NULL)
 		_closeReq = true;
 	_gen++;
 	_want.clear();
 	pthread_cond_signal(&_cond);
-	/* wait until the worker took the hand-off (it may be mid-render) */
-	while(_running && (_pending != NULL || _closeReq)) {
-		pthread_mutex_unlock(&_mtx);
-		usleep(2000);
-		pthread_mutex_lock(&_mtx);
-	}
 	pthread_mutex_unlock(&_mtx);
 }
 

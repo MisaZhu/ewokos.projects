@@ -23,6 +23,7 @@ TxtBook::TxtBook(const string& fname) {
 	_spaceW = 0;
 	_lineH = 0;
 	_pad = 0;
+	_abort = false;
 }
 
 TxtBook::~TxtBook() {
@@ -46,6 +47,21 @@ bool TxtBook::open() {
 	return true;
 }
 
+/* Full-width glyphs (CJK ideographs, kana, hangul, fullwidth forms...)
+   advance exactly one em in system-cn. Measuring them through fontd costs
+   one IPC round trip per character on real hardware, which made whole-book
+   pagination take minutes; the width is known without asking. */
+static bool isWideCp(uint32_t cp) {
+	return (cp >= 0x1100 && cp <= 0x115F) ||
+		(cp >= 0x2E80 && cp <= 0xA4CF) ||
+		(cp >= 0xAC00 && cp <= 0xD7A3) ||
+		(cp >= 0xF900 && cp <= 0xFAFF) ||
+		(cp >= 0xFE30 && cp <= 0xFE4F) ||
+		(cp >= 0xFF01 && cp <= 0xFF60) ||
+		(cp >= 0xFFE0 && cp <= 0xFFE6) ||
+		(cp >= 0x20000 && cp <= 0x3FFFD);
+}
+
 int TxtBook::width(uint32_t cp) {
 	if(_widthFont != _fontSize) {
 		_widths.clear();
@@ -54,6 +70,8 @@ int TxtBook::width(uint32_t cp) {
 		font_char_size(' ', _font, _fontSize, &w, &h);
 		_spaceW = (w > 0) ? (int)w : _fontSize/2;
 	}
+	if(isWideCp(cp))
+		return _fontSize;
 	unordered_map<uint32_t,int>::iterator it = _widths.find(cp);
 	if(it != _widths.end())
 		return it->second;
@@ -124,7 +142,7 @@ int TxtBook::layoutUpTo(int idx, int w, int h) {
 		return (int)_pages.size();
 	}
 
-	while(!_eof && (int)_pages.size() <= idx) {
+	while(!_abort && !_eof && (int)_pages.size() <= idx) {
 		Page page;
 		int y = 0;
 		bool lineOpen = false;
@@ -137,6 +155,8 @@ int TxtBook::layoutUpTo(int idx, int w, int h) {
 		int indentW = 0;
 
 		while(true) {
+			if(_abort)
+				return (int)_pages.size();
 			if(_laidTo >= _cps.size()) {
 				_eof = true;
 				if(lineOpen && cur.count > 0)
@@ -264,6 +284,8 @@ int TxtBook::layoutUpTo(int idx, int w, int h) {
 void TxtBook::drawLine(graph_t* g, const Line& ln, int x, int y, uint32_t ink) {
 	int cx = x + (ln.indent ? _fontSize*2 : 0);
 	for(uint32_t i = 0; i < ln.count; i++) {
+		if(_abort)
+			return;
 		uint32_t cp = _cps[ln.start + i];
 		uint32_t w = 0;
 		graph_draw_unicode_font(g, cx, y, cp, _font, _fontSize, ink, &w, NULL);
@@ -286,7 +308,7 @@ graph_t* TxtBook::renderPage(int idx, int w, int h, uint32_t ink) {
 	/* keep paginating ahead so the total count settles in background */
 	if(!_eof)
 		layoutUpTo(idx + 24, w, h);
-	if(idx < 0 || idx >= (int)_pages.size()) {
+	if(_abort || idx < 0 || idx >= (int)_pages.size()) {
 		pthread_mutex_unlock(&_mtx);
 		return NULL;
 	}
@@ -309,6 +331,25 @@ graph_t* TxtBook::renderPage(int idx, int w, int h, uint32_t ink) {
 	}
 	pthread_mutex_unlock(&_mtx);
 	return g;
+}
+
+void TxtBook::abort() {
+	_abort = true;
+}
+
+/* paginate a chunk towards EOF while the worker has no page job, so the
+   total page count settles without the user having to turn every page */
+bool TxtBook::layoutIdle() {
+	pthread_mutex_lock(&_mtx);
+	if(_abort || _eof || _font == NULL || _layoutW <= 0) {
+		pthread_mutex_unlock(&_mtx);
+		return false;
+	}
+	size_t n0 = _pages.size();
+	layoutUpTo((int)_pages.size() + 8, _layoutW, _layoutH);
+	bool more = !_eof && _pages.size() > n0;
+	pthread_mutex_unlock(&_mtx);
+	return more;
 }
 
 }

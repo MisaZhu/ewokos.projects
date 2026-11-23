@@ -44,6 +44,7 @@ private:
 	int _spaceW;
 	int _lineH;
 	int _pad;
+	volatile bool _abort;              /* set when the book is replaced */
 
 	int  width(uint32_t cp);
 	void resetLayout();
@@ -62,6 +63,8 @@ public:
 	bool isTxt() { return true; }
 	void setFontSize(int px);
 	void setLineGap(int pct);
+	void abort();
+	bool layoutIdle();
 };
 
 }

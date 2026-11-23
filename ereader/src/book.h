@@ -20,6 +20,11 @@ public:
 	virtual bool isTxt() = 0;
 	virtual void setFontSize(int px) { (void)px; }
 	virtual void setLineGap(int pct) { (void)pct; }
+	/* ask a long render/layout to bail out (book is being replaced) */
+	virtual void abort() { }
+	/* background pagination chunk while no page job is pending;
+	   true when more work may remain (false = idle/done/not applicable) */
+	virtual bool layoutIdle() { return false; }
 };
 
 /* ---- rendered-page cache (LRU, refcounted while the UI blits) --------- */
@@ -96,7 +101,8 @@ public:
 	void stop();
 
 	/* hand a new book to the worker (NULL closes the current one).
-	   blocks until the worker picked it up, so the caller may forget it. */
+	   returns immediately: ownership transfers at once and a long render
+	   on the old book is aborted so the swap never stalls the UI. */
 	void setBook(Book* b);
 	bool bookReady();
 	int  pageCount();
