@@ -43,7 +43,7 @@
 
 static int win_width = 640;
 static int win_height = 480;
-/* Actual window (screen) size.  On backends that need stride alignment (q8b)
+/* Actual window (screen) size.  On backends that need stride alignment (qcom8gen3)
  * win_width/win_height track the aligned *render* size while these track the
  * window; the mouse arrives in window coords and is scaled into render space. */
 static int scr_width = 640;
@@ -924,7 +924,7 @@ static void render_frame(void)
     eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
     if (w > 0 && h > 0) { scr_width = w; scr_height = h; }
     /* Drive the GL viewport / projection from the render size so it matches the
-     * surface the engine actually renders into (== window size off q8b). */
+     * surface the engine actually renders into (== window size off qcom8gen3). */
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &rw);
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &rh);
     if (rw > 0 && rh > 0 && (rw != win_width || rh != win_height))

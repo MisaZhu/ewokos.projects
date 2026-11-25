@@ -67,7 +67,7 @@ extern "C" uint32_t v3d_mesa_debug;
 static int win_width  = 800;
 static int win_height = 600;
 /* Actual window (screen) size.  win_width/win_height track the render size
- * (stride-aligned on q8b); the mouse arrives in window pixels and is mapped
+ * (stride-aligned on qcom8gen3); the mouse arrives in window pixels and is mapped
  * into render space so the iMouse.xy / iResolution.xx remap stays consistent. */
 static int scr_width  = 800;
 static int scr_height = 600;
@@ -535,7 +535,7 @@ static void render_frame(void)
     eglQuerySurface(egl_dpy, egl_surf, EGL_HEIGHT, &h);
     if (w > 0 && h > 0) { scr_width = w; scr_height = h; }
     /* Drive glViewport / iResolution / DisplaySize from the render size so they
-     * match the surface the engine renders into (== window size off q8b). */
+     * match the surface the engine renders into (== window size off qcom8gen3). */
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &rw);
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &rh);
     if (rw > 0 && rh > 0 && (rw != win_width || rh != win_height)) {

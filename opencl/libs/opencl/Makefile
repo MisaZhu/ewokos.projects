@@ -17,7 +17,7 @@ CFLAGS += -I../../include -Isrc -Isrc/clc
 
 # Phase 2 GPU front-end gate.  The GPU device is compiled in ONLY on the OpenCL
 # GPU targets: PGL_G3D=yes AND a machine with a real bsp_cl compute back end
-# (raspi5's V3D CSD, q8b's Adreno 690 CS).  raspix exports PGL_G3D=yes but is
+# (raspi5's V3D CSD, qcom8gen3's Adreno 690 CS).  raspix exports PGL_G3D=yes but is
 # not an OpenCL GPU target yet, so the HW filter keeps it -- and virt -- on the
 # CPU-only Phase-1 build (matching libs/clclient's identical gate).  When gated on:
 #   - src/gpu is added and OPENCL_GPU_BACKEND is defined, so runtime.c registers

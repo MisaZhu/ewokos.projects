@@ -743,7 +743,7 @@ static void render_frame(void)
     float dt;
     int gpu;
 
-    /* Query the render size (stride-aligned on q8b, == window elsewhere) so
+    /* Query the render size (stride-aligned on qcom8gen3, == window elsewhere) so
      * glViewport / projection / DisplaySize match the engine back buffer. */
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &w);
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &h);

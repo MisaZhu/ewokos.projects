@@ -14,7 +14,7 @@ TASK_OBJS = $(ARCH)/$(TASK).o
 TASK_DIR = $(BUILD_DIR)/rootfs/bin
 OPENCL_LIB = $(BUILD_DIR)/lib/libOpenCL.a
 
-# Phase 2 GPU targets (raspi5 V3D CSD, q8b Adreno 690 CS): libOpenCL.a
+# Phase 2 GPU targets (raspi5 V3D CSD, qcom8gen3 Adreno 690 CS): libOpenCL.a
 # additionally folds in clclient + the on-device mesa compiler, so the command
 # must also link the g2d transport and the C++ runtime mesa needs (operator
 # new[]/delete[] + the STL from libewokstl, the cxa guards from libcxx).  Gated

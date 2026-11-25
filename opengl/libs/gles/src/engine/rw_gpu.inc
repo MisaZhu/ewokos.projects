@@ -151,7 +151,7 @@ static void rw_chunk_boxes_rebuild(size_t count)
 }
 
 /* A g2d compute dispatch is synchronous and has a fixed cache-clean/IRQ/IPC
- * cost.  Keep the cutoff tunable for board-side profiling.  On q8b the CPU
+ * cost.  Keep the cutoff tunable for board-side profiling.  On qcom8gen3 the CPU
  * interpreter is more expensive than a GPU submit for the small world meshes
  * emitted by re3, so the default leaves only empty/degenerate draws on CPU;
  * PGL_RW_MIN_TRIS can override the cutoff (set it to 0 to force collection

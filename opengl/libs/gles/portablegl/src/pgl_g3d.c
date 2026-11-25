@@ -1648,7 +1648,7 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 			pgl_g3d_shader_patch_uniform(prog, _unif, PGL_G3D_MAX_UNIF,
 			                             "uScissor", sc, 4u);
 		}
-		/* Q8B pixel-owned raster kernels launch one workgroup per 16x16
+		/* QCOM8GEN3 pixel-owned raster kernels launch one workgroup per 16x16
 		   screen tile: a small fireworks burst covering a few hundred pixels
 		   would still touch every pixel of the framebuffer.  When the raster
 		   kernel declares uDispatchOffset (that route only), compute this

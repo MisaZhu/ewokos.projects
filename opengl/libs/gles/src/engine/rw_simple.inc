@@ -35,14 +35,14 @@
 #define RW_VS100_SKIN_LIGHT   0xe41775742826f20eULL
 #define RW_VS100_IM2D_BASE    0xd1f3e4386edf64e4ULL
 #define RW_VS100_IM2D_LIGHT   0x3b5d78c7a1adf88bULL
-/* Q8B's GLES2 shader builder emits a stable preamble/body pair for the
+/* QCOM8GEN3's GLES2 shader builder emits a stable preamble/body pair for the
  * default RenderWare, dynamic-light, and im2d programs.  These fingerprints
  * were captured from the board image and are kept as exact matches so those
  * high-volume shaders can use the native executor without enabling the broad
  * source-shape matcher for arbitrary effects. */
-#define RW_VS_Q8B_DEFAULT_BASE  0x236720f1bed55afaULL
-#define RW_VS_Q8B_DEFAULT_LIGHT 0xb9db3a51daf6750dULL
-#define RW_VS_Q8B_IM2D_BASE     0xdcfb9dc1dff632b6ULL
+#define RW_VS_QCOM8GEN3_DEFAULT_BASE  0x236720f1bed55afaULL
+#define RW_VS_QCOM8GEN3_DEFAULT_LIGHT 0xb9db3a51daf6750dULL
+#define RW_VS_QCOM8GEN3_IM2D_BASE     0xdcfb9dc1dff632b6ULL
 
 static int rw_native_uniform(const glsl_program *gp, const char *name)
 {
@@ -205,9 +205,9 @@ static void rw_native_vs_link(interp_entry *e)
     else if (h == RW_VS_SKIN_LIGHT || h == RW_VS100_SKIN_LIGHT) kind = 4, light = 1;
     else if (h == RW_VS_IM2D_BASE || h == RW_VS100_IM2D_BASE) kind = 5;
     else if (h == RW_VS_IM2D_LIGHT || h == RW_VS100_IM2D_LIGHT) kind = 5, light = 1;
-    else if (h == RW_VS_Q8B_DEFAULT_BASE) kind = 2;
-    else if (h == RW_VS_Q8B_DEFAULT_LIGHT) kind = 2, light = 1;
-    else if (h == RW_VS_Q8B_IM2D_BASE) kind = 5;
+    else if (h == RW_VS_QCOM8GEN3_DEFAULT_BASE) kind = 2;
+    else if (h == RW_VS_QCOM8GEN3_DEFAULT_LIGHT) kind = 2, light = 1;
+    else if (h == RW_VS_QCOM8GEN3_IM2D_BASE) kind = 5;
     if (!kind) {
         /* Source-shape matching was added for shader variants whose hash is
          * absent from the verified RenderWare family.  It is intentionally

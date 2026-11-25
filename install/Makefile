@@ -9,7 +9,7 @@ GUI_TASK = xinstall
 GUI_DIR = $(TARGET_DIR)/apps/$(GUI_TASK)
 GUI_TARGET = $(GUI_DIR)/$(GUI_TASK)
 
-# The installer links the machine BSP directly: the q8b backend drives the
+# The installer links the machine BSP directly: the qcom8gen3 backend drives the
 # SDCC2 card and the M.2 NVMe through the user-space drivers that
 # machines/qcom/8gen3/system/libs/bsp stages into $(SDK_DIR).  No filesystem daemon
 # is involved; every copy is raw-sector IO, same model as sdupdate/espwrite.
@@ -17,7 +17,7 @@ CORE_OBJS = $(ARCH)/src/gpt.o \
 	$(ARCH)/src/copy.o \
 	$(ARCH)/src/clone.o \
 	$(ARCH)/src/mach/mach.o \
-	$(ARCH)/src/mach/q8b.o
+	$(ARCH)/src/mach/qcom8gen3.o
 
 CLI_OBJS = $(ARCH)/src/main.o
 GUI_OBJS = $(ARCH)/gui/xinstall.o

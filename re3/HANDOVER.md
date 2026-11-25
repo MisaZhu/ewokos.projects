@@ -7,7 +7,7 @@
 
 ## 1. 项目概述
 
-将 reverse-engineered GTA III（re3，约 20 万行 C++）移植为 EwokOS 原生应用，部署到 q8b 板（radxa-dragon-q8b，Adreno A6xx GPU）。
+将 reverse-engineered GTA III（re3，约 20 万行 C++）移植为 EwokOS 原生应用，部署到 qcom8gen3 板（radxa-dragon-qcom8gen3，Adreno A6xx GPU）。
 
 - 源码：`/Users/tony/work/re3`（上游），移植树在 `EwokOS/projects/re3`
 - 渲染：librw gl3 后端 → EwokOS GLES2/EGL → portablegl 引擎（CPU 解释器 / Adreno GPU compute 路线）
@@ -34,35 +34,35 @@
 | 文件 | 作用 |
 |---|---|
 | `projects/opengl/libs/gles/src/engine/rw_gpu.inc` | **re3 专用 Adreno GPU 路线**（详见 §4.3），当前 bug 所在 |
-| `projects/opengl/libs/gles/src/engine/pgl_engine.c` | portablegl 适配器：GPU 分类（gpu_link）/分发/纹理槽/coalesce；`gles_engine_gpu_link` 是 GLSL→GPU 的桥（q8b 上全部 decline） |
+| `projects/opengl/libs/gles/src/engine/pgl_engine.c` | portablegl 适配器：GPU 分类（gpu_link）/分发/纹理槽/coalesce；`gles_engine_gpu_link` 是 GLSL→GPU 的桥（qcom8gen3 上全部 decline） |
 | `projects/opengl/libs/gles/src/engine/rw_simple.inc` | CPU 快速路径：对 librw FS 做**逐 token 精确匹配**（simple/matfx 两种契约），命中则替换解释执行 |
 | `projects/opengl/libs/gles/src/egl/egl_api.c` | `egl_on_repaint`：alpha 强制 0xFF（GL 客户端写 alpha=0 会让窗口透出桌面）——保留的修复，非调试代码 |
 | `projects/opengl/libs/gles/pglcompiler/include/rw_raster_cs.h` | Adreno 上的 RW 光栅 compute 内核（GLSL ES 310）+ rw_xform_cs |
 
 ## 3. 构建与部署
 
-### 3.1 构建（q8b 目标）
+### 3.1 构建（qcom8gen3 目标）
 
 ```bash
 cd /Users/tony/work/EwokOS
-export ARCH=aarch64 HW=q8b
+export ARCH=aarch64 HW=8gen3
 export PGL_G3D=yes
-export PGL_G3D_COMPILER_DIR=$PWD/machines/q8b/system/libs/adrenocompiler
+export PGL_G3D_COMPILER_DIR=$PWD/machines/qcom/8gen3/system/libs/adrenocompiler
 
 # 关键：翻转 PGL_G3D 后必须清对象（见下方“陈旧对象陷阱”）
 rm -rf projects/opengl/libs/gles/aarch64 projects/opengl/libs/gles/portablegl/aarch64
 make -C projects/opengl/libs/gles -j8     # 产出 libGLESv2.a + libEGL.a
-make -C projects/re3 -j8                  # 产出 system/build_aarch64/q8b/rootfs/apps/re3/re3
+make -C projects/re3 -j8                  # 产出 system/build_aarch64/8gen3/rootfs/apps/re3/re3
 ```
 
 **产物自检（按内容不按习惯）**：
-- `system/build_aarch64/q8b/lib/libGLESv2.a` ≈ **8.7MB**（含 mesa→Adreno 编译器合并），`nm` 应有 ~276 个 `T pglc_/ir3_` 定义
+- `system/build_aarch64/8gen3/lib/libGLESv2.a` ≈ **8.7MB**（含 mesa→Adreno 编译器合并），`nm` 应有 ~276 个 `T pglc_/ir3_` 定义
 - `re3` 二进制 ≈ **8.0MB**；`strings re3 | grep -c PGLGPU` 非零（当前含调试打印）
 - 若 libGLESv2.a ≈ 540KB / re3 ≈ 3.5MB ⇒ **PGL_G3D 没生效，GPU 代码完全没编进去**（链接仍会成功，因为 CPU 形状的引擎不引用编译器符号——务必按大小/符号校验）
 
 **⚠️ 陈旧对象陷阱（本次浪费数小时的根因）**：gles/portablegl 的对象目录只按 `$(ARCH)/$(HW)` 键控，**翻转 PGL_G3D 不会触发重编**，陈旧的 CPU 形状 `.o` 会被静默复用（症状：链接成功但 `pglGpuBegin`/`pglc_*` 未定义或缺失）。改标志必清 `gles/aarch64` 与 `gles/portablegl/aarch64`。
 
-**机器级构建**（`machines/q8b/system`）会通过其 make.inc 的 `export PGL_G3D=yes` 自动传播；从 projects 树单独构建时必须手工 export 上面两个变量（`projects/make.inc` 不包含机器 make.inc）。
+**机器级构建**（`machines/qcom/8gen3/system`）会通过其 make.inc 的 `export PGL_G3D=yes` 自动传播；从 projects 树单独构建时必须手工 export 上面两个变量（`projects/make.inc` 不包含机器 make.inc）。
 
 ### 3.2 部署（板子 root@192.168.8.50，密码 root）
 
@@ -85,7 +85,7 @@ rm /apps/re3/re3.tmp
 - 不支持 `VAR=val cmd` 环境变量前缀、无 `tail`/`mv`/`&&`；`ls -l 单个文件` 无输出（用 `ls 目录`）
 - 用**文件开关**代替环境变量（见 §6.3）
 
-## 4. 渲染架构（q8b 实际路径）
+## 4. 渲染架构（qcom8gen3 实际路径）
 
 ### 4.1 分层
 ```
@@ -96,7 +96,7 @@ re3/librw (GLSL shader 源)
       └─ GPU 路线（Adreno）：
           ├─ GLSL 程序编译 pglc_compile_glsl：**未移植**（decline，见 §6.1）
           ├─ 固定函数内核路线（pgl_g3d_batch_tri）：需要 gpu_bringup，
-          │   而 bringup 依赖“存在编译成功的 eligible 程序”→ q8b+re3 上**从未启用**
+          │   而 bringup 依赖“存在编译成功的 eligible 程序”→ qcom8gen3+re3 上**从未启用**
           └─ RW compute 路线（rw_gpu.inc）→ g2dd (ver==690) → rw_raster_cs  ← 唯一启用的 GPU 路线，**当前损坏**
 ```
 
@@ -125,7 +125,7 @@ re3/librw (GLSL shader 源)
 1. **Adreno 后端无图形管线**：`pglc_compile_glsl` 一律返回
    `the Adreno backend has no graphics pipeline port; use the compute route (pglc_compile_compute*)`
    —— re3 的 14 个 librw 程序全部静默回退 CPU。要真 GPU 加速全部程序，需给
-   `machines/q8b/system/libs/adrenocompiler` 移植图形管线（当前只有 compute）。
+   `machines/qcom/8gen3/system/libs/adrenocompiler` 移植图形管线（当前只有 compute）。
 2. **唯一启用的 GPU 路线（RW compute）会损坏渲染**，但提交全部 G2D_OK、无 MMU fault。
 3. **损坏在喂给 GPU 的顶点数据，不在内核数学**（板上实测统计）：
    - 第 1 批（正交 quad，不裁剪）：`x[0..640] y[0..480]` 正常
@@ -168,7 +168,7 @@ re3/librw (GLSL shader 源)
 
 ## 7. 快速验证清单（每次大改后）
 1. `gltest`（`/apps/gltest/gltest`）：应打印 `prog linked ok=1` + 每条 GLSL 的
-   `PGLGPU: compile declined …no graphics pipeline port…`（q8b 上的预期行为）
+   `PGLGPU: compile declined …no graphics pipeline port…`（qcom8gen3 上的预期行为）
 2. 启动 re3 → 在启动端输出中出现 `PGL RW GPU route adopted w=640 h=480` → 抓屏看渲染
 3. A/B：`cp /bin/ls /apps/rwoff` 后重启 re3 → 全 CPU 渲染应完全正确（基线）
 4. 抓屏对比：`/apps/screencap /tmp/g.png` → sftp get → 本机查看

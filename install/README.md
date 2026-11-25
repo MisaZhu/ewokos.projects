@@ -1,7 +1,7 @@
 # install — 将 EwokOS 安装到其他启动介质
 
 `install` 是一个用户态安装器:它把当前启动介质上的 EwokOS 完整克隆到另一块
-介质上(q8b 上即 SD 卡 → M.2 NVMe),安装后目标介质就是一块可引导的
+介质上(qcom8gen3 上即 SD 卡 → M.2 NVMe),安装后目标介质就是一块可引导的
 EwokOS 盘。包含两个前端:
 
 - **CLI** `/bin/install` — 控制台/SSH 使用;
@@ -9,7 +9,7 @@ EwokOS 盘。包含两个前端:
   克隆引擎。
 
 工具**自带设备驱动**:每个机型的后端直接链接该机型 BSP 库里的用户态驱动
-(q8b 为 SDCC2 SD 卡驱动 + NVMe 轮询驱动),不依赖系统中正在运行的
+(qcom8gen3 为 SDCC2 SD 卡驱动 + NVMe 轮询驱动),不依赖系统中正在运行的
 `sdfsd`/存储守护进程,所有读写都是裸扇区 IO——与 `sdupdate`/`espwrite`
 同一模型。
 
@@ -28,13 +28,13 @@ EwokOS 盘。包含两个前端:
 克隆结束后目标盘与源盘分区内容逐字节一致;目标盘更大的尾部空间保持空闲
 (不做 ext3 扩容)。
 
-## q8b:从 SD 卡安装到 NVMe
+## qcom8gen3:从 SD 卡安装到 NVMe
 
-q8b 的启动链:板载 EDK2 固件(SPI NOR)→ 启动介质 ESP 里的
+qcom8gen3 的启动链:板载 EDK2 固件(SPI NOR)→ 启动介质 ESP 里的
 `BOOTAA64.EFI` → 同卷 `KERNEL.BIN`(及可选 `ROOTFS.IMG`)→ 根文件系统
 (SD 上的 ext3 分区,或 ESP 里的 ROOTFS.IMG 内存盘)。固件在
 ExitBootServices 之前已完成 PCIe 控制器初始化和链路训练,因此用户态 NVMe
-驱动(`machines/q8b/system/libs/bsp/src/nvme.c`)只需遍历 ECAM、映射
+驱动(`machines/qcom/8gen3/system/libs/bsp/src/nvme.c`)只需遍历 ECAM、映射
 BAR0、跑轮询队列即可。
 
 安装后从 NVMe 启动:固件启动菜单(F12 / Boot Maintenance Manager →
@@ -104,8 +104,8 @@ reboot                  # 重要:见下
 后端依赖机型 BSP,只随对应 HW 构建:
 
 ```sh
-make -C projects install ARCH=aarch64 HW=q8b
-# 产物:machines/q8b SDK rootfs 的 /bin/install(CLI)
+make -C projects install ARCH=aarch64 HW=8gen3
+# 产物:machines/qcom/8gen3 SDK rootfs 的 /bin/install(CLI)
 #       与 rootfs 的 /apps/xinstall/xinstall(GUI)
 ```
 
@@ -135,7 +135,7 @@ projects/install/
 │   ├── clone.c              # 状态机 runner,GUI/CLI 共用
 │   └── mach/
 │       ├── mach.c           # 机型后端注册表
-│       └── q8b.c            # SD(libsd/SDCC2)+ NVMe(bsp/nvme.c)后端
+│       └── qcom8gen3.c            # SD(libsd/SDCC2)+ NVMe(bsp/nvme.c)后端
 └── gui/
     └── xinstall.cc          # widget++ 图形前端(信息/列表/进度/日志)
 ```

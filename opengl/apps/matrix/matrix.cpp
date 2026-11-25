@@ -1000,7 +1000,7 @@ static void render_frame(void) {
     EGLint w = 0, h = 0;
     int nquad = 0;
 
-    /* Query the render size (stride-aligned on q8b, == window elsewhere) so
+    /* Query the render size (stride-aligned on qcom8gen3, == window elsewhere) so
      * the ortho uMVP / glViewport / DisplaySize match the engine back
      * buffer. */
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &w);

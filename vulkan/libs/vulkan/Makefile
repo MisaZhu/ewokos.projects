@@ -17,7 +17,7 @@ CFLAGS += -I../../include -Isrc -Isrc/spirv
 
 # GPU back-end gate.  The GPU device is compiled in ONLY on the Vulkan GPU
 # targets: PGL_G3D=yes AND a machine with a real bsp_cl compute back end
-# (raspi5/raspix V3D CSD, q8b's Adreno 690 CS).  When gated on:
+# (raspi5/raspix V3D CSD, qcom8gen3's Adreno 690 CS).  When gated on:
 #   - src/gpu is added and VULKAN_GPU_BACKEND is defined, so runtime registers the
 #     GPU device (vk_gpu_probe/vk_gpu_device_init in src/gpu/gpu_device.c);
 #   - the private vkclient transport + the on-device mesa compiler archives that

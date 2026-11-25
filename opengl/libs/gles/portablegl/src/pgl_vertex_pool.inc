@@ -3,7 +3,7 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <errno.h>
-/* q8b has eight application cores. The calling render thread participates in
+/* qcom8gen3 has eight application cores. The calling render thread participates in
  * the vertex range, so eight total workers means seven persistent threads and
  * no idle application core during the vertex stage. PGL_VERTEX_THREADS can
  * lower this for CPU-only workloads. */

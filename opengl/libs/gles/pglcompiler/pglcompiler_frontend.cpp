@@ -303,7 +303,7 @@ init_context(struct gl_context *ctx, unsigned glsl_version, bool is_es,
    ctx->Const.Program[MESA_SHADER_COMPUTE].MaxUniformComponents = 1024;
    ctx->Const.Program[MESA_SHADER_COMPUTE].MaxCombinedUniformComponents = 1024;
    ctx->Const.Program[MESA_SHADER_COMPUTE].MaxUniformBlocks = 12;
-   /* 8 matches ADRENO_PROG_MAX_SSBO: the q8b VERSION 8 binned raster binds a
+   /* 8 matches ADRENO_PROG_MAX_SSBO: the qcom8gen3 VERSION 8 binned raster binds a
     * 5th SSBO (the coarse-bin list).  The V3D back end keeps its own
     * 4-binding gate, so raising the shared frontend limit only widens what
     * the Adreno replacement templates may declare. */

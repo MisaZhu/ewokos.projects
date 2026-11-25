@@ -501,7 +501,7 @@ ewok_on_window_created(xwin_t *xwin)
 
 	/* RE3 starts in fullscreen mode.  This must happen before EGL creates its
 	 * surface so the GPU backbuffer is allocated at the final workspace size;
-	 * resizing an already-created surface can require a large contiguous q8b
+	 * resizing an already-created surface can require a large contiguous qcom8gen3
 	 * allocation and may force an avoidable CPU fallback.  RE3_WINDOWED=1 is a
 	 * deliberate debugging escape hatch and keeps the old windowed behaviour. */
 	if (getenv("RE3_WINDOWED") == NULL &&
@@ -956,7 +956,7 @@ int main(int argc, char *argv[])
 	setenv("RE3_NATIVE_RENDER_SIZE", "640x480", 1);
 	g_renderBenchmark = getenv("RE3_RENDER_BENCHMARK") != NULL;
 	/* RW emits many small native vertex draws. Waking seven threads for
-	 * each one costs more than evaluating them on the render thread on Q8B.
+	 * each one costs more than evaluating them on the render thread on QCOM8GEN3.
 	 * Keep the indexed vertex cache; an explicit setting still selects 1..8. */
 	if (!getenv("PGL_VERTEX_THREADS"))
 		setenv("PGL_VERTEX_THREADS", "1", 0);

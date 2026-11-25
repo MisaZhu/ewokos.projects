@@ -243,7 +243,7 @@ static int init_egl(xwin_t* xwin)
 static void render_frame(void)
 {
     EGLint w = 0, h = 0;
-    /* Query the render size (stride-aligned on q8b, == window elsewhere) so
+    /* Query the render size (stride-aligned on qcom8gen3, == window elsewhere) so
      * glViewport / iResolution / DisplaySize match the engine back buffer. */
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_WIDTH_EWOK, &w);
     eglQuerySurface(egl_dpy, egl_surf, EGL_RENDER_HEIGHT_EWOK, &h);

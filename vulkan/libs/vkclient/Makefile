@@ -17,7 +17,7 @@ PRIV = $(BUILD_DIR)/lib/.vulkan_priv
 # a machine with a real bsp_cl compute back end.  vkclient.c depends on
 # <g2dclient/g2dclient.h> (the g2dd IPC transport) and <pglcompiler.h> (the
 # on-device mesa compiler contract), which only those machines stage into
-# $(SDK_DIR)/include (raspi5/raspix V3D CSD, q8b's Adreno 690 CS).  On a
+# $(SDK_DIR)/include (raspi5/raspix V3D CSD, qcom8gen3's Adreno 690 CS).  On a
 # CPU-only target this Makefile is a no-op (libvulkan.a stays the
 # software-device library).
 VK_GPU_HWS := raspi5 raspix 8gen3

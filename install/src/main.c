@@ -10,7 +10,7 @@
  *   install scan                       probe devices, show GPT layouts
  *   install plan                       dry run of `disk`
  *   install disk [--force] [--no-verify]
- *                                      full clone (q8b: SD card -> NVMe)
+ *                                      full clone (qcom8gen3: SD card -> NVMe)
  *   install part <n> [--no-verify]     clone partition n only
  *   install boot [--no-verify]         clone the EFI System Partition only
  *   install verify                     re-compare all partitions
@@ -19,7 +19,7 @@
  * console/SSH path.
  *
  * Machine backends are registered in src/mach/mach.c; the backend name is
- * accepted as an optional trailing argument (default: q8b).
+ * accepted as an optional trailing argument (default: qcom8gen3).
  */
 #include <stdio.h>
 #include <stdlib.h>

@@ -245,7 +245,7 @@ static void render(void *)
 {
     if (!current) return;
     EGLint w = 0, h = 0;
-    /* Query the render size (stride-aligned on q8b, == window elsewhere) so
+    /* Query the render size (stride-aligned on qcom8gen3, == window elsewhere) so
      * glViewport / iResolution / DisplaySize match the engine back buffer. */
     if (!eglQuerySurface(display, surface, EGL_RENDER_WIDTH_EWOK, &w) ||
         !eglQuerySurface(display, surface, EGL_RENDER_HEIGHT_EWOK, &h) || w <= 0 || h <= 0) {

@@ -1737,7 +1737,7 @@ startEwok(void)
 	 * -1/32,32 entry point. */
 	/* A game surface does not need a compositor frame or title bar.  Keeping
 	 * those allocations for a normal window costs another full display-sized
-	 * canvas on Q8B, which can exhaust the scattered shm pool before EGL is
+	 * canvas on QCOM8GEN3, which can exhaust the scattered shm pool before EGL is
 	 * even initialized (the failure is reported only as xwin_open()==NULL).
 	 * Use a borderless client surface by default; RE3_WINDOWED=1 retains the
 	 * decorated window for debugging and desktop use. */

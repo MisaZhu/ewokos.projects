@@ -38,7 +38,7 @@ static GLuint texid[4];     /* A, B, C, D staged as CPU-uploaded ctex slots */
 static GLuint progImage;
 static GLuint quad;
 static int width = 800, height = 450;
-/* Render size (stride-aligned on q8b, == window elsewhere).  glViewport and
+/* Render size (stride-aligned on qcom8gen3, == window elsewhere).  glViewport and
  * iResolution follow this so they match the engine back buffer; the mouse UV
  * normalization keeps using the window size (width/height). */
 static int rend_width = 800, rend_height = 450;

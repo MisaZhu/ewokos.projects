@@ -38,11 +38,11 @@ sound (EwokOS has no OpenAL).
 ```sh
 # from the repo root; the opengl project must have staged
 # libEGL/libGLESv2/headers first (projects/Makefile enforces the order)
-make -C projects/re3 ARCH=aarch64 HW=q8b
+make -C projects/re3 ARCH=aarch64 HW=8gen3
 ```
 
 Any ARCH/HW with a staged `system/build_$(ARCH)/$(HW)` SDK works in principle
-(aarch64 + q8b is the one exercised). Output lands in
+(aarch64 + qcom8gen3 is the one exercised). Output lands in
 `system/build_$(ARCH)/$(HW)/rootfs/apps/re3/` with the binary and the
 freely distributable `gamefiles/` data staged for packaging. On EwokOS, the
 runtime uses `/data/gta3/` as the game-data root when that directory exists;
@@ -82,11 +82,11 @@ Textures load directly from the original archive. The optional first-launch
 conversion to `models/txd.img` is disabled on EwokOS to avoid a lengthy cache
 generation step on the SD filesystem.
 
-## Q8B rendering and profiling
+## QCOM8GEN3 rendering and profiling
 
 Build `projects/opengl/libs/gles` with `PGL_G3D=yes` and
-`PGL_G3D_COMPILER_DIR` pointing at `machines/q8b/system/libs/adrenocompiler`,
-then rebuild re3. The Q8B g2dd must accept version-7 pixel-owned geometry
+`PGL_G3D_COMPILER_DIR` pointing at `machines/qcom/8gen3/system/libs/adrenocompiler`,
+then rebuild re3. The QCOM8GEN3 g2dd must accept version-7 pixel-owned geometry
 programs. Kind 6 directly consumes the clipped vertex stream by default; if
 the daemon declines it, the client retries kind 5 with a GPU copy stage.
 `PGL_RW_DIRECT=0` explicitly selects that two-stage GPU path.
@@ -99,7 +99,7 @@ leave most of the dispatch rectangle unrendered. Run the native compiler
 regression from the repository root with:
 
 ```sh
-make -C machines/q8b/system/libs/adreno -f shaders/Makefile.host test-rw-pixel
+make -C machines/qcom/8gen3/system/libs/adreno -f shaders/Makefile.host test-rw-pixel
 ```
 
 The Adreno 690 compute route rasterizes the exact RenderWare simple and
@@ -107,7 +107,7 @@ environment-reflection fragment shaders. Recognized vertex shaders use native
 CPU functions, with the original GLSL interpreter handling other shaders,
 followed by CPU clipping/culling. Re3 defaults to evaluating vertices on the
 render thread: waking seven workers for many small native draws costs more
-than the vertex work on Q8B. `PGL_VERTEX_THREADS=8` enables the persistent
+than the vertex work on QCOM8GEN3. `PGL_VERTEX_THREADS=8` enables the persistent
 workers for other workloads. A per-draw index cache evaluates shared
 vertices once and expands the results in the original primitive order.
 The renderer merges consecutive draws
@@ -135,7 +135,7 @@ time and includes IPC/driver waits. Neither number is GPU utilization.
 Compare the same scene at 640x480 after streaming settles; loading screens,
 menus, cutscenes, and a 4K fullscreen target have very different costs.
 
-On Q8B, the original interpreter-only game measured about 1.0–1.2 FPS.
+On QCOM8GEN3, the original interpreter-only game measured about 1.0–1.2 FPS.
 With the compute route, native fragment fallback and vertex workers, the
 tested 640x480 street view settles at about 3.5–3.6 FPS (other street samples
 were 3.7–4.9 FPS), while the opening sequence varies around 7–11 FPS.
@@ -235,7 +235,7 @@ skeleton tracks deltas like the glfw build.
 - The display settings list one initial 640x480 windowed mode. Resizing,
   maximizing and fullscreen update both the EGL target and camera dimensions.
 - Settings round-trip through `gta3.set` only (re3.ini is disabled).
-- Performance remains scene dependent. Q8B accelerates supported RW fragments
+- Performance remains scene dependent. QCOM8GEN3 accelerates supported RW fragments
   using compute; this is not a complete hardware GLES graphics pipeline.
   Vertex interpretation, clipping, game logic and streaming still use the CPU,
   and frequent texture/state changes limit draw merging.

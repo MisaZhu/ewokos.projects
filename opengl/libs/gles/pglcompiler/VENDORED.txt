@@ -4,7 +4,7 @@ Vendored mesa compiler source tree (shared front half)
 PURPOSE
   On-device GLSL -> linked NIR frontend shared by every GPU-backed EwokOS
   machine (pglcompiler.h contract).  The machine backends (V3D NIR->QPU on
-  raspi5/raspix, Adreno NIR->ir3 on q8b) consume the NIR this tree produces
+  raspi5/raspix, Adreno NIR->ir3 on qcom8gen3) consume the NIR this tree produces
   to compile shadertoy fragment shaders and the geometry compute kernels at
   runtime.  See the plan "PGL_G3D Adreno backend port".
 
@@ -38,7 +38,7 @@ VENDORED SUBTREES  (under mesa/src/, preserving mesa's include layout)
   upstream pin:
     machines/raspi5/system/libs/v3dcompiler/mesa/src/broadcom/   V3D (NIR->QPU)
     machines/raspix/system/libs/v3dcompiler/mesa/src/broadcom/   V3D (NIR->QPU)
-    machines/q8b/system/libs/adrenocompiler/mesa/src/freedreno/  Adreno (NIR->ir3)
+    machines/qcom/8gen3/system/libs/adrenocompiler/mesa/src/freedreno/  Adreno (NIR->ir3)
   Those backends include this tree's headers through PGLC_FE_DIR.
 
   Include roots needed by the build:  -I mesa/src (compiler/nir/nir.h,

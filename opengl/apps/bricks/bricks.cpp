@@ -766,7 +766,7 @@ static void draw_quad(GLuint prog)
     glDisableVertexAttribArray(0);
 }
 
-/* Snap a window size up to the q8b Adreno fullscreen-compute alignment: the
+/* Snap a window size up to the qcom8gen3 Adreno fullscreen-compute alignment: the
    width to a multiple of 32 (so stride=w*4 is 128B, satisfying the 64B
    requirement and tiling local_size.x exactly).  The height is derived from the
    aligned width and the window aspect ratio (ceil) rather than aligned to 8, so
@@ -974,13 +974,13 @@ int main(int argc, char **argv)
         }
     }
 
-    /* The q8b Adreno fullscreen compute path renders straight into the window
+    /* The qcom8gen3 Adreno fullscreen compute path renders straight into the window
      * framebuffer with a row pitch fb_stride = width*4 that the GPU requires to
      * be 64-byte aligned.  Unlike the geometry path it does NOT decline a
      * misaligned stride -- it submits the dispatch and wedges: the 600-wide
      * default (stride 2400, 2400 % 64 == 32) hangs with no frame printed at all.
      * raspi5/V3D only needs 4-byte stride alignment, so pi5 is unaffected and
-     * this is q8b-specific.  Snap the window up to a multiple of the compute
+     * this is qcom8gen3-specific.  Snap the window up to a multiple of the compute
      * local_size (32x8): width*4 then becomes a multiple of 128 (64-byte
      * aligned) and the workgrid is exact, keeping the default on the GPU
      * (600x400 -> 608x400).

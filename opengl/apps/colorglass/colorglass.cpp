@@ -14,10 +14,10 @@
  * original samples them:
  *   iChannel0 = Uffizi Gallery cubemap (6 faces, res/uffizi_0..5.jpg) on unit 0
  *   iChannel1 = Rock Tiles 2D texture  (res/rock_tiles.jpg)          on unit 1
- * On a GPU target (raspi5 V3D, q8b Adreno) the engine compiles the shader to a
+ * On a GPU target (raspi5 V3D, qcom8gen3 Adreno) the engine compiles the shader to a
  * compute kernel through the fullscreen-quad route and samples BOTH the cubemap
  * and the 2D bump map on the GPU.  Both samplers use GL_LINEAR (no mipmapped
- * min-filter): the q8b Adreno texture path stages a SINGLE mip level, so a
+ * min-filter): the qcom8gen3 Adreno texture path stages a SINGLE mip level, so a
  * mipmapped min-filter makes gpu_ctex_slot request a multi-level image that the
  * layout/staging rejects, silently dropping the effect to the (unusably slow)
  * CPU GLSL interpreter.  raspi5 V3D accepts mip chains, but GL_LINEAR is the
@@ -193,7 +193,7 @@ static void init_quad(void)
  * in +X,-X,+Y,-Y,+Z,-Z order (the engine loader's fixed mapping); vflip=false
  * so no flip.  The Rock Tiles bump map uses GL_REPEAT wrap (the reference's
  * wrap=repeat) and a vertical flip (the reference's vflip=true).  BOTH samplers
- * use GL_LINEAR: q8b Adreno stages one mip level only, where a mipmapped
+ * use GL_LINEAR: qcom8gen3 Adreno stages one mip level only, where a mipmapped
  * min-filter would fail staging and drop the effect to the CPU (see header). */
 static void init_textures(void)
 {

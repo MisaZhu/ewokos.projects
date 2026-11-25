@@ -27,9 +27,9 @@ const machine_backend_t* mach_default(void);
 int mach_count(void);
 const machine_backend_t* mach_at(int i);
 
-/* q8b backend (mach/q8b.c) */
-int q8b_sd_dev(blockdev_t* out);
-int q8b_nvme_dev(blockdev_t* out);
+/* qcom8gen3 backend (mach/qcom8gen3.c) */
+int qcom8gen3_sd_dev(blockdev_t* out);
+int qcom8gen3_nvme_dev(blockdev_t* out);
 
 #ifdef __cplusplus
 }

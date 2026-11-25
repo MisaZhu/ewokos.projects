@@ -30,7 +30,7 @@
 static int win_width = 640;
 static int win_height = 480;
 // Actual window (screen) size.  win_width/win_height track the render size
-// (stride-aligned on q8b); the mouse arrives in window coords and is scaled
+// (stride-aligned on qcom8gen3); the mouse arrives in window coords and is scaled
 // into render space for ImGui.
 static int scr_width = 640;
 static int scr_height = 480;

@@ -3,9 +3,10 @@
 #include "mach.h"
 
 static const machine_backend_t _machines[] = {
-    /* q8b: boots from the SDCC2 card; installs onto the M.2 NVMe the
-     * firmware already brought up before ExitBootServices. */
-    { "q8b", q8b_sd_dev, q8b_nvme_dev },
+    /* qcom8gen3 (HW name "8gen3"): boots from the SDCC2 card; installs
+     * onto the M.2 NVMe the firmware already brought up before
+     * ExitBootServices. */
+    { "8gen3", qcom8gen3_sd_dev, qcom8gen3_nvme_dev },
     /* raspi5 could plug in here: machines/raspi5 already carries a
      * user-space NVMe driver (system/libs/bsp/src/bsp_nvme.c) next to its
      * SD host backend. */

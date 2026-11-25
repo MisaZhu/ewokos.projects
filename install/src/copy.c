@@ -6,7 +6,7 @@
 
 #include <install/copy.h>
 
-/* 1 MiB per in-flight chunk; the q8b backends split further against their
+/* 1 MiB per in-flight chunk; the qcom8gen3 backends split further against their
  * driver limits (SDCC2 ADMA batches, NVMe max_xfer). */
 #define COPY_BUF_SECTORS 2048
 

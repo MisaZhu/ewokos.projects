@@ -33,8 +33,8 @@ all: $(TASK)
 # not the runtime.  The Dear ImGui Vulkan overlay (libimgui_vk.a) references the
 # runtime's vk* entry points, so it must precede libvulkan.a in the link order;
 # ImGui is C++, hence -lcxx on every target.  On the GPU targets (PGL_G3D:
-# raspi5, raspix, q8b) the teapot draw qualifies for the GPU back-end and the
-# g2dclient/ewokstl libs are pulled in; elsewhere it is CPU-only.  On q8b the
+# raspi5, raspix, qcom8gen3) the teapot draw qualifies for the GPU back-end and the
+# g2dclient/ewokstl libs are pulled in; elsewhere it is CPU-only.  On qcom8gen3 the
 # same geom_kind-5 pipeline is compiled to Adreno compute kernels and dispatched
 # through the machine's PGL backend.
 $(TASK): $(TASK_OBJS) $(IMGUI_VK_LIB) $(VULKAN_LIB) \

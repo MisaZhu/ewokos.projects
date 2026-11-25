@@ -11,7 +11,7 @@ TASK_OBJS = $(ARCH)/$(TASK).o
 TASK_DIR = $(BUILD_DIR)/rootfs/bin
 VULKAN_LIB = $(BUILD_DIR)/lib/libvulkan.a
 
-# GPU targets (raspi5/raspix V3D CSD, q8b Adreno 690 CS): libvulkan.a additionally
+# GPU targets (raspi5/raspix V3D CSD, qcom8gen3 Adreno 690 CS): libvulkan.a additionally
 # folds in vkclient + the on-device mesa compiler, so the command must also link
 # the g2d transport and the C++ runtime mesa needs.  Gated on the same
 # PGL_G3D=yes + VK-GPU-HW condition libs/vulkan uses, so a CPU-only target keeps
