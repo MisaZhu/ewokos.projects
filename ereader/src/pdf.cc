@@ -1966,11 +1966,14 @@ static const Obj* embeddedProgram(const Obj& fds) {
 	return e;
 }
 
-/* extract an embedded TrueType font program and register it with fontd */
+/* extract an embedded font program and register it with fontd. Drop files
+   live in a dedicated /tmp/fonts dir, not scattered over the /tmp root;
+   fontd keeps such transient faces out of the user-visible font list. */
 static font_t* loadEmbedded(const uint8_t* data, int n, font_t* fallback) {
 	if(data == NULL || n < 12) return fallback;
 	string name = fmt("erpdf%08x", hashBytes(data, n));
-	string path = "/tmp/" + name + ".ttf";
+	if(!ensureDir("/tmp/fonts")) return fallback;
+	string path = "/tmp/fonts/" + name + ".ttf";
 	FILE* f = fopen(path.c_str(), "w");
 	if(f != NULL) {
 		fwrite(data, 1, n, f);
