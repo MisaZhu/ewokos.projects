@@ -1453,9 +1453,10 @@ struct PdfFont {
 	bool pua;                 /* synthesized cmap carries PUA->gid */
 	bool macRoman;            /* /Encoding /MacRomanEncoding       */
 	map<int, int> asc;
+	uint64_t tick;             /* FontCache LRU stamp */
 
 	PdfFont() : ft(NULL), twoByte(false), dw(1000), stdW(NULL), courier(false),
-			pua(false), macRoman(false) {
+			pua(false), macRoman(false), tick(0) {
 		for(int i = 0; i < 256; i++) { w[i] = 500; hw[i] = false; }
 	}
 };
@@ -1722,6 +1723,15 @@ static vector<uint8_t> synthesizeCmap(const vector<uint8_t>& ttf,
 	return out;
 }
 
+/* embedded font program: TrueType (FontFile2), CFF/OpenType (FontFile3)
+   or Type1 (FontFile); FreeType sniffs the actual format from the bytes */
+static const Obj* embeddedProgram(const Obj& fds) {
+	const Obj* e = fds.get("FontFile2");
+	if(e == NULL) e = fds.get("FontFile3");
+	if(e == NULL) e = fds.get("FontFile");
+	return e;
+}
+
 /* extract an embedded TrueType font program and register it with fontd */
 static font_t* loadEmbedded(const uint8_t* data, int n, font_t* fallback) {
 	if(data == NULL || n < 12) return fallback;
@@ -1742,7 +1752,8 @@ static font_t* loadEmbedded(const uint8_t* data, int n, font_t* fallback) {
 struct FontCache {
 	map<long, PdfFont*> byKey;
 	font_t* sysFont;
-	FontCache() : sysFont(NULL) { }
+	uint64_t clock;
+	FontCache() : sysFont(NULL), clock(0) { }
 	~FontCache() {
 		for(map<long,PdfFont*>::iterator it = byKey.begin(); it != byKey.end(); ++it) {
 			if(it->second->ft != NULL && it->second->ft != sysFont)
@@ -1753,16 +1764,40 @@ struct FontCache {
 	}
 };
 
+/* per-page subset fonts accumulate without bound; cap the live set and
+   release the least recently used ones so fontd slots stay available */
+#define PDF_FONT_CACHE_MAX 64
+static void fcInsert(FontCache* fc, long key, PdfFont* f) {
+	f->tick = ++fc->clock;
+	fc->byKey[key] = f;
+	while(fc->byKey.size() > PDF_FONT_CACHE_MAX) {
+		map<long, PdfFont*>::iterator victim = fc->byKey.end();
+		uint64_t best = ~0ull;
+		for(map<long, PdfFont*>::iterator it = fc->byKey.begin(); it != fc->byKey.end(); ++it) {
+			if(it->second->ft == fc->sysFont) continue;
+			if(it->second->tick < best) { best = it->second->tick; victim = it; }
+		}
+		if(victim == fc->byKey.end()) break;
+		if(victim->second->ft != NULL && victim->second->ft != fc->sysFont)
+			font_free(victim->second->ft);
+		delete victim->second;
+		fc->byKey.erase(victim);
+	}
+}
+
 static PdfFont* loadFont(PdfDoc* doc, FontCache* fc, const Obj& ref, long key) {
 	map<long,PdfFont*>::iterator it = fc->byKey.find(key);
-	if(it != fc->byKey.end()) return it->second;
+	if(it != fc->byKey.end()) {
+		it->second->tick = ++fc->clock;
+		return it->second;
+	}
 
 	PdfFont* f = new PdfFont();
 	f->ft = fc->sysFont;
 	vector<uint8_t> c2g;   /* explicit CIDToGIDMap stream, if any */
 	Obj fd = doc->resolve(ref);
 	if(fd.t != O_DICT && fd.t != O_STREAM) {
-		fc->byKey[key] = f;
+		fcInsert(fc, key, f);
 		return f;
 	}
 	string subtype = fd.getName("Subtype");
@@ -1817,7 +1852,7 @@ static PdfFont* loadFont(PdfDoc* doc, FontCache* fc, const Obj& ref, long key) {
 		const Obj* fdesc = cid.get("FontDescriptor");
 		if(fdesc != NULL) {
 			Obj fds = doc->resolve(*fdesc);
-			embedded = fds.get("FontFile2");
+			embedded = embeddedProgram(fds);
 		}
 	}
 	else {
@@ -1863,7 +1898,7 @@ static PdfFont* loadFont(PdfDoc* doc, FontCache* fc, const Obj& ref, long key) {
 		const Obj* fdesc = fd.get("FontDescriptor");
 		if(fdesc != NULL) {
 			Obj fds = doc->resolve(*fdesc);
-			embedded = fds.get("FontFile2");
+			embedded = embeddedProgram(fds);
 		}
 	}
 
@@ -1881,7 +1916,7 @@ static PdfFont* loadFont(PdfDoc* doc, FontCache* fc, const Obj& ref, long key) {
 			f->ft = loadEmbedded(prog.data(), (int)prog.size(), fc->sysFont);
 		}
 	}
-	fc->byKey[key] = f;
+	fcInsert(fc, key, f);
 	return f;
 }
 
