@@ -1577,6 +1577,150 @@ static void parseToUnicode(const string& cm, PdfFont* f) {
 	}
 }
 
+/* glyph count of a bare CFF program: CharStrings INDEX count, reached via
+   the Top DICT CharStrings operator (17); also reports units_per_EM from
+   the FontMatrix (12 7) when present */
+static uint32_t cffNumGlyphs(const vector<uint8_t>& d, uint32_t* upemOut = NULL,
+		uint32_t* charsetOffOut = NULL) {
+	if(upemOut != NULL) *upemOut = 0;
+	if(charsetOffOut != NULL) *charsetOffOut = 0;
+	if(d.size() < 4 || d[0] != 1 || d[1] != 0) return 0;
+	size_t hdr = d[2];
+	if(hdr < 4 || hdr > d.size()) return 0;
+	/* INDEX layout: count(2) offSize(1) offsets[count+1] data; returns the
+	   position right after the INDEX and the data range */
+	struct Idx { size_t next, beg, end; uint32_t cnt; };
+	Idx (*idx)(const vector<uint8_t>&, size_t) =
+		[](const vector<uint8_t>& d, size_t p) -> Idx {
+			Idx r; r.next = r.beg = r.end = d.size(); r.cnt = 0;
+			if(p + 2 > d.size()) return r;
+			r.cnt = ((uint32_t)d[p] << 8) | d[p+1];
+			if(r.cnt == 0) { r.next = p + 2; r.beg = r.end = r.next; return r; }
+			if(p + 3 > d.size()) return r;
+			int os = d[p+2];
+			if(os < 1 || os > 4) return r;
+			size_t op = p + 3;
+			if(op + (size_t)(r.cnt+1)*os > d.size()) return r;
+			uint32_t o0 = 0, o1 = 0;
+			for(int k = 0; k < os; k++) {
+				o0 = (o0 << 8) | d[op + k];
+				o1 = (o1 << 8) | d[op + (size_t)r.cnt*os + k];
+			}
+			r.beg = op + (size_t)(r.cnt+1)*os + o0 - 1;
+			r.end = op + (size_t)(r.cnt+1)*os + o1 - 1;
+			if(r.beg > d.size() || r.end > d.size() || r.end < r.beg) {
+				r.next = r.beg = r.end = d.size(); return r;
+			}
+			r.next = r.end;
+			return r;
+		};
+	Idx name = idx(d, hdr);
+	Idx top = idx(d, name.next);
+	if(top.cnt == 0) return 0;
+	/* scan Top DICT for operator 17 (CharStrings offset) */
+	uint32_t csOff = 0;
+	int64_t val = 0;
+	double rval = 0;
+	bool have = false;
+	size_t p = top.beg;
+	while(p < top.end) {
+		uint8_t b = d[p];
+		if(b == 28) {
+			if(p + 2 >= top.end) break;
+			val = (int16_t)(((uint32_t)d[p+1] << 8) | d[p+2]); p += 3; have = true;
+		}
+		else if(b == 29) {
+			if(p + 4 >= top.end) break;
+			val = (int32_t)(((uint32_t)d[p+1] << 24) | ((uint32_t)d[p+2] << 16) |
+					((uint32_t)d[p+3] << 8) | d[p+4]); p += 5; have = true;
+		}
+		else if(b == 30) { /* real: decode nibbles until 0xf terminator */
+			char rb[64];
+			int rn = 0;
+			p++;
+			while(p < top.end && rn < 62) {
+				uint8_t r = d[p++];
+				for(int k = 0; k < 2 && rn < 62; k++) {
+					int nib = k ? (r & 0xf) : (r >> 4);
+					if(nib == 0xf) { p = top.end; break; }
+					if(nib <= 9) rb[rn++] = '0' + nib;
+					else if(nib == 0xa) rb[rn++] = '.';
+					else if(nib == 0xb) rb[rn++] = 'E';
+					else if(nib == 0xc) { rb[rn++] = 'E'; rb[rn++] = '-'; }
+					else if(nib == 0xe) rb[rn++] = '-';
+				}
+			}
+			rb[rn] = 0;
+			rval = atof(rb);
+			val = (int64_t)rval;
+			have = true;
+		}
+		else if(b >= 32 && b <= 246) { val = b - 139; p++; have = true; }
+		else if(b >= 247 && b <= 250) {
+			if(p + 1 >= top.end) break;
+			val = (b - 247)*256 + d[p+1] + 108; p += 2; have = true;
+		}
+		else if(b >= 251 && b <= 254) {
+			if(p + 1 >= top.end) break;
+			val = -(b - 251)*256 - d[p+1] - 108; p += 2; have = true;
+		}
+		else if(b <= 21) {
+			int op = b;
+			p++;
+			if(b == 12 && p < top.end) op = (12 << 8) | d[p++];
+			if(op == 17 && have && val >= 0) csOff = (uint32_t)val;
+			if(op == 15 && have && val >= 0 && charsetOffOut != NULL)
+				*charsetOffOut = (uint32_t)val;
+			if(op == ((12 << 8) | 7) && have && rval > 0 && upemOut != NULL)
+				*upemOut = (uint32_t)(1.0 / rval + 0.5);
+			have = false;
+		}
+		else p++;
+	}
+	if(csOff == 0) return 0;
+	Idx cs = idx(d, csOff);
+	return cs.cnt;
+}
+
+/* CID-keyed CFF charset: gid -> CID table (formats 0/1/2). PDF CIDFontType0
+   without /CIDToGIDMap addresses glyphs through this charset, so CID != gid */
+static vector<uint32_t> cffCharset(const vector<uint8_t>& d, uint32_t off,
+		uint32_t n) {
+	vector<uint32_t> g2c;
+	if(off < 3 || n == 0 || off >= d.size()) return g2c; /* 0/1/2: predefined */
+	g2c.push_back(0); /* gid 0 is .notdef, CID 0 */
+	uint8_t fmt = d[off];
+	size_t p = off + 1;
+	if(fmt == 0) {
+		for(uint32_t g = 1; g < n; g++) {
+			if(p + 2 > d.size()) return g2c;
+			g2c.push_back(((uint32_t)d[p] << 8) | d[p+1]);
+			p += 2;
+		}
+	}
+	else if(fmt == 1 || fmt == 2) {
+		uint32_t g = 1;
+		while(g < n) {
+			if(p + 2 > d.size()) break;
+			uint32_t first = ((uint32_t)d[p] << 8) | d[p+1];
+			p += 2;
+			uint32_t left;
+			if(fmt == 1) {
+				if(p >= d.size()) break;
+				left = d[p++];
+			}
+			else {
+				if(p + 2 > d.size()) break;
+				left = ((uint32_t)d[p] << 8) | d[p+1];
+				p += 2;
+			}
+			for(uint32_t k = 0; k <= left && g < n; k++, g++)
+				g2c.push_back(first + k);
+		}
+	}
+	return g2c;
+}
+
 /* Subset CID fonts (Identity-H) usually ship WITHOUT a usable cmap: glyphs
    are addressed by CID == glyph id, and post 3.0 subsets carry no names for
    freetype to synthesize one from. fontd draws by Unicode, so synthesize a
@@ -1587,21 +1731,37 @@ static vector<uint8_t> synthesizeCmap(const vector<uint8_t>& ttf,
 		const map<uint32_t,uint32_t>& toUni, const vector<uint8_t>& c2g) {
 	vector<uint8_t> out;
 	if(ttf.size() < 12) return out;
-	int num = (ttf[4] << 8) | ttf[5];
-	if(num <= 0 || 12 + 16*num > (int)ttf.size()) return out;
+	/* bare CFF (FontFile3 without sfnt wrapper): glyph count comes from the
+	   CharStrings INDEX; the program gets wrapped into OTTO below */
+	bool bareCff = ttf[0] == 1 && ttf[1] == 0;
+	int num = 0;
 	uint32_t numGlyphs = 0;
-	for(int i = 0; i < num; i++) {
-		size_t e = 12 + 16*i;
-		if(ttf[e]=='c' && ttf[e+1]=='m' && ttf[e+2]=='a' && ttf[e+3]=='p')
-			return out; /* real cmap present: trust it */
-		if(ttf[e]=='m' && ttf[e+1]=='a' && ttf[e+2]=='x' && ttf[e+3]=='p') {
-			uint32_t mo = ((uint32_t)ttf[e+8]<<24)|((uint32_t)ttf[e+9]<<16)|
-					((uint32_t)ttf[e+10]<<8)|ttf[e+11];
-			if(mo + 6 <= ttf.size())
-				numGlyphs = ((uint32_t)ttf[mo+4] << 8) | ttf[mo+5];
+	uint32_t cffUpem = 0;
+	uint32_t cffCharsetOff = 0;
+	if(bareCff) {
+		numGlyphs = cffNumGlyphs(ttf, &cffUpem, &cffCharsetOff);
+	}
+	else {
+		num = (ttf[4] << 8) | ttf[5];
+		if(num <= 0 || 12 + 16*num > (int)ttf.size()) return out;
+		for(int i = 0; i < num; i++) {
+			size_t e = 12 + 16*i;
+			if(ttf[e]=='c' && ttf[e+1]=='m' && ttf[e+2]=='a' && ttf[e+3]=='p')
+				return out; /* real cmap present: trust it */
+			if(ttf[e]=='m' && ttf[e+1]=='a' && ttf[e+2]=='x' && ttf[e+3]=='p') {
+				uint32_t mo = ((uint32_t)ttf[e+8]<<24)|((uint32_t)ttf[e+9]<<16)|
+						((uint32_t)ttf[e+10]<<8)|ttf[e+11];
+				if(mo + 6 <= ttf.size())
+					numGlyphs = ((uint32_t)ttf[mo+4] << 8) | ttf[mo+5];
+			}
 		}
 	}
 	vector<pair<uint32_t,uint32_t> > ent; /* unicode -> gid */
+	map<uint32_t,uint32_t> cid2gid;
+	if(bareCff && c2g.empty()) {
+		vector<uint32_t> g2c = cffCharset(ttf, cffCharsetOff, numGlyphs);
+		for(size_t g = 0; g < g2c.size(); g++) cid2gid[g2c[g]] = (uint32_t)g;
+	}
 	for(map<uint32_t,uint32_t>::const_iterator it = toUni.begin();
 			it != toUni.end(); ++it) {
 		uint32_t cid = it->first, u = it->second, gid = cid;
@@ -1610,8 +1770,19 @@ static vector<uint8_t> synthesizeCmap(const vector<uint8_t>& ttf,
 			if(p + 1 >= c2g.size()) continue;
 			gid = ((uint32_t)c2g[p] << 8) | c2g[p+1];
 		}
+		else if(!cid2gid.empty()) {
+			map<uint32_t,uint32_t>::const_iterator cg = cid2gid.find(cid);
+			if(cg == cid2gid.end()) continue;
+			gid = cg->second;
+		}
 		if(u == 0 || u >= 0xF0000 || gid > 0xFFFF) continue;
 		ent.push_back(pair<uint32_t,uint32_t>(u, gid));
+	}
+	/* bare CFF: PUA keyed by CID (showString falls back to 0xF0000+CID) */
+	if(bareCff) {
+		for(map<uint32_t,uint32_t>::const_iterator it = cid2gid.begin();
+				it != cid2gid.end(); ++it)
+			ent.push_back(pair<uint32_t,uint32_t>(0xF0000u + it->first, it->second));
 	}
 	if(ent.empty() && numGlyphs == 0) return out;
 	sort(ent.begin(), ent.end());
@@ -1633,7 +1804,7 @@ static vector<uint8_t> synthesizeCmap(const vector<uint8_t>& ttf,
 			gr.push_back(g);
 		}
 	}
-	if(numGlyphs > 0 && numGlyphs <= 0xFFFF) {
+	if(!bareCff && numGlyphs > 0 && numGlyphs <= 0xFFFF) {
 		Grp g; g.u0 = 0xF0000; g.u1 = 0xF0000 + numGlyphs - 1; g.g0 = 0;
 		gr.push_back(g);
 	}
@@ -1662,6 +1833,69 @@ static vector<uint8_t> synthesizeCmap(const vector<uint8_t>& ttf,
 			cm[g+4*k] = (uint8_t)(v[k] >> 24); cm[g+4*k+1] = (uint8_t)(v[k] >> 16);
 			cm[g+4*k+2] = (uint8_t)(v[k] >> 8); cm[g+4*k+3] = (uint8_t)v[k];
 		}
+	}
+
+	if(bareCff) {
+		/* wrap bare CFF + synth cmap into a minimal OTTO sfnt. head/maxp/
+		   hhea/hmtx are required: without head freetype takes the pure-CFF
+		   path, which never builds charmaps from the cmap table (and
+		   CID-keyed CFF skips glyph-name synthesis entirely) */
+		uint32_t upem = cffUpem != 0 ? cffUpem : 1000;
+		vector<uint8_t> head(54, 0), maxp(6, 0), hhea(36, 0), hmtx(4, 0);
+		head[1] = 1;                          /* version 1.0 */
+		head[12] = 0x5F; head[13] = 0x0F; head[14] = 0x3C; head[15] = 0xF5;
+		head[18] = (uint8_t)(upem >> 8); head[19] = (uint8_t)upem;
+		head[40] = (uint8_t)(upem >> 8); head[41] = (uint8_t)upem;
+		head[42] = (uint8_t)(upem >> 8); head[43] = (uint8_t)upem;
+		head[47] = 8;                         /* lowestRecPPEM */
+		head[49] = 2;                         /* fontDirectionHint */
+		maxp[2] = 0x50;                       /* version 0.5 */
+		maxp[4] = (uint8_t)(numGlyphs >> 8); maxp[5] = (uint8_t)numGlyphs;
+		hhea[3] = 1;                          /* version 1.0 */
+		hhea[4] = 3; hhea[5] = 32;            /* ascender 800 */
+		hhea[6] = 0xFF; hhea[7] = 0x38;       /* descender -200 */
+		hhea[10] = (uint8_t)(upem >> 8); hhea[11] = (uint8_t)upem;
+		hhea[16] = (uint8_t)(upem >> 8); hhea[17] = (uint8_t)upem;
+		hhea[19] = 1;                         /* caretSlopeRise */
+		hhea[35] = 1;                         /* numberOfHMetrics */
+		hmtx[0] = (uint8_t)(upem >> 8); hmtx[1] = (uint8_t)upem;
+		struct WT { const char* tag; vector<uint8_t> data; };
+		vector<WT> wt;
+		WT t0; t0.tag = "CFF "; t0.data = ttf; wt.push_back(t0);
+		WT t1; t1.tag = "cmap"; t1.data = cm; wt.push_back(t1);
+		WT t2; t2.tag = "head"; t2.data = head; wt.push_back(t2);
+		WT t3; t3.tag = "hhea"; t3.data = hhea; wt.push_back(t3);
+		WT t4; t4.tag = "hmtx"; t4.data = hmtx; wt.push_back(t4);
+		WT t5; t5.tag = "maxp"; t5.data = maxp; wt.push_back(t5);
+		for(size_t i = 1; i < wt.size(); i++)
+			for(size_t j = i; j > 0 && memcmp(wt[j].tag, wt[j-1].tag, 4) < 0; j--) {
+				WT t = wt[j]; wt[j] = wt[j-1]; wt[j-1] = t;
+			}
+		int n2 = (int)wt.size();
+		int sel2 = 0; while((2 << (sel2+1)) <= n2*16) sel2++;
+		int sr2 = 16 << sel2;
+		out.resize(12 + 16*n2, 0);
+		memcpy(&out[0], "OTTO", 4);
+		out[4] = (uint8_t)(n2 >> 8); out[5] = (uint8_t)n2;
+		out[6] = (uint8_t)(sr2 >> 8); out[7] = (uint8_t)sr2;
+		out[8] = 0; out[9] = (uint8_t)sel2;
+		int rs2 = n2*16 - sr2;
+		out[10] = (uint8_t)(rs2 >> 8); out[11] = (uint8_t)rs2;
+		size_t pos = 12 + 16*n2;
+		for(int i = 0; i < n2; i++) {
+			size_t e = 12 + 16*i;
+			memcpy(&out[e], wt[i].tag, 4);
+			uint32_t off = (uint32_t)pos, len = (uint32_t)wt[i].data.size();
+			out[e+8] = (uint8_t)(off >> 24); out[e+9] = (uint8_t)(off >> 16);
+			out[e+10] = (uint8_t)(off >> 8); out[e+11] = (uint8_t)off;
+			out[e+12] = (uint8_t)(len >> 24); out[e+13] = (uint8_t)(len >> 16);
+			out[e+14] = (uint8_t)(len >> 8); out[e+15] = (uint8_t)len;
+			for(size_t k = 0; k < wt[i].data.size(); k++)
+				out.push_back(wt[i].data[k]);
+			while(out.size() & 3) out.push_back(0);
+			pos = out.size();
+		}
+		return out;
 	}
 
 	/* rebuild sfnt: sorted directory with one extra entry, tables rebased */
@@ -1806,6 +2040,7 @@ static PdfFont* loadFont(PdfDoc* doc, FontCache* fc, const Obj& ref, long key) {
 	if(plus == 8) base = base.substr(plus + 1);
 
 	const Obj* embedded = NULL;
+	Obj fds;   /* must outlive `embedded`: it points into this dict */
 	if(subtype == "Type0") {
 		f->twoByte = true;
 		const Obj* desc = fd.get("DescendantFonts");
@@ -1851,7 +2086,7 @@ static PdfFont* loadFont(PdfDoc* doc, FontCache* fc, const Obj& ref, long key) {
 		}
 		const Obj* fdesc = cid.get("FontDescriptor");
 		if(fdesc != NULL) {
-			Obj fds = doc->resolve(*fdesc);
+			fds = doc->resolve(*fdesc);
 			embedded = embeddedProgram(fds);
 		}
 	}
@@ -1897,7 +2132,7 @@ static PdfFont* loadFont(PdfDoc* doc, FontCache* fc, const Obj& ref, long key) {
 			f->stdW = (base.find("Bold") != string::npos) ? HELVB_W : HELV_W;
 		const Obj* fdesc = fd.get("FontDescriptor");
 		if(fdesc != NULL) {
-			Obj fds = doc->resolve(*fdesc);
+			fds = doc->resolve(*fdesc);
 			embedded = embeddedProgram(fds);
 		}
 	}
