@@ -13,7 +13,7 @@ TxtBook::TxtBook(const string& fname) {
 	_title = stripExt(baseName(fname));
 	pthread_mutex_init(&_mtx, NULL);
 	_font = NULL;
-	_fontSize = X::hidpiSize(18);
+	_fontSize = X::hidpiSize(16);
 	_lineGap = 150;
 	_layoutW = 0;
 	_layoutH = 0;
