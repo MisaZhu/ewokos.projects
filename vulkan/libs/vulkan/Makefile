@@ -63,7 +63,11 @@ VULKAN = $(BUILD_DIR)/lib/libvulkan.a
 
 all: $(VULKAN) install_headers
 
-$(OBJDIR)/%.o: %.c
+# Order-only on install_headers: the SDK include dir precedes -I../../include
+# in CFLAGS, so objects resolve the staged headers first.  Under make -j the
+# cp staging must finish before any compile starts, else a half-copied
+# vk_video/ tree yields "vulkan_video_codecs_common.h: No such file".
+$(OBJDIR)/%.o: %.c | install_headers
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -89,11 +93,12 @@ $(VULKAN): $(OBJS)
 endif
 
 # Stage the Khronos Vulkan headers where apps find them via the standard
-# -I$(SDK_DIR)/include.
+# -I$(SDK_DIR)/include.  Copy dir contents (src/.) into a pre-created target:
+# plain `cp -r src dst` nests src inside an existing dst/src on GNU cp.
 install_headers:
-	@mkdir -p $(BUILD_DIR)/include
-	cp -r ../../include/vulkan $(BUILD_DIR)/include
-	cp -r ../../include/vk_video $(BUILD_DIR)/include
+	@mkdir -p $(BUILD_DIR)/include/vulkan $(BUILD_DIR)/include/vk_video
+	cp -r ../../include/vulkan/. $(BUILD_DIR)/include/vulkan/
+	cp -r ../../include/vk_video/. $(BUILD_DIR)/include/vk_video/
 
 .PHONY: all clean install_headers
 
