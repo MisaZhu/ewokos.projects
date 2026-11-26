@@ -69,12 +69,12 @@ static EGLContext egl_ctx = EGL_NO_CONTEXT;
 #define GLYPH_PX     8
 #define NGLYPH_SET   72          /* distinct procedural marks            */
 
-#define NCOL         28          /* columns across X (2x github baseline 14) */
+#define NCOL         19          /* columns across X (2/3 of the old 28: rain density cut by 1/3) */
 #define NDEPTH       4           /* layers across Z (depth)              */
 #define NCOLS        (NCOL * NDEPTH)
 #define MAXTRAIL     24
 
-#define SPACE_X      0.725f      /* halved from baseline 1.45 so 2x columns fill the same field width; 0.725 > GLYPH_SIZE 0.62 keeps neighbours distinct (no wall) */
+#define SPACE_X      1.0875f     /* (28-1)*0.725/(19-1): keeps the same field width with 1/3 fewer columns; > GLYPH_SIZE 0.44 keeps neighbours distinct (no wall) */
 #define SPACE_Z      2.80f
 #define GY           0.85f       /* world distance between glyphs in a col */
 #define YTOP         14.00f      /* sim field raised from baseline +/-9 so the doubled trail (26*GY=22.1) fits without re-triggering reset every frame */

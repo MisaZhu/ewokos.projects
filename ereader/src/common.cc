@@ -69,7 +69,7 @@ uint32_t strHash(const string& s) {
 
 /* ---- settings / store --------------------------------------------------- */
 Settings::Settings() {
-	fontSize = 18;
+	fontSize = 16;
 	theme = THEME_PAPER;
 	lineGap = 150;
 	shelfDir = SHELF_DEFAULT;
@@ -86,7 +86,7 @@ void Store::load() {
 	json_var_t* v = json_parse_file(fname.c_str());
 	if(v == NULL)
 		return;
-	settings.fontSize = json_get_int_def(v, "fontSize", 18);
+	settings.fontSize = json_get_int_def(v, "fontSize", 16);
 	settings.theme    = json_get_int_def(v, "theme", THEME_PAPER);
 	settings.lineGap  = json_get_int_def(v, "lineGap", 150);
 	if(settings.fontSize < 12) settings.fontSize = 12;
