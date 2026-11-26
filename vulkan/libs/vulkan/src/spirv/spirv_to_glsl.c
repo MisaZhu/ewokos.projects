@@ -74,11 +74,16 @@ typedef struct {
 
     uint32_t  barriers[MAX_BARRIERS];
     int       nbar;
+    /* Enclosing-loop merge/continue labels: a branch onto one of these is a
+     * structured break/continue, not an irregular escape. */
+    uint32_t  loop_merge[MAX_BARRIERS], loop_cont[MAX_BARRIERS];
+    int       nloop;
     int       depth;
     int       nssbo;
 
     /* ---- kernel-generation state (GM_XFORM / GM_RASTER only) ---- */
     int        mode;
+    int        in_func;                    /* emitting a called helper body    */
     kern_iface kin[SPIRV_MAX_LOCATIONS];  int nkin;   /* inputs / varyings    */
     kern_iface kout[SPIRV_MAX_LOCATIONS]; int nkout;  /* VS outputs (varyings)*/
     int        has_position;               /* VS wrote gl_Position            */
@@ -206,6 +211,16 @@ static int type_name(gctx *c, uint32_t tid, char *out, size_t n)
                 return decl(c, "only float matrices supported");
         }
         snprintf(out, n, "mat%u", t->comps);
+        return 0;
+    }
+    case OpTypeArray: {
+        /* fixed-size array of a value type: "int[40]" etc.  GLSL has no array
+         * assignment, so whole-array copies are lowered separately (see the
+         * OpVariable/OpStore/OpLoad array cases in emit_stmt). */
+        char base[32];
+        if (t->count == 0) return decl(c, "runtime array outside a buffer");
+        if (type_name(c, t->elem, base, sizeof base) != 0) return -1;
+        snprintf(out, n, "%s[%u]", base, t->count);
         return 0;
     }
     default:
@@ -451,6 +466,13 @@ static int declare_global_var(gctx *c, const spirv_insn *in)
     if (!pt) return decl(c, "bad variable pointer type");
     bt = spirv_type_find(c->m, pointee);
 
+    /* glslang emits SSBOs in the legacy Vulkan style: storage class Uniform
+     * with a BufferBlock-decorated pointee struct.  Reclassify exactly as
+     * spirv_entry_bindings does, so standard glslang output is accepted. */
+    if (storage == SC_Uniform &&
+        spirv_deco_find(c->m, pointee, 0xffffffffu, DecoBufferBlock) != NULL)
+        storage = SC_StorageBuffer;
+
     switch (storage) {
     case SC_Input:
     case SC_Output: {
@@ -544,6 +566,49 @@ static int assign_start(gctx *c, const spirv_insn *in, int ind)
     return 0;
 }
 
+/* Whole-array store lowering: GLSL ES 3.10 has neither array assignment nor
+ * array constructors, so an OpStore of an entire fixed array is unrolled into
+ * per-element writes.  Supported sources: an OpConstantComposite array, or an
+ * OpBitcast between a vector and an array of the same total width (glslang's
+ * int[4](vec4) idiom).  Anything else declines. */
+static int emit_array_store(gctx *c, uint32_t ptr, uint32_t val, int ind)
+{
+    spirv_type *pt = spirv_type_find(c->m, id_type(c, ptr));
+    spirv_type *at = pt ? spirv_type_find(c->m, pt->elem) : NULL;
+    int32_t dv = (val < c->m->bound) ? c->m->def_at[val] : -1;
+    const spirv_insn *vin;
+    uint32_t k;
+    if (!at || at->op != OpTypeArray || at->count == 0)
+        return decl(c, "array store: bad destination");
+    if (dv < 0) return decl(c, "array store: bad source");
+    vin = &c->m->insns[dv];
+    if (vin->op == OpConstantComposite) {
+        if (vin->wc - 3 != at->count) return decl(c, "array store: size mismatch");
+        for (k = 0; k < at->count; k++) {
+            indent(c, ind);
+            gf(c, "%s[%u] = %s;\n", idname(c, ptr), k, idname(c, vin->w[3 + k]));
+        }
+        return 0;
+    }
+    if (vin->op == OpBitcast) {
+        spirv_type *st = spirv_type_find(c->m, id_type(c, vin->w[3]));
+        spirv_type *se = st ? spirv_type_find(c->m, st->elem) : NULL;
+        spirv_type *ae = spirv_type_find(c->m, at->elem);
+        uint32_t sw = st ? st->comps : 0;
+        if (!st || st->op != OpTypeVector || sw != at->count || !se || !ae ||
+            se->op != ae->op || se->width != ae->width)
+            return decl(c, "array store: unsupported bitcast source");
+        for (k = 0; k < at->count; k++) {
+            indent(c, ind);
+            gf(c, "%s[%u] = %s(%s.%c);\n", idname(c, ptr), k,
+               ae->op == OpTypeFloat ? "float" : (ae->is_signed ? "int" : "uint"),
+               idname(c, vin->w[3]), swz[k]);
+        }
+        return 0;
+    }
+    return decl(c, "whole-array copy unsupported");
+}
+
 static const char *binop_str(uint32_t op)
 {
     switch (op) {
@@ -551,7 +616,7 @@ static const char *binop_str(uint32_t op)
     case OpISub: case OpFSub: return "-";
     case OpIMul: case OpFMul: return "*";
     case OpSDiv: case OpUDiv: case OpFDiv: return "/";
-    case OpSRem: case OpUMod: return "%";
+    case OpSRem: case OpSMod: case OpUMod: return "%";
     case OpBitwiseAnd: return "&";
     case OpBitwiseOr:  return "|";
     case OpBitwiseXor: return "^";
@@ -621,8 +686,8 @@ static int emit_extinst(gctx *c, const spirv_insn *in, int ind)
         return 0;
     case G_Pow: case G_Atan2: case G_FMin: case G_NMin: case G_FMax: case G_NMax:
     case G_UMin: case G_SMin: case G_UMax: case G_SMax: case G_Distance:
-    case G_Cross: case G_Reflect: case G_FMix:
-        if (na != 2 && eop != G_FMix) return decl(c, "bad extinst arity");
+    case G_Cross: case G_Reflect:
+        if (na != 2) return decl(c, "bad extinst arity");
         if (assign_start(c, in, ind) != 0) return -1;
         {
             const char *fn;
@@ -631,10 +696,15 @@ static int emit_extinst(gctx *c, const spirv_insn *in, int ind)
             case G_FMin: case G_NMin: case G_UMin: case G_SMin: fn = "min"; break;
             case G_FMax: case G_NMax: case G_UMax: case G_SMax: fn = "max"; break;
             case G_Distance: fn = "distance"; break; case G_Cross: fn = "cross"; break;
-            case G_Reflect: fn = "reflect"; break; default: fn = "mix"; break;
+            default: fn = "reflect"; break;
             }
             gf(c, "%s(%s, %s);\n", fn, idname(c, a[0]), idname(c, a[1]));
         }
+        return 0;
+    case G_FMix:
+        if (na != 3) return decl(c, "bad extinst arity");
+        if (assign_start(c, in, ind) != 0) return -1;
+        gf(c, "mix(%s, %s, %s);\n", idname(c, a[0]), idname(c, a[1]), idname(c, a[2]));
         return 0;
     case G_Fma:
         /* The on-device mesa frontend has no fma() builtin; expand to a*b+c,
@@ -718,16 +788,27 @@ static int emit_stmt(gctx *c, const spirv_insn *in, int ind)
         uint32_t storage = (in->wc >= 4) ? w[3] : 0;
         spirv_type *pt = spirv_type_find(c->m, w[1]);
         uint32_t pointee = pt ? pt->elem : 0;
+        spirv_type *pdt = spirv_type_find(c->m, pointee);
         char nm[32];
         if (storage != SC_Function)
             return decl(c, "non-function variable inside a body");
         if (type_name(c, pointee, tn, sizeof tn) != 0) return -1;
         snprintf(nm, sizeof nm, "v%u", w[2]);
-        indent(c, ind);
-        if (in->wc >= 5) gf(c, "%s %s = %s;\n", tn, nm, idname(c, w[4]));
-        else gf(c, "%s %s;\n", tn, nm);
         set_name(c, w[2], nm);
         c->is_ptr[w[2]] = 1;
+        indent(c, ind);
+        if (pdt && pdt->op == OpTypeArray) {
+            /* GLSL array declarator syntax; no array constructors exist, so an
+             * initializer must be a whole-array store lowered per element. */
+            spirv_type *ae = spirv_type_find(c->m, pdt->elem);
+            char en[32];
+            if (!ae || type_name(c, pdt->elem, en, sizeof en) != 0) return -1;
+            gf(c, "%s %s[%u];\n", en, nm, pdt->count);
+            if (in->wc >= 5) return emit_array_store(c, w[2], w[4], ind);
+            return 0;
+        }
+        if (in->wc >= 5) gf(c, "%s %s = %s;\n", tn, nm, idname(c, w[4]));
+        else gf(c, "%s %s;\n", tn, nm);
         return 0;
     }
 
@@ -774,15 +855,27 @@ static int emit_stmt(gctx *c, const spirv_insn *in, int ind)
             set_name(c, w[2], idname(c, w[3]));
             return 0;
         }
+        /* whole-array load: alias the source lvalue.  GLSL cannot copy arrays;
+         * this is exact for the write-once-then-index pattern (the array is
+         * fully stored before any whole load and never written afterwards). */
+        if (rt && rt->op == OpTypeArray) {
+            set_name(c, w[2], idname(c, w[3]));
+            return 0;
+        }
         if (assign_start(c, in, ind) != 0) return -1;
         gf(c, "%s;\n", idname(c, w[3]));
         return 0;
     }
 
-    case OpStore:
+    case OpStore: {
+        spirv_type *pt = spirv_type_find(c->m, id_type(c, w[1]));
+        spirv_type *pdt = pt ? spirv_type_find(c->m, pt->elem) : NULL;
+        if (pdt && pdt->op == OpTypeArray)
+            return emit_array_store(c, w[1], w[2], ind);
         indent(c, ind);
         gf(c, "%s = %s;\n", idname(c, w[1]), idname(c, w[2]));
         return 0;
+    }
 
     case OpArrayLength: {
         /* base ptr w[3], member index w[4]; runtime array named "data" */
@@ -797,11 +890,20 @@ static int emit_stmt(gctx *c, const spirv_insn *in, int ind)
         return 0;
 
     case OpSelect: {
-        /* only a scalar-bool condition maps onto the GLSL ternary */
+        /* scalar-bool condition maps onto the GLSL ternary (vector results
+         * are fine); a per-component bool vector maps onto mix(x,y,bvec),
+         * which selects y where true -- note the swapped operand order. */
         spirv_type *ct = spirv_type_find(c->m, id_type(c, w[3]));
-        if (!ct || ct->op != OpTypeBool) return decl(c, "vector select unsupported");
+        spirv_type *ce = (ct && ct->op == OpTypeVector)
+                         ? spirv_type_find(c->m, ct->elem) : NULL;
+        if (!ct || (ct->op != OpTypeBool &&
+                    !(ce && ce->op == OpTypeBool)))
+            return decl(c, "vector select unsupported");
         if (assign_start(c, in, ind) != 0) return -1;
-        gf(c, "(%s ? %s : %s);\n", idname(c, w[3]), idname(c, w[4]), idname(c, w[5]));
+        if (ct->op == OpTypeBool)
+            gf(c, "(%s ? %s : %s);\n", idname(c, w[3]), idname(c, w[4]), idname(c, w[5]));
+        else
+            gf(c, "mix(%s, %s, %s);\n", idname(c, w[5]), idname(c, w[4]), idname(c, w[3]));
         return 0;
     }
 
@@ -922,6 +1024,27 @@ static int emit_stmt(gctx *c, const spirv_insn *in, int ind)
 
     case OpExtInst:
         return emit_extinst(c, in, ind);
+
+    case OpFunctionCall: {
+        /* w[3] = callee id, w[4..] = arguments.  Pointer arguments pass the
+         * caller's lvalue (the callee signature made them `inout`); a void
+         * return is a bare statement (its result id is never used). */
+        spirv_func *cf = spirv_func_find(c->m, w[3]);
+        spirv_type *rt = spirv_type_find(c->m, w[1]);
+        uint32_t k;
+        if (!cf || cf->first_block == 0xffffffffu)
+            return decl(c, "call to an unknown function");
+        if (rt && rt->op == OpTypeVoid) {
+            indent(c, ind);
+        } else {
+            if (assign_start(c, in, ind) != 0) return -1;
+        }
+        gf(c, "f%u(", w[3]);
+        for (k = 4; k < in->wc; k++)
+            gf(c, "%s%s", (k > 4) ? ", " : "", idname(c, w[k]));
+        gf(c, ");\n");
+        return 0;
+    }
 
     default: {
         const char *bo = binop_str(in->op);
@@ -1053,7 +1176,7 @@ static void emit_body(gctx *c, const blockinfo *bi, int ind)
     int32_t pc;
     for (pc = bi->start + 1; pc < bi->term && !c->declined; pc++) {
         spirv_insn *in = &c->m->insns[pc];
-        if (in->op == OpPhi || in->op == OpLabel) continue;
+        if (in->op == OpPhi || in->op == OpLabel || in->op == OpFunctionEnd) continue;
         if (emit_stmt(c, in, ind) != 0) return;
     }
 }
@@ -1082,7 +1205,29 @@ static void emit_loop(gctx *c, const blockinfo *bi, uint32_t follow, int ind)
             indent(c, ind + 1); gf(c, "break;\n");
             body_entry = 0;
         } else {
-            body_entry = t;
+            /* glslang may split the loop: the header (LoopMerge) branches
+             * unconditionally to a plain condition block whose conditional
+             * branch selects body vs merge.  Fold that block into the loop
+             * head here; it carries no merge instruction of its own. */
+            blockinfo cb;
+            if (get_block(c, t, &cb) == 0 && !cb.is_loop && !cb.is_sel &&
+                c->m->insns[cb.term].op == OpBranchConditional) {
+                spirv_insn *ct = &c->m->insns[cb.term];
+                uint32_t ct_t = ct->w[2], ct_f = ct->w[3];
+                emit_body(c, &cb, ind + 1);
+                if (c->declined) return;
+                if (ct_t == bi->merge) {
+                    indent(c, ind + 1); gf(c, "if (%s) break;\n", idname(c, ct->w[1]));
+                    body_entry = ct_f;
+                } else if (ct_f == bi->merge) {
+                    indent(c, ind + 1); gf(c, "if (!(%s)) break;\n", idname(c, ct->w[1]));
+                    body_entry = ct_t;
+                } else {
+                    decl(c, "loop exit not through the merge block"); return;
+                }
+            } else {
+                body_entry = t;
+            }
         }
     } else {
         decl(c, "loop header without a branch"); return;
@@ -1090,10 +1235,14 @@ static void emit_loop(gctx *c, const blockinfo *bi, uint32_t follow, int ind)
     if (c->nbar + 2 > MAX_BARRIERS) { decl(c, "control flow too deep"); return; }
     c->barriers[c->nbar++] = bi->merge;
     c->barriers[c->nbar++] = bi->cont;
+    c->loop_merge[c->nloop] = bi->merge;
+    c->loop_cont[c->nloop] = bi->cont;
+    c->nloop++;
     if (body_entry) emit_region(c, body_entry, bi->cont, ind + 1);
     c->nbar--;   /* pop cont so the continue block itself can be entered */
     emit_region(c, bi->cont, bi->label, ind + 1);
     c->nbar--;   /* pop merge */
+    c->nloop--;
     indent(c, ind); gf(c, "}\n");
     emit_region(c, bi->merge, follow, ind);
 }
@@ -1135,6 +1284,10 @@ static void emit_region(gctx *c, uint32_t label, uint32_t follow, int ind)
         indent(c, ind); gf(c, "discard;\n");
         break;
     case OpReturnValue:
+        if (c->in_func) {
+            indent(c, ind); gf(c, "return %s;\n", idname(c, term->w[1]));
+            break;
+        }
         decl(c, "return with a value in an entry point");
         break;
     case OpSwitch:
@@ -1142,26 +1295,66 @@ static void emit_region(gctx *c, uint32_t label, uint32_t follow, int ind)
         break;
     case OpBranch: {
         uint32_t t = term->w[1];
+        /* A branch onto the innermost enclosing loop's merge/continue block
+         * is a structured break/continue (glslang emits these for `break`
+         * and `continue` inside the loop body). */
+        if (c->nloop > 0 && t == c->loop_merge[c->nloop - 1]) {
+            indent(c, ind); gf(c, "break;\n");
+            break;
+        }
+        if (c->nloop > 0 && t == c->loop_cont[c->nloop - 1] && t != follow) {
+            /* A MID-BODY continue (the branch jumps to the continue construct
+             * from inside the body, not as the body's natural fall-through).
+             * The loop is emitted as for(;;) with the continue construct
+             * (back-edge phi copies + loop increment) as straight-line code at
+             * the body tail, NOT in a for-iteration clause, so a bare
+             * `continue` would skip the increment and spin forever.  Run the
+             * construct inline here, then loop.  The natural fall-through
+             * (t == follow) is left to the default path below: it stops at the
+             * construct, which emit_loop then emits once at the body tail. */
+            blockinfo cb;
+            emit_phi_copies(c, t, label, ind);
+            if (get_block(c, t, &cb) == 0) {
+                spirv_insn *ct;
+                emit_body(c, &cb, ind);
+                ct = &c->m->insns[cb.term];
+                if (ct->op == OpBranch)
+                    emit_phi_copies(c, ct->w[1], t, ind);
+            }
+            indent(c, ind); gf(c, "continue;\n");
+            break;
+        }
         emit_phi_copies(c, t, label, ind);
         if (t != follow) emit_region(c, t, follow, ind);
         break;
     }
     case OpBranchConditional: {
         uint32_t cond = term->w[1], t = term->w[2], f = term->w[3];
+        int crit_t, crit_f;
         if (!bi.is_sel) { decl(c, "unstructured conditional branch"); break; }
-        if (phi_uses_edge(c, t, label) || phi_uses_edge(c, f, label)) {
+        /* A critical edge (this branch is not the target's only predecessor)
+         * cannot carry its phi copies at the branch tail.  When the target is
+         * the merge block itself, the copies can instead be emitted INSIDE the
+         * taking arm, which executes exactly on that edge. */
+        crit_t = phi_uses_edge(c, t, label);
+        crit_f = phi_uses_edge(c, f, label);
+        if ((crit_t && t != bi.merge) || (crit_f && f != bi.merge)) {
             decl(c, "phi on a critical edge"); break;
         }
         if (c->nbar + 1 > MAX_BARRIERS) { decl(c, "control flow too deep"); break; }
         c->barriers[c->nbar++] = bi.merge;
         if (t == bi.merge && f == bi.merge) {
-            /* both edges go straight to the merge: nothing to emit */
+            /* both edges go straight to the merge: the phi copies (if any)
+             * run unconditionally on either edge */
+            if (crit_t) emit_phi_copies(c, t, label, ind);
         } else if (t == bi.merge) {
             indent(c, ind); gf(c, "if (!(%s)) {\n", idname(c, cond));
+            if (crit_f) emit_phi_copies(c, f, label, ind + 1);
             emit_region(c, f, bi.merge, ind + 1);
             indent(c, ind); gf(c, "}\n");
         } else if (f == bi.merge) {
             indent(c, ind); gf(c, "if (%s) {\n", idname(c, cond));
+            if (crit_t) emit_phi_copies(c, t, label, ind + 1);
             emit_region(c, t, bi.merge, ind + 1);
             indent(c, ind); gf(c, "}\n");
         } else {
@@ -1193,6 +1386,91 @@ static void declare_phis(gctx *c, int ind)
         if (type_name(c, in->w[1], tn, sizeof tn) != 0) return;
         indent(c, ind); gf(c, "%s v%u;\n", tn, in->w[2]);
     }
+}
+
+/* Emit the module's non-entry functions (the helpers an entry calls via
+ * OpFunctionCall, e.g. a Shadertoy FS's string builders).  Prototypes go out
+ * first so call order in the module does not matter, then each body with the
+ * same SSA-lowering as the entry.  glslang passes aggregates and `out`
+ * parameters (Shadertoy's mainImage fragColor) as Function-storage pointers:
+ * they become GLSL `inout` value parameters, and the call site passes the
+ * caller's lvalue so write-back lands in the caller's variable.  Any other
+ * pointer parameter declines. */
+static int func_param_is_ptr(gctx *c, uint32_t tid, uint32_t *pointee)
+{
+    spirv_type *t = spirv_type_find(c->m, tid);
+    if (t && t->op == OpTypePointer && t->storage == SC_Function) {
+        *pointee = t->elem;
+        return 1;
+    }
+    *pointee = tid;
+    return 0;
+}
+
+static int emit_functions(gctx *c)
+{
+    spirv_module *m = c->m;
+    spirv_func *save_f = c->f;
+    uint32_t fi, pass;
+
+    for (pass = 0; pass < 2 && !c->declined; pass++) {
+        for (fi = 0; fi < m->nfuncs && !c->declined; fi++) {
+            spirv_func *f = &m->funcs[fi];
+            spirv_insn *fin;
+            char rt[32];
+            uint32_t pc;
+            const char *sep;
+            if (f->id == c->ep->id || f->first_block == 0xffffffffu) continue;
+            fin = &m->insns[f->start];
+            if (fin->op != OpFunction) return decl(c, "bad function definition");
+            if (type_name(c, f->ret_type, rt, sizeof rt) != 0) return -1;
+            if (pass == 0) {
+                /* prototype */
+                gf(c, "%s f%u(", rt, f->id);
+                sep = "";
+                for (pc = f->start + 1; pc < f->first_block; pc++) {
+                    spirv_insn *pin = &m->insns[pc];
+                    char pt[32];
+                    uint32_t pe;
+                    int is_ptr;
+                    if (pin->op != OpFunctionParameter) continue;
+                    is_ptr = func_param_is_ptr(c, pin->w[1], &pe);
+                    if (type_name(c, pe, pt, sizeof pt) != 0) return -1;
+                    gf(c, "%s%s%s v%u", sep, is_ptr ? "inout " : "", pt, pin->w[2]);
+                    sep = ", ";
+                }
+                gf(c, ");\n");
+                continue;
+            }
+            /* body */
+            gf(c, "%s f%u(", rt, f->id);
+            sep = "";
+            for (pc = f->start + 1; pc < f->first_block; pc++) {
+                spirv_insn *pin = &m->insns[pc];
+                char pt[32], pn[24];
+                uint32_t pe;
+                int is_ptr;
+                if (pin->op != OpFunctionParameter) continue;
+                is_ptr = func_param_is_ptr(c, pin->w[1], &pe);
+                if (type_name(c, pe, pt, sizeof pt) != 0) return -1;
+                snprintf(pn, sizeof pn, "v%u", pin->w[2]);
+                set_name(c, pin->w[2], pn);
+                gf(c, "%s%s%s %s", sep, is_ptr ? "inout " : "", pt, pn);
+                sep = ", ";
+            }
+            gf(c, ") {\n");
+            c->f = f;
+            c->in_func = 1;
+            declare_phis(c, 1);
+            emit_region(c, m->insns[f->first_block].w[1], 0, 1);
+            c->in_func = 0;
+            c->f = save_f;
+            if (c->declined) return -1;
+            gf(c, "}\n\n");
+        }
+    }
+    gf(c, "\n");
+    return c->declined ? -1 : 0;
 }
 
 /* ---- top level ----------------------------------------------------------- */
@@ -1450,9 +1728,18 @@ static int declare_pervertex_block(gctx *c, uint32_t id, uint32_t struct_tid)
 
     for (mj = 0; mj < st->nmembers; mj++) {
         uint32_t mt = struct_member_type(c, struct_tid, mj);
+        spirv_type *mtt = spirv_type_find(c->m, mt);
         uint32_t mc = 0;
         int mb = spirv_deco_int(c->m, struct_tid, mj, DecoBuiltIn, -1);
-        if (iface_float_comps(c, mt, &mc) != 0) return -1;
+        /* glslang pads gl_PerVertex with ClipDistance/CullDistance float
+         * arrays even when the shader never touches them; accept float
+         * arrays so plain vertex shaders still qualify (the harness only
+         * reads the gl_Position member). */
+        if (mtt && mtt->op == OpTypeArray) {
+            spirv_type *ae = spirv_type_find(c->m, mtt->elem);
+            if (!ae || ae->op != OpTypeFloat || ae->width != 32)
+                return decl(c, "gl_PerVertex array member must be float");
+        } else if (iface_float_comps(c, mt, &mc) != 0) return -1;
         if (mb == BiPosition) pos_member = (int)mj;
     }
     if (pos_member < 0)
@@ -1461,7 +1748,12 @@ static int declare_pervertex_block(gctx *c, uint32_t id, uint32_t struct_tid)
     gf(c, "struct vkPerVertex_t {\n");
     for (mj = 0; mj < st->nmembers; mj++) {
         uint32_t mt = struct_member_type(c, struct_tid, mj);
+        spirv_type *mtt = spirv_type_find(c->m, mt);
         char tn[12];
+        if (mtt && mtt->op == OpTypeArray) {
+            gf(c, "    float m%u[%u];\n", mj, mtt->count);
+            continue;
+        }
         if (type_name(c, mt, tn, sizeof tn) != 0) return -1;
         gf(c, "    %s m%u;\n", tn, mj);
     }
@@ -1663,6 +1955,7 @@ static char *gen_xform_kernel(spirv_module *m, const spirv_entry *e,
 
     if (kern_scan_globals(&c) != 0) goto done;
     if (!c.has_position) { decl(&c, "vertex shader does not write gl_Position"); goto done; }
+    if (emit_functions(&c) != 0) goto done;
 
     /* carry this stage's flattened UBO/push members into the layout (the raster
      * stage merges its own on top, de-duplicated by name) */
@@ -1923,6 +2216,7 @@ static char *gen_raster_kernel(spirv_module *m, const spirv_entry *e,
     if (fs) {
         if (kern_scan_globals(&c) != 0) goto done;
         if (!c.has_color) { decl(&c, "fragment shader writes no vec4 colour output"); goto done; }
+        if (emit_functions(&c) != 0) goto done;
         /* resolve each FS input varying against the VS vout layout */
         voff = (int *)malloc((size_t)(c.nkin ? c.nkin : 1) * sizeof(int));
         if (!voff) { decl(&c, "out of memory"); goto done; }

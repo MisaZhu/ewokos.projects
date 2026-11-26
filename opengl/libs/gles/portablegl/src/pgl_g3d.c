@@ -1698,6 +1698,13 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 					int partial = (x1 > x0 && y1 > y0 &&
 					               (x0 > 0.0f || y0 > 0.0f ||
 					                x1 < fw || y1 < fh));
+					/* FORCE full-frame launch on the pixel-owned route. The
+					   shrunk-grid + uDispatchOffset window is the ONLY difference
+					   between windowed (sliced/shifted bands on 8gen3) and
+					   fullscreen (clean) GL draws; launching the full grid with
+					   offset {0,0} reproduces the proven-clean fullscreen path.
+					   Correctness over the per-draw full-frame read cost. */
+					partial = 0;
 					/* The kernel ALWAYS adds uDispatchOffset, so a
 					   full-frame launch needs it patched to zero: a
 					   stale blob word would shift every pixel. */

@@ -1,0 +1,190 @@
+#version 450
+/* vkmatrix compute stage: "Inside the Matrix" (Shadertoy 4t3BWl, And390)
+ * evaluated on the GPU at NATIVE window resolution, one invocation per pixel.
+ *
+ * This is the reference rain/rune/hash math inlined into a single entry point
+ * because the EwokOS GPU transpiler (spirv_to_glsl.c) declines function calls,
+ * non-square matrices, `continue` and early returns from loops.  Equivalence
+ * notes against the verified CPU port (matrix.c):
+ *   - hash2/hash4 expansions use the row-vector convention of `v * matNxM`
+ *     exactly as matrix.c does (px = x*127.1 + y*269.5, ...);
+ *   - the camera (ro + column-major M) is built once per frame by the app's
+ *     camera_build and passed through the params SSBO, so the per-pixel ray
+ *     setup is bit-identical to matrix_render_band;
+ *   - fragCoord is bottom-left (fy = H - 0.5 - row), pixel centres +0.5;
+ *   - the reference `continue` (gap cells) becomes an inverted guard, and the
+ *     early `return result.xyz` becomes a done flag + structured breaks;
+ *   - output packing matches the graph canvas: r | g<<8 | b<<16 | 0xff000000.
+ *
+ * params p[]: [0]=time [1]=W [2]=H [3..5]=ro [6..14]=M (column-major)
+ * out px[]:   W*H packed pixels, row-major from the TOP row.
+ */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Params { float p[]; };
+layout(set = 0, binding = 1) buffer OutBuf { uint px[]; };
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    uint W = uint(p[1]);
+    uint H = uint(p[2]);
+    if (id >= W * H) return;
+
+    float time = p[0];
+    float fw = float(W);
+    float fh = float(H);
+    float fx = float(id % W) + 0.5;
+    float fy = fh - 0.5 - float(id / W);
+    float uv_x = (fx * 2.0 - fw) / fh;
+    float uv_y = (fy * 2.0 - fh) / fh;
+
+    /* rd_un = M * (uv_x, 2, uv_y); ro = cam.ro + rd_un*0.2 (matrix.c order) */
+    vec3 v = vec3(uv_x, 2.0, uv_y);
+    vec3 rd_un = vec3(
+        p[6] * v.x + p[9]  * v.y + p[12] * v.z,
+        p[7] * v.x + p[10] * v.y + p[13] * v.z,
+        p[8] * v.x + p[11] * v.y + p[14] * v.z);
+    vec3 ro = vec3(p[3], p[4], p[5]) + rd_un * 0.2;
+    vec3 rd = normalize(rd_un);
+
+    /* ---- rain (reference inlined) ---- */
+    vec4 result = vec4(0.0);
+    vec2 ro2 = ro.xy;
+    vec2 rd2 = normalize(rd.xy);
+    bool prefer_dx = abs(rd2.x) > abs(rd2.y);
+    float t3_to_t2 = prefer_dx ? rd.x / rd2.x : rd.y / rd2.y;
+    ivec3 cell_side = ivec3(step(0.0, rd));
+    ivec3 cell_shift = ivec3(sign(rd));
+    float t2 = 0.0;
+    ivec2 next_cell = ivec2(floor(ro2 / 1.2));   /* XYCELL_SIZE */
+    bool done = false;
+    for (int i = 0; i < 40; i++) {               /* ITERATIONS */
+        ivec2 cell = next_cell;
+        float t2s = t2;
+        vec2 side = vec2(next_cell + cell_side.xy) * 1.2;
+        vec2 t2_side = (side - ro2) / rd2;
+        if (t2_side.x < t2_side.y) {
+            t2 = t2_side.x;
+            next_cell.x += cell_shift.x;
+        } else {
+            t2 = t2_side.y;
+            next_cell.y += cell_shift.y;
+        }
+        vec2 cell_in_block = fract(vec2(cell) / 10.0);   /* BLOCK_SIZE */
+        /* gap cells: reference `continue` as an inverted guard.  Written
+         * without &&/|| because glslang lowers logical short-circuiting into
+         * unmerged conditional branches the transpiler declines.
+         * (cx<0.2 || cy<0.2) == min(cx,cy)<0.2;
+         * (cx<0.3 && cy<0.3) == max(cx,cy)<0.3; OR via bool ternary. */
+        bool gap = (min(cell_in_block.x, cell_in_block.y) < 0.2)
+                   ? true : (max(cell_in_block.x, cell_in_block.y) < 0.3);
+        if (!gap) {
+            float t3s = t2s / t3_to_t2;
+            float pos_z = ro.z + rd.z * t3s;
+            float xycell_hash = fract(sin(dot(vec2(cell), vec2(5.3983, 5.4427)))
+                                      * 43758.5453123);
+            float z_shift = xycell_hash * 11.0 - time *
+                (0.5 + xycell_hash + xycell_hash * xycell_hash +
+                 pow(xycell_hash, 16.0) * 3.0);
+            float char_z_shift = floor(z_shift / 0.15);  /* STRIP_CHAR_HEIGHT */
+            z_shift = char_z_shift * 0.15;
+            int zcell = int(floor((pos_z - z_shift) / 6.0));  /* ZCELL_SIZE */
+            for (int j = 0; j < 2; j++) {
+                vec3 cv = vec3(float(cell.x), float(cell.y), float(zcell));
+                vec4 cell_hash = fract(sin(vec4(
+                    cv.x * 127.1 + cv.y * 311.7 + cv.z * 74.7,
+                    cv.x * 269.5 + cv.y * 183.3 + cv.z * 246.1,
+                    cv.x * 113.5 + cv.y * 271.9 + cv.z * 124.6,
+                    cv.x * 271.9 + cv.y * 269.5 + cv.z * 311.7))
+                    * 43758.5453123);
+                vec4 cell_hash2 = fract(cell_hash * vec4(127.1, 311.7, 271.9, 124.6));
+                float chars_count = cell_hash.w * 33.0 + 7.0;
+                float target_length = chars_count * 0.15;
+                float target_rad = 0.05;                 /* STRIP_CHAR_WIDTH/2 */
+                float target_z = (float(zcell) * 6.0 + z_shift) +
+                                 cell_hash.z * (6.0 - target_length);
+                vec2 target = vec2(cell) * 1.2 + target_rad +
+                              cell_hash.xy * (1.2 - target_rad * 2.0);
+                vec2 s = target - ro2;
+                float tmin = dot(s, rd2);
+                /* tmin in [t2s,t2] without && (see gap-guard note) */
+                if (min(tmin - t2s, t2 - tmin) >= 0.0) {
+                    float u = s.x * rd2.y - s.y * rd2.x;
+                    if (abs(u) < target_rad) {
+                        u = (u / target_rad + 1.0) / 2.0;
+                        float z = ro.z + rd.z * tmin / t3_to_t2;
+                        float vv = (z - target_z) / target_length;
+                        /* vv in [0,1) == floor(vv)==0, without && */
+                        if (floor(vv) == 0.0) {
+                            float c = floor(vv * chars_count);
+                            float q = fract(vv * chars_count);
+                            vec2 char_hash = fract(sin(vec2(
+                                (c + char_z_shift) * 127.1 + cell_hash2.x * 269.5,
+                                (c + char_z_shift) * 311.7 + cell_hash2.x * 183.3))
+                                * 43758.5453123);
+                            /* char_hash.x>=0.1 || c==0, without || */
+                            bool keep = (char_hash.x >= 0.1) ? true : (c == 0.0);
+                            if (keep) {
+                                float time_factor = floor(c == 0.0 ? time * 5.0 :
+                                    time * (cell_hash2.z + cell_hash2.w *
+                                            cell_hash2.w * 4.0 * pow(char_hash.y, 4.0)));
+                                /* random_char + rune inlined */
+                                vec2 outer = vec2(char_hash.x, time_factor);
+                                vec2 seed = vec2(dot(outer, vec2(269.5, 183.3)),
+                                                 dot(outer, vec2(113.5, 271.9)));
+                                float highlight = max(1.0, 3.0 - c / 2.0) * 0.2;
+                                float d = 1e5;
+                                for (int k = 0; k < 4; k++) {
+                                    vec4 pos = fract(sin(vec4(
+                                        seed.x * 127.1 + seed.y * 311.7,
+                                        seed.x * 269.5 + seed.y * 183.3,
+                                        seed.x * 113.5 + seed.y * 271.9,
+                                        seed.x * 246.1 + seed.y * 124.6))
+                                        * 43758.5453123);
+                                    seed += 1.0;
+                                    if (k == 0) pos.y = 0.0;
+                                    if (k == 1) pos.x = 0.999;
+                                    if (k == 2) pos.x = 0.0;
+                                    if (k == 3) pos.y = 0.999;
+                                    vec4 snaps = vec4(2.0, 3.0, 2.0, 3.0);
+                                    pos = (floor(pos * snaps) + 0.5) / snaps;
+                                    /* pos.xy != pos.zw, without || */
+                                    bool degen = (pos.x != pos.z) ? true : (pos.y != pos.w);
+                                    if (degen) {
+                                        vec2 pp = vec2(u, q) - pos.xy;
+                                        vec2 bb = pos.zw + 0.001 - pos.xy;
+                                        float h = clamp(dot(pp, bb) / dot(bb, bb),
+                                                        0.0, 1.0);
+                                        d = min(d, length(pp - bb * h));
+                                    }
+                                }
+                                float a = smoothstep(0.1, 0.0, d) +
+                                          highlight * smoothstep(0.4, 0.0, d);
+                                a *= clamp((chars_count - 0.5 - c) / 2.0, 0.0, 1.0);
+                                if (a > 0.0) {
+                                    float attenuation = 1.0 +
+                                        pow(0.06 * tmin / t3_to_t2, 2.0);
+                                    vec3 col = (c == 0.0 ? vec3(0.67, 1.0, 0.82)
+                                                         : vec3(0.25, 0.80, 0.40))
+                                               / attenuation;
+                                    float a1 = result.a;
+                                    result.a = a1 + (1.0 - a1) * a;
+                                    result.xyz = (result.xyz * a1 +
+                                                  col * (1.0 - a1) * a) / result.a;
+                                    if (result.a > 0.98) { done = true; break; }
+                                }
+                            }
+                        }
+                    }
+                }
+                zcell += cell_shift.z;
+            }
+            if (done) break;
+        }
+    }
+    vec3 col = done ? result.xyz : result.xyz * result.a;
+    uint r = uint(clamp(col.x, 0.0, 1.0) * 255.0 + 0.5);
+    uint g = uint(clamp(col.y, 0.0, 1.0) * 255.0 + 0.5);
+    uint b = uint(clamp(col.z, 0.0, 1.0) * 255.0 + 0.5);
+    px[id] = r | (g << 8) | (b << 16) | 0xff000000u;
+}

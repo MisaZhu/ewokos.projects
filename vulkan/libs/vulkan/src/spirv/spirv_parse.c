@@ -151,7 +151,13 @@ void spirv_free(spirv_module *m)
     free(m->label_at);
     free(m->scratch);
     free(m->scratch_valid);
+    for (uint32_t bi = 0; bi < m->narena_old; bi++)
+        free(m->arena_old[bi]);
+    free(m->arena_old);
     free(m->arena);
+    for (uint32_t i = 0; i < m->nconst_blocks; i++)
+        free(m->const_blocks[i]);
+    free(m->const_blocks);
     free(m);
 }
 

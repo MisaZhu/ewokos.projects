@@ -1086,7 +1086,16 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
             }
         }
     }
-    /* ---- resolve the FS combined-image samplers into TMU textures ---- */
+    /* ---- resolve the FS combined-image samplers into TMU textures ----
+     * The daemon binds tex[i] to the kernel's a6xx texture_index i, and ir3
+     * numbers texture_index DENSELY in sampler declaration order (num_samp ==
+     * the count, so the first sampler is always index 0 regardless of its
+     * Vulkan descriptor binding).  The tex[] staging slot must therefore be the
+     * dense sampler index j, NOT the raw Vulkan binding: a font sampler declared
+     * at binding 1 still samples texture_index 0, and staging it at tex[1] would
+     * leave tex[0] empty -- vkclient binds a contiguous run from unit 0, so it
+     * would bind nothing and the daemon declines the draw (num_tex=0).  The
+     * Vulkan (set,binding) is used only to LOOK UP the descriptor below. */
     memset(tex, 0, sizeof(tex));
     for (j = 0; j < (uint32_t)gp->glayout.num_samplers; j++) {
         uint32_t bset = gp->glayout.sampler_set[j];
@@ -1096,7 +1105,7 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
         vk_image *tim;
         void *th;
         uint32_t tbpp, tpitch;
-        if (bbind >= VKCLIENT_MAX_TEX)
+        if (j >= VKCLIENT_MAX_TEX)
             GFX_CPU();
         /* the FS samples this unit, so it MUST be bound: decline rather than let
          * the kernel read an unbound TMU (the daemon declines that too). */
@@ -1112,17 +1121,17 @@ static VkResult gpu_draw(vk_command_buffer *cb, vk_draw_ctx *dc,
         if (!th || tbpp != 4u || tpitch != tim->extent.width * 4u ||
             tim->extent.width == 0 || tim->extent.height == 0)
             GFX_CPU();
-        tex[bbind].host   = th;
-        tex[bbind].w      = tim->extent.width;
-        tex[bbind].h      = tim->extent.height;
-        tex[bbind].linear = (smp && (smp->mag == VK_FILTER_LINEAR ||
-                                     smp->min_f == VK_FILTER_LINEAR)) ? 1 : 0;
+        tex[j].host   = th;
+        tex[j].w      = tim->extent.width;
+        tex[j].h      = tim->extent.height;
+        tex[j].linear = (smp && (smp->mag == VK_FILTER_LINEAR ||
+                                 smp->min_f == VK_FILTER_LINEAR)) ? 1 : 0;
         /* Content generation of the image backing: vkclient keys its tiled-texture
          * cache on it, so an unchanged sampled image is not reconverted per draw.
          * th is non-NULL here, which implies tim->mem is non-NULL. */
-        tex[bbind].version = tim->mem ? tim->mem->content_version : 0u;
-        if (bbind + 1u > ntex)
-            ntex = bbind + 1u;
+        tex[j].version = tim->mem ? tim->mem->content_version : 0u;
+        if (j + 1u > ntex)
+            ntex = j + 1u;
     }
 
     /* ---- pack the per-draw uniform blob [xform | raster] ---- */

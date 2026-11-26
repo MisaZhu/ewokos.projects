@@ -62,10 +62,23 @@ static void *arena_alloc(interp *st, size_t bytes)
     if (m->arena_used + bytes > m->arena_cap) {
         size_t need = m->arena_cap ? m->arena_cap : 4096;
         uint8_t *na;
-        while (need < m->arena_used + bytes) need *= 2;
-        na = (uint8_t *)realloc(m->arena, need);
+        while (need < bytes) need *= 2;
+        /* Retire the current block instead of realloc: ptr.base pointers
+         * already handed out (private globals, interface vars) must remain
+         * valid until the invocation ends.  Retired blocks are freed at the
+         * next arena reset. */
+        if (m->arena) {
+            if (m->narena_old == m->arena_old_cap) {
+                uint32_t nc = m->arena_old_cap ? m->arena_old_cap * 2 : 8;
+                uint8_t **no = (uint8_t **)realloc(m->arena_old, nc * sizeof(*no));
+                if (!no) { st->error = 1; return NULL; }
+                m->arena_old = no; m->arena_old_cap = nc;
+            }
+            m->arena_old[m->narena_old++] = m->arena;
+        }
+        na = (uint8_t *)malloc(need);
         if (!na) { st->error = 1; return NULL; }
-        m->arena = na; m->arena_cap = need;
+        m->arena = na; m->arena_cap = need; m->arena_used = 0;
     }
     p = m->arena + m->arena_used;
     m->arena_used += bytes;
@@ -301,6 +314,10 @@ static int mem_load(interp *st, sval *out, const void *base, int64_t off, uint32
     case OpTypeStruct:
         out->klass = SV_STRUCT; out->agg = (void *)p; out->n = 0;
         return 0;
+    case OpTypeArray:
+        /* whole-array load: same zero-copy aggregate convention as structs */
+        out->klass = SV_STRUCT; out->agg = (void *)p; out->n = 0;
+        return 0;
     default:
         st->error = 1; return -1;
     }
@@ -363,6 +380,27 @@ static int mem_store(interp *st, void *base, int64_t off, uint32_t tid, const sv
             if (sz) memcpy(p, v->agg, sz);
         } else { st->error = 1; return -1; }
         return 0;
+    case OpTypeArray: {
+        /* whole-array store: aggregate copy, else packed elements from u[] */
+        uint32_t es = elem_stride(m, tid);
+        spirv_type *et;
+        uint32_t cn, j;
+        if (v->klass == SV_STRUCT && v->agg) {
+            uint32_t sz = spirv_type_size(m, tid, NULL);
+            if (sz) memcpy(p, v->agg, sz);
+            return 0;
+        }
+        if (!es) { st->error = 1; return -1; }
+        et = spirv_type_find(m, t->elem);
+        cn = (et && et->op == OpTypeVector) ? et->comps : 1;
+        for (i = 0; i * cn < v->n && i < t->count; i++) {
+            sval c;
+            describe(m, t->elem, &c);
+            for (j = 0; j < cn && j < SV_MAX_COMP; j++) c.u[j] = v->u[i * cn + j];
+            if (mem_store(st, p, (int64_t)i * es, t->elem, &c) != 0) return -1;
+        }
+        return 0;
+    }
     default:
         st->error = 1; return -1;
     }
@@ -371,6 +409,26 @@ static int mem_store(interp *st, void *base, int64_t off, uint32_t tid, const sv
 /* ---- constant materialisation -------------------------------------------- */
 
 static int materialize_const(interp *st, uint32_t id);
+
+/* Module-lifetime byte block for an aggregate constant (see const_blocks in
+ * spirv_priv.h): the scratch cache keeps the materialised sval across
+ * invocations, so its base must not live in the per-invocation arena. */
+static uint8_t *const_block_alloc(interp *st, size_t bytes)
+{
+    spirv_module *m = st->m;
+    uint8_t *b;
+    if (m->nconst_blocks == m->const_blocks_cap) {
+        uint32_t nc = m->const_blocks_cap ? m->const_blocks_cap * 2 : 8;
+        uint8_t **na = (uint8_t **)realloc(m->const_blocks, nc * sizeof(*na));
+        if (!na) { st->error = 1; return NULL; }
+        m->const_blocks = na; m->const_blocks_cap = nc;
+    }
+    b = (uint8_t *)malloc(bytes ? bytes : 1);
+    if (!b) { st->error = 1; return NULL; }
+    memset(b, 0, bytes);
+    m->const_blocks[m->nconst_blocks++] = b;
+    return b;
+}
 
 static int fetch_const_composite(interp *st, uint32_t id, sval *out)
 {
@@ -384,6 +442,29 @@ static int fetch_const_composite(interp *st, uint32_t id, sval *out)
         return -1;
     describe(m, in->w[1], out);
     out->n = 0;
+    {
+        /* const arrays (e.g. the int[] string tables of Shadertoy text
+         * shaders) exceed SV_MAX_COMP and are only ever read through access
+         * chains / composite extracts: materialise them as a packed byte
+         * block, the same SV_STRUCT+agg convention mem_load uses for structs. */
+        spirv_type *at = spirv_type_find(m, in->w[1]);
+        if (at && at->op == OpTypeArray) {
+            uint32_t es = elem_stride(m, in->w[1]);
+            uint32_t ne = in->wc - 3;
+            uint8_t *blk;
+            if (!es || !at->count) return -1;
+            blk = const_block_alloc(st, (size_t)es * ne);
+            if (!blk) return -1;
+            for (k = 3; k < in->wc; k++) {
+                if (materialize_const(st, in->w[k]) != 0) return -1;
+                if (mem_store(st, blk, (int64_t)(k - 3) * es, at->elem,
+                              &st->vals[in->w[k]]) != 0)
+                    return -1;
+            }
+            out->klass = SV_STRUCT; out->agg = blk; out->n = 0;
+            return 0;
+        }
+    }
     for (k = 3; k < in->wc; k++) {
         sval c;
         uint32_t j;
@@ -1017,6 +1098,27 @@ static int do_extinst(interp *st, sval *r, uint32_t setid, uint32_t op,
         for (i = 0; i < r->n; i++) { int ai; bin_index(a0, i, r->n, &ai);
             { int64_t x = comp_i(a0, ai); set_i(r, i, (x > 0) ? 1 : ((x < 0) ? -1 : 0)); } }
         r->skind = a0->skind; return 0;
+    case G_SMin: case G_SMax: case G_UMin: case G_UMax:
+        for (i = 0; i < r->n; i++) { int ai; bin_index(a0, i, r->n, &ai);
+            int64_t x = comp_i(a0, ai), y = comp_i(a1, (a1->n == 1) ? 0 : i);
+            int less = (op == G_UMin || op == G_UMax)
+                     ? ((uint64_t)x < (uint64_t)y) : (x < y);
+            if (op == G_SMax || op == G_UMax) less = !less;
+            set_i(r, i, less ? x : y); }
+        r->skind = a0->skind; return 0;
+    case G_SClamp: case G_UClamp:
+        for (i = 0; i < r->n; i++) { int ai; bin_index(a0, i, r->n, &ai);
+            int64_t x = comp_i(a0, ai);
+            int64_t lo = comp_i(a1, (a1->n == 1) ? 0 : i);
+            int64_t hi = comp_i(a2, (a2->n == 1) ? 0 : i);
+            if (op == G_UClamp) {
+                if ((uint64_t)x < (uint64_t)lo) x = lo;
+                else if ((uint64_t)x > (uint64_t)hi) x = hi;
+            } else {
+                if (x < lo) x = lo; else if (x > hi) x = hi;
+            }
+            set_i(r, i, x); }
+        r->skind = a0->skind; return 0;
     case G_Length: {
         double s = 0; for (i = 0; i < a0->n; i++) { double v = comp_f(a0, i); s += v * v; }
         r->n = 1; set_f(r, 0, sqrt(s)); return 0;
@@ -1139,7 +1241,31 @@ static int exec_insn(interp *st, const spirv_insn *in)
 
     case OpAccessChain: case OpInBoundsAccessChain: {
         sval *base = fetch(st, w[3]);
+        sval pb;
         if (!base) return -1;
+        if (base->klass != SV_PTR) {
+            /* chain rooted at a constant composite (const int[] string
+             * tables): give it a real byte base so the result is loadable.
+             * Aggregate constants already own a module-lifetime block;
+             * vector/matrix constants are copied into the invocation arena. */
+            memset(&pb, 0, sizeof(pb));
+            pb.type = base->type; pb.klass = SV_PTR; pb.n = 1;
+            pb.ptr.elem = base->type; pb.ptr.storage = SC_Function;
+            pb.ptr.off = 0; pb.ptr.binding = 0xffffffffu;
+            if (base->klass == SV_STRUCT && base->agg) {
+                pb.ptr.base = base->agg;
+            } else {
+                uint32_t sz = var_bytes(m, base->type);
+                uint8_t *bb;
+                if (!sz) return -1;
+                bb = (uint8_t *)arena_alloc(st, sz);
+                if (!bb) return -1;
+                memset(bb, 0, sz);
+                if (mem_store(st, bb, 0, base->type, base) != 0) return -1;
+                pb.ptr.base = bb;
+            }
+            base = &pb;
+        }
         memset(&r, 0, sizeof(r));
         if (do_access_chain(st, base, w + 4, in->wc - 4, &r) != 0) return -1;
         r.type = w[1]; r.klass = SV_PTR; r.n = 1;
@@ -1244,6 +1370,24 @@ static int exec_insn(interp *st, const spirv_insn *in)
         r.type = w[1];
         st->vals[w[2]] = r; st->valid[w[2]] = 1;
         return 0;
+
+    /* ---- boolean vector reduction (all/any) ---- */
+    case OpAll: case OpAny: {
+        uint32_t k;
+        int acc = (op == OpAll) ? 1 : 0;
+        a = fetch(st, w[3]);
+        if (!a) return -1;
+        for (k = 0; k < a->n; k++) {
+            int t = (comp_u(a, k) != 0);
+            acc = (op == OpAll) ? (acc && t) : (acc || t);
+        }
+        describe(m, w[1], &r);
+        r.u[0] = acc ? 1u : 0u;
+        r.skind = SV_BOOL; r.klass = SV_BOOL;
+        r.type = w[1];
+        st->vals[w[2]] = r; st->valid[w[2]] = 1;
+        return 0;
+    }
 
     case OpSelect: {
         sval *c = fetch(st, w[3]);
@@ -1673,7 +1817,12 @@ int spirv_run(const spirv_module *cm, const spirv_entry *ce, spirv_resources *re
     st.m = m; st.res = res;
     st.vals = m->scratch; st.valid = m->scratch_valid; st.n = m->scratch_n;
     st.budget = INSN_BUDGET;
-    m->arena_used = 0;                 /* reset arena, keep capacity */
+    /* reset arena: free retired growth blocks, keep the (largest) current
+     * block's capacity for the next invocation */
+    for (uint32_t bi = 0; bi < m->narena_old; bi++)
+        free(m->arena_old[bi]);
+    m->narena_old = 0;
+    m->arena_used = 0;
     memset(st.valid, 0, m->scratch_n);
 
     /* set up module-scope variables (descriptors, interface, private) */

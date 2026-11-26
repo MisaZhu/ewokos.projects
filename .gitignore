@@ -112,3 +112,5 @@ macemu/src/uae_cpu/cpustbl_nf.cpp
 macemu/src/uae_cpu/cpustbl.cpp
 macemu/src/uae_cpu/cputbl.h
 imgui/aarch64/.headers_staged
+vulkan/apps/vkmatrix/tests/host_render
+vulkan/apps/vkmatrix/.host

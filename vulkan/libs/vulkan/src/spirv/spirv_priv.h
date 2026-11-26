@@ -47,6 +47,7 @@ enum {
     OpVectorTimesScalar = 142, OpMatrixTimesScalar = 143,
     OpVectorTimesMatrix = 144, OpMatrixTimesVector = 145, OpMatrixTimesMatrix = 146,
     OpOuterProduct = 147, OpDot = 148,
+    OpAll = 154, OpAny = 155,
     OpLogicalEqual = 164, OpLogicalNotEqual = 165, OpLogicalOr = 166,
     OpLogicalAnd = 167, OpLogicalNot = 168, OpSelect = 169,
     OpIEqual = 170, OpINotEqual = 171, OpUGreaterThan = 172, OpSGreaterThan = 173,
@@ -248,9 +249,20 @@ struct spirv_module {
     int32_t   *label_at;
 
     /* bump arena for per-invocation Function/Private/Input/Output variable
-     * storage.  Reset (not freed) between invocations. */
+     * storage.  Reset (not freed) between invocations.  Growth RETIRES the
+     * current block (kept alive until the next reset) instead of realloc:
+     * handed-out ptr.base addresses (private globals, interface vars) must
+     * stay valid for the whole invocation even when the arena grows. */
     uint8_t   *arena;
     size_t     arena_cap, arena_used;
+    uint8_t  **arena_old;
+    uint32_t   narena_old, arena_old_cap;
+
+    /* heap blocks backing materialised aggregate constants (const arrays).
+     * Module lifetime, NOT arena: the SSA scratch caches the materialised
+     * value across invocations, so its byte base must outlive the arena reset. */
+    uint8_t  **const_blocks;
+    uint32_t   nconst_blocks, const_blocks_cap;
 };
 
 /* parser entry (spirv_parse.c) builds the module; interpreter (spirv_interp.c)

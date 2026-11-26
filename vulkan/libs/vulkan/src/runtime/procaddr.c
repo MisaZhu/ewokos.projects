@@ -29,6 +29,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDevicePresentRectanglesKHR(VkPhysica
 /* EwokOS-specific surface creation (implemented in wsi.c). */
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateEwokOSSurfaceVK(VkInstance, uint32_t, uint32_t,
                                                        VkFormat, void *, void *, VkSurfaceKHR *);
+/* EwokOS-specific buffer shm-key query (implemented in memory.c). */
+VKAPI_ATTR int32_t VKAPI_CALL vkGetBufferMemoryShmEWOK(VkDevice, VkBuffer);
 
 typedef struct {
     const char          *name;
@@ -79,6 +81,8 @@ static const vk_proc g_ext_procs[] = {
     { "vkGetPrivateDataEXT", (PFN_vkVoidFunction)(void *)vkGetPrivateData },
     /* EwokOS WSI surface entry point (not a Khronos extension). */
     VK__ENTRY(vkCreateEwokOSSurfaceVK)
+    /* EwokOS buffer shm-key query for zero-copy compute presentation. */
+    VK__ENTRY(vkGetBufferMemoryShmEWOK)
 };
 
 static PFN_vkVoidFunction lookup(const char *name)

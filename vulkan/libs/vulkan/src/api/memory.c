@@ -293,6 +293,20 @@ VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(
 }
 
 /* ---- buffer device address ----------------------------------------------- */
+/* EwokOS query (not a Khronos extension): the contiguous-shm key backing a
+ * buffer's device memory, or 0 when it has no GPU-addressable backing.  Lets
+ * an app wrap a compute SSBO in a graph_t and present it through the 2D
+ * hardware blit path, exactly as the WSI present callback does for swapchain
+ * images. */
+VKAPI_ATTR int32_t VKAPI_CALL vkGetBufferMemoryShmEWOK(VkDevice device,
+                                                       VkBuffer buffer)
+{
+    vk_buffer *b = (vk_buffer *)VK_H2P(buffer);
+    (void)device;
+    if (!b || !b->mem || b->offset != 0) return 0;
+    return b->mem->gfx_shm;
+}
+
 VKAPI_ATTR VkDeviceAddress VKAPI_CALL vkGetBufferDeviceAddress(
     VkDevice device, const VkBufferDeviceAddressInfo *pInfo)
 {

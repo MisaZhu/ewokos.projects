@@ -233,6 +233,16 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
         dx = (g->w - dw) / 2;
         dy = (g->h - dh) / 2;
     }
+    /* The GPU present-scale path (adreno_compute_scale) lays down vertical
+       band artifacts when upscaling a fixed-size render (teapot 640x480) to
+       the window; the GPU raster backbuffer itself is clean (verified by
+       capturing it directly). Keep the GPU zero-copy blit for 1:1 presents,
+       but route SCALED presents through the CPU/NEON scaler so the picture
+       stays correct. */
+    if (dw != bw || dh != bh) {
+        src.shm_id = -1;
+        src.shm_contig = 0;
+    }
     graph_clear(g, 0xFF000000u);
     if (egl_profile_enabled())
         blit_start = egl_profile_us();
