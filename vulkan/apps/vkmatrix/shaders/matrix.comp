@@ -58,7 +58,7 @@ void main()
     float t2 = 0.0;
     ivec2 next_cell = ivec2(floor(ro2 / 1.2));   /* XYCELL_SIZE */
     bool done = false;
-    for (int i = 0; i < 40; i++) {               /* ITERATIONS */
+    for (int i = 0; i < 16; i++) {               /* ITERATIONS */
         ivec2 cell = next_cell;
         float t2s = t2;
         vec2 side = vec2(next_cell + cell_side.xy) * 1.2;

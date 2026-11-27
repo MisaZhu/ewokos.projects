@@ -127,7 +127,7 @@ static PFN_vkGetBufferMemoryShmEWOK_t pfnBufShm = NULL;
 /* effect parameters (HUD-editable) */
 static int   render_scale = 2;      /* internal resolution = window / scale */
 static int   scale_auto   = 1;      /* pick scale from window height until touched */
-static int   iterations   = 40;     /* reference ITERATIONS                   */
+static int   iterations   = 16;     /* ITERATIONS (matches matrix.comp)       */
 static float speed        = 1.0f;   /* reference SPEED                        */
 static float effect_time  = 0.0f;   /* accumulated iTime * SPEED              */
 static float mouse_gl[2]  = { 0.0f, 0.0f };  /* iMouse.xy, GL origin, internal px */
@@ -1397,7 +1397,7 @@ static void process_imgui_frame(void)
                            "Renderer: %s",
                            g_compute ? "GPU compute" : (g_gpu ? "GPU" : "CPU"));
         if (g_compute)
-            ImGui::Text("Rain: %ux%u native (compute, 40 iter)", T.width, T.height);
+            ImGui::Text("Rain: %ux%u native (compute, 16 iter)", T.width, T.height);
         else
             ImGui::Text("Rain: %dx%d -> %ux%u (%d workers)", eff_w, eff_h,
                         T.width, T.height, RAIN_WORKERS);
