@@ -1,6 +1,6 @@
 /*
  * cl_mem.c - buffer memory objects: create/sub-buffer, retain/release, info,
- * destructor callback.  GPU-context buffers prefer a shared contig backing;
+ * destructor callback.  GPU-context buffers prefer a shared shm backing;
  * CL_MEM_USE_HOST_PTR adopts the caller's pointer instead.  Images are created
  * in cl_image.c but share struct _cl_mem and its info/refcount paths.
  */

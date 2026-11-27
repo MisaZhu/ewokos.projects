@@ -134,7 +134,6 @@ static void VKAPI_CALL fonts_present(void *user, const void *pixels,
         graph_t sg;
         graph_init(&sg, (const uint32_t *)src, stride_bytes / 4u, height);
         sg.shm_id = shm_id;
-        sg.shm_contig = 1;
         graph_blt(&sg, 0, 0, width, height, g, 0, 0, g->w, g->h);
         return;
     }

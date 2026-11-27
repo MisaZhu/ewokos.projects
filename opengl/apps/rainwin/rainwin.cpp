@@ -430,10 +430,10 @@ int main(int argc, char** argv)
      * waterdrop / city): xwin_fullscreen() is synchronous, so on return the
      * window graph already carries the full display size and
      * eglCreateWindowSurface hands gles_engine_init those dimensions, letting
-     * pgl_g3d_init allocate the fb/z contig pair once at full size.
+     * pgl_g3d_init allocate the fb/z shm pair once at full size.
      * Fullscreening AFTER EGL would instead route through egl_on_resize ->
      * pglResizeFramebuffer -> pgl_g3d_resize's grow branch, which frees the
-     * small runs then asks the contig pool for a large pair in one shot; on
+     * small runs then asks the shm pool for a large pair in one shot; on
      * fragmentation that fails, the GPU latches off (_pgl_gpu_off=1) and the
      * session falls back to the CPU interpreter with no recovery.
      * win_width/win_height stay as the fallback should a WM reject MAX. */

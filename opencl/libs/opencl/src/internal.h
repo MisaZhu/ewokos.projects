@@ -166,11 +166,11 @@ struct _cl_mem {
     struct _cl_context     *context;
     size_t                  size;
 
-    /* CPU and GPU share this store.  GPU-context buffers prefer contig shm so
+    /* CPU and GPU share this store.  GPU-context buffers prefer shm so
      * dispatch can use them directly; other buffers retain staging fallback. */
     void                   *host_ptr;
     int                     owns_ptr;
-    int                     gfx_shm;       /* >0: GPU-addressable contig shm */
+    int                     gfx_shm;       /* >0: GPU-addressable shm */
 
     /* sub-buffer linkage */
     struct _cl_mem         *parent;

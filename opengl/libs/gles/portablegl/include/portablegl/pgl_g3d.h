@@ -43,7 +43,7 @@ extern "C" {
 #define PGL_G3D_FS_GOURAUD 1
 #define PGL_G3D_FS_TEX_MOD 2
 
-/* Phase D texture table: a small fixed number of contig-shm RGBA8 texture
+/* Phase D texture table: a small fixed number of shm RGBA8 texture
    images addressable by slot index.  Uploading a slot twice replaces its
    image (the previous shm segment is freed).  A TEX_MOD batch references one
    slot; changing the slot mid-frame flushes the batch first (a batch is
@@ -124,7 +124,7 @@ typedef struct {
     uint32_t color_mask;
 } pgl_g3d_ext_t;
 
-/* Bring the GPU path up for a w x h RGBA8 target: allocate the contig-shm
+/* Bring the GPU path up for a w x h RGBA8 target: allocate the shm
    render target plus the fixed vertex/varying staging, then probe-clear it to
    confirm the daemon actually has a 3D path.  Returns 1 when the GPU is usable
    (pgl_g3d_enabled() then stays true until a later op latches it off), 0 when
@@ -135,13 +135,13 @@ int  pgl_g3d_init(int w, int h);
    it off).  Once it returns 0 it never returns 1 again for this process. */
 int  pgl_g3d_enabled(void);
 
-/* The contig-shm render-target pixels: portablegl points its back_buffer here so
+/* The shm render-target pixels: portablegl points its back_buffer here so
    CPU and GPU draws land in the SAME buffer and the demo's present blit goes
    through the existing GPU path for free.  Valid only while enabled. */
 void* pgl_g3d_pixels(void);
 
-/* The contig shm id backing pgl_g3d_pixels(), 0 while not enabled.  A present
-   blit that tags its source graph with this id (shm_contig=1) is routed by
+/* The shm id backing pgl_g3d_pixels(), 0 while not enabled.  A present
+   blit that tags its source graph with this id is routed by
    graph_blt to the g2d GPU copy instead of a CPU read of the whole NOCACHE
    target.  Re-query per present: a resize may reallocate the segment. */
 int   pgl_g3d_pixels_shm(void);
@@ -201,7 +201,7 @@ void pgl_g3d_flush(void);
 
 /* Phase D texture upload: allocate (or replace) a w x h linear RGBA8 texture
    image in slot [0, PGL_G3D_MAX_TEX) and copy the caller's tightly-packed
-   rgba8 pixels (w*h*4 bytes) into it.  The image is contig-shm so the GPU can
+   rgba8 pixels (w*h*4 bytes) into it.  The image is shm so the GPU can
    address it by physical base with no per-draw copy.  Returns 1 on success, 0
    when the GPU path is off, the slot is out of range, w/h are non-positive,
    or the allocation failed (the GPU is NOT latched off by an allocation

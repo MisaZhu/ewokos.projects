@@ -8,8 +8,8 @@
  *
  * Every function mirrors the proven clclient.c pattern value-for-value:
  *   vkclient_gpu_version  <- has_g2d + g2d_get_version + pglc_set_version gate
- *   vk_program_upload     <- g2d_cl_program (blob in a contig-shm canvas)
- *   vk_kernel_dispatch    <- g2d_cl_dispatch (per-SSBO contig-shm staging)
+ *   vk_program_upload     <- g2d_cl_program (blob in a shm canvas)
+ *   vk_kernel_dispatch    <- g2d_cl_dispatch (per-SSBO shm staging)
  *   vk_program_free       <- g2d_cl_program_free
  */
 #include "vkclient.h"
@@ -67,13 +67,13 @@ int32_t vk_program_upload(const void *blob, uint32_t size)
         return G2D_ERR_FAILED;
 
     /* the daemon reads the blob as a raw byte buffer (it deep-copies the QPU
-     * into GPU dma), so a client-side physical base is not needed - contig=1
-     * lets the daemon resolve phy on attach exactly like the pgl upload. */
+     * into GPU dma), so a client-side physical base is not needed - the
+     * daemon resolves phy on attach exactly like the pgl upload. */
     if (g2d_shm_alloc(size, &shm, &px) != 0 || shm <= 0 || px == NULL)
         return G2D_ERR_FAILED;
     memcpy(px, blob, size);
 
-    g2d_cl_program_req_init(&req, g2d_canvas(shm, size, size / 4u, 1u, 1));
+    g2d_cl_program_req_init(&req, g2d_canvas(shm, size, size / 4u, 1u));
     handle = g2d_cl_program(&req);   /* >= 0 handle, or a negative G2D_ERR_* */
     g2d_shm_free(px);
     return handle;
@@ -82,7 +82,7 @@ int32_t vk_program_upload(const void *blob, uint32_t size)
 /* Staged compute canvases persist across submissions.  Their contents are still
  * copied in both directions on every dispatch, so host writes remain visible,
  * but the steady-state path does not repeat allocation/map/free.  Zero-offset
- * buffers already backed by contig shm bypass these canvases entirely. */
+ * buffers already backed by shm bypass these canvases entirely. */
 typedef struct {
     int       shm;
     uint32_t *px;
@@ -127,30 +127,30 @@ int32_t vk_kernel_dispatch(int32_t prog_handle,
     g2d_cl_dispatch_req_init(&req, prog_handle, wg[0], wg[1], wg[2], wg_size);
     req.num_args = n;
 
-    /* Stage each storage-buffer host store into its own contig-shm canvas and
+    /* Stage each storage-buffer host store into its own shm canvas and
      * copy the input in.  The canvas is modelled w = ceil(size/4), h = 1 so the
      * driver's size >= w*h*4 attach check holds and the daemon resolves the
-     * physical base (contig=1, phy=0) for the CSD's SSBO offset. */
+     * physical base (phy left 0) for the CSD's SSBO offset. */
     for (i = 0; i < n; i++) {
         uint32_t sz = arg_size ? arg_size[i] : 0u;
         uint32_t alloc;
         vk_stage_t *s = &_compute_args[i];
         if (sz == 0u || arg_host == NULL || arg_host[i] == NULL) {
-            req.args[i] = g2d_canvas(0, 0, 0, 0, 0);   /* unused slot */
+            req.args[i] = g2d_canvas(0, 0, 0, 0);   /* unused slot */
             continue;
         }
         alloc = (sz + 3u) & ~3u;
         if (arg_shm && arg_shm[i] > 0) {
             if (_compute_direct_blocked)
                 return rc;
-            req.args[i] = g2d_canvas(arg_shm[i], alloc, alloc / 4u, 1u, 1);
+            req.args[i] = g2d_canvas(arg_shm[i], alloc, alloc / 4u, 1u);
             direct_used = 1;
             continue;
         }
         if (!ensure_stage(s, alloc))
             return rc;
         memcpy(s->px, arg_host[i], sz);
-        req.args[i] = g2d_canvas(s->shm, alloc, alloc / 4u, 1u, 1);
+        req.args[i] = g2d_canvas(s->shm, alloc, alloc / 4u, 1u);
     }
 
     /* The scalar uniform blob: num_unif u32 dwords modelled w = num_unif, h = 1
@@ -162,10 +162,10 @@ int32_t vk_kernel_dispatch(int32_t prog_handle,
             return rc;
         memcpy(_compute_unif.px, unif, ub);
         req.num_uniforms = num_unif;
-        req.unif = g2d_canvas(_compute_unif.shm, ub, num_unif, 1u, 1);
+        req.unif = g2d_canvas(_compute_unif.shm, ub, num_unif, 1u);
     } else {
         req.num_uniforms = 0;
-        req.unif = g2d_canvas(0, 0, 0, 0, 0);
+        req.unif = g2d_canvas(0, 0, 0, 0);
     }
 
     rc = g2d_cl_dispatch(&req);
@@ -211,9 +211,9 @@ int32_t vk_program_free(int32_t prog_handle)
  * same physically-contiguous shm segments the CSD addresses by physical base.
  *
  * The daemon resolves each canvas' physical base from its shm id on attach
- * (g2d_attach -> shm_contig_phy_addr), so - exactly like vk_program_upload /
- * vk_kernel_dispatch - these canvases are allocated with g2d_shm_alloc (contig,
- * phy left 0) rather than g2d_shm_alloc_phy. */
+ * (g2d_attach -> shm_phy_addr), so - exactly like vk_program_upload /
+ * vk_kernel_dispatch - these canvases are allocated with g2d_shm_alloc (phy
+ * left 0) rather than g2d_shm_alloc_phy. */
 
 static vk_stage_t _fb, _z, _attr, _unif;
 static vk_stage_t _tex[VKCLIENT_MAX_TEX];
@@ -320,7 +320,7 @@ int32_t vk_gfx_program_upload(const void *blob, uint32_t size)
         return G2D_ERR_FAILED;
     memcpy(px, blob, size);
 
-    g2d_pgl_program_req_init(&req, g2d_canvas(shm, size, size / 4u, 1u, 1));
+    g2d_pgl_program_req_init(&req, g2d_canvas(shm, size, size / 4u, 1u));
     handle = g2d_pgl_program(&req);   /* >= 0 handle, or a negative G2D_ERR_* */
     g2d_shm_free(px);
     return handle;
@@ -457,11 +457,11 @@ int32_t vk_gfx_draw(int32_t prog_handle,
      * zero values keep vc_pgl3d's fixed-function eligibility gates satisfied. */
     {
         g2d_canvas_t dst  = direct_fb
-            ? g2d_canvas(fb_shm,  fb_bytes, gpu_w, fb_h, 1)
-            : g2d_canvas(_fb.shm, fb_bytes, gpu_w, fb_h, 1);
-        g2d_canvas_t pos  = g2d_canvas(_attr.shm, attr_bytes, nverts, attr_stride, 1);
-        g2d_canvas_t col  = g2d_canvas(0, 0, 0, 0, 0);
-        g2d_canvas_t zc   = g2d_canvas(_z.shm,    fb_bytes, gpu_w, fb_h, 1);
+            ? g2d_canvas(fb_shm,  fb_bytes, gpu_w, fb_h)
+            : g2d_canvas(_fb.shm, fb_bytes, gpu_w, fb_h);
+        g2d_canvas_t pos  = g2d_canvas(_attr.shm, attr_bytes, nverts, attr_stride);
+        g2d_canvas_t col  = g2d_canvas(0, 0, 0, 0);
+        g2d_canvas_t zc   = g2d_canvas(_z.shm,    fb_bytes, gpu_w, fb_h);
 
         g2d_pgl_draw_req_init(&req, dst, pos, col,
                               G2D_PGL_MODE_TRIANGLES, nverts,
@@ -472,7 +472,7 @@ int32_t vk_gfx_draw(int32_t prog_handle,
                               clear_rgba, clear_z);
         g2d_pgl_draw_req_set_shader(&req, prog_handle,
                                     (num_unif > 0u) ? _unif.shm : 0,
-                                    num_unif, 1);
+                                    num_unif);
 
         for (i = 0; i < ntex_bound; i++) {
             struct pglc_tex_layout layout;
@@ -481,7 +481,7 @@ int32_t vk_gfx_draw(int32_t prog_handle,
             if (!pglc_tex_layout_2d(tex[i].w, tex[i].h, 4u, &layout))
                 continue;
             req.ctex[i] = g2d_canvas(_tex[i].shm, layout.size,
-                                     tex[i].w, tex[i].h, 1);
+                                     tex[i].w, tex[i].h);
             req.ctex_w[i]      = tex[i].w;
             req.ctex_h[i]      = tex[i].h;
             req.ctex_stride[i] = layout.stride;

@@ -1,14 +1,14 @@
 /*
  * clclient.c - libOpenCL's user-space IPC client to the g2dd daemon's OpenCL
  * compute offload path (see clclient.h).  A thin wrapper over the g2dclient
- * dev_cntl transport portablegl already uses: contig-shm buffers dispatch
+ * dev_cntl transport portablegl already uses: shm buffers dispatch
  * directly, other buffers use persistent staging, and the request structs are
  * marshalled for the daemon.
  *
  * Every function mirrors the proven portablegl pattern:
  *   clclient_gpu_version  <- pgl_g3d_ensure_version + pgl_g3d_init's gate
  *   cl_program_upload     <- pgl_g3d_shader.c program_upload
- *   cl_kernel_dispatch    <- the pgl pos/col/unif contig-shm staging model
+ *   cl_kernel_dispatch    <- the pgl pos/col/unif shm staging model
  */
 #include "clclient.h"
 
@@ -65,20 +65,19 @@ int32_t cl_program_upload(const void *blob, uint32_t size)
         return G2D_ERR_FAILED;
 
     /* the daemon reads the blob as a raw byte buffer (it deep-copies the QPU
-     * into GPU dma), so a client-side physical base is not needed - contig=1
-     * lets the daemon resolve phy on attach exactly like the pgl upload. */
+     * into GPU dma), so a client-side physical base is not needed - the
+     * daemon resolves phy on attach exactly like the pgl upload. */
     if (g2d_shm_alloc(size, &shm, &px) != 0 || shm <= 0 || px == NULL)
         return G2D_ERR_FAILED;
     memcpy(px, blob, size);
 
-    g2d_cl_program_req_init(&req, g2d_canvas(shm, size, size / 4u, 1u, 1));
+    g2d_cl_program_req_init(&req, g2d_canvas(shm, size, size / 4u, 1u));
     handle = g2d_cl_program(&req);   /* >= 0 handle, or a negative G2D_ERR_* */
     g2d_shm_free(px);
     return handle;
 }
 
-/* Staging canvases persist across launches.  Buffers already backed by contig
- * shm bypass them entirely; other buffers keep host visibility through copies. */
+/* Staging canvases persist across launches.  Buffers already backed by shm bypass them entirely; other buffers keep host visibility through copies. */
 typedef struct {
     int       shm;
     uint32_t *px;
@@ -147,21 +146,21 @@ int32_t cl_kernel_dispatch(int32_t prog_handle,
         cl_stage_t *s = &_compute_args[i];
 
         if (sz == 0u || arg_host == NULL || arg_host[i] == NULL) {
-            req.args[i] = g2d_canvas(0, 0, 0, 0, 0);
+            req.args[i] = g2d_canvas(0, 0, 0, 0);
             continue;
         }
         alloc = (sz + 3u) & ~3u;
         if (arg_shm && arg_shm[i] > 0) {
             if (_compute_direct_blocked)
                 return rc;
-            req.args[i] = g2d_canvas(arg_shm[i], alloc, alloc / 4u, 1u, 1);
+            req.args[i] = g2d_canvas(arg_shm[i], alloc, alloc / 4u, 1u);
             direct_used = 1;
             continue;
         }
         if (!ensure_stage(s, alloc))
             return rc;
         memcpy(s->px, arg_host[i], sz);
-        req.args[i] = g2d_canvas(s->shm, alloc, alloc / 4u, 1u, 1);
+        req.args[i] = g2d_canvas(s->shm, alloc, alloc / 4u, 1u);
     }
 
     if (num_unif > 0u && unif != NULL) {
@@ -170,10 +169,10 @@ int32_t cl_kernel_dispatch(int32_t prog_handle,
             return rc;
         memcpy(_compute_unif.px, unif, ub);
         req.num_uniforms = num_unif;
-        req.unif = g2d_canvas(_compute_unif.shm, ub, num_unif, 1u, 1);
+        req.unif = g2d_canvas(_compute_unif.shm, ub, num_unif, 1u);
     } else {
         req.num_uniforms = 0;
-        req.unif = g2d_canvas(0, 0, 0, 0, 0);
+        req.unif = g2d_canvas(0, 0, 0, 0);
     }
 
     rc = g2d_cl_dispatch(&req);

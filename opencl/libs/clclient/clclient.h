@@ -1,7 +1,7 @@
 /*
  * clclient.h - libOpenCL's user-space IPC client to the g2dd daemon's OpenCL
  * compute offload path (G2D_DEV_CNTL_CL_*).  This is a thin wrapper over the
- * same g2dclient dev_cntl transport portablegl uses: it dispatches contig-shm
+ * same g2dclient dev_cntl transport portablegl uses: it dispatches shm
  * buffers directly, stages other buffers, and marshals the request structs.
  *
  * It is built as a PRIVATE intermediate (libclclient.a) and folded into
@@ -54,7 +54,7 @@ int32_t cl_program_upload(const void *blob, uint32_t size);
 /* Run prog_handle over a wg[0] x wg[1] x wg[2] grid of work-groups, each of
  * wg_size work-items (1..256).  arg_host[i]/arg_size[i] are the __global buffer
  * stores in SSBO binding order.  A positive arg_shm[i] identifies a zero-offset
- * contig-shm backing and dispatches it directly without upload/readback; other
+ * shm backing and dispatches it directly without upload/readback; other
  * buffers use persistent staging canvases.  A NULL arg_host[i] (or zero size)
  * marks an unused trailing slot.  unif/num_unif is the packed scalar +
  * __constant uniform blob (num_unif u32 dwords; may be 0/NULL).

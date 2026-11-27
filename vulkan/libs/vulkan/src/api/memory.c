@@ -2,8 +2,7 @@
  * memory.c - VkDeviceMemory lifecycle and mapping, buffer/image memory binding,
  * memory-requirement queries, and the buffer-device-address / opaque-capture
  * surface.  Every allocation is simultaneously device-local and host-visible.
- * The software device uses plain host buffers; the GPU device prefers contig
- * shm so compute buffers can be dispatched in place.  Map/bind/flush remain
+ * The software device uses plain host buffers; the GPU device prefers shm so compute buffers can be dispatched in place.  Map/bind/flush remain
  * direct host operations and a device address is simply the host pointer.
  */
 #include "internal.h"

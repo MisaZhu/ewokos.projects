@@ -381,7 +381,7 @@ static int rw_gpu_compile(void)
         if(pglc_program_serialize(&rw_rs,rw_direct_mode ? NULL : &rw_xs,&opts,blob.px,bytes)==bytes) {
             /* Use the same owner table for program upload and free. */
             g2d_cl_program_req_t req;
-            g2d_cl_program_req_init(&req,g2d_canvas(blob.shm,bytes,bytes/4,1,1));
+            g2d_cl_program_req_init(&req,g2d_canvas(blob.shm,bytes,bytes/4,1));
             rw_program=g2d_cl_program(&req);
         }
         if(rw_program>=0 || !rw_direct_mode) break;
@@ -814,23 +814,23 @@ static int rw_gpu_flush(void)
         /* Keep the declared span stable for rw_attr's shm id.  The shader
          * consumes only `n` vertices; the fixed span prevents an older g2dd
          * attach cache from retaining a short mapping across draw layouts. */
-        g2d_pgl_draw_req_init(&req,g2d_canvas(rw_fb.shm,g_w*g_h*4,g_w,g_h,1),
-            g2d_canvas(attr_shm,attr_bytes,n,20,1),g2d_canvas(0,0,0,0,0),
+        g2d_pgl_draw_req_init(&req,g2d_canvas(rw_fb.shm,g_w*g_h*4,g_w,g_h),
+            g2d_canvas(attr_shm,attr_bytes,n,20),g2d_canvas(0,0,0,0),
             G2D_PGL_MODE_TRIANGLES,n,G2D_PGL_FMT_RGBA8,g_w*4,G2D_PGL_FS_SOLID,0,0,
-            G2D_PGL_DEPTH_NONE,0,G2D_PGL_CULL_NONE,g2d_canvas(rw_z.shm,g_w*g_h*4,g_w,g_h,1),g_w*4,0,0,1.0f);
+            G2D_PGL_DEPTH_NONE,0,G2D_PGL_CULL_NONE,g2d_canvas(rw_z.shm,g_w*g_h*4,g_w,g_h),g_w*4,0,0,1.0f);
         /* g2d's dispatch rectangle is top-left-origin, matching
          * dispatchOffset and the linear framebuffer layout. */
         req.ext.dispatch_x=clip[0];
         req.ext.dispatch_y=g_h-clip[3];
         req.ext.dispatch_w=clip[2]-clip[0];
         req.ext.dispatch_h=clip[3]-clip[1];
-        g2d_pgl_draw_req_set_shader(&req,rw_program,rw_unif.shm,nwords,1);
-        req.ctex[0]=g2d_canvas(tex->canvas.shm,tex->layout.size,rw_batch.w,rw_batch.h,1);
+        g2d_pgl_draw_req_set_shader(&req,rw_program,rw_unif.shm,nwords);
+        req.ctex[0]=g2d_canvas(tex->canvas.shm,tex->layout.size,rw_batch.w,rw_batch.h);
         req.ctex_w[0]=rw_batch.w;req.ctex_h[0]=rw_batch.h;req.ctex_stride[0]=tex->layout.stride;
         req.ctex_tiling[0]=tex->layout.tiling;
         req.ctex_ub_pad[0]=G2D_PGL_CTEX_UB_PAD_PACK(tex->layout.ub_pad,
             rw_batch.ts[2]?G2D_PGL_CTEX_FILTER_LINEAR:G2D_PGL_CTEX_FILTER_NEAREST);
-        req.ctex[1]=g2d_canvas(tex1->canvas.shm,tex1->layout.size,rw_batch.w1,rw_batch.h1,1);
+        req.ctex[1]=g2d_canvas(tex1->canvas.shm,tex1->layout.size,rw_batch.w1,rw_batch.h1);
         req.ctex_w[1]=rw_batch.w1;req.ctex_h[1]=rw_batch.h1;req.ctex_stride[1]=tex1->layout.stride;
         req.ctex_tiling[1]=tex1->layout.tiling;
         req.ctex_ub_pad[1]=G2D_PGL_CTEX_UB_PAD_PACK(tex1->layout.ub_pad,

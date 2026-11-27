@@ -51,7 +51,7 @@
 typedef VkResult (VKAPI_PTR *PFN_vkCreateEwokOSSurfaceVK_t)(
     VkInstance instance, uint32_t width, uint32_t height, VkFormat format,
     void *present_fn, void *user, VkSurfaceKHR *pSurface);
-/* EwokOS query: contig-shm key backing a buffer's memory (0 = none), so the
+/* EwokOS query: shm key backing a buffer's memory (0 = none), so the
  * compute output can be presented through the 2D hardware blit path */
 typedef int32_t (VKAPI_PTR *PFN_vkGetBufferMemoryShmEWOK_t)(
     VkDevice device, VkBuffer buffer);
@@ -112,7 +112,7 @@ typedef struct {
     hbuf_t                cs_params;   /* float[15]: time,W,H,ro,M */
     hbuf_t                cs_out;      /* W*H packed pixels          */
     uint32_t              cs_out_w, cs_out_h;
-    int32_t               cs_shm;      /* out buffer's contig-shm key */
+    int32_t               cs_shm;      /* out buffer's shm key */
 } vk_matrix;
 
 static vk_matrix T;
@@ -135,12 +135,12 @@ static float mouse_gl[2]  = { 0.0f, 0.0f };  /* iMouse.xy, GL origin, internal p
 /* internal effect buffer */
 static uint32_t *eff_buf = NULL;
 static int eff_w = 0, eff_h = 0;
-/* cached staging buffer the rain workers render into: the contig shm canvas
+/* cached staging buffer the rain workers render into: the shm canvas
  * is mapped NOCACHE (kernel shm.c), so per-pixel shading writes must stay in
  * cached memory and only the finished frame is streamed into the canvas */
 static uint32_t *rain_buf = NULL;
 /* keyed shm canvas backing eff_buf: lets the present blit upscale on the 2D
- * hardware (graph_blt routes to g2d only for shm+contig sources) */
+ * hardware (graph_blt routes to g2d only for shm sources) */
 static graph_t *eff_g = NULL;
 
 static uint32_t tic_now(void)
@@ -182,7 +182,7 @@ static void VKAPI_CALL matrix_present(void *user, const void *pixels,
     if ((stride_bytes & 3u) != 0) return;
     /* rain first, then the panel-res HUD (transparent clear + ImGui)
      * alpha-composited over it.  The rain never goes through the Vulkan
-     * rasterizer: GPU mode blits the compute SSBO 1:1 (its contig-shm key
+     * rasterizer: GPU mode blits the compute SSBO 1:1 (its shm key
      * routes graph_blt to the 2D hardware), CPU mode scale-blits the
      * internal canvas. */
     if (g_compute && T.cs_out.map) {
@@ -190,7 +190,6 @@ static void VKAPI_CALL matrix_present(void *user, const void *pixels,
         graph_init(&cg, (const uint32_t *)T.cs_out.map, T.cs_out_w, T.cs_out_h);
         if (T.cs_shm > 0) {
             cg.shm_id = T.cs_shm;
-            cg.shm_contig = 1;
         }
         graph_blt(&cg, 0, 0, cg.w, cg.h, g, 0, 0, g->w, g->h);
     } else if (eff_g) {
@@ -200,7 +199,6 @@ static void VKAPI_CALL matrix_present(void *user, const void *pixels,
     graph_init(&sg, (const uint32_t *)src, stride_bytes / 4u, height);
     if (shm_id > 0) {
         sg.shm_id = shm_id;
-        sg.shm_contig = 1;
     }
     graph_blt_alpha(&sg, 0, 0, width, height, g, 0, 0, g->w, g->h, 0xff);
 }
@@ -452,7 +450,7 @@ static void write_cs_descriptors(void)
     vkUpdateDescriptorSets(T.device, 2, wr, 0, NULL);
 }
 
-/* (re)allocate the native-resolution pixel SSBO; its contig-shm key lets
+/* (re)allocate the native-resolution pixel SSBO; its shm key lets
  * matrix_present blit it through the 2D hardware.  Any failure disables the
  * compute path (the CPU rain bands remain the always-correct fallback). */
 static void resize_compute_out(uint32_t w, uint32_t h)
@@ -646,7 +644,7 @@ static void probe_compute(void)
 }
 
 /* internal effect buffer: a keyed shm canvas so the present blit can upscale
- * it on the 2D hardware (graph_blt routes to g2d only for shm+contig srcs) */
+ * it on the 2D hardware (graph_blt routes to g2d only for shm srcs) */
 static void resize_effect_buffer(void)
 {
     int w = (int)T.width / render_scale;

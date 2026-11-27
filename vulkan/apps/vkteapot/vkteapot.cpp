@@ -159,7 +159,6 @@ static void VKAPI_CALL teapot_present(void *user, const void *pixels,
          * cropping the padding instead of falling back to a full CPU copy. */
         graph_init(&sg, (const uint32_t *)src, stride_bytes / 4u, height);
         sg.shm_id = shm_id;
-        sg.shm_contig = 1;
         graph_blt(&sg, 0, 0, width, height, g, 0, 0, g->w, g->h);
         return;
     }

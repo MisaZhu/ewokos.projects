@@ -64,7 +64,7 @@ int32_t vk_program_upload(const void *blob, uint32_t size);
 /* Run prog_handle over a wg[0] x wg[1] x wg[2] grid of work-groups, each of
  * wg_size work-items (1..256).  arg_host[i]/arg_size[i] are the storage-buffer
  * host stores in SSBO binding order.  A positive arg_shm[i] identifies a
- * zero-offset contig-shm backing and dispatches it in place; otherwise the host
+ * zero-offset shm backing and dispatches it in place; otherwise the host
  * store is staged and copied back.  A NULL arg_host[i] (or arg_size[i] == 0)
  * marks an unused trailing slot.  unif/num_unif is the
  * packed scalar uniform blob (num_unif u32 dwords; may be 0/NULL).  Returns

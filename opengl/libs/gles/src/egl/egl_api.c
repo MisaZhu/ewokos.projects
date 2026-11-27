@@ -210,13 +210,12 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
      * self-deadlock (EwokOS pthread_mutex_t is non-recursive), so the blit into
      * ws_g is done directly, exactly like the SDL backend's fb_on_repaint.
      *
-     * When the back buffer is the adopted GPU target it lives in NOCACHE contig
+     * When the back buffer is the adopted GPU target it lives in NOCACHE
      * shm; tag the source graph with that segment so graph_blt takes the g2d
      * copy (GPU, same daemon that just rendered it) rather than the CPU reading
      * the whole uncached frame.  A CPU back buffer (shm 0) keeps the CPU blit. */
     graph_init(&src, (const uint32_t *)bb, bw, bh);
     src.shm_id = gles_engine_backbuffer_shm();
-    src.shm_contig = src.shm_id > 0;
 
     /* RE3 renders at its logical size while the xwin workspace is fullscreen.
      * Scale into the largest centered rectangle that fits and clear first so
@@ -241,7 +240,6 @@ static void egl_on_repaint(xwin_t *xwin, graph_t *g)
        stays correct. */
     if (dw != bw || dh != bh) {
         src.shm_id = -1;
-        src.shm_contig = 0;
     }
     graph_clear(g, 0xFF000000u);
     if (egl_profile_enabled())

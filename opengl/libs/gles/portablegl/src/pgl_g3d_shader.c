@@ -915,7 +915,7 @@ uint32_t pgl_g3d_shader_patch_uniform(pgl_g3d_prog p, uint32_t* blob,
 	return hi;
 }
 
-/* Serialize one compiled program into a fresh contig-shm canvas holding the
+/* Serialize one compiled program into a fresh shm canvas holding the
    machine backend's wire blob (the byte layout bsp_g3d_program on the daemon
    side parses: a header followed by its variable payload - V3D's
    g2d_pgl_program_blob_t, Adreno's adreno_prog_blob_t, ...), upload it with
@@ -942,7 +942,7 @@ static int program_upload(const prog_entry_t* e)
 		if (g2d_shm_alloc(total, &shm, &px) != 0 || shm <= 0 || px == NULL)
 			return G2D_ERR_FAILED;
 		memcpy(px, e->cached_blob, total);
-		g2d_pgl_program_req_init(&req, g2d_canvas(shm, total, total / 4u, 1u, 1));
+		g2d_pgl_program_req_init(&req, g2d_canvas(shm, total, total / 4u, 1u));
 		handle = g2d_pgl_program(&req);
 		g2d_shm_free(px);
 		return handle;
@@ -965,7 +965,7 @@ static int program_upload(const prog_entry_t* e)
 			return G2D_ERR_FAILED;
 		}
 
-		g2d_pgl_program_req_init(&req, g2d_canvas(shm, total, total / 4u, 1u, 1));
+		g2d_pgl_program_req_init(&req, g2d_canvas(shm, total, total / 4u, 1u));
 		handle = g2d_pgl_program(&req);
 		g2d_shm_free(px);
 		return handle;

@@ -2282,7 +2282,7 @@ static gpu_entry g_gpu[GLES_MAX_INTERP];
 static int       g_gpu_ready = 0;
 /* Set once a program links to a GPU-eligible geometry kernel.  gpu_bringup()
  * only adopts the pgl_g3d render target as portablegl's back buffer after this
- * is set: that target is contig NOCACHE (uncached) shm so the GPU can DMA it,
+ * is set: that target is NOCACHE (uncached) shm so the GPU can DMA it,
  * and a pure-CPU app (no uMVP -> never eligible, e.g. the fullscreen-quad
  * texblit of Fireworks/matrix) would otherwise rasterise every pixel into
  * uncached memory - DRAM-bound with no write-combining, ~an order of magnitude

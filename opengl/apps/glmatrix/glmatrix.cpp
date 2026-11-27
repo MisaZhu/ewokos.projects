@@ -854,10 +854,10 @@ int main(int argc, char* argv[])
      * synchronous: on return xinfo->wsr already carries the MAX-state size and
      * ws_g has been rebuilt to match, so eglCreateWindowSurface's
      * xwin_fetch_graph hands gles_engine_init the full display dimensions and
-     * pgl_g3d_init allocates the fb/z contig pair at that size once.  Doing it
+     * pgl_g3d_init allocates the fb/z shm pair at that size once.  Doing it
      * the other way round (EGL at 600x400 first, fullscreen after) routes
      * through egl_on_resize -> pglResizeFramebuffer -> pgl_g3d_resize's grow
-     * branch, which frees the small runs and then asks the contig pool for a
+     * branch, which frees the small runs and then asks the shm pool for a
      * ~12MB pair in one shot; on any fragmentation the alloc fails, the GPU
      * latches off (_pgl_gpu_off=1) and the whole session falls back to the CPU
      * interpreter with no way to recover.  The initial win_width/win_height

@@ -4,7 +4,7 @@
  * opts in by exporting PGL_G3D=yes from its system/make.inc).
  *
  * Everything here is a thin marshaller over the stateless g2dclient protocol:
- * it owns one contig-shm render target (which portablegl adopts as its
+ * it owns one shm render target (which portablegl adopts as its
  * back_buffer so CPU and GPU draws share one surface) plus fixed vertex/varying
  * staging, batches post-vertex-shader triangles, and turns a full batch into a
  * single G2D_DEV_CNTL_PGL_DRAW.  The g2dd daemon resolves each canvas's
@@ -68,9 +68,9 @@ static int      _enabled;    /* GPU path engaged and not latched off */
 
 static int      _w, _h;
 /* physical fb/z capacity in pixels (>= _w*_h; alloc_target reserves it with
-   grow-with-headroom, see fb_grow_capacity).  Resize reuses the contig-slab
+   grow-with-headroom, see fb_grow_capacity).  Resize reuses the shm
    runs whenever the new viewport fits this capacity, so a shrink - or any
-   in-capacity resize - performs zero slab alloc/free operations. */
+   in-capacity resize - performs zero shm alloc/free operations. */
 static uint32_t _fb_cap;
 static int      _fb_shm;
 static uint32_t* _fb;        /* render-target pixels (RGBA8) */
@@ -143,7 +143,7 @@ static ewokos_addr_t _nrm_phy;
    range into the fixed base-phy _pos/_nrm GPU staging allocated once at init.
    The slot deliberately owns no GPU segment of its own: the GLES engine
    uploads, draws and frees a mesh per coalesced batch (gpu_coalesce_flush),
-   so a per-slot segment would mean two contig shm alloc/free round trips per
+   so a per-slot segment would mean two shm alloc/free round trips per
    draw plus two guaranteed g2dd attach-cache misses (fresh shm ids), with the
    daemon pinning the dead segments until its TTL sweep - exactly the cost a
    fixed staging exists to avoid.  A static GPU VBO addressed by a per-draw
@@ -193,7 +193,7 @@ static ewokos_addr_t _inst_phy;
 static uint32_t _inst_floats;
 static uint32_t _inst_cap;
 
-/* Phase D texture table (see PGL_G3D_MAX_TEX): each slot owns a contig-shm
+/* Phase D texture table (see PGL_G3D_MAX_TEX): each slot owns a shm
    RGBA8 image addressable by physical base.  A slot is "loaded" iff
    .pixels != NULL.  tiling is the backend-defined GPU memory layout of the
    pixels (pglc_tex_layout.tiling): PGLC_TEX_TILING_RASTER for the
@@ -267,7 +267,7 @@ static int _blend_mode = PGL_G3D_BLEND_OPAQUE;
 
 /* WS4 compiled-shader draw-path state: the active on-device-compiled program
    plus the per-draw GL uniform blob the daemon's QUNIFORM interpreter indexes.
-   The uniform staging is a CPU-read contig-shm segment (the daemon copies the
+   The uniform staging is a CPU-read shm segment (the daemon copies the
    words; the GPU never reads it directly), allocated once at init.  _unif_gen
    bumps on every pgl_g3d_set_uniforms so the blob joins the batch homogeneity
    key - a batch never mixes two uniform blobs.  _batch_prog/_batch_unif_gen
@@ -371,10 +371,10 @@ static void put_uv(int i, const float* uv)
 
 static g2d_canvas_t fb_canvas(void)
 {
-	/* contig=1 so the daemon addresses the target by physical base; phy is
+	/* shm-backed so the daemon addresses the target by physical base; phy is
 	   pre-filled from the allocation so g2dd skips its resolve syscall */
 	g2d_canvas_t cv = g2d_canvas(_fb_shm, (uint32_t)_w * (uint32_t)_h * 4u,
-	                             (uint32_t)_w, (uint32_t)_h, 1);
+	                             (uint32_t)_w, (uint32_t)_h);
 	cv.phy = _fb_phy;
 	return cv;
 }
@@ -385,16 +385,16 @@ static g2d_canvas_t z_canvas(void)
 	/* no persistent Z surface: send a zero-size canvas so the daemon skips
 	   the Z attach and the back end falls back to tile-local Z */
 	if (!_z)
-		return g2d_canvas(0, 0, 0, 0, 0);
+		return g2d_canvas(0, 0, 0, 0);
 	cv = g2d_canvas(_z_shm, (uint32_t)_w * (uint32_t)_h * 4u,
-	                (uint32_t)_w, (uint32_t)_h, 1);
+	                (uint32_t)_w, (uint32_t)_h);
 	cv.phy = _z_phy;
 	return cv;
 }
 
 /* Reduced-resolution scratch target for the fullscreen-compute render-scale path
    (see pgl_g3d_set_render_scale).  Grow-only like alloc_target: an in-capacity
-   resize reuses the run, so a window drag does not thrash the contig slab. */
+   resize reuses the run, so a window drag does not thrash the shm allocator. */
 static int rs_ensure(int rw, int rh)
 {
 	uint32_t need = (uint32_t)rw * (uint32_t)rh;
@@ -426,7 +426,7 @@ static int rs_ensure(int rw, int rh)
 static g2d_canvas_t rs_canvas(int rw, int rh)
 {
 	g2d_canvas_t cv = g2d_canvas(_rs_shm, (uint32_t)rw * (uint32_t)rh * 4u,
-	                             (uint32_t)rw, (uint32_t)rh, 1);
+	                             (uint32_t)rw, (uint32_t)rh);
 	cv.phy = _rs_phy;
 	return cv;
 }
@@ -461,7 +461,7 @@ static int taa_ensure(int w, int h)
 static g2d_canvas_t taa_hist_canvas(int w, int h)
 {
 	g2d_canvas_t cv = g2d_canvas(_taa_shm, (uint32_t)w * (uint32_t)h * 4u,
-	                             (uint32_t)w, (uint32_t)h, 1);
+	                             (uint32_t)w, (uint32_t)h);
 	cv.phy = _taa_hist_phy;
 	return cv;
 }
@@ -469,7 +469,7 @@ static g2d_canvas_t taa_hist_canvas(int w, int h)
 static g2d_canvas_t taa_tmp_canvas(int w, int h)
 {
 	g2d_canvas_t cv = g2d_canvas(_taat_shm, (uint32_t)w * (uint32_t)h * 4u,
-	                             (uint32_t)w, (uint32_t)h, 1);
+	                             (uint32_t)w, (uint32_t)h);
 	cv.phy = _taa_tmp_phy;
 	return cv;
 }
@@ -515,7 +515,7 @@ void pgl_g3d_flush(void)
 	 * same _pos shm is reused by the 3/6/10-float layouts below; advertising
 	 * the live prefix here can therefore make a subsequent layout read through
 	 * a stale short mapping, which shows up as clipped/garbled frames. */
-	pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, _nverts, 3, 1);
+	pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, _nverts, 3);
 	pos.phy = _pos_phy;
 	z = z_canvas();
 
@@ -532,23 +532,23 @@ void pgl_g3d_flush(void)
 		/* col is unused on the TEX_MOD path: send a zero-size canvas so the
 		   g2dd handler skips the attach and the back end keeps col_iova == 0.
 		   uv is modelled w=nverts h=3 (nverts*3*4 == nverts*12 bytes). */
-		col = g2d_canvas(0, 0, 0, 0, 0);
-		uvcv = g2d_canvas(_uv_shm, PGL_G3D_UV_BYTES, _nverts, 3, 1);
+		col = g2d_canvas(0, 0, 0, 0);
+		uvcv = g2d_canvas(_uv_shm, PGL_G3D_UV_BYTES, _nverts, 3);
 		uvcv.phy = _uv_phy;
 		texcv = g2d_canvas(t->shm, (uint32_t)t->w * (uint32_t)t->h * 4u,
-		                   (uint32_t)t->w, (uint32_t)t->h, 1);
+		                   (uint32_t)t->w, (uint32_t)t->h);
 		texcv.phy = t->phy;
 	} else if (compiled) {
 		/* pos-only: col/uv/tex unused, send zero-size canvases so the daemon
 		   keeps their iovas at 0 and the back end takes the compiled branch. */
-		col   = g2d_canvas(0, 0, 0, 0, 0);
-		texcv = g2d_canvas(0, 0, 0, 0, 0);
-		uvcv  = g2d_canvas(0, 0, 0, 0, 0);
+		col   = g2d_canvas(0, 0, 0, 0);
+		texcv = g2d_canvas(0, 0, 0, 0);
+		uvcv  = g2d_canvas(0, 0, 0, 0);
 	} else {
-		col = g2d_canvas(_col_shm, PGL_G3D_COL_BYTES, _nverts, 1, 1);
+		col = g2d_canvas(_col_shm, PGL_G3D_COL_BYTES, _nverts, 1);
 		col.phy = _col_phy;
-		texcv = g2d_canvas(0, 0, 0, 0, 0);
-		uvcv  = g2d_canvas(0, 0, 0, 0, 0);
+		texcv = g2d_canvas(0, 0, 0, 0);
+		uvcv  = g2d_canvas(0, 0, 0, 0);
 	}
 
 	/* Render-scale: dispatch a non-geom fullscreen compute into the reduced
@@ -587,15 +587,15 @@ void pgl_g3d_flush(void)
 	}
 	/* WS4: bind the compiled program (its cached daemon handle) plus the
 	   per-draw uniform blob so the back end builds the shader-state record
-	   and expands the QUNIFORM stream.  contig=1 mirrors the CPU-read blob
+	   and expands the QUNIFORM stream.  shm staging mirrors the CPU-read blob
 	   upload in pgl_g3d_shader.c. */
 	if (compiled) {
 		int u;
 		g2d_pgl_draw_req_set_shader(&req,
 		                            pgl_g3d_shader_daemon_handle(_batch_prog),
-		                            _unif_shm, _unif_count, 1);
+		                            _unif_shm, _unif_count);
 		/* WS4 sampler bindings: stage each bound unit's texture image as a
-		   ctex canvas (contig-shm, phy pre-filled) so the daemon resolves its
+		   ctex canvas (shm, phy pre-filled) so the daemon resolves its
 		   physical base and the back end builds its texture-state record for
 		   the slot the compiled FS references.  Unbound units keep size 0 (the
 		   daemon skips them).  Whether a raster (untiled) slot may be bound is
@@ -615,7 +615,7 @@ void pgl_g3d_flush(void)
 			    !pglc_tex_sampler_reads_raster())
 				continue;
 			req.ctex[u] = g2d_canvas(t->shm, t->size,
-			                         (uint32_t)t->w, (uint32_t)t->h, 1);
+			                         (uint32_t)t->w, (uint32_t)t->h);
 			req.ctex[u].phy  = t->phy;
 			req.ctex_w[u]      = (uint32_t)t->w;
 			req.ctex_h[u]      = (uint32_t)t->h;
@@ -1242,7 +1242,7 @@ void pgl_g3d_free_mesh(pgl_g3d_mesh m)
 /* Stage the per-frame instance-matrix buffer an instanced mesh draw reads
    (binding 3 of geom_xform_inst_cs_glsl): nfloats consecutive floats, one
    36-float record per instance (MVP mat4 + normal mat4 + material rgb + pad).
-   The buffer lives in a GPU-resident contig-shm segment grown on demand and
+   The buffer lives in a GPU-resident shm segment grown on demand and
    marshalled as ctex unit 0 by the next instanced draw_mesh_compiled. */
 int pgl_g3d_set_instances(const float* data, uint32_t nfloats)
 {
@@ -1488,27 +1488,27 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 		/* pos+uv+colour interleaved stride-10: model the canvas w=count h=10
 		 * (count*40 bytes) so g2dd's pos.w==nverts check and the size>=w*h*4
 		 * attach check both pass; col is unused (zero canvas). */
-		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 10, 1);
-		col = g2d_canvas(0, 0, 0, 0, 0);
+		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 10);
+		col = g2d_canvas(0, 0, 0, 0);
 		pos.phy = _pos_phy;
 	} else if (geom_tex) {
 		/* pos+uv interleaved stride-6: the g2dd handler requires
 		 * pos.w == nverts, so model the canvas w=count h=6 (the
 		 * size>=w*h*4 attach check still encodes count*24 bytes). */
-		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 6, 1);
-		col = g2d_canvas(0, 0, 0, 0, 0);
+		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 6);
+		col = g2d_canvas(0, 0, 0, 0);
 		pos.phy = _pos_phy;
 	} else if (geom_inst) {
 		/* pos vec4 stride-4 (count*16 bytes, modelled w=count h=4) + nrm float3. */
-		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 4, 1);
-		col = g2d_canvas(_nrm_shm, PGL_G3D_NRM_BYTES, count, 3, 1);
+		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 4);
+		col = g2d_canvas(_nrm_shm, PGL_G3D_NRM_BYTES, count, 3);
 		col.phy = _nrm_phy;
 		pos.phy = _pos_phy;
 	} else {
-		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 3, 1);
+		pos = g2d_canvas(_pos_shm, PGL_G3D_POS_BYTES, count, 3);
 		/* cola widens the attribute-1 record to float4 (rgba) so the colour
 		   xform kernel can carry the per-vertex alpha through. */
-		col = g2d_canvas(_nrm_shm, PGL_G3D_NRM_BYTES, count, cola ? 4 : 3, 1);
+		col = g2d_canvas(_nrm_shm, PGL_G3D_NRM_BYTES, count, cola ? 4 : 3);
 		col.phy = _nrm_phy;
 		pos.phy = _pos_phy;
 	}
@@ -1758,10 +1758,10 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 	                      _clear_rgba, _clear_z);
 	/* fs_id is ignored on the compiled path (prog_handle >= 0); the per-draw
 	   uniform blob staged by pgl_g3d_set_uniforms feeds the VS/coord/FS
-	   QUNIFORM expansion.  contig=1 mirrors the CPU-read blob upload.  unif_n
+	   QUNIFORM expansion.  shm staging mirrors the CPU-read blob upload.  unif_n
 	   covers any per-draw kernel words the geom branch just patched beyond
 	   the app-staged count. */
-	g2d_pgl_draw_req_set_shader(&req, dh, _unif_shm, unif_n, 1);
+	g2d_pgl_draw_req_set_shader(&req, dh, _unif_shm, unif_n);
 
 	/* Carry the geom branch's pixel-owned launch window into the request
 	   (the init above memsets, so it must be filled after).  Top-left
@@ -1787,7 +1787,7 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 	if (geom_tex || geom_texcol) {
 		const pgl_g3d_tex_slot_t* t = &_tex[_ctex_bind[0]];
 		req.ctex[0] = g2d_canvas(t->shm, t->size,
-		                         (uint32_t)t->w, (uint32_t)t->h, 1);
+		                         (uint32_t)t->w, (uint32_t)t->h);
 		req.ctex[0].phy  = t->phy;
 		req.ctex_w[0]      = (uint32_t)t->w;
 		req.ctex_h[0]      = (uint32_t)t->h;
@@ -1801,7 +1801,7 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 		   base and the daemon hands it to the kernel as a raw SSBO.  No texture
 		   state record is built for it (the kernel indexes it linearly, no TMU). */
 		uint32_t bytes = _inst_floats * 4u;
-		req.ctex[0] = g2d_canvas(_inst_shm, bytes, _inst_floats, 1u, 1);
+		req.ctex[0] = g2d_canvas(_inst_shm, bytes, _inst_floats, 1u);
 		req.ctex[0].phy  = _inst_phy;
 		req.ctex_w[0]      = _inst_floats;
 		req.ctex_h[0]      = 1u;
@@ -1820,7 +1820,7 @@ static int draw_mesh_compiled_slot(pgl_g3d_prog prog, pgl_g3d_mesh_slot_t* m,
 			    !pglc_tex_sampler_reads_raster())
 				continue;
 			req.ctex[u] = g2d_canvas(t->shm, t->size,
-			                         (uint32_t)t->w, (uint32_t)t->h, 1);
+			                         (uint32_t)t->w, (uint32_t)t->h);
 			req.ctex[u].phy  = t->phy;
 			req.ctex_w[u]      = (uint32_t)t->w;
 			req.ctex_h[u]      = (uint32_t)t->h;
@@ -1936,7 +1936,7 @@ int pgl_g3d_draw_interleaved_compiled_color(pgl_g3d_prog prog,
 }
 
 /* Shared body of the raster / tiled texture uploads: (re)allocate the slot's
-   contig-shm image (layout->size bytes), shuffle the caller's raster rgba8
+   shm image (layout->size bytes), shuffle the caller's raster rgba8
    rows into it per *layout and record the layout on the slot. */
 static int tex_slot_fill(int slot, int w, int h, const void* rgba8,
                          const struct pglc_tex_layout* layout)
@@ -2285,18 +2285,17 @@ static void free_all(void)
  *
    g2d_shm_free() is a client-side shmdt only; the g2dd attach cache holds its
    own shmat reference on every segment it has drawn into, so the kernel does
-   not reclaim the contig-slab run until the cache's idle sweep drops the entry
-   (G2D_ATTACH_CACHE_TTL_MS == 250ms, system/gui/drivers/g2dd/g2dd.c).  The
-   contig sub-allocator (kernel/kernel/src/mm/shm.c) is first-fit with a hard
-   SHM_POOL_MAX == 128 entry cap and splits a free run on every alloc, so a
-   segment its owner already released still occupies a pool entry while the
-   daemon pins it.
+   not reclaim the shm run until the cache's idle sweep drops the entry
+   (G2D_ATTACH_CACHE_TTL_MS == 250ms, system/gui/drivers/g2dd/g2dd.c).  Every
+   shm segment is a physically-contiguous run claimed from general RAM
+   (kernel/kernel/src/mm/shm.c), so a segment its owner already released
+   still occupies that RAM while the daemon pins it.
 
    The previous grow path reallocated fb/z to the EXACT new size on every
    incremental resize, so a continuous drag-to-enlarge orphaned a pair of
    segments per event (~60/s) - far faster than the 250ms sweep reclaims them.
-   Within a few hundred ms the pinned orphans exhausted the 64-entry pool,
-   shm_pool_alloc returned 0, shmget(IPC_CONTIG) failed, alloc_target failed,
+   Within a few hundred ms the pinned orphans piled up faster than the RAM
+   could be reclaimed, shmget failed, alloc_target failed,
    pgl_g3d_resize returned 0 and pglResizeFramebuffer latched the GPU off
    (_pgl_gpu_off = 1) for the rest of the process.  gears and teapot both hit
    this because they share the portablegl resize path.
@@ -2306,10 +2305,10 @@ static void free_all(void)
    the window must grow 50% in area before the next realloc, which at any
    realistic drag speed leaves far more than one TTL between grows, so the
    sweep reclaims each orphan before the next is created.  Resizes that fit the
-   allocated capacity stay on the zero-slab-op reuse path in pgl_g3d_resize. */
+   allocated capacity stay on the zero-alloc reuse path in pgl_g3d_resize. */
 static uint32_t fb_grow_capacity(uint32_t need_pixels)
 {
-	const uint32_t gran = 4096u;   /* 16KB slab granularity */
+	const uint32_t gran = 4096u;   /* 16KB granularity */
 	uint32_t cap = need_pixels + need_pixels / 2u;   /* 1.5x headroom */
 	return (cap + gran - 1u) & ~(gran - 1u);
 }
@@ -2317,7 +2316,7 @@ static uint32_t fb_grow_capacity(uint32_t need_pixels)
 /* Allocate the physical fb/z pair.  w/h are the LOGICAL viewport the daemon
    renders into (fb_canvas marshals them as the canvas dims and _w*4 as the row
    stride); cap_pixels is the physical capacity to reserve, which may exceed
-   w*h so a later in-capacity resize needs no slab operation.  The daemon writes
+   w*h so a later in-capacity resize needs no shm operation.  The daemon writes
    only w*h tightly-packed pixels, so the spare capacity is never touched. */
 static int alloc_target(int w, int h, uint32_t cap_pixels)
 {
@@ -2364,19 +2363,17 @@ int pgl_g3d_resize(int w, int h)
 
 	pgl_g3d_flush();
 
-	/* Grow-only physical targets. The kernel contig-slab sub-allocator is
-	   first-fit with a hard entry cap (SHM_POOL_MAX) and splits on every
-	   alloc, merging only physically-adjacent free runs. The previous
-	   alloc-new-before-free-old order forced the slab to hold both the old
-	   and new fb/z at once, so the still-held old run could not satisfy the
-	   (often smaller) new request; each resize fragmented the slab further
-	   and after 2-3 resizes a contig alloc failed and the GPU latched off
-	   even though the slab had ample total free memory. Reusing the existing
-	   runs whenever the new viewport fits the allocated capacity makes a
-	   shrink (or any in-capacity resize) perform ZERO slab operations - it
-	   only retargets the viewport. The daemon is handed the logical _w/_h as
-	   the viewport and _w*4 as the row stride every draw, and writes only
-	   _w*_h pixels tightly packed, so a larger physical buffer is safe. */
+	/* Grow-only physical targets. Every shm segment is a contiguous run
+	   claimed from general RAM, so the previous alloc-new-before-free-old
+	   order forced the allocator to hold both the old and new fb/z at once,
+	   doubling peak shm occupancy on every resize; after 2-3 resizes a shm
+	   alloc could fail and the GPU latched off even with ample total free
+	   memory. Reusing the existing runs whenever the new viewport fits the
+	   allocated capacity makes a shrink (or any in-capacity resize) perform
+	   ZERO shm operations - it only retargets the viewport. The daemon is
+	   handed the logical _w/_h as the viewport and _w*4 as the row stride
+	   every draw, and writes only _w*_h pixels tightly packed, so a larger
+	   physical buffer is safe. */
 	if ((uint32_t)w * (uint32_t)h <= _fb_cap) {
 		_w = w;
 		_h = h;
@@ -2386,11 +2383,11 @@ int pgl_g3d_resize(int w, int h)
 
 	/* Growth beyond capacity: free the old runs FIRST, then allocate the new
 	   target with 1.5x headroom (fb_grow_capacity) so a continuous drag does
-	   not reallocate - and orphan a daemon-pinned segment pair in the contig
+	   not reallocate - and orphan a daemon-pinned segment pair in the shm
 	   pool - on every incremental size increase.  The freed runs stay pinned
 	   by the g2dd attach cache until its 250ms sweep, so bounding the NUMBER
-	   of grows (not their order) is what keeps the 64-entry pool from
-	   exhausting.  On failure the GPU latches off (the caller in
+	   of grows (not their order) is what keeps the pinned orphans from
+	   exhausting RAM.  On failure the GPU latches off (the caller in
 	   pglResizeFramebuffer shuts down and falls back to CPU). */
 	if (_fb) { g2d_shm_free(_fb); _fb = NULL; }
 	if (_z)  { g2d_shm_free(_z);  _z = NULL; }
@@ -2506,7 +2503,7 @@ int pgl_g3d_init(int w, int h)
 	_nrm_shm = nrm_shm; _nrm = (float*)nrm_px; _nrm_phy = nrm_phy;
 	_batch_tex_slot = -1;
 
-	/* WS4 uniform staging: a CPU-read contig-shm blob the daemon copies to
+	/* WS4 uniform staging: a CPU-read shm blob the daemon copies to
 	   expand the compiled program's QUNIFORM stream.  Allocated non-phy (the
 	   GPU never reads it directly); a failure does NOT latch the GPU off - the
 	   fixed-function path stays live and the compiled path simply declines. */

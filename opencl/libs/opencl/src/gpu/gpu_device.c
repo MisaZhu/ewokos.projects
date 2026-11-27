@@ -464,7 +464,7 @@ static int gpu_ndrange(struct _cl_command_queue *queue, struct _cl_kernel *kerne
     }
 
     /* Gather __global buffers in binding order.  Only a zero-origin buffer can
-     * use its contig-shm id directly; sub-buffer offsets need staged storage. */
+     * use its shm id directly; sub-buffer offsets need staged storage. */
     memset(arg_host, 0, sizeof(arg_host));
     memset(arg_size, 0, sizeof(arg_size));
     memset(arg_shm, 0, sizeof(arg_shm));
